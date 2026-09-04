@@ -14505,11 +14505,8 @@ fn select_item_aggregate<'a>(
             if input_expression.is_some() {
                 return unsupported("MEDIAN does not support computed input expressions");
             }
-            if !matches!(
-                column.physical_arrow_type,
-                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
-            ) {
-                return unsupported("MEDIAN currently supports Int64 or Decimal128 input columns");
+            if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
+                return unsupported("MEDIAN currently supports only Int64 input columns");
             }
             Ok(ParsedAggregateProjection {
                 output: SupportedAggregateOutput {
@@ -14566,12 +14563,9 @@ fn select_item_aggregate<'a>(
                     "{name} does not support computed input expressions"
                 ));
             }
-            if !matches!(
-                column.physical_arrow_type,
-                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
-            ) {
+            if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
                 return unsupported(format!(
-                    "{name} currently supports Int64 or Decimal128 input columns"
+                    "{name} currently supports only Int64 input columns"
                 ));
             }
             Ok(ParsedAggregateProjection {

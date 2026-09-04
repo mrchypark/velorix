@@ -6912,6 +6912,72 @@ fn single_key_aggregate_sql_accepts_decimal_avg_as_float64_output() {
 }
 
 #[test]
+fn percentile_families_reject_non_int64_input_columns() {
+    let string_catalog = scores_with_category_catalog();
+    let mut decimal_catalog = purchases_catalog_without_value_role();
+    let amount = decimal_catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "amount")
+        .unwrap();
+    amount.logical_type = VelorixLogicalTypeV1::Decimal {
+        precision: 12,
+        scale: 2,
+    };
+    amount.physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+        precision: 12,
+        scale: 2,
+    };
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&decimal_catalog.relation_schema)
+            .expect("decimal catalog should fingerprint");
+    decimal_catalog.schema_fingerprint = schema_fingerprint.clone();
+    decimal_catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+
+    for (catalog, group_key, input, aggregate) in [
+        (&string_catalog, "user_id", "category", "median(category)"),
+        (
+            &string_catalog,
+            "user_id",
+            "category",
+            "percentile_disc(category, 0.5)",
+        ),
+        (
+            &string_catalog,
+            "user_id",
+            "category",
+            "percentile_cont(category, 0.5)",
+        ),
+        (&decimal_catalog, "user_id", "amount", "median(amount)"),
+        (
+            &decimal_catalog,
+            "user_id",
+            "amount",
+            "percentile_disc(amount, 0.5)",
+        ),
+        (
+            &decimal_catalog,
+            "user_id",
+            "amount",
+            "percentile_cont(amount, 0.5)",
+        ),
+    ] {
+        let sql = format!(
+            "select {group_key}, {aggregate} as result from {} group by {group_key}",
+            catalog.relation_schema.relation_name
+        );
+        let error = validate_supported_view_sql(&sql, catalog).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("currently supports only Int64 input columns"),
+            "expected Int64-only rejection for `{input}` in `{sql}`, got {error}"
+        );
+    }
+}
+
+#[test]
 fn tumbling_event_time_aggregate_sql_lowers_to_hashed_logical_view_plan() {
     let catalog = purchases_event_time_catalog();
     let output_schema = purchases_window_output_schema();

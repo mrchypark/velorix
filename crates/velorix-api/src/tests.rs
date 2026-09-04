@@ -13821,6 +13821,289 @@ fn canonical_join_api_checkpoint(checkpoint: &RuntimeCheckpoint) -> Value {
 }
 
 #[tokio::test]
+async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state =
+        test_public_api_state_with_store(store.clone(), "api-test-percentiles-a", false).await;
+    let router = app(state);
+    let score_samples = test_relation_catalog_for_e2e(
+        "score_samples",
+        &[
+            ("sample_id", VelorixLogicalTypeV1::Utf8, false),
+            ("bucket", VelorixLogicalTypeV1::Utf8, false),
+            ("value", VelorixLogicalTypeV1::Int64, false),
+        ],
+    );
+    let latency_samples = test_relation_catalog_for_e2e(
+        "latency_samples",
+        &[
+            ("observation_id", VelorixLogicalTypeV1::Utf8, false),
+            ("segment", VelorixLogicalTypeV1::Utf8, false),
+            ("latency", VelorixLogicalTypeV1::Int64, false),
+        ],
+    );
+    for catalog in [score_samples, latency_samples] {
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({"catalog": catalog, "default_orders_sum_count": false}),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
+    }
+
+    for (view_id, relation_id, sql) in [
+        (
+            "median_score_by_bucket",
+            "score_samples",
+            "select bucket, median(value) as median from score_samples group by bucket",
+        ),
+        (
+            "latency_percentiles_by_segment",
+            "latency_samples",
+            "select segment, percentile_disc(latency, 0.5) as p50_disc, percentile_cont(latency, 0.5) as p50_cont from latency_samples group by segment",
+        ),
+    ] {
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": view_id,
+                "input_relation_id": relation_id,
+                "input_relation_version": "2026-08-14.v1",
+                "sql": sql,
+            }),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
+        assert_eq!(response.1["query_enabled"], true, "{response:?}");
+    }
+
+    let ingest = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({"batches": [
+            {
+                "relation_id": "score_samples",
+                "relation_version": "2026-08-14.v1",
+                "stream_id": "median-samples",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"sample_id": "a-1", "bucket": "alpha", "value": 2, "delta": 1},
+                    {"sample_id": "a-2", "bucket": "alpha", "value": 10, "delta": 1},
+                    {"sample_id": "b-1", "bucket": "beta", "value": 4, "delta": 1},
+                    {"sample_id": "b-2", "bucket": "beta", "value": 8, "delta": 1},
+                    {"sample_id": "b-3", "bucket": "beta", "value": 12, "delta": 1}
+                ]
+            },
+            {
+                "relation_id": "latency_samples",
+                "relation_version": "2026-08-14.v1",
+                "stream_id": "percentile-samples",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"observation_id": "c-1", "segment": "critical", "latency": 20, "delta": 1},
+                    {"observation_id": "c-2", "segment": "critical", "latency": 50, "delta": 1},
+                    {"observation_id": "c-3", "segment": "critical", "latency": 100, "delta": 1},
+                    {"observation_id": "s-1", "segment": "standard", "latency": 10, "delta": 1},
+                    {"observation_id": "s-2", "segment": "standard", "latency": 20, "delta": 1}
+                ]
+            }
+        ]}),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+    let expected_rows = [
+        (
+            "median_score_by_bucket",
+            json!([
+                {"bucket": "alpha", "median": 6.0},
+                {"bucket": "beta", "median": 8.0}
+            ]),
+        ),
+        (
+            "latency_percentiles_by_segment",
+            json!([
+                {"segment": "critical", "p50_disc": 50, "p50_cont": 50.0},
+                {"segment": "standard", "p50_disc": 10, "p50_cont": 15.0}
+            ]),
+        ),
+    ];
+    for (view_id, expected) in &expected_rows {
+        let response = call_json(
+            &router,
+            Method::POST,
+            &format!("/v1/views/{view_id}/query"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{response:?}");
+        assert_eq!(response.1["rows"], *expected, "{response:?}");
+    }
+
+    let restarted_state =
+        test_public_api_state_with_store(store, "api-test-percentiles-b", true).await;
+    assert_eq!(
+        restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        2
+    );
+    let restarted_router = app(restarted_state);
+    for (view_id, expected) in &expected_rows {
+        let response = call_json(
+            &restarted_router,
+            Method::POST,
+            &format!("/v1/views/{view_id}/query"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::OK, "{response:?}");
+        assert_eq!(response.1["rows"], *expected, "{response:?}");
+    }
+}
+
+#[tokio::test]
+async fn rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs() {
+    let state = test_public_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "api-test-percentile-admission-rejections",
+        false,
+    )
+    .await;
+    let router = app(state);
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation_response.0, StatusCode::CREATED);
+
+    let mut decimal_scores = test_scores_catalog();
+    decimal_scores.relation_schema.relation_id = "decimal_scores".to_string();
+    decimal_scores.relation_schema.relation_name = "decimal_scores".to_string();
+    decimal_scores.datafusion_registration.name = "decimal_scores".to_string();
+    decimal_scores.incremental_relation.relation_id = "decimal_scores".to_string();
+    let score = decimal_scores
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "score")
+        .unwrap();
+    score.logical_type = VelorixLogicalTypeV1::Decimal {
+        precision: 12,
+        scale: 2,
+    };
+    score.physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+        precision: 12,
+        scale: 2,
+    };
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&decimal_scores.relation_schema).unwrap();
+    decimal_scores.schema_fingerprint = schema_fingerprint.clone();
+    decimal_scores.incremental_relation.schema_fingerprint = schema_fingerprint;
+    let decimal_relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": decimal_scores, "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(decimal_relation_response.0, StatusCode::CREATED);
+
+    for (view_id, relation_id, sql) in [
+        (
+            "global_median",
+            "scores",
+            "select median(score) as median from scores",
+        ),
+        (
+            "percentile_wrong_arity",
+            "scores",
+            "select user_id, percentile_disc(score) as p50 from scores group by user_id",
+        ),
+        (
+            "percentile_non_literal",
+            "scores",
+            "select user_id, percentile_cont(score, user_id) as p50 from scores group by user_id",
+        ),
+        (
+            "percentile_out_of_range",
+            "scores",
+            "select user_id, percentile_disc(score, 1.1) as p110 from scores group by user_id",
+        ),
+        (
+            "median_string_input",
+            "scores",
+            "select score, median(user_id) as median from scores group by score",
+        ),
+        (
+            "percentile_disc_string_input",
+            "scores",
+            "select score, percentile_disc(user_id, 0.5) as p50 from scores group by score",
+        ),
+        (
+            "percentile_cont_string_input",
+            "scores",
+            "select score, percentile_cont(user_id, 0.5) as p50 from scores group by score",
+        ),
+        (
+            "median_decimal_input",
+            "decimal_scores",
+            "select user_id, median(score) as median from decimal_scores group by user_id",
+        ),
+        (
+            "percentile_disc_decimal_input",
+            "decimal_scores",
+            "select user_id, percentile_disc(score, 0.5) as p50 from decimal_scores group by user_id",
+        ),
+        (
+            "percentile_cont_decimal_input",
+            "decimal_scores",
+            "select user_id, percentile_cont(score, 0.5) as p50 from decimal_scores group by user_id",
+        ),
+    ] {
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": view_id,
+                "input_relation_id": relation_id,
+                "input_relation_version": "2026-05-24.v1",
+                "sql": sql,
+            }),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST, "{response:?}");
+        assert!(
+            response.1["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported view SQL for materialized runtime"),
+            "{response:?}"
+        );
+        let persisted = call_json(
+            &router,
+            Method::GET,
+            &format!("/v1/views/{view_id}"),
+            Value::Null,
+        )
+        .await;
+        assert!(persisted.0.is_client_error(), "{persisted:?}");
+    }
+}
+
+#[tokio::test]
 async fn rest_two_relation_join_count_only_view_materialized_output_survives_api_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-join-count-only-a", false).await;
