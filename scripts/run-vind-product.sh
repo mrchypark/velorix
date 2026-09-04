@@ -305,6 +305,146 @@ if [ "$#" -ne 0 ]; then
   exit 64
 fi
 
+write_public_evidence() {
+  local path="$1"
+  local public_path
+  local failure_path
+  local temporary_path
+  if [ -z "$path" ] || [ ! -f "$path" ]; then
+    echo "public evidence generation requires an existing private JSON artifact" >&2
+    return 66
+  fi
+  case "$path" in
+    *.json) public_path="${path%.json}.public.json" ;;
+    *) public_path="${path}.public.json" ;;
+  esac
+  failure_path="${public_path}.failed"
+  temporary_path="${public_path}.tmp.$$"
+  rm -f "$public_path" "$failure_path" "$temporary_path"
+  chmod 600 "$path"
+  if ! python3 - "$path" "$temporary_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+private_path = Path(sys.argv[1])
+public_path = Path(sys.argv[2])
+marker = "<redacted>"
+sensitive_keys = {
+    "api_url",
+    "api_path",
+    "attester",
+    "authority_namespace",
+    "authority_store_id",
+    "bucket",
+    "cluster",
+    "context",
+    "credentials_secret_name",
+    "credentials_sha256",
+    "deployment_id",
+    "deployed_topology",
+    "container_image",
+    "container_image_id",
+    "image",
+    "image_digest",
+    "endpoint",
+    "endpoint_url",
+    "external_hostname",
+    "external_s3_validation_key",
+    "evidence_files",
+    "ingest_writer_object_key",
+    "ingress_controller",
+    "inputRelationRefs",
+    "meta_s3_prefix",
+    "namespace",
+    "nodes",
+    "object_key",
+    "object_store_endpoint",
+    "operator_id",
+    "job_name",
+    "job_uid",
+    "pod_name",
+    "pod_uid",
+    "container_name",
+    "node_name",
+    "service_name",
+    "resource_name",
+    "resource_uid",
+    "hostname",
+    "host_name",
+    "provenance",
+    "evidence_provenance",
+    "probe_prefix",
+    "problems",
+    "raft_secret_sha256",
+    "region",
+    "relation_id",
+    "relation_ids",
+    "relation_version",
+    "remediation_commands",
+    "run_id",
+    "s3_prefix",
+    "secret_name",
+    "source_revision",
+    "stream_id",
+    "admin_secret_name",
+    "tls_certificate_sha256",
+    "tls_certificate_issuer",
+    "url",
+    "urlPath",
+    "view_id",
+    "promoted_api_path",
+    "owner_id",
+}
+redacted_paths = []
+
+
+def redact(value, path_parts=()):
+    if isinstance(value, dict):
+        output = {}
+        for key, child in value.items():
+            child_path = ".".join((*path_parts, str(key)))
+            if key in sensitive_keys:
+                output[key] = marker
+                redacted_paths.append(child_path)
+            else:
+                output[key] = redact(child, (*path_parts, str(key)))
+        return output
+    if isinstance(value, list):
+        return [redact(child, (*path_parts, str(index))) for index, child in enumerate(value)]
+    return value
+
+
+with private_path.open(encoding="utf-8") as stream:
+    payload = json.load(stream)
+payload = redact(payload)
+payload["identifier_redaction"] = "enabled"
+payload["redaction_marker"] = marker
+payload["redacted_environment_fields"] = sorted(set(redacted_paths))
+with public_path.open("w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
+  then
+    rm -f "$public_path" "$temporary_path"
+    printf '%s\n' "public_evidence_redaction_failed" >"$failure_path"
+    chmod 600 "$failure_path"
+    return 1
+  fi
+  chmod 600 "$temporary_path"
+  if ! mv -f "$temporary_path" "$public_path"; then
+    rm -f "$public_path" "$temporary_path"
+    printf '%s\n' "public_evidence_redaction_failed" >"$failure_path"
+    chmod 600 "$failure_path"
+    return 1
+  fi
+}
+
+if [ "${VELORIX_EVIDENCE_REDACT_ONLY:-0}" = "1" ]; then
+  write_public_evidence "${VELORIX_EVIDENCE_REDACT_ONLY_FILE:-}"
+  exit $?
+fi
+
 if [ "$preserve_state" = "1" ] || [ -n "${VELORIX_S3_PREFIX+x}" ]; then
   if [ -z "${VELORIX_K8S_NAMESPACE+x}" ]; then
     echo "VELORIX_K8S_NAMESPACE must be explicit when preserving or sharing state" >&2
@@ -339,7 +479,7 @@ preflight_docker_daemon() {
 
   echo "docker daemon is not reachable; cannot run the vind product deployment" >&2
   if [ -n "$context_name" ]; then
-    echo "docker_context=${context_name}" >&2
+    echo "docker_context=available" >&2
   fi
   echo "$output" >&2
   if command -v colima >/dev/null 2>&1; then
@@ -1804,64 +1944,45 @@ write_diagnostics() {
   mkdir -p "$output_dir"
   {
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "cluster=${cluster}"
     echo "cluster_driver=${cluster_driver}"
-    echo "product_deployment_id=${product_deployment_id}"
-    echo "context=${context}"
-    echo "namespace=${namespace}"
     echo "object_store_mode=${object_store_mode}"
-    echo "object_store_endpoint=${s3_endpoint}"
-    echo "authority_store_id=${s3_authority_store_id}"
-    echo "s3_bucket=${bucket}"
-    echo "s3_prefix=${s3_prefix}"
-    echo "aws_region=${aws_region}"
     echo "external_s3_validate=${external_s3_validate}"
     echo "external_s3_bucket_validated=${external_s3_bucket_validated}"
-    echo "hiqlite_authority_attestation_file=${hiqlite_authority_attestation_file:-}"
     echo "hiqlite_authority_attestation_validated=${hiqlite_authority_attestation_validated}"
-    echo "ingress_tls_auth_attestation_file=${ingress_tls_auth_attestation_file:-}"
     echo "ingress_tls_auth_attestation_validated=${ingress_tls_auth_attestation_validated}"
-    echo "ingest_writer_lifecycle_attestation_file=${ingest_writer_lifecycle_attestation_file:-}"
     echo "ingest_writer_lifecycle_attestation_validated=${ingest_writer_lifecycle_attestation_validated}"
-    echo
-    if [ "$cluster_driver" = "docker-vcluster" ]; then
-      echo "== vcluster list =="
-      vcluster list --driver docker || true
-      echo
+    if kubectl --context "$context" get --raw=/readyz >/dev/null 2>&1; then
+      echo "kubernetes_api_ready=true"
+    else
+      echo "kubernetes_api_ready=false"
     fi
-    echo "== kubectl contexts =="
-    kubectl config get-contexts || true
-    echo
-    echo "== pods =="
-    kubectl --context "$context" get pods -n "$namespace" -o wide || true
-    echo
-    echo "== services =="
-    kubectl --context "$context" get svc -n "$namespace" -o wide || true
-    echo
-    echo "== nodes =="
-    kubectl --context "$context" get nodes -o wide || true
-    echo
-    echo "== node conditions and taints =="
-    kubectl --context "$context" describe nodes || true
-    echo
-    echo "== recent events =="
-    kubectl --context "$context" get events -A --sort-by=.lastTimestamp || true
-    echo
-    echo "== api logs =="
-    kubectl --context "$context" logs -n "$namespace" deploy/velorix-api --tail=200 || true
-    echo
-    echo "== meta logs =="
-    kubectl --context "$context" logs -n "$namespace" deploy/velorix-meta --tail=200 || true
-    if [ "$object_store_mode" = "rustfs" ]; then
-      echo
-      echo "== rustfs logs =="
-      kubectl --context "$context" logs -n "$namespace" deploy/rustfs --tail=200 || true
+    if kubectl --context "$context" -n "$namespace" get pods >/dev/null 2>&1; then
+      echo "product_pods_query_succeeded=true"
+    else
+      echo "product_pods_query_succeeded=false"
     fi
+    echo "identifier_redaction=enabled"
   } >"${output_dir}/diagnostics.txt" 2>&1
 }
 
 cleanup_vind() {
   status="$1"
+
+  if [ -f "${output_dir}/product-evidence.json" ]; then
+    if ! write_public_evidence "${output_dir}/product-evidence.json"; then
+      status=1
+    fi
+  fi
+  if [ -f "${output_dir}/product-completion-report.json" ]; then
+    if ! write_public_evidence "${output_dir}/product-completion-report.json"; then
+      status=1
+    fi
+  fi
+  if [ -f "${output_dir}/local-environment-blocker.json" ]; then
+    if ! write_public_evidence "${output_dir}/local-environment-blocker.json"; then
+      status=1
+    fi
+  fi
 
   if [ "$status" != "0" ]; then
     write_diagnostics
@@ -1914,7 +2035,7 @@ wait_for_kubernetes() {
     fi
     sleep 1
   done
-  echo "vind Kubernetes API did not become ready for ${context}" >&2
+  echo "vind Kubernetes API did not become ready" >&2
   return 1
 }
 
@@ -1966,7 +2087,7 @@ PY
       return 0
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-      echo "vind Kubernetes node scheduling did not become ready for ${context}" >&2
+      echo "vind Kubernetes node scheduling did not become ready" >&2
       return 1
     fi
     sleep 2
@@ -1978,14 +2099,14 @@ validate_local_vcluster_context() {
   local server
   current_context="$(kubectl config current-context)"
   if [ "$current_context" != "$context" ]; then
-    echo "refusing to continue: current kube context is ${current_context}, expected ${context}" >&2
+    echo "refusing to continue: current kube context did not match the selected target" >&2
     return 1
   fi
   server="$(kubectl --context "$context" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
   case "$server" in
     https://127.0.0.1:* | https://localhost:*) ;;
     *)
-      echo "refusing to continue: ${context} does not point at a local vCluster API server (${server})" >&2
+      echo "refusing to continue: selected target does not point at a local vCluster API server" >&2
       return 1
       ;;
   esac
@@ -1994,7 +2115,7 @@ validate_local_vcluster_context() {
 validate_existing_kubernetes_context() {
   local server
   if ! kubectl config get-contexts "$context" >/dev/null 2>&1; then
-    echo "existing Kubernetes context does not exist: ${context}" >&2
+    echo "existing Kubernetes context does not exist" >&2
     return 1
   fi
   server="$(kubectl --context "$context" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
@@ -2002,7 +2123,7 @@ validate_existing_kubernetes_context() {
     case "$server" in
       https://127.0.0.1:* | https://localhost:* | https://0.0.0.0:*) ;;
       *)
-        echo "refusing existing-context driver for non-local Kubernetes API server ${server}; set VELORIX_EXISTING_CONTEXT_ALLOW_REMOTE=1 to override" >&2
+        echo "refusing existing-context driver for non-local Kubernetes API server; set VELORIX_EXISTING_CONTEXT_ALLOW_REMOTE=1 to override" >&2
         return 1
         ;;
     esac
@@ -2014,7 +2135,7 @@ vcluster_container() {
   id="$(docker ps --filter "name=${cluster}" --format '{{.ID}} {{.Names}}' \
     | awk -v c="$cluster" '$2 == "vcluster-" c || $2 == c || index($2, c) > 0 { print $1; exit }')"
   if [ -z "$id" ]; then
-    echo "could not find Docker container for vCluster ${cluster}" >&2
+    echo "could not find Docker container for vCluster" >&2
     docker ps --format '{{.ID}} {{.Names}}' >&2
     exit 1
   fi
@@ -2059,10 +2180,10 @@ load_image_into_kind() {
   local image="$1"
   local detected_cluster
   detected_cluster="$(infer_kind_cluster_name)" || {
-    echo "could not infer kind cluster from Kubernetes context ${context}; set VELORIX_IMAGE_LOAD_MODE=none if images are already pullable" >&2
+    echo "could not infer a kind image loader; set VELORIX_IMAGE_LOAD_MODE=none if images are already pullable" >&2
     exit 66
   }
-  echo "loading ${image} into kind cluster ${detected_cluster}"
+  echo "loading image into kind cluster"
   kind load docker-image "$image" --name "$detected_cluster"
 }
 
@@ -2071,7 +2192,7 @@ load_image_into_k3d() {
   local nodes
   nodes="$(k3d_node_containers)"
   if [ -z "$nodes" ]; then
-    echo "could not find k3d server/agent containers for Kubernetes context ${context}; set VELORIX_K3D_CLUSTER or VELORIX_IMAGE_LOAD_MODE=none" >&2
+    echo "could not find k3d server/agent containers; set VELORIX_K3D_CLUSTER or VELORIX_IMAGE_LOAD_MODE=none" >&2
     exit 66
   fi
   while IFS= read -r node; do
@@ -2103,7 +2224,7 @@ load_image_into_product_cluster() {
       elif infer_kind_cluster_name >/dev/null 2>&1; then
         load_image_into_kind "$image"
       else
-        echo "VELORIX_IMAGE_LOAD_MODE=auto cannot infer an image loader for context ${context}; set VELORIX_IMAGE_LOAD_MODE=none if images are already pullable" >&2
+        echo "VELORIX_IMAGE_LOAD_MODE=auto cannot infer an image loader; set VELORIX_IMAGE_LOAD_MODE=none if images are already pullable" >&2
         exit 66
       fi
       ;;
@@ -2114,10 +2235,10 @@ load_image_into_product_cluster() {
       load_image_into_kind "$image"
       ;;
     *:none)
-      echo "skipping image load for ${image}; assuming it is already pullable by ${context}"
+      echo "skipping image load; assuming the image is already pullable"
       ;;
     *)
-      echo "unsupported VELORIX_IMAGE_LOAD_MODE=${image_load_mode} for VELORIX_VIND_CLUSTER_DRIVER=${cluster_driver}" >&2
+      echo "unsupported VELORIX_IMAGE_LOAD_MODE for selected cluster driver" >&2
       exit 64
       ;;
   esac
@@ -2179,7 +2300,7 @@ wait_for_rollout() {
     check_kubernetes_scheduling_health "rollout-${deployment}"
     if [ "$SECONDS" -ge "$deadline" ]; then
       kubectl --context "$context" -n "$namespace" rollout status "deployment/${deployment}" --timeout=1s >&2 || true
-      echo "deployment/${deployment} did not roll out in ${context}/${namespace}" >&2
+      echo "deployment did not roll out" >&2
       exit 1
     fi
   done
@@ -2251,7 +2372,7 @@ wait_for_statefulset_rollout() {
     check_kubernetes_scheduling_health "rollout-${statefulset}"
     if [ "$SECONDS" -ge "$deadline" ]; then
       kubectl --context "$context" -n "$namespace" rollout status "statefulset/${statefulset}" --timeout=1s >&2 || true
-      echo "statefulset/${statefulset} did not roll out in ${context}/${namespace}" >&2
+      echo "statefulset did not roll out" >&2
       exit 1
     fi
   done
@@ -2306,7 +2427,7 @@ wait_for_job_complete() {
     check_kubernetes_scheduling_health "job-${job}"
     if [ "$SECONDS" -ge "$deadline" ]; then
       kubectl --context "$context" -n "$namespace" logs "job/${job}" --tail=200 >&2 || true
-      echo "job/${job} did not complete in ${context}/${namespace}" >&2
+      echo "job did not complete" >&2
       exit 1
     fi
   done
@@ -2322,7 +2443,7 @@ wait_for_job_failed() {
     check_kubernetes_scheduling_health "job-${job}"
     if [ "$SECONDS" -ge "$deadline" ]; then
       kubectl --context "$context" -n "$namespace" logs "job/${job}" --tail=200 >&2 || true
-      echo "job/${job} did not fail as expected in ${context}/${namespace}" >&2
+      echo "job did not fail as expected" >&2
       exit 1
     fi
   done
@@ -2471,9 +2592,7 @@ if problems:
     raise SystemExit(75)
 PY
   then
-    kubectl --context "$context" get nodes -o wide >&2 || true
-    kubectl --context "$context" -n "$namespace" get pods -o wide >&2 || true
-    kubectl --context "$context" get events -A --sort-by=.lastTimestamp | tail -60 >&2 || true
+    echo "Kubernetes scheduling health check failed; detailed resource output is suppressed by identifier redaction" >&2
     exit 75
   fi
   rm -f "$blocker_json"
@@ -2532,8 +2651,9 @@ if "context was not found" in lowered:
     problems.append("vCluster kube context was not created")
 if not problems:
     blocker_detail_kind.append("vcluster_bootstrap_unknown")
-    tail = "\n".join(log.splitlines()[-20:])
-    problems.append(f"vCluster bootstrap failed; last log lines:\n{tail}")
+    problems.append(
+        "vCluster bootstrap failed; diagnostic log tail is withheld by identifier redaction"
+    )
 
 evidence_files = {"vcluster_bootstrap_log": log_path}
 doctor = None
@@ -2654,6 +2774,66 @@ create_vcluster_with_retry() {
   return 75
 }
 
+kubectl_auth_can_i() {
+  local check_name="$1"
+  shift
+  case "$check_name" in
+    '' | *[!A-Za-z0-9._-]*)
+      echo "Kubernetes authorization check name is invalid" >&2
+      return 1
+      ;;
+  esac
+  local stdout_file="${output_dir}/auth-can-i-${check_name}.stdout"
+  local stderr_file="${output_dir}/auth-can-i-${check_name}.stderr"
+  if ! kubectl "$@" >"$stdout_file" 2>"$stderr_file"; then
+    echo "Kubernetes authorization check command failed" >&2
+    return 1
+  fi
+  chmod 600 "$stdout_file" "$stderr_file"
+  local observed
+  observed="$(<"$stdout_file")"
+  case "$observed" in
+    yes) return 0 ;;
+    no) return 2 ;;
+    *)
+      echo "Kubernetes authorization check returned unexpected output" >&2
+      return 1
+      ;;
+  esac
+}
+
+assert_kubectl_auth_can_i_denied() {
+  local check_name="$1"
+  shift
+  local status
+  if kubectl_auth_can_i "$check_name" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    2) return 0 ;;
+    0) echo "no-PVC authorization policy violation" >&2; return 1 ;;
+    *) echo "no-PVC authorization check failed closed" >&2; return 1 ;;
+  esac
+}
+
+assert_kubectl_auth_can_i_allowed() {
+  local check_name="$1"
+  shift
+  local status
+  if kubectl_auth_can_i "$check_name" "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) return 0 ;;
+    2) echo "required Kubernetes authorization was denied" >&2; return 1 ;;
+    *) echo "Kubernetes authorization check failed closed" >&2; return 1 ;;
+  esac
+}
+
 validate_no_pvc_namespace() {
   if [ "$no_pvc_namespace_validate" != "1" ]; then
     return 0
@@ -2673,29 +2853,23 @@ if items:
 PY
   if [ "$ingest_writer_smoke" = "1" ]; then
     for service_account in velorix-ingest-writer-append velorix-ingest-writer-lease-probe; do
-      if kubectl --context "$context" auth can-i create persistentvolumeclaims \
+      assert_kubectl_auth_can_i_denied "pvc-${service_account}" \
+        --context "$context" auth can-i create persistentvolumeclaims \
         --namespace "$namespace" \
-        --as "system:serviceaccount:${namespace}:${service_account}" | grep -qx "yes"; then
-        echo "no-PVC product contract violated; service account ${service_account} can create PVCs" >&2
-        exit 1
-      fi
+        --as "system:serviceaccount:${namespace}:${service_account}"
     done
     for verb in get create update patch; do
-      if ! kubectl --context "$context" auth can-i "$verb" leases.coordination.k8s.io \
+      assert_kubectl_auth_can_i_allowed "lease-${verb}" \
+        --context "$context" auth can-i "$verb" leases.coordination.k8s.io \
         --namespace "$namespace" \
-        --as "system:serviceaccount:${namespace}:velorix-ingest-writer-lease-probe" | grep -qx "yes"; then
-        echo "lease-guarded ingest-writer service account must be able to ${verb} Kubernetes Leases" >&2
-        exit 1
-      fi
+        --as "system:serviceaccount:${namespace}:velorix-ingest-writer-lease-probe"
     done
     for service_account in velorix-ingest-writer-append velorix-ingest-writer-lease-probe; do
       for verb in get list watch; do
-        if kubectl --context "$context" auth can-i "$verb" secrets \
+        assert_kubectl_auth_can_i_denied "secret-${service_account}-${verb}" \
+          --context "$context" auth can-i "$verb" secrets \
           --namespace "$namespace" \
-          --as "system:serviceaccount:${namespace}:${service_account}" | grep -qx "yes"; then
-          echo "ingest-writer service account ${service_account} must not be able to ${verb} Kubernetes Secrets" >&2
-          exit 1
-        fi
+          --as "system:serviceaccount:${namespace}:${service_account}"
       done
     done
   fi
@@ -2734,19 +2908,15 @@ if "HQL_SECRET_API" not in env or "HQL_SECRET_RAFT" not in env:
 if "ENC_KEY_ACTIVE" not in env or "ENC_KEYS" not in env:
     raise SystemExit("managed Hiqlite authority must configure backup encryption keys")
 PY
-    if kubectl --context "$context" auth can-i create persistentvolumeclaims \
+    assert_kubectl_auth_can_i_denied "hiqlite-pvc" \
+      --context "$context" auth can-i create persistentvolumeclaims \
       --namespace "$namespace" \
-      --as "system:serviceaccount:${namespace}:velorix-hiqlite" | grep -qx "yes"; then
-      echo "no-PVC product contract violated; service account velorix-hiqlite can create PVCs" >&2
-      exit 1
-    fi
+      --as "system:serviceaccount:${namespace}:velorix-hiqlite"
     for verb in get list watch; do
-      if kubectl --context "$context" auth can-i "$verb" secrets \
+      assert_kubectl_auth_can_i_denied "hiqlite-secret-${verb}" \
+        --context "$context" auth can-i "$verb" secrets \
         --namespace "$namespace" \
-        --as "system:serviceaccount:${namespace}:velorix-hiqlite" | grep -qx "yes"; then
-        echo "managed Hiqlite service account must not be able to ${verb} Kubernetes Secrets" >&2
-        exit 1
-      fi
+        --as "system:serviceaccount:${namespace}:velorix-hiqlite"
     done
   fi
   no_pvc_namespace_validated=1
@@ -5276,6 +5446,7 @@ run_product_completion_report() {
     VELORIX_REST_API_SMOKE_EVIDENCE="${output_dir}/rest-api-smoke.json" \
     VELORIX_PRODUCT_COMPLETION_REPORT="${output_dir}/product-completion-report.json" \
     scripts/report-vind-product-completion.sh
+  chmod 600 "${output_dir}/product-completion-report.json"
   product_completion_report_status="pass"
   product_completion_report_file="${output_dir}/product-completion-report.json"
 }
@@ -6298,6 +6469,7 @@ with open(path, "w", encoding="utf-8") as f:
     json.dump(evidence, f, indent=2, sort_keys=True)
     f.write("\n")
 PY
+  chmod 600 "${output_dir}/product-evidence.json"
 }
 
 assert_product_complete_evidence() {
@@ -6320,6 +6492,7 @@ PY
 
 cd "$repo_root"
 mkdir -p "$output_dir"
+chmod 700 "$output_dir"
 preflight_docker_daemon
 check_local_disk_preflight
 trap 'status=$?; cleanup_vind "$status"; exit "$status"' EXIT
@@ -6331,7 +6504,7 @@ if [ "$cluster_driver" = "docker-vcluster" ]; then
 
   if vcluster_exists; then
     if [ "$reuse_existing" != "1" ]; then
-      echo "vcluster already exists: ${cluster}; set VELORIX_VIND_REUSE_EXISTING=1 or choose another name" >&2
+      echo "vcluster already exists; set VELORIX_VIND_REUSE_EXISTING=1 or choose another name" >&2
       exit 1
     fi
   else
@@ -6539,7 +6712,7 @@ EOF
 else
   existing_s3_credentials_secret_json="${output_dir}/s3-credentials-secret.json"
   if ! kubectl --context "$context" -n "$namespace" get secret "$s3_credentials_secret_name" -o json >"$existing_s3_credentials_secret_json"; then
-    echo "VELORIX_S3_CREDENTIALS_SECRET_MANAGED=0 requires existing Secret ${s3_credentials_secret_name} in namespace ${namespace}" >&2
+    echo "VELORIX_S3_CREDENTIALS_SECRET_MANAGED=0 requires the configured existing Kubernetes Secret" >&2
     exit 66
   fi
   s3_credentials_hash="$(
@@ -7827,18 +8000,21 @@ fi
 attach_final_rest_to_writer_owner
 run_rest_api_smoke
 run_product_completion_report
+if [ -f "${output_dir}/rest-api-smoke.json" ]; then
+  write_public_evidence "${output_dir}/rest-api-smoke.json"
+fi
+write_public_evidence "${output_dir}/product-evidence.json"
+if [ -f "${output_dir}/product-completion-report.json" ]; then
+  write_public_evidence "${output_dir}/product-completion-report.json"
+fi
 
-echo "velorix-api is running at http://127.0.0.1:${api_local_port}"
-echo "cluster=${cluster}"
-echo "product_deployment_id=${product_deployment_id}"
-echo "namespace=${namespace}"
-echo "context=${context}"
+echo "velorix-api is ready"
+echo "identifier_redaction=enabled"
 echo "product_evidence_level=${product_evidence_level}"
-echo "product_evidence=${output_dir}/product-evidence.json"
+echo "product_evidence_public=${output_dir}/product-evidence.public.json"
 echo "meta_enabled=${meta_enabled}"
 if [ "$meta_enabled" = "1" ]; then
   echo "meta_backend=${meta_backend}"
-  echo "meta_service=velorix-meta.${namespace}.svc:9090"
   if [ "$meta_backend" = "hiqlite" ]; then
     echo "hiqlite_authority_attestation_validated=${hiqlite_authority_attestation_validated}"
   fi
@@ -7847,12 +8023,12 @@ echo "product_smoke=${product_smoke}"
 echo "rest_api_smoke=${rest_api_smoke}"
 echo "rest_api_smoke_status=${rest_api_smoke_status}"
 if [ -n "$rest_api_smoke_evidence_file" ]; then
-  echo "rest_api_smoke_evidence=${rest_api_smoke_evidence_file}"
+  echo "rest_api_smoke_evidence_public=${rest_api_smoke_evidence_file%.json}.public.json"
 fi
 echo "product_completion_report=${product_completion_report}"
 echo "product_completion_report_status=${product_completion_report_status}"
 if [ -n "$product_completion_report_file" ]; then
-  echo "product_completion_report_file=${product_completion_report_file}"
+  echo "product_completion_report_public=${product_completion_report_file%.json}.public.json"
 fi
 echo "ingest_writer_smoke=${ingest_writer_smoke}"
 echo "ingest_writer_lifecycle_attestation_validated=${ingest_writer_lifecycle_attestation_validated}"
@@ -7865,24 +8041,17 @@ echo "hiqlite_backend_time_assessment_validated=${hiqlite_backend_time_assessmen
 echo "hiqlite_backend_time_attest=${hiqlite_backend_time_attest}"
 echo "hiqlite_backend_time_attestation_validated=${hiqlite_backend_time_attestation_validated}"
 if [ "$ingest_writer_smoke" = "1" ]; then
-  echo "ingest_writer_image=${ingest_writer_image}"
   echo "ingest_writer_job_completed=${ingest_writer_job_completed}"
-  if [ -n "$ingest_writer_object_key" ]; then
-    echo "ingest_writer_object_key=${ingest_writer_object_key}"
-  fi
 fi
 echo "preserve_state=${preserve_state}"
 echo "object_store_mode=${object_store_mode}"
-echo "object_store_endpoint=${s3_endpoint}"
-echo "authority_store_id=${s3_authority_store_id}"
 if [ "$object_store_mode" = "external-s3" ]; then
   echo "external_s3_validate=${external_s3_validate}"
   echo "external_s3_bucket_validated=${external_s3_bucket_validated}"
 fi
-echo "s3_prefix=${s3_prefix}"
 echo "s3_credentials_source=${s3_credentials_source}"
 if [ "$meta_enabled" = "1" ]; then
-  echo "meta_s3_prefix=${meta_s3_prefix}"
+  echo "meta_store_configured=true"
 fi
 echo "api_replica_count=${api_replica_count}"
 echo "standing_runtime_fencing=${standing_runtime_fencing}"
@@ -7891,14 +8060,7 @@ echo "api_auth_token_source=${api_bearer_token_source}"
 echo "admin_auth_token_source=${admin_bearer_token_source}"
 echo "ingress_tls_auth_attestation_validated=${ingress_tls_auth_attestation_validated}"
 echo "no_pvc_namespace_validated=${no_pvc_namespace_validated}"
-if [ "$api_auth_mode" = "bearer-token" ]; then
-  echo "api_auth_env=${output_dir}/api-auth.env"
-fi
 echo "final_owner_aware_attach=${final_owner_aware_attach}"
-if [ -n "$api_final_rest_attach_evidence_file" ]; then
-  echo "rest_attach_evidence=${api_final_rest_attach_evidence_file}"
-fi
-echo "port_forward_pid=${port_forward_pid}"
 echo
 echo "Try:"
 if [ "$api_auth_mode" = "bearer-token" ]; then

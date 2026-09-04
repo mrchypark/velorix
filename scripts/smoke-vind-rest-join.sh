@@ -8,13 +8,16 @@ auth_env_file="${VELORIX_API_AUTH_ENV:-${product_dir}/api-auth.env}"
 attach_evidence_file="${VELORIX_API_ATTACH_EVIDENCE:-${product_dir}/rest-attach-evidence.json}"
 output_dir="${VELORIX_JOIN_REST_API_SMOKE_DIR:-${product_dir}/join-rest-api-smoke}"
 summary_file="${VELORIX_JOIN_REST_API_SMOKE_EVIDENCE:-${product_dir}/join-rest-api-smoke.json}"
+summary_public_file="${summary_file%.json}.public.json"
 auto_attach="${VELORIX_JOIN_REST_API_SMOKE_ATTACH:-auto}"
 query_wait_seconds="${VELORIX_JOIN_REST_API_SMOKE_QUERY_WAIT_SECONDS:-20}"
+authoritative_relation_ingest="${VELORIX_API_AUTHORITATIVE_RELATION_INGEST:-0}"
 
 usage() {
   cat <<'EOF'
 Smoke-test a two-relation REST join against an existing Velorix product API.
-Uses multi-relation `/v1/relations/ingest` as the ordered join frontier path.
+Uses one-batch relation-scoped ingest in authoritative mode; legacy mode uses
+multi-relation `/v1/relations/ingest` as the ordered join frontier path.
 
 Usage:
   scripts/smoke-vind-rest-join.sh
@@ -53,6 +56,29 @@ require() {
 require curl
 require python3
 
+write_public_evidence() {
+  local path="$1"
+  if [ -z "$path" ] || [ ! -f "$path" ]; then
+    echo "public join evidence requires an existing private JSON artifact" >&2
+    return 66
+  fi
+  chmod 600 "$path"
+  VELORIX_EVIDENCE_REDACT_ONLY=1 \
+    VELORIX_EVIDENCE_REDACT_ONLY_FILE="$path" \
+    "$repo_root/scripts/run-vind-product.sh" >/dev/null
+}
+
+case "$authoritative_relation_ingest" in
+  0 | 1) ;;
+  *)
+    echo "VELORIX_API_AUTHORITATIVE_RELATION_INGEST must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+if [ "$authoritative_relation_ingest" = "1" ]; then
+  require jq
+fi
+
 cd "$repo_root"
 
 case "$auto_attach" in
@@ -70,12 +96,13 @@ case "$query_wait_seconds" in
 esac
 
 if [ ! -f "$auth_env_file" ]; then
-  echo "missing API auth env file: $auth_env_file" >&2
+  echo "missing API auth environment" >&2
   echo "run scripts/run-vind-product.sh first, or reattach with scripts/attach-vind-product-rest.sh" >&2
   exit 66
 fi
 
 mkdir -p "$output_dir"
+chmod 700 "$output_dir"
 
 # shellcheck disable=SC1090
 source "$auth_env_file"
@@ -117,8 +144,8 @@ if ! curl -fsS --max-time 3 "$VELORIX_API_URL/healthz" >/dev/null 2>&1; then
     auto | 1)
       attach_rest_api
       ;;
-    0)
-      echo "REST API is not reachable: $VELORIX_API_URL/healthz" >&2
+  0)
+      echo "REST API health check failed" >&2
       echo "run scripts/attach-vind-product-rest.sh or set VELORIX_JOIN_REST_API_SMOKE_ATTACH=auto" >&2
       exit 75
       ;;
@@ -130,29 +157,27 @@ if ! curl -fsS --max-time 5 "$VELORIX_API_URL/v1/openapi.json" -H "$VELORIX_API_
   case "$auto_attach" in
     auto | 1)
       attach_rest_api
-      if ! curl -fsS --max-time 5 "$VELORIX_API_URL/v1/openapi.json" -H "$VELORIX_API_AUTH_HEADER" >"$auth_precheck_file"; then
-        echo "authenticated REST API is not reachable after reattach: $VELORIX_API_URL/v1/openapi.json" >&2
-        cat "$auth_precheck_file" >&2 || true
+      if ! curl -fsS --max-time 5 "$VELORIX_API_URL/v1/openapi.json" -H "$VELORIX_API_AUTH_HEADER" >"$auth_precheck_file" 2>/dev/null; then
+        echo "authenticated REST API precheck failed after reattach" >&2
         exit 75
       fi
       ;;
     0)
-      echo "authenticated REST API is not reachable: $VELORIX_API_URL/v1/openapi.json" >&2
+      echo "authenticated REST API precheck failed" >&2
       echo "run scripts/attach-vind-product-rest.sh or set VELORIX_JOIN_REST_API_SMOKE_ATTACH=auto" >&2
-      cat "$auth_precheck_file" >&2 || true
       exit 75
       ;;
   esac
 fi
 
 curl_api() {
-  curl -fsS --max-time 15 "$@" -H "$VELORIX_API_AUTH_HEADER"
+  curl -fsS --max-time 15 "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
 }
 
 curl_api_status() {
   local output_file="$1"
   shift
-  curl -sS --max-time 15 -o "$output_file" -w '%{http_code}' "$@" -H "$VELORIX_API_AUTH_HEADER"
+  curl -sS --max-time 15 -o "$output_file" -w '%{http_code}' "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"
@@ -174,6 +199,8 @@ view_request_file="${output_dir}/join-view-request.json"
 view_file="${output_dir}/join-view.json"
 backfill_file="${output_dir}/join-backfill.json"
 relations_ingest_file="${output_dir}/relations-ingest.json"
+readings_ingest_file="${output_dir}/readings-ingest.json"
+devices_ingest_file="${output_dir}/devices-ingest.json"
 view_query_file="${output_dir}/join-view-query.json"
 
 python3 - \
@@ -315,6 +342,14 @@ PY
 
 curl -fsS --max-time 10 "$VELORIX_API_URL/healthz" >"$healthz_file"
 curl_api "$VELORIX_API_URL/readyz" >"$readyz_file"
+if [ "$authoritative_relation_ingest" = "1" ] && ! jq -e '
+  .relation_ingest.mode == "authoritative"
+  and .relation_ingest.authoritative == true
+  and .relation_ingest.owner_id_configured == true
+' "$readyz_file" >/dev/null; then
+  echo "readyz relation ingest capability did not confirm authoritative mode" >&2
+  exit 1
+fi
 
 readings_relation_status="$(curl_api_status "$readings_relation_file" \
   -X POST "$VELORIX_API_URL/v1/relations" \
@@ -324,7 +359,7 @@ case "$readings_relation_status" in
   200 | 201) ;;
   *)
     echo "expected readings relation creation to return 200 or 201; got ${readings_relation_status}" >&2
-    cat "$readings_relation_file" >&2 || true
+    echo "readings relation creation failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
@@ -337,7 +372,7 @@ case "$devices_relation_status" in
   200 | 201) ;;
   *)
     echo "expected devices relation creation to return 200 or 201; got ${devices_relation_status}" >&2
-    cat "$devices_relation_file" >&2 || true
+    echo "devices relation creation failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
@@ -359,6 +394,7 @@ case "$view_status" in
       "$view_id" \
       "$api_path" \
       "$view_status" \
+      "$authoritative_relation_ingest" \
       "$readings_relation_file" \
       "$devices_relation_file" \
       "$view_file" \
@@ -377,6 +413,7 @@ from datetime import datetime, timezone
     view_id,
     api_path,
     view_status,
+    authoritative_relation_ingest,
     readings_relation_path,
     devices_relation_path,
     view_path,
@@ -395,6 +432,7 @@ payload = {
     "status": "blocked",
     "blocker_kind": "join_view_admission_failed",
     "http_status": int(view_status),
+    "relation_ingest_mode": "authoritative-single-batch" if authoritative_relation_ingest == "1" else "legacy-multi-relation",
     "api_url": api_url,
     "run_id": run_id,
     "relation_ids": [readings_relation_id, devices_relation_id],
@@ -402,7 +440,7 @@ payload = {
     "view_id": view_id,
     "promoted_api_path": api_path,
     "sql": view_request["sql"],
-    "join_frontier_path": "/v1/relations/ingest",
+    "join_frontier_path": "/v1/relations/{relation_id}/ingest" if authoritative_relation_ingest == "1" else "/v1/relations/ingest",
     "join_frontier_contract": "sequential_relation_ingest_frontier_vector",
     "view_response": view_response,
     "trusted_for_product_complete": False,
@@ -416,10 +454,10 @@ with open(summary_path, "w", encoding="utf-8") as f:
     json.dump(payload, f, indent=2, sort_keys=True)
     f.write("\n")
 PY
+    write_public_evidence "$summary_file"
     echo "expected join view creation to return 200, 201, or duplicate 409; got ${view_status}" >&2
-    cat "$view_file" >&2 || true
-    printf '\n' >&2
-    echo "wrote join REST smoke blocker evidence to ${summary_file}" >&2
+    echo "join view admission failed; raw response remains in private evidence" >&2
+    echo "wrote join REST smoke blocker public evidence to ${summary_public_file}" >&2
     exit 1
     ;;
 esac
@@ -464,10 +502,42 @@ with open(relations_path, "w", encoding="utf-8") as f:
     f.write("\n")
 PY
 
-curl_api -X POST "$VELORIX_API_URL/v1/relations/ingest" \
-  -H 'content-type: application/json' \
-  -d @"$output_dir/relations-ingest-request.json" \
-  >"$relations_ingest_file"
+if [ "$authoritative_relation_ingest" = "1" ]; then
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/${readings_relation_id}/ingest" \
+    -H 'content-type: application/json' \
+    -d @"$output_dir/readings-ingest-request.json" \
+    >"$readings_ingest_file"
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/${devices_relation_id}/ingest" \
+    -H 'content-type: application/json' \
+    -d @"$output_dir/devices-ingest-request.json" \
+    >"$devices_ingest_file"
+  python3 - "$relations_ingest_file" "$readings_ingest_file" "$devices_ingest_file" <<'PY'
+import json
+import sys
+
+output_path, readings_path, devices_path = sys.argv[1:]
+with open(readings_path, "r", encoding="utf-8") as f:
+    readings = json.load(f)
+with open(devices_path, "r", encoding="utf-8") as f:
+    devices = json.load(f)
+with open(output_path, "w", encoding="utf-8") as f:
+    json.dump(
+        {
+            "mode": "authoritative-single-batch",
+            "batches": [readings, devices],
+        },
+        f,
+        indent=2,
+        sort_keys=True,
+    )
+    f.write("\n")
+PY
+else
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/ingest" \
+    -H 'content-type: application/json' \
+    -d @"$output_dir/relations-ingest-request.json" \
+    >"$relations_ingest_file"
+fi
 
 backfill_status="$(curl_api_status "$backfill_file" \
   -X POST "$VELORIX_API_URL/v1/views/${view_id}/backfill" \
@@ -477,7 +547,7 @@ case "$backfill_status" in
   200 | 201) ;;
   *)
     echo "expected join view backfill to return 200 or 201; got ${backfill_status}" >&2
-    cat "$backfill_file" >&2 || true
+    echo "join view backfill failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
@@ -511,8 +581,7 @@ PY
     break
   fi
   if [ "$SECONDS" -ge "$deadline" ]; then
-    echo "timed out waiting for join view ${view_id} to materialize expected rows" >&2
-    cat "$view_query_file" >&2 || true
+    echo "timed out waiting for join view materialization" >&2
     exit 1
   fi
   sleep 1
@@ -527,6 +596,7 @@ python3 - \
   "$relation_version" \
   "$view_id" \
   "$api_path" \
+  "$authoritative_relation_ingest" \
   "$readings_relation_file" \
   "$devices_relation_file" \
   "$view_file" \
@@ -546,6 +616,7 @@ from datetime import datetime, timezone
     relation_version,
     view_id,
     api_path,
+    authoritative_relation_ingest,
     readings_relation_path,
     devices_relation_path,
     view_path,
@@ -570,12 +641,13 @@ payload = {
     "status": "pass",
     "run_id": run_id,
     "api_url": api_url,
+    "relation_ingest_mode": "authoritative-single-batch" if authoritative_relation_ingest == "1" else "legacy-multi-relation",
     "relation_ids": [readings_relation_id, devices_relation_id],
     "relation_version": relation_version,
     "view_id": view_id,
     "promoted_api_path": api_path,
     "sql": view_request["sql"],
-    "join_frontier_path": "/v1/relations/ingest",
+    "join_frontier_path": "/v1/relations/{relation_id}/ingest" if authoritative_relation_ingest == "1" else "/v1/relations/ingest",
     "join_frontier_contract": "sequential_relation_ingest_frontier_vector",
     "join_rows_verified": {
         "pump-a": rows["pump-a"],
@@ -594,11 +666,11 @@ with open(summary_path, "w", encoding="utf-8") as f:
     json.dump(payload, f, indent=2, sort_keys=True)
     f.write("\n")
 PY
+write_public_evidence "$summary_file"
 
 cat <<EOF
 REST join smoke passed
-api_url=${VELORIX_API_URL}
-view_id=${view_id}
-evidence=${summary_file}
-details=${output_dir}
+identifier_redaction=enabled
+evidence_public=${summary_public_file}
+join_rows_verified=pump-a,pump-b
 EOF

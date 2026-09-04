@@ -77,6 +77,196 @@ def add_fixture_ref_digests(value):
     return value
 
 
+def evidence_redaction_fixture():
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="evidence-redaction-", dir=target_dir) as raw_dir:
+        evidence_path = Path(raw_dir) / "product-evidence.json"
+        public_path = Path(raw_dir) / "product-evidence.public.json"
+        failure_path = Path(raw_dir) / "product-evidence.public.json.failed"
+        sensitive = {
+            "run_id": "run-private",
+            "deployment_id": "deployment-private",
+            "cluster": "cluster-private",
+            "context": "context-private",
+            "namespace": "namespace-private",
+            "image": "ghcr.io/private/velorix-api:private",
+            "image_digest": "sha256:private-image-digest",
+            "source_revision": "source-private",
+            "job_uid": "job-private",
+            "pod_uid": "pod-private",
+            "pod_name": "pod-name-private",
+            "container_image": "container-image-private",
+            "container_image_id": "container-image-id-private",
+            "ingress_controller": "ingress-controller-private",
+            "evidence_provenance": {"attester": "attester-private"},
+            "relation_id": "relation-private",
+            "relation_ids": ["relation-private-a", "relation-private-b"],
+            "relation_version": "version-private",
+            "view_id": "view-private",
+            "object_store": {
+                "endpoint": "https://object-store.private",
+                "authority_store_id": "s3://private/bucket/prefix",
+                "bucket": "private-bucket",
+                "region": "private-region",
+                "s3_prefix": "private/prefix",
+                "credentials_secret_name": "private-secret",
+                "credentials_sha256": "private-secret-hash",
+                "external_s3_validation_key": "private/key",
+            },
+            "relation_ingest": {
+                "owner_id": "private-owner",
+                "probe_prefix": "private/probe",
+                "authority_namespace": "private-authority-namespace",
+                "authority_store_id": "s3://private/authority",
+            },
+            "ingress": {
+                "endpoint_url": "https://private.example",
+                "external_hostname": "private.example",
+                "tls_certificate_sha256": "private-tls-fingerprint",
+            },
+            "safe_status": True,
+        }
+        evidence_path.write_text(json.dumps(sensitive) + "\n", encoding="utf-8")
+        raw_before = json.loads(evidence_path.read_text(encoding="utf-8"))
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "VELORIX_EVIDENCE_REDACT_ONLY": "1",
+                "VELORIX_EVIDENCE_REDACT_ONLY_FILE": str(evidence_path),
+            }
+        )
+        result = subprocess.run(
+            [str(script_path)],
+            cwd=repo_root,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            return False
+        raw_after = json.loads(evidence_path.read_text(encoding="utf-8"))
+        if not public_path.is_file() or raw_before != raw_after:
+            return False
+        redacted = json.loads(public_path.read_text(encoding="utf-8"))
+        encoded = json.dumps(redacted, sort_keys=True)
+        expected_values = [
+            "run-private",
+            "deployment-private",
+            "cluster-private",
+            "context-private",
+            "namespace-private",
+            "https://object-store.private",
+            "s3://private/bucket/prefix",
+            "private-bucket",
+            "private-region",
+            "private/prefix",
+            "private-secret",
+            "private-secret-hash",
+            "private/key",
+            "private-owner",
+            "private/probe",
+            "private-authority-namespace",
+            "s3://private/authority",
+            "https://private.example",
+            "private.example",
+            "private-tls-fingerprint",
+            "ghcr.io/private/velorix-api:private",
+            "sha256:private-image-digest",
+            "source-private",
+            "relation-private",
+            "relation-private-a",
+            "relation-private-b",
+            "version-private",
+            "view-private",
+            "job-private",
+            "pod-private",
+            "pod-name-private",
+            "container-image-private",
+            "container-image-id-private",
+            "ingress-controller-private",
+            "attester-private",
+        ]
+        success = (
+            redacted.get("identifier_redaction") == "enabled"
+            and redacted.get("redaction_marker") == "<redacted>"
+            and redacted.get("safe_status") is True
+            and redacted.get("object_store", {}).get("bucket") == "<redacted>"
+            and redacted.get("relation_ingest", {}).get("owner_id") == "<redacted>"
+            and redacted.get("ingress", {}).get("endpoint_url") == "<redacted>"
+            and redacted.get("redacted_environment_fields")
+            and all(value not in encoded for value in expected_values)
+        )
+        if not success:
+            return False
+
+        evidence_path.write_text("{malformed\n", encoding="utf-8")
+        public_path.write_text("must be removed\n", encoding="utf-8")
+        failure = subprocess.run(
+            [str(script_path)],
+            cwd=repo_root,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return (
+            failure.returncode != 0
+            and not public_path.exists()
+            and failure_path.is_file()
+            and failure_path.read_text(encoding="utf-8").strip()
+            == "public_evidence_redaction_failed"
+        )
+
+
+def no_pvc_auth_can_i_fixture():
+    start = script.find("kubectl_auth_can_i() {")
+    end = script.find("validate_no_pvc_namespace() {", start)
+    if start < 0 or end < 0:
+        return False
+    helper = script[start:end]
+    required = (
+        'local stdout_file="${output_dir}/auth-can-i-${check_name}.stdout"',
+        'local stderr_file="${output_dir}/auth-can-i-${check_name}.stderr"',
+        'if ! kubectl "$@" >"$stdout_file" 2>"$stderr_file"; then',
+        'observed="$(<"$stdout_file")"',
+        "yes) return 0 ;;",
+        "no) return 2 ;;",
+        'echo "Kubernetes authorization check returned unexpected output" >&2',
+        'assert_kubectl_auth_can_i_denied()',
+        'assert_kubectl_auth_can_i_allowed()',
+        "local status",
+        "status=$?",
+        'case "$status" in',
+        '0) echo "no-PVC authorization policy violation" >&2; return 1 ;;',
+        '2) return 0 ;;',
+        '0) return 0 ;;',
+        '2) echo "required Kubernetes authorization was denied" >&2; return 1 ;;',
+    )
+    if not all(fragment in helper for fragment in required) or 'case "$?"' in helper:
+        return False
+
+    # Keep the contract explicit: a successful exact "yes" is allowed for
+    # lease checks, exact "no" is the only denied result, and command errors
+    # or any other output fail closed.
+    def classify(command_succeeded, stdout):
+        if not command_succeeded:
+            return 1
+        return {"yes": 0, "no": 2}.get(stdout, 1)
+
+    return all(
+        classify(succeeded, stdout) == expected
+        for succeeded, stdout, expected in (
+            (True, "yes", 0),
+            (True, "no", 2),
+            (True, "unexpected", 1),
+            (True, "yes\nno", 1),
+            (False, "no", 1),
+        )
+    )
+
+
 s3_checkpoint_fault_matrix_evidence_path = (
     repo_root / "scripts" / "check-s3-checkpoint-fault-matrix-evidence.sh"
 )
@@ -1673,6 +1863,7 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
 
 
 checks = {
+    "product evidence redaction fixture removes environment identifiers": evidence_redaction_fixture(),
     "rejects stale durability attestation false-ready fixture": durability_false_ready_fixture_rejected(),
     "Hiqlite release input-required gate wins over will-run fixture": hiqlite_release_input_required_wins_over_will_run_fixture(),
     "defines admin API curl helper": (
@@ -3318,6 +3509,62 @@ checks["standalone REST join smoke proves two-relation materialized query"] = (
     and "DBSP" not in rest_join_smoke
     and "pipeline-manager" not in rest_join_smoke
     and "PersistentVolumeClaim" not in rest_join_smoke
+)
+
+checks["authoritative REST join smoke gates on observed readyz capability"] = (
+    "require jq" in rest_join_smoke
+    and '.relation_ingest.mode == "authoritative"' in rest_join_smoke
+    and ".relation_ingest.authoritative == true" in rest_join_smoke
+    and ".relation_ingest.owner_id_configured == true" in rest_join_smoke
+    and "readyz relation ingest capability did not confirm authoritative mode" in rest_join_smoke
+)
+
+checks["no-PVC auth can-i checks fail closed on error or unexpected output"] = (
+    no_pvc_auth_can_i_fixture()
+    and "assert_kubectl_auth_can_i_denied" in script
+    and "assert_kubectl_auth_can_i_allowed" in script
+    and "| grep -qx" not in script.split("validate_no_pvc_namespace() {", 1)[1].split("wait_for_api() {", 1)[0]
+)
+
+checks["REST join smoke separates private and public evidence"] = (
+    "summary_public_file=\"${summary_file%.json}.public.json\"" in rest_join_smoke
+    and "write_public_evidence \"$summary_file\"" in rest_join_smoke
+    and "evidence_public=${summary_public_file}" in rest_join_smoke
+    and "api_url=${VELORIX_API_URL}" not in rest_join_smoke
+    and "view_id=${view_id}" not in rest_join_smoke
+    and "evidence=${summary_file}" not in rest_join_smoke
+    and 'cat "$view_file" >&2' not in rest_join_smoke
+    and "join view admission failed; raw response remains in private evidence" in rest_join_smoke
+)
+
+checks["REST join smoke keeps raw API diagnostics private"] = (
+    not re.search(r'cat "\$[^\"]+" >&2', rest_join_smoke)
+    and not re.search(r'echo "[^\"]*\$VELORIX_API_URL', rest_join_smoke)
+    and "cat \"$auth_precheck_file\" >&2" not in rest_join_smoke
+    and "2>/dev/null" in rest_join_smoke.split("curl_api()", 1)[1].split("curl_api_status()", 1)[0]
+)
+
+checks["public evidence redacts pod job image ingress provenance identifiers"] = (
+    '"job_uid"' in script
+    and '"pod_uid"' in script
+    and '"pod_name"' in script
+    and '"container_image"' in script
+    and '"container_image_id"' in script
+    and '"ingress_controller"' in script
+    and '"evidence_provenance"' in script
+)
+
+checks["product evidence declares environment redaction"] = (
+    'payload["redaction_marker"] = marker' in script
+    and 'payload["redacted_environment_fields"]' in script
+    and '"run_id": run_id' in script
+    and '"deployment_id": product_deployment_id' in script
+    and 'chmod 600 "$path"' in script
+    and 'chmod 700 "$output_dir"' in script
+    and 'write_public_evidence "${output_dir}/product-evidence.json"' in script
+    and 'write_public_evidence "${output_dir}/product-completion-report.json"' in script
+    and 'product_evidence_public=${output_dir}/product-evidence.public.json' in script
+    and 'diagnostic log tail is withheld' in script
 )
 
 old_atomic_join_claims = [

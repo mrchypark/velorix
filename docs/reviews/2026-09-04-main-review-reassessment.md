@@ -1,7 +1,9 @@
 # Reassessment of the 2026-09-03 main-branch review
 
-**Reassessed 2026-09-05 at HEAD `6fcbcab`.** The supplied review was a static
-assessment of `1ffbca70`. This is a source-and-test reassessment, not a claim
+**Reassessed 2026-09-05 against the validated code/test range through commit
+`677c125` (not a moving-HEAD claim).** The supplied review was a static
+assessment of `1ffbca70`. The range includes the latest authoritative,
+no-PVC product deployment gate in `scripts/run-vind-product.sh`. This is a source-and-test reassessment, not a claim
 that live object storage, a cluster, scale benchmarks, or disaster recovery was
 run here. Status: **fixed** means committed code plus focused repository
 evidence address the finding; **partial** means a bounded mitigation exists;
@@ -87,7 +89,8 @@ cargo test -p velorix-api --lib
 ## Evidence sources
 
 - Task-supplied historical review dated 2026-09-03.
-- Current baseline: `git log 1ffbca70..6fcbcab` and the committed source/tests.
+- Validated range: `git log 1ffbca70..677c125` and the committed source/tests,
+  including the authoritative no-PVC deployment gate.
 - Public admission: `crates/velorix-api/src/view_admission.rs` and `lib.rs`.
 - Runtime: `crates/velorix-runtime/src/materialized_view_runtime/` and its
   integration test.

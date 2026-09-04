@@ -81,6 +81,11 @@ The local product path is no-PVC and jarless. Evidence is written under
 
 ## Feature-gated authoritative relation ingest
 
+The documented contract and focused evidence are verified against committed
+code/tests through `677c125`; that range includes the latest authoritative
+no-PVC deployment gate in `scripts/run-vind-product.sh`. This does not claim
+that live Kubernetes verification has been run.
+
 The API has an opt-in authoritative relation-ingest path. Enable it only with a
 metadata service that advertises the required relation-ingest capability:
 

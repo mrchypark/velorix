@@ -1,6 +1,9 @@
 # Supported materialized-view SQL
 
-**Status: 2026-09-05 (HEAD `6fcbcab`).** This is the canonical contract for
+**Status: 2026-09-05; contract verified against committed code/tests through
+`677c125` (not a moving-HEAD claim).** The verification range includes the
+latest authoritative, no-PVC product deployment gate in
+`scripts/run-vind-product.sh`. This is the canonical contract for
 `POST /v1/views`.
 It is deliberately narrower than parser acceptance and than SQL accepted by a
 read-only query over an already materialized output. A view is admitted only
