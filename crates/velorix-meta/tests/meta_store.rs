@@ -8,12 +8,15 @@ use velorix_core::standing_program::{
     RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
 };
 use velorix_meta::{
+    AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
     CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
     FixViewBootstrapActivationCutRequest, InMemoryMetaStore, IngestRangeReservation,
-    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, OssMetaStore,
+    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreCapabilities,
+    OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
     PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
     PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
     ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
     StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
@@ -25,11 +28,11 @@ mod common;
 
 #[tokio::test]
 async fn meta_store_capabilities_mark_in_memory_and_oss_as_not_production_multi_writer_safe() {
-    let in_memory = InMemoryMetaStore::default()
+    let in_memory_capabilities = InMemoryMetaStore::default()
         .read_meta_store_capabilities()
         .await
-        .unwrap()
-        .standing_runtime_fencing;
+        .unwrap();
+    let in_memory = in_memory_capabilities.standing_runtime_fencing.clone();
     assert_eq!(in_memory.backend_name, "in-memory");
     assert!(in_memory.linearizable_owner_lease);
     assert!(in_memory.owner_validated_checkpoint_publish);
@@ -52,6 +55,26 @@ async fn meta_store_capabilities_mark_in_memory_and_oss_as_not_production_multi_
     assert_eq!(in_memory.failover_time_bound_ms, 0);
     assert!(!in_memory.production_bounded_failover_safe);
     assert!(!in_memory.production_multi_writer_safe);
+    assert!(
+        in_memory_capabilities
+            .partition_authority
+            .partition_scoped_authority
+    );
+    assert!(
+        in_memory_capabilities
+            .partition_authority
+            .backend_owned_time
+    );
+    assert!(!in_memory_capabilities.partition_authority.production_safe);
+
+    let mut legacy_json = serde_json::to_value(&in_memory_capabilities).unwrap();
+    legacy_json
+        .as_object_mut()
+        .unwrap()
+        .remove("partition_authority");
+    let legacy: MetaStoreCapabilities = serde_json::from_value(legacy_json).unwrap();
+    assert!(!legacy.partition_authority.partition_scoped_authority);
+    assert!(!legacy.partition_authority.production_safe);
 
     let temp = TempDir::new().unwrap();
     let object_store = Arc::new(LocalFileSystem::new_with_prefix(temp.path()).unwrap());
@@ -79,6 +102,36 @@ async fn meta_store_capabilities_mark_in_memory_and_oss_as_not_production_multi_
     assert_eq!(oss.failover_time_bound_ms, 0);
     assert!(!oss.production_bounded_failover_safe);
     assert!(!oss.production_multi_writer_safe);
+}
+
+#[tokio::test]
+async fn partition_authority_is_explicitly_unsupported_by_unwired_backends() {
+    let temp = TempDir::new().unwrap();
+    let store = OssMetaStore::new(Arc::new(
+        LocalFileSystem::new_with_prefix(temp.path()).unwrap(),
+    ));
+    let capability = store.read_partition_authority_capability().await;
+    let acquire = store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key: partition_key(),
+            owner_id: "writer-a".to_string(),
+            current_token: None,
+            ttl_ms: 100,
+        })
+        .await;
+
+    assert!(matches!(
+        capability,
+        Err(velorix_meta::MetaStoreError::UnsupportedCapability(
+            "partition_authority"
+        ))
+    ));
+    assert!(matches!(
+        acquire,
+        Err(velorix_meta::MetaStoreError::UnsupportedCapability(
+            "partition_authority"
+        ))
+    ));
 }
 
 #[tokio::test]
@@ -653,6 +706,218 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
 }
 
 #[tokio::test]
+async fn partition_authority_uses_backend_clock_and_requires_exact_token_to_renew() {
+    let store = InMemoryMetaStore::default();
+    store.set_partition_authority_clock_for_test(100).await;
+    let key = partition_key();
+
+    let first = acquire_partition(&store, key.clone(), "writer-a", None).await;
+    assert_eq!(first.owner_epoch, 1);
+    assert_eq!(first.expires_at_unix_ms, 200);
+
+    let round_tripped: PartitionAuthorityToken =
+        serde_json::from_slice(&serde_json::to_vec(&first).unwrap()).unwrap();
+    assert_eq!(round_tripped, first);
+    // The request carries no time, so a caller clock cannot skew authority.
+    store.set_partition_authority_clock_for_test(150).await;
+    let renewed = acquire_partition(&store, key.clone(), "writer-a", Some(round_tripped)).await;
+    assert_eq!(renewed.owner_epoch, 1);
+    assert_eq!(renewed.expires_at_unix_ms, 250);
+    assert_eq!(
+        store.read_partition_authority(&key).await.unwrap(),
+        Some(renewed.clone())
+    );
+
+    let stale_renewal = store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".to_string(),
+            current_token: Some(first),
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale_renewal,
+        AcquirePartitionAuthorityOutcome::Conflict(_)
+    ));
+
+    let wrong_key = store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key: PartitionAuthorityKey {
+                partition_id: 9,
+                ..key.clone()
+            },
+            owner_id: "writer-a".to_string(),
+            current_token: Some(renewed.clone()),
+            ttl_ms: 100,
+        })
+        .await;
+    assert!(matches!(
+        wrong_key,
+        Err(velorix_meta::MetaStoreError::PartitionAuthorityTokenScopeMismatch)
+    ));
+    let wrong_owner = store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key,
+            owner_id: "writer-b".to_string(),
+            current_token: Some(renewed),
+            ttl_ms: 100,
+        })
+        .await;
+    assert!(matches!(
+        wrong_owner,
+        Err(velorix_meta::MetaStoreError::PartitionAuthorityInvalidToken)
+    ));
+}
+
+#[tokio::test]
+async fn partition_checkpoint_publish_rejects_token_at_and_after_expiry_before_duplicate() {
+    let store = InMemoryMetaStore::default();
+    let key = partition_key();
+    store.set_partition_authority_clock_for_test(10).await;
+    let authority = acquire_partition(&store, key.clone(), "writer-a", None).await;
+    let candidate = partition_pointer(key, "first");
+    assert_eq!(
+        store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: None,
+                candidate: candidate.clone(),
+                authority: authority.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishPartitionCheckpointPointerOutcome::Published
+    );
+
+    for now in [
+        authority.expires_at_unix_ms,
+        authority.expires_at_unix_ms + 1,
+    ] {
+        store.set_partition_authority_clock_for_test(now).await;
+        let result = store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: None,
+                candidate: candidate.clone(),
+                authority: authority.clone(),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(velorix_meta::MetaStoreError::PartitionAuthorityInvalidToken)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn partition_authority_takeover_fences_stale_tokens_and_key_mismatches() {
+    let store = InMemoryMetaStore::default();
+    let key = partition_key();
+    store.set_partition_authority_clock_for_test(10).await;
+    let first = acquire_partition(&store, key.clone(), "writer-a", None).await;
+    store.set_partition_authority_clock_for_test(110).await;
+    let second = acquire_partition(&store, key.clone(), "writer-b", None).await;
+    assert_eq!(second.owner_epoch, 2);
+
+    let stale = store
+        .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+            expected_previous: None,
+            candidate: partition_pointer(key.clone(), "first"),
+            authority: first,
+        })
+        .await;
+    assert!(matches!(
+        stale,
+        Err(velorix_meta::MetaStoreError::PartitionAuthorityInvalidToken)
+    ));
+
+    let other_key = PartitionAuthorityKey {
+        partition_id: 1,
+        ..key.clone()
+    };
+    let mismatched = store
+        .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+            expected_previous: None,
+            candidate: partition_pointer(other_key, "wrong"),
+            authority: second,
+        })
+        .await;
+    assert!(matches!(
+        mismatched,
+        Err(velorix_meta::MetaStoreError::PartitionCheckpointScopeMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn partition_checkpoint_pointer_cas_has_one_winner_and_idempotent_retry() {
+    let store = Arc::new(InMemoryMetaStore::default());
+    let key = partition_key();
+    store.set_partition_authority_clock_for_test(10).await;
+    let authority = acquire_partition(&store, key.clone(), "writer-a", None).await;
+    let first = partition_pointer(key.clone(), "first");
+    let second = partition_pointer(key.clone(), "second");
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tasks = Vec::new();
+    for candidate in [first.clone(), second] {
+        let store = Arc::clone(&store);
+        let authority = authority.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                    expected_previous: None,
+                    candidate,
+                    authority,
+                })
+                .await
+                .unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let outcomes = [
+        tasks.remove(0).await.unwrap(),
+        tasks.remove(0).await.unwrap(),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == PublishPartitionCheckpointPointerOutcome::Published)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == PublishPartitionCheckpointPointerOutcome::Conflict)
+            .count(),
+        1
+    );
+
+    let latest = store
+        .read_partition_checkpoint_pointer(&key)
+        .await
+        .unwrap()
+        .unwrap();
+    let duplicate = store
+        .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+            expected_previous: None,
+            candidate: latest.clone(),
+            authority,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate,
+        PublishPartitionCheckpointPointerOutcome::Duplicate
+    );
+    assert_eq!(
+        store.read_partition_checkpoint_pointer(&key).await.unwrap(),
+        Some(latest)
+    );
+}
+
+#[tokio::test]
 async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previous() {
     let store = InMemoryMetaStore::default();
     let owner = acquire_owner(&store, "owner-a").await;
@@ -1216,6 +1481,46 @@ fn checkpoint_pointer_for_cut(
     pointer.coverage_hash = coverage.stable_hash().unwrap();
     pointer.input_coverage = Some(coverage);
     pointer
+}
+
+fn partition_key() -> PartitionAuthorityKey {
+    PartitionAuthorityKey {
+        namespace: "default".to_string(),
+        view_id: "orders-view".to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+    }
+}
+
+fn partition_pointer(key: PartitionAuthorityKey, suffix: &str) -> PartitionCheckpointPointer {
+    PartitionCheckpointPointer {
+        checkpoint_key: format!("partition-checkpoint-{suffix}"),
+        key,
+    }
+}
+
+async fn acquire_partition(
+    store: &InMemoryMetaStore,
+    key: PartitionAuthorityKey,
+    owner_id: &str,
+    current_token: Option<PartitionAuthorityToken>,
+) -> PartitionAuthorityToken {
+    match store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key,
+            owner_id: owner_id.to_string(),
+            current_token,
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token)
+        | AcquirePartitionAuthorityOutcome::Renewed(token) => token,
+        AcquirePartitionAuthorityOutcome::Conflict(token) => {
+            panic!("unexpected partition authority conflict: {token:?}")
+        }
+    }
 }
 
 async fn acquire_owner(store: &InMemoryMetaStore, owner_id: &str) -> StandingRuntimeOwnerToken {

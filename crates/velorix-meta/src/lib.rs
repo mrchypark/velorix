@@ -88,9 +88,12 @@ pub enum CommitIngestRangeOutcome {
     Conflict,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetaStoreCapabilities {
     pub standing_runtime_fencing: StandingRuntimeFencingCapability,
+    #[serde(default)]
+    pub partition_authority: PartitionAuthorityCapability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -182,6 +185,96 @@ pub struct StandingRuntimeOwnerToken {
     pub owner_epoch: u64,
 }
 
+/// Identifies the independent authority domain for one input partition.
+///
+/// This is intentionally not a standing-runtime owner scope: a runtime owner
+/// cannot be used as authority to publish a partition checkpoint.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionAuthorityKey {
+    pub namespace: String,
+    pub view_id: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionAuthorityToken {
+    pub key: PartitionAuthorityKey,
+    pub owner_id: String,
+    pub owner_epoch: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcquirePartitionAuthorityRequest {
+    pub key: PartitionAuthorityKey,
+    pub owner_id: String,
+    /// Required only when renewing an unexpired authority token. The backend
+    /// rejects a same-owner renewal unless its exact current epoch is supplied.
+    pub current_token: Option<PartitionAuthorityToken>,
+    pub ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcquirePartitionAuthorityOutcome {
+    Acquired(PartitionAuthorityToken),
+    Renewed(PartitionAuthorityToken),
+    Conflict(PartitionAuthorityToken),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionCheckpointPointer {
+    pub key: PartitionAuthorityKey,
+    pub checkpoint_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishPartitionCheckpointPointerRequest {
+    pub expected_previous: Option<PartitionCheckpointPointer>,
+    pub candidate: PartitionCheckpointPointer,
+    pub authority: PartitionAuthorityToken,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublishPartitionCheckpointPointerOutcome {
+    Published,
+    Duplicate,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionAuthorityCapability {
+    pub backend_name: String,
+    pub partition_scoped_authority: bool,
+    pub backend_owned_time: bool,
+    pub fenced_checkpoint_pointer_publish: bool,
+    pub durable_across_restart: bool,
+    pub production_safe: bool,
+}
+
+impl Default for PartitionAuthorityCapability {
+    fn default() -> Self {
+        Self::unsupported("unwired")
+    }
+}
+
+impl PartitionAuthorityCapability {
+    fn unsupported(backend_name: &str) -> Self {
+        Self {
+            backend_name: backend_name.to_string(),
+            partition_scoped_authority: false,
+            backend_owned_time: false,
+            fenced_checkpoint_pointer_publish: false,
+            durable_across_restart: false,
+            production_safe: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcquireStandingRuntimeOwnerRequest {
     pub tenant_id: String,
@@ -249,6 +342,14 @@ pub enum MetaStoreError {
     StandingRuntimeCheckpointScopeMismatch,
     #[error("standing runtime owner token does not match the current unexpired owner")]
     StandingRuntimeOwnerMismatch,
+    #[error("partition checkpoint pointer scope does not match its authority key")]
+    PartitionCheckpointScopeMismatch,
+    #[error("partition authority token scope does not match the requested authority")]
+    PartitionAuthorityTokenScopeMismatch,
+    #[error(
+        "partition authority token is invalid or does not match the current unexpired authority"
+    )]
+    PartitionAuthorityInvalidToken,
     #[error("duplicate source-cut relation {relation_id}/{relation_version}")]
     DuplicateSourceCutRelation {
         relation_id: String,
@@ -397,6 +498,47 @@ pub trait MetaStore: Send + Sync + 'static {
         view_id: &str,
     ) -> Result<Option<StandingRuntimeCheckpointPointer>, MetaStoreError>;
 
+    /// Returns support details for the separate partition-authority contract.
+    /// Backends must opt in; treating an unimplemented backend as authoritative
+    /// would permit an unsafe fallback.
+    async fn read_partition_authority_capability(
+        &self,
+    ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
+        Err(MetaStoreError::UnsupportedCapability("partition_authority"))
+    }
+
+    async fn acquire_partition_authority(
+        &self,
+        request: AcquirePartitionAuthorityRequest,
+    ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability("partition_authority"))
+    }
+
+    async fn read_partition_authority(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        Err(MetaStoreError::UnsupportedCapability("partition_authority"))
+    }
+
+    async fn publish_partition_checkpoint_pointer(
+        &self,
+        request: PublishPartitionCheckpointPointerRequest,
+    ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability("partition_authority"))
+    }
+
+    async fn read_partition_checkpoint_pointer(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
+        key.validate()?;
+        Err(MetaStoreError::UnsupportedCapability("partition_authority"))
+    }
+
     /// Current view-on-view dependency graph revision for a tenant.
     ///
     /// Required: a default `Ok(0)` here silently turns every missing
@@ -539,6 +681,40 @@ where
             .read_standing_runtime_checkpoint(tenant_id, program_id, view_id)
             .await
     }
+
+    async fn read_partition_authority_capability(
+        &self,
+    ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
+        (**self).read_partition_authority_capability().await
+    }
+
+    async fn acquire_partition_authority(
+        &self,
+        request: AcquirePartitionAuthorityRequest,
+    ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
+        (**self).acquire_partition_authority(request).await
+    }
+
+    async fn read_partition_authority(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        (**self).read_partition_authority(key).await
+    }
+
+    async fn publish_partition_checkpoint_pointer(
+        &self,
+        request: PublishPartitionCheckpointPointerRequest,
+    ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
+        (**self).publish_partition_checkpoint_pointer(request).await
+    }
+
+    async fn read_partition_checkpoint_pointer(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
+        (**self).read_partition_checkpoint_pointer(key).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -557,6 +733,17 @@ struct InMemoryMetaState {
     standing_runtime_owners: HashMap<(String, String, String), StandingRuntimeOwnerClaim>,
     standing_runtime_checkpoints:
         HashMap<(String, String, String), StandingRuntimeCheckpointPointer>,
+    partition_authority_now_unix_ms: u64,
+    partition_authorities: HashMap<PartitionAuthorityKey, PartitionAuthorityToken>,
+    partition_checkpoint_pointers: HashMap<PartitionAuthorityKey, PartitionCheckpointPointer>,
+}
+
+impl InMemoryMetaStore {
+    /// Controls the in-memory backend clock for deterministic authority tests.
+    /// Production callers never provide time through the authority API.
+    pub async fn set_partition_authority_clock_for_test(&self, now_unix_ms: u64) {
+        self.inner.write().await.partition_authority_now_unix_ms = now_unix_ms;
+    }
 }
 
 #[async_trait]
@@ -583,6 +770,7 @@ impl MetaStore for InMemoryMetaStore {
                     control_plane_auth_enforced: false,
                 },
             ),
+            partition_authority: in_memory_partition_authority_capability(),
         })
     }
 
@@ -1085,6 +1273,121 @@ impl MetaStore for InMemoryMetaStore {
             ))
             .cloned())
     }
+
+    async fn read_partition_authority_capability(
+        &self,
+    ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
+        Ok(in_memory_partition_authority_capability())
+    }
+
+    async fn acquire_partition_authority(
+        &self,
+        request: AcquirePartitionAuthorityRequest,
+    ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let mut guard = self.inner.write().await;
+        let now = guard.partition_authority_now_unix_ms;
+        let expires_at_unix_ms = now
+            .checked_add(request.ttl_ms)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        match guard.partition_authorities.get(&request.key).cloned() {
+            Some(current) if current.expires_at_unix_ms > now => {
+                if current.owner_id == request.owner_id
+                    && request.current_token.as_ref() == Some(&current)
+                {
+                    let renewed = PartitionAuthorityToken {
+                        expires_at_unix_ms,
+                        ..current
+                    };
+                    guard
+                        .partition_authorities
+                        .insert(request.key, renewed.clone());
+                    Ok(AcquirePartitionAuthorityOutcome::Renewed(renewed))
+                } else {
+                    Ok(AcquirePartitionAuthorityOutcome::Conflict(current))
+                }
+            }
+            Some(current) => {
+                let owner_epoch = current
+                    .owner_epoch
+                    .checked_add(1)
+                    .ok_or(MetaStoreError::TimestampOverflow)?;
+                let token = PartitionAuthorityToken {
+                    key: request.key.clone(),
+                    owner_id: request.owner_id,
+                    owner_epoch,
+                    expires_at_unix_ms,
+                };
+                guard
+                    .partition_authorities
+                    .insert(request.key, token.clone());
+                Ok(AcquirePartitionAuthorityOutcome::Acquired(token))
+            }
+            None => {
+                let token = PartitionAuthorityToken {
+                    key: request.key.clone(),
+                    owner_id: request.owner_id,
+                    owner_epoch: 1,
+                    expires_at_unix_ms,
+                };
+                guard
+                    .partition_authorities
+                    .insert(request.key, token.clone());
+                Ok(AcquirePartitionAuthorityOutcome::Acquired(token))
+            }
+        }
+    }
+
+    async fn read_partition_authority(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        let guard = self.inner.read().await;
+        Ok(guard
+            .partition_authorities
+            .get(key)
+            .filter(|token| token.expires_at_unix_ms > guard.partition_authority_now_unix_ms)
+            .cloned())
+    }
+
+    async fn publish_partition_checkpoint_pointer(
+        &self,
+        request: PublishPartitionCheckpointPointerRequest,
+    ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
+        request.validate()?;
+        let mut guard = self.inner.write().await;
+        let now = guard.partition_authority_now_unix_ms;
+        let current_authority = guard.partition_authorities.get(&request.candidate.key);
+        validate_current_partition_authority(current_authority, &request.authority, now)?;
+        let current = guard
+            .partition_checkpoint_pointers
+            .get(&request.candidate.key);
+        if current == Some(&request.candidate) {
+            return Ok(PublishPartitionCheckpointPointerOutcome::Duplicate);
+        }
+        if current != request.expected_previous.as_ref() {
+            return Ok(PublishPartitionCheckpointPointerOutcome::Conflict);
+        }
+        guard
+            .partition_checkpoint_pointers
+            .insert(request.candidate.key.clone(), request.candidate);
+        Ok(PublishPartitionCheckpointPointerOutcome::Published)
+    }
+
+    async fn read_partition_checkpoint_pointer(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
+        key.validate()?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .partition_checkpoint_pointers
+            .get(key)
+            .cloned())
+    }
 }
 
 #[derive(Clone)]
@@ -1126,6 +1429,7 @@ impl MetaStore for OssMetaStore {
                     control_plane_auth_enforced: false,
                 },
             ),
+            partition_authority: PartitionAuthorityCapability::unsupported("oss"),
         })
     }
 
@@ -1404,6 +1708,69 @@ impl StandingRuntimeOwnerToken {
     }
 }
 
+impl PartitionAuthorityKey {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        require_non_empty("namespace", &self.namespace)?;
+        require_non_empty("view_id", &self.view_id)?;
+        require_non_empty("stream_id", &self.stream_id)?;
+        Ok(())
+    }
+}
+
+impl PartitionAuthorityToken {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.key.validate()?;
+        if self.owner_id.is_empty() || self.owner_epoch == 0 {
+            return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+        }
+        Ok(())
+    }
+}
+
+impl AcquirePartitionAuthorityRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.key.validate()?;
+        require_non_empty("owner_id", &self.owner_id)?;
+        if self.ttl_ms == 0 {
+            return Err(MetaStoreError::InvalidDuration { field: "ttl_ms" });
+        }
+        if let Some(token) = &self.current_token {
+            token.validate()?;
+            if token.key != self.key {
+                return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+            }
+            if token.owner_id != self.owner_id {
+                return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PartitionCheckpointPointer {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.key.validate()?;
+        require_non_empty("checkpoint_key", &self.checkpoint_key)
+    }
+}
+
+impl PublishPartitionCheckpointPointerRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.candidate.validate()?;
+        self.authority.validate()?;
+        if self.authority.key != self.candidate.key {
+            return Err(MetaStoreError::PartitionCheckpointScopeMismatch);
+        }
+        if let Some(expected) = &self.expected_previous {
+            expected.validate()?;
+            if expected.key != self.candidate.key {
+                return Err(MetaStoreError::PartitionCheckpointScopeMismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl StandingRuntimeCheckpointPointer {
     fn validate(&self) -> Result<(), MetaStoreError> {
         validate_standing_runtime_scope(&self.tenant_id, &self.program_id, &self.view_id)?;
@@ -1576,6 +1943,20 @@ fn validate_current_standing_runtime_owner(
     Ok(())
 }
 
+fn validate_current_partition_authority(
+    current: Option<&PartitionAuthorityToken>,
+    authority: &PartitionAuthorityToken,
+    now_unix_ms: u64,
+) -> Result<(), MetaStoreError> {
+    let Some(current) = current else {
+        return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+    };
+    if current.expires_at_unix_ms <= now_unix_ms || current != authority {
+        return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+    }
+    Ok(())
+}
+
 struct StandingRuntimeFencingCapabilityInput {
     backend_name: &'static str,
     linearizable_owner_lease: bool,
@@ -1592,6 +1973,17 @@ struct StandingRuntimeFencingCapabilityInput {
     latest_read_linearizable: bool,
     publish_rejects_scope_mismatch: bool,
     control_plane_auth_enforced: bool,
+}
+
+fn in_memory_partition_authority_capability() -> PartitionAuthorityCapability {
+    PartitionAuthorityCapability {
+        backend_name: "in-memory".to_string(),
+        partition_scoped_authority: true,
+        backend_owned_time: true,
+        fenced_checkpoint_pointer_publish: true,
+        durable_across_restart: false,
+        production_safe: false,
+    }
 }
 
 fn standing_runtime_fencing_capability(
@@ -2421,6 +2813,9 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
         | MetaStoreError::StandingRuntimeOwnerMismatch
+        | MetaStoreError::PartitionCheckpointScopeMismatch
+        | MetaStoreError::PartitionAuthorityTokenScopeMismatch
+        | MetaStoreError::PartitionAuthorityInvalidToken
         | MetaStoreError::DuplicateSourceCutRelation { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::UnexpectedOutcome(_) => Status::invalid_argument(error.to_string()),
@@ -3042,6 +3437,7 @@ impl MetaStore for HiqliteMetaStore {
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing: hiqlite_standing_runtime_fencing_capability(false),
+            partition_authority: PartitionAuthorityCapability::unsupported("hiqlite"),
         })
     }
 
@@ -4728,6 +5124,9 @@ impl MetaStore for GrpcMetaStore {
 
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing,
+            // The current wire contract has no partition-authority capability
+            // field; fail closed until the server advertises it explicitly.
+            partition_authority: PartitionAuthorityCapability::unsupported("grpc"),
         })
     }
 

@@ -7578,12 +7578,15 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
         | MetaStoreError::TimestampOverflow
         | MetaStoreError::Serialization(_)
         | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
+        | MetaStoreError::PartitionCheckpointScopeMismatch
+        | MetaStoreError::PartitionAuthorityTokenScopeMismatch
         | MetaStoreError::DuplicateSourceCutRelation { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::UnexpectedOutcome(_) => ApiError::bad_request(error),
         MetaStoreError::RelationCatalogConflict { .. }
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
-        | MetaStoreError::StandingRuntimeOwnerMismatch => ApiError::conflict(error),
+        | MetaStoreError::StandingRuntimeOwnerMismatch
+        | MetaStoreError::PartitionAuthorityInvalidToken => ApiError::conflict(error),
         MetaStoreError::UnsupportedCapability(_) => ApiError::service_unavailable(error),
         MetaStoreError::Remote(_) | MetaStoreError::Oss(_) | MetaStoreError::Hiqlite(_) => {
             ApiError::internal(error)
