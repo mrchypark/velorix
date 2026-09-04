@@ -27,6 +27,12 @@ preserve_state="${VELORIX_VIND_PRESERVE_STATE:-0}"
 api_image="${VELORIX_API_IMAGE:-velorix-api:product-${run_id}}"
 api_image_digest="${VELORIX_API_IMAGE_DIGEST:-}"
 build_api_image="${VELORIX_BUILD_API_IMAGE:-1}"
+api_authoritative_relation_ingest="${VELORIX_API_AUTHORITATIVE_RELATION_INGEST:-0}"
+relation_ingest_owner_id="${VELORIX_RELATION_INGEST_OWNER_ID:-velorix-api-${namespace}}"
+operator_id="${VELORIX_OPERATOR_ID:-velorix-api}"
+relation_ingest_probe_prefix="${VELORIX_RELATION_INGEST_PROBE_PREFIX:-v1/api-probes/${operator_id}}"
+relation_ingest_mode="legacy"
+authority_namespace="${VELORIX_AUTHORITY_NAMESPACE:-${namespace}}"
 meta_enabled="${VELORIX_META_ENABLED:-1}"
 meta_image="${VELORIX_META_IMAGE:-velorix-meta:product-${run_id}}"
 meta_image_digest="${VELORIX_META_IMAGE_DIGEST:-}"
@@ -89,6 +95,7 @@ s3_credentials_secret_managed="${VELORIX_S3_CREDENTIALS_SECRET_MANAGED:-1}"
 s3_credentials_source="supplied"
 s3_endpoint=""
 s3_authority_store_id=""
+s3_backend_name="${VELORIX_OBJECT_STORE_BACKEND:-s3-compatible}"
 s3_backend_label=""
 s3_durability_label=""
 api_bearer_token="${VELORIX_API_BEARER_TOKEN:-}"
@@ -118,6 +125,8 @@ generated_ingest_writer_lifecycle_attestation="${VELORIX_INGEST_WRITER_LIFECYCLE
 no_pvc_namespace_validate="${VELORIX_NO_PVC_NAMESPACE_VALIDATE:-1}"
 no_pvc_namespace_validated=0
 api_auth_observed_readyz_mode=""
+api_relation_ingest_observed_mode=""
+api_relation_ingest_observed_authoritative=""
 api_auth_missing_token_rejected=0
 api_auth_wrong_token_rejected=0
 api_auth_correct_token_smoke_passed=0
@@ -226,6 +235,11 @@ Main overrides:
   VELORIX_VIND_PRESERVE_STATE=0
   VELORIX_VIND_CLEANUP=1
   VELORIX_API_IMAGE=velorix-api:product
+  VELORIX_API_AUTHORITATIVE_RELATION_INGEST=0  # set 1 with a metadata authority; legacy mode remains the default
+  VELORIX_RELATION_INGEST_OWNER_ID=velorix-api-<namespace>  # deterministic for ephemeral namespaces; required for preserved/shared state
+  VELORIX_RELATION_INGEST_PROBE_PREFIX=v1/api-probes/velorix-api
+  VELORIX_AUTHORITY_NAMESPACE=<namespace>
+  VELORIX_OPERATOR_ID=velorix-api
   VELORIX_BUILD_API_IMAGE=1
   VELORIX_META_ENABLED=1
   VELORIX_META_IMAGE=velorix-meta:product
@@ -289,6 +303,17 @@ fi
 if [ "$#" -ne 0 ]; then
   usage >&2
   exit 64
+fi
+
+if [ "$preserve_state" = "1" ] || [ -n "${VELORIX_S3_PREFIX+x}" ]; then
+  if [ -z "${VELORIX_K8S_NAMESPACE+x}" ]; then
+    echo "VELORIX_K8S_NAMESPACE must be explicit when preserving or sharing state" >&2
+    exit 64
+  fi
+  if [ -z "${VELORIX_RELATION_INGEST_OWNER_ID+x}" ]; then
+    echo "VELORIX_RELATION_INGEST_OWNER_ID must be explicit when preserving or sharing state" >&2
+    exit 64
+  fi
 fi
 
 require() {
@@ -949,6 +974,35 @@ normalized_meta_backend() {
   esac
 }
 
+validate_yaml_dns_value() {
+  local name="$1"
+  local value="$2"
+  local max_length="${3:-63}"
+  python3 - "$name" "$value" "$max_length" <<'PY'
+import re
+import sys
+
+name, value, max_length = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if not value or len(value) > max_length or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", value):
+    raise SystemExit(f"{name} must be a nonempty lowercase DNS-safe value of at most {max_length} characters")
+PY
+}
+
+validate_yaml_scalar() {
+  local name="$1"
+  local value="$2"
+  local max_length="${3:-512}"
+  python3 - "$name" "$value" "$max_length" <<'PY'
+import sys
+
+name, value, max_length = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if not value or len(value) > max_length or any(ord(char) < 0x20 or ord(char) > 0x7e for char in value):
+    raise SystemExit(f"{name} must be a nonempty printable YAML-safe value of at most {max_length} characters")
+if any(char in value for char in ('"', "'", "\\")):
+    raise SystemExit(f"{name} must not contain quotes or backslashes when rendered into YAML")
+PY
+}
+
 is_mutable_image_reference() {
   python3 - "$1" <<'PY'
 import sys
@@ -1144,6 +1198,16 @@ case "$object_store_mode" in
     ;;
 esac
 
+if [ -z "${VELORIX_OBJECT_STORE_BACKEND+x}" ]; then
+  s3_backend_name="$s3_backend_label"
+fi
+case "$s3_backend_name" in
+  '' | *[!a-zA-Z0-9._-]*)
+    echo "VELORIX_OBJECT_STORE_BACKEND must be a nonempty backend identifier" >&2
+    exit 64
+    ;;
+esac
+
 case "$ingest_writer_smoke" in
   0 | 1) ;;
   *)
@@ -1167,6 +1231,50 @@ case "$multi_replica_fencing_smoke" in
     exit 64
     ;;
 esac
+
+case "$api_authoritative_relation_ingest" in
+  0 | 1) ;;
+  *)
+    echo "VELORIX_API_AUTHORITATIVE_RELATION_INGEST must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+validate_yaml_dns_value "VELORIX_K8S_NAMESPACE" "$namespace"
+validate_yaml_dns_value "VELORIX_AUTHORITY_NAMESPACE" "$authority_namespace"
+validate_yaml_dns_value "VELORIX_OPERATOR_ID" "$operator_id"
+validate_yaml_dns_value "VELORIX_RELATION_INGEST_OWNER_ID" "$relation_ingest_owner_id"
+validate_yaml_scalar "VELORIX_AUTHORITY_STORE_ID" "$s3_authority_store_id"
+validate_yaml_scalar "VELORIX_OBJECT_STORE_BACKEND" "$s3_backend_name" 63
+if [ "$relation_ingest_owner_id" = "pod" ] || [ "$relation_ingest_owner_id" = "random" ] || [ "$relation_ingest_owner_id" = "ephemeral" ] || [[ "$relation_ingest_owner_id" == pod-* ]]; then
+  echo "VELORIX_RELATION_INGEST_OWNER_ID must identify the deployment unit, not a pod or random owner" >&2
+  exit 64
+fi
+python3 - "$relation_ingest_probe_prefix" <<'PY'
+import sys
+
+probe_prefix = sys.argv[1].strip("/")
+if not probe_prefix or any(character.isspace() for character in probe_prefix):
+    raise SystemExit(
+        "VELORIX_RELATION_INGEST_PROBE_PREFIX must be a nonempty path without whitespace"
+    )
+PY
+if [ "$relation_ingest_probe_prefix" != "v1/api-probes/${operator_id}" ]; then
+  echo "VELORIX_RELATION_INGEST_PROBE_PREFIX must match the API operator probe path v1/api-probes/${operator_id}" >&2
+  exit 64
+fi
+
+if [ "$api_authoritative_relation_ingest" = "1" ] && [ "$meta_enabled" != "1" ]; then
+  echo "VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1 requires VELORIX_META_ENABLED=1" >&2
+  exit 64
+fi
+if [ "$api_authoritative_relation_ingest" = "1" ] \
+  && { [ "$meta_backend" = "memory" ] || [ "$meta_backend" = "in-memory" ]; }; then
+  echo "VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1 requires a durable metadata backend; memory is development-only" >&2
+  exit 64
+fi
+if [ "$api_authoritative_relation_ingest" = "1" ]; then
+  relation_ingest_mode="authoritative"
+fi
 
 case "$external_s3_validate" in
   0 | 1) ;;
@@ -2147,6 +2255,45 @@ wait_for_statefulset_rollout() {
       exit 1
     fi
   done
+}
+
+validate_rendered_no_pvc_manifest() {
+  local manifest="$1"
+  if [ ! -r "$manifest" ]; then
+    echo "cannot read rendered manifest for no-PVC validation: ${manifest}" >&2
+    exit 1
+  fi
+  if grep -Eiq 'persistentvolumeclaim|volumeclaimtemplates' "$manifest"; then
+    echo "no-PVC product contract violated by rendered manifest: ${manifest}" >&2
+    exit 1
+  else
+    local grep_status=$?
+    if [ "$grep_status" -ne 1 ]; then
+      echo "no-PVC validation failed to inspect rendered manifest: ${manifest}" >&2
+      exit 1
+    fi
+  fi
+}
+
+validate_rendered_no_pvc_manifests() {
+  local manifests
+  local manifest
+  if ! manifests="$(find "$output_dir" -type f -name '*.yaml' -print)"; then
+    echo "no-PVC validation could not enumerate rendered manifests" >&2
+    exit 1
+  fi
+  if [ -n "$manifests" ]; then
+    while IFS= read -r manifest; do
+      validate_rendered_no_pvc_manifest "$manifest"
+    done <<< "$manifests"
+  fi
+}
+
+wait_for_hiqlite_ready() {
+  kubectl --context "$context" -n "$namespace" wait \
+    --for=condition=ready pod \
+    -l 'app=velorix-hiqlite' \
+    --timeout=240s >/dev/null
 }
 
 wait_for_job_complete() {
@@ -5434,7 +5581,14 @@ write_product_evidence() {
     "$api_tls_certificate_sha256" \
     "$api_tls_evidence_file" \
     "$ingress_tls_auth_attestation_file" \
-    "$ingress_tls_auth_attestation_validated" <<'PY'
+    "$ingress_tls_auth_attestation_validated" \
+    "$api_authoritative_relation_ingest" \
+    "$relation_ingest_owner_id" \
+    "$relation_ingest_probe_prefix" \
+    "$authority_namespace" \
+    "$s3_backend_name" \
+    "$api_relation_ingest_observed_mode" \
+    "$api_relation_ingest_observed_authoritative" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -5524,6 +5678,13 @@ from datetime import datetime, timezone
     api_tls_evidence_file,
     ingress_tls_auth_attestation_file,
     ingress_tls_auth_attestation_validated,
+    api_authoritative_relation_ingest,
+    relation_ingest_owner_id,
+    relation_ingest_probe_prefix,
+    authority_namespace,
+    s3_backend_name,
+    api_relation_ingest_observed_mode,
+    api_relation_ingest_observed_authoritative,
 ) = sys.argv[1:]
 
 readyz = {}
@@ -6099,6 +6260,17 @@ evidence = {
             "deployment_env_verified": api_deployment_env_verified == "1",
             "local_tls_auth_smoke": local_tls_auth_smoke,
             "ingress_tls_auth_attestation": ingress_tls_auth_attestation,
+        },
+        "relation_ingest": {
+            "mode": api_relation_ingest_observed_mode or None,
+            "authoritative_enabled": api_relation_ingest_observed_authoritative == "true",
+            "requested": api_authoritative_relation_ingest == "1",
+            "owner_id": relation_ingest_owner_id,
+            "probe_prefix": relation_ingest_probe_prefix,
+            "authority_namespace": authority_namespace,
+            "authority_store_id": s3_authority_store_id,
+            "object_store_backend": s3_backend_name,
+            "single_batch_per_request": api_authoritative_relation_ingest == "1",
         },
     },
     "ingest_writer": {
@@ -6678,10 +6850,12 @@ $(image_pull_secrets_yaml)
           emptyDir: {}
 EOF
 
+  validate_rendered_no_pvc_manifest "${output_dir}/velorix-hiqlite.yaml"
   kubectl --context "$context" apply -f "${output_dir}/velorix-hiqlite.yaml"
   remove_service_run_id_selector velorix-hiqlite-headless
   remove_service_run_id_selector velorix-hiqlite
   wait_for_statefulset_rollout velorix-hiqlite
+  wait_for_hiqlite_ready
   if [ -z "$hiqlite_image_digest" ]; then
     hiqlite_image_digest="$(docker image inspect "$hiqlite_image" --format '{{.Id}}' 2>/dev/null || true)"
   fi
@@ -6916,6 +7090,10 @@ spec:
         velorix.dev/meta-token-sha256: "${meta_bearer_token_hash}"
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
         velorix.dev/hiqlite-secret-sha256: "${hiqlite_api_secret_hash}"
+        velorix.dev/authority-namespace: "${authority_namespace}"
+        velorix.dev/authority-store-id: "${s3_authority_store_id}"
+        velorix.dev/object-store-backend: "${s3_backend_name}"
+        velorix.dev/relation-ingest-probe-prefix: "${relation_ingest_probe_prefix}"
     spec:
 $(image_pull_secrets_yaml)
       securityContext:
@@ -7020,6 +7198,9 @@ EOF
   kubectl --context "$context" apply -f "${output_dir}/velorix-meta.yaml"
   remove_service_run_id_selector velorix-meta
   wait_for_rollout velorix-meta
+  kubectl --context "$context" -n "$namespace" wait \
+    --for=condition=available deployment/velorix-meta \
+    --timeout=30s >/dev/null
   meta_deployment_observed_file="${output_dir}/velorix-meta-deployment-observed.json"
   kubectl --context "$context" -n "$namespace" get deployment velorix-meta -o json >"$meta_deployment_observed_file"
   meta_pods_file="${output_dir}/velorix-meta-pods.json"
@@ -7114,6 +7295,12 @@ spec:
         velorix.dev/api-auth-source: "${api_bearer_token_source}"
         velorix.dev/api-auth-rollout-id: "${run_id}"
         velorix.dev/api-tls-cert-sha256: "${api_tls_certificate_sha256:-disabled}"
+        velorix.dev/authority-namespace: "${authority_namespace}"
+        velorix.dev/authority-store-id: "${s3_authority_store_id}"
+        velorix.dev/object-store-backend: "${s3_backend_name}"
+        velorix.dev/relation-ingest-mode: "${relation_ingest_mode}"
+        velorix.dev/relation-ingest-owner-id: "${relation_ingest_owner_id}"
+        velorix.dev/relation-ingest-probe-prefix: "${relation_ingest_probe_prefix}"
         velorix.dev/meta-token-sha256: "${meta_bearer_token_hash}"
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
     spec:
@@ -7166,9 +7353,15 @@ $(image_pull_secrets_yaml)
             - name: VELORIX_AUTHORITY_STORE_ID
               value: "${s3_authority_store_id}"
             - name: VELORIX_AUTHORITY_NAMESPACE
-              value: "velorix"
+              value: "${authority_namespace}"
+            - name: VELORIX_OBJECT_STORE_BACKEND
+              value: "${s3_backend_name}"
             - name: VELORIX_OPERATOR_ID
-              value: "velorix-api"
+              value: "${operator_id}"
+            - name: VELORIX_API_AUTHORITATIVE_RELATION_INGEST
+              value: "${api_authoritative_relation_ingest}"
+            - name: VELORIX_RELATION_INGEST_OWNER_ID
+              value: "${relation_ingest_owner_id}"
             - name: VELORIX_STATE_PATH
               value: "v1/state/slatedb"
             - name: VELORIX_API_BIND
@@ -7250,15 +7443,35 @@ curl -fsS "http://127.0.0.1:${api_local_port}/healthz" | tee "${output_dir}/heal
 api_healthz_unauthenticated=1
 curl -fsS "http://127.0.0.1:${api_local_port}/readyz" | tee "${output_dir}/readyz.json" >/dev/null
 api_readyz_unauthenticated=1
-IFS=$'\t' read -r api_auth_observed_readyz_mode object_store_namespace_count object_store_artifact_catalog_conditional_update < <(python3 - "${output_dir}/readyz.json" "$meta_enabled" "$meta_backend" "$standing_runtime_fencing" "$api_auth_mode" <<'PY'
+if [ "$api_authoritative_relation_ingest" = "1" ]; then
+  require jq
+  jq -e '.relation_ingest.mode == "authoritative" and .relation_ingest.authoritative == true and .relation_ingest.owner_id_configured == true' "${output_dir}/readyz.json" >/dev/null
+fi
+IFS=$'\t' read -r api_auth_observed_readyz_mode object_store_namespace_count object_store_artifact_catalog_conditional_update api_relation_ingest_observed_mode api_relation_ingest_observed_authoritative < <(python3 - "${output_dir}/readyz.json" "$meta_enabled" "$meta_backend" "$standing_runtime_fencing" "$api_auth_mode" "$api_authoritative_relation_ingest" <<'PY'
 import json
 import sys
 
-path, meta_enabled, meta_backend, fencing, api_auth_mode = sys.argv[1:]
+path, meta_enabled, meta_backend, fencing, api_auth_mode, authoritative_requested = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as f:
     readyz = json.load(f)
 if readyz.get("status") != "ready":
     raise SystemExit(f"readyz status is not ready: {readyz}")
+relation_ingest = readyz.get("relation_ingest")
+if not isinstance(relation_ingest, dict):
+    raise SystemExit(f"relation_ingest readiness capability is missing: {readyz}")
+relation_ingest_mode = relation_ingest.get("mode")
+relation_ingest_authoritative = relation_ingest.get("authoritative")
+if relation_ingest_mode not in {"legacy", "authoritative"} or not isinstance(relation_ingest_authoritative, bool):
+    raise SystemExit(f"relation_ingest readiness capability is malformed: {readyz}")
+expected_authoritative = authoritative_requested == "1"
+if relation_ingest_authoritative is not expected_authoritative:
+    raise SystemExit(f"relation_ingest authoritative readiness mismatch: expected {expected_authoritative}, got {relation_ingest}")
+if expected_authoritative and relation_ingest_mode != "authoritative":
+    raise SystemExit(f"authoritative relation ingest mode is missing from readyz: {readyz}")
+if not expected_authoritative and relation_ingest_mode != "legacy":
+    raise SystemExit(f"legacy relation ingest mode is missing from readyz: {readyz}")
+if expected_authoritative and relation_ingest.get("owner_id_configured") is not True:
+    raise SystemExit(f"authoritative relation ingest owner capability is missing from readyz: {readyz}")
 api_auth = readyz.get("api_auth") or {}
 if api_auth.get("mode") != api_auth_mode:
     raise SystemExit(f"api auth mode mismatch: expected {api_auth_mode}, got {api_auth}")
@@ -7356,7 +7569,7 @@ else:
         raise SystemExit(f"metadata_store should not be configured: {readyz}")
 if fencing == "unsafe-dev-only" and readyz.get("standing_runtime_fencing_required") is not False:
     raise SystemExit(f"unsafe-dev-only should not require production fencing: {readyz}")
-print(f"{api_auth.get('mode', '')}\t{namespace_count}\t1")
+print(f"{api_auth.get('mode', '')}\t{namespace_count}\t1\t{relation_ingest_mode}\t{str(relation_ingest_authoritative).lower()}")
 PY
 )
 
@@ -7598,6 +7811,7 @@ PY
 fi
 
 generate_ingress_tls_auth_attestation
+validate_rendered_no_pvc_manifests
 validate_no_pvc_namespace
 write_product_evidence
 run_standing_runtime_failover_smoke
