@@ -19,7 +19,7 @@ required_env() {
 
 if [ "$#" -gt 0 ]; then
   case "$1" in
-    lease-guarded-append | probe-lease-guarded-append | probe-kubernetes-lease-acquire | probe-ingest-admission-crash-restart | probe-lease-loss-during-reservation | -h | --help | help)
+    lease-guarded-append | probe-lease-guarded-append | probe-meta-stale-token | probe-kubernetes-lease-acquire | probe-ingest-admission-crash-restart | probe-lease-loss-during-reservation | -h | --help | help)
       exec velorix-ingest-writer "$@"
       ;;
     append | probe-kubernetes-lease-handoff | lease-handoff-probe)
@@ -42,10 +42,10 @@ required_env VELORIX_INGEST_WRITER_OPERATOR_ID
 required_env VELORIX_INGEST_WRITER_ID
 required_env VELORIX_INGEST_WRITER_PAYLOAD_FILE
 required_env VELORIX_INGEST_WRITER_NAMESPACE
-required_env VELORIX_INGEST_WRITER_LEASE_VIEW_ID
-required_env VELORIX_INGEST_WRITER_LEASE_STREAM_ID
-required_env VELORIX_INGEST_WRITER_LEASE_PARTITION_ID
-required_env VELORIX_INGEST_WRITER_LEASE_OWNER_ID
+required_env VELORIX_INGEST_WRITER_PARTITION_VIEW_ID
+required_env VELORIX_INGEST_WRITER_PARTITION_STREAM_ID
+required_env VELORIX_INGEST_WRITER_PARTITION_ID
+required_env VELORIX_INGEST_WRITER_PARTITION_OWNER_ID
 required_env VELORIX_META_GRPC_ENDPOINT
 required_env VELORIX_S3_COMPAT
 required_env AWS_ENDPOINT_URL
@@ -64,11 +64,11 @@ if [ ! -r "$VELORIX_INGEST_WRITER_PAYLOAD_FILE" ]; then
   exit 66
 fi
 
-lease_ttl_ms="${VELORIX_INGEST_WRITER_LEASE_TTL_MS:-60000}"
+partition_ttl_ms="${VELORIX_INGEST_WRITER_PARTITION_TTL_MS:-60000}"
 
 # lease-guarded-append obtains and renews its production authority from Meta.
-# The Kubernetes lease-shaped inputs below only name the partition; they are not
-# used as a write authority. Never print the Meta endpoint or bearer token.
+# Partition identity is supplied independently of Kubernetes. Never print the
+# Meta endpoint or bearer token.
 exec velorix-ingest-writer lease-guarded-append \
   --payload-file "$VELORIX_INGEST_WRITER_PAYLOAD_FILE" \
   --authority-store-id "$VELORIX_INGEST_WRITER_AUTHORITY_STORE_ID" \
@@ -76,11 +76,11 @@ exec velorix-ingest-writer lease-guarded-append \
   --operator-id "$VELORIX_INGEST_WRITER_OPERATOR_ID" \
   --writer-id "$VELORIX_INGEST_WRITER_ID" \
   --lease-namespace "$VELORIX_INGEST_WRITER_NAMESPACE" \
-  --lease-view-id "$VELORIX_INGEST_WRITER_LEASE_VIEW_ID" \
-  --lease-stream-id "$VELORIX_INGEST_WRITER_LEASE_STREAM_ID" \
-  --lease-partition-id "$VELORIX_INGEST_WRITER_LEASE_PARTITION_ID" \
-  --owner-id "$VELORIX_INGEST_WRITER_LEASE_OWNER_ID" \
-  --ttl-ms "$lease_ttl_ms" \
+  --lease-view-id "$VELORIX_INGEST_WRITER_PARTITION_VIEW_ID" \
+  --lease-stream-id "$VELORIX_INGEST_WRITER_PARTITION_STREAM_ID" \
+  --lease-partition-id "$VELORIX_INGEST_WRITER_PARTITION_ID" \
+  --owner-id "$VELORIX_INGEST_WRITER_PARTITION_OWNER_ID" \
+  --ttl-ms "$partition_ttl_ms" \
   --acquire-lease \
   --expected-outcome appended-or-duplicate \
   --json

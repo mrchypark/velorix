@@ -3560,6 +3560,26 @@ checks["deployment emits explicit no-PVC emptyDir storage only"] = (
     and ("claim" + "Name: velorix-rustfs-data") not in script
 )
 
+checks["production ingest writer uses Meta partition authority without Kubernetes lease authority"] = (
+    'VELORIX_INGEST_WRITER_PARTITION_VIEW_ID' in script
+    and 'VELORIX_INGEST_WRITER_PARTITION_STREAM_ID' in script
+    and 'VELORIX_INGEST_WRITER_PARTITION_OWNER_ID' in script
+    and 'VELORIX_META_GRPC_ENDPOINT' in script
+    and 'name: velorix-meta-auth' in script
+    and 'VELORIX_INGEST_WRITER_SMOKE=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite' in script
+    and 'serviceAccountName: velorix-ingest-writer-append' in script
+    and 'meta_partition_authority' in ingest_writer
+    and 'GrpcMetaStore::connect' in ingest_writer
+    and 'production_safe' in ingest_writer
+    and 'probe-meta-stale-token' in ingest_writer
+    and 'stale_pointer_publish_rejected' in ingest_writer
+    and 'snapshot_ingest_writer_partition_state' in script
+    and 'stale Meta re-acquire changed batch/admission/log object state' in script
+    and 'local guarded_ttl_ms="60000"' in script
+    and 'guarded_ttl_ms="2000"' in script
+    and 'VELORIX_INGEST_WRITER_LEASE_' not in (repo_root / 'scripts' / 'velorix-ingest-writer-entrypoint.sh').read_text(encoding='utf-8')
+)
+
 checks["external immutable images pull without changing local-load defaults"] = (
     'image_pull_secret="${VELORIX_IMAGE_PULL_SECRET:-}"' in script
     and 'ingest_writer_image_digest="${VELORIX_INGEST_WRITER_IMAGE_DIGEST:-}"' in script

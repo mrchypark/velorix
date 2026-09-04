@@ -40,7 +40,8 @@ use velorix_k8s::{
 };
 use velorix_meta::{
     AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest, GrpcMetaStore, MetaStore,
-    PartitionAuthorityKey, PartitionAuthorityToken,
+    PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
+    PublishPartitionCheckpointPointerRequest,
 };
 use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
@@ -156,6 +157,23 @@ enum Command {
         acquire_lease: bool,
         #[arg(long)]
         expected_outcome: String,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(name = "probe-meta-stale-token")]
+    ProbeMetaStaleToken {
+        #[arg(long)]
+        namespace: String,
+        #[arg(long, default_value = "ingest-writer-lifecycle")]
+        view_id: String,
+        #[arg(long, default_value = "scores")]
+        stream_id: String,
+        #[arg(long, default_value_t = 0)]
+        partition_id: u32,
+        #[arg(long, default_value_t = 2_000)]
+        ttl_ms: u64,
+        #[arg(long, default_value_t = 60_000)]
+        takeover_ttl_ms: u64,
         #[arg(long)]
         json: bool,
     },
@@ -732,6 +750,140 @@ async fn grpc_meta_store_from_env() -> anyhow::Result<Arc<dyn MetaStore>> {
     Ok(store)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct MetaStaleTokenProbeArtifactV1 {
+    schema_version: u16,
+    evidence_kind: String,
+    status: String,
+    owner_a_epoch: u64,
+    owner_b_epoch: u64,
+    owner_b_epoch_higher: bool,
+    before_admission_rejected: bool,
+    before_commit_rejected: bool,
+    stale_pointer_publish_rejected: bool,
+    pointer_unchanged: bool,
+    session_fenced: bool,
+}
+
+async fn run_meta_stale_token_probe(
+    meta_store: Arc<dyn MetaStore>,
+    key: PartitionAuthorityKey,
+    ttl_ms: u64,
+    takeover_ttl_ms: u64,
+) -> anyhow::Result<MetaStaleTokenProbeArtifactV1> {
+    if ttl_ms < 3 || takeover_ttl_ms < ttl_ms {
+        bail!("stale-token probe requires ttl-ms >= 3 and takeover-ttl-ms >= ttl-ms");
+    }
+    let owner_a = "stale-token-probe-owner-a".to_string();
+    let owner_b = "stale-token-probe-owner-b".to_string();
+    let token_a = match meta_store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: owner_a.clone(),
+            current_token: None,
+            ttl_ms,
+        })
+        .await?
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        AcquirePartitionAuthorityOutcome::Conflict(_)
+        | AcquirePartitionAuthorityOutcome::Renewed(_) => {
+            bail!("stale-token probe could not acquire owner A authority")
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(ttl_ms.saturating_add(250))).await;
+    let token_b = match meta_store
+        .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: owner_b.clone(),
+            current_token: None,
+            ttl_ms: takeover_ttl_ms,
+        })
+        .await?
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        AcquirePartitionAuthorityOutcome::Conflict(_)
+        | AcquirePartitionAuthorityOutcome::Renewed(_) => {
+            bail!("stale-token probe could not acquire owner B authority after expiry")
+        }
+    };
+    if token_b.owner_epoch <= token_a.owner_epoch {
+        bail!("stale-token probe owner B epoch did not advance");
+    }
+    let owner_a_epoch = token_a.owner_epoch;
+    let (cancellation, _) = watch::channel(false);
+    let stale_session = PartitionAuthoritySession {
+        meta_store: Arc::clone(&meta_store),
+        key: key.clone(),
+        owner_id: owner_a.clone(),
+        token: Arc::new(RwLock::new(token_a.clone())),
+        admission_binding: IngestCommitGuardBindingV1::new(
+            "meta_partition_authority",
+            partition_authority_identity(&key),
+            owner_a,
+            token_a.owner_epoch,
+        ),
+        fenced: Arc::new(AtomicBool::new(false)),
+        safety_deadline: Arc::new(RwLock::new(Instant::now() + Duration::from_secs(60))),
+        cancellation,
+        renewal_task: Arc::new(Mutex::new(None)),
+        ttl: Duration::from_millis(takeover_ttl_ms),
+        rpc_timeout: Duration::from_secs(5),
+    };
+    let descriptor = IngestBatchDescriptor {
+        stream_id: key.stream_id.clone(),
+        partition_id: key.partition_id,
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 1,
+        object_key: ObjectKey::ingest_batch(&key.stream_id, key.partition_id, 0, 1)?,
+    };
+    let before_admission_rejected = stale_session
+        .verify(IngestCommitGuardPhase::BeforeAdmission, &descriptor)
+        .await
+        .is_err();
+    let before_commit_rejected = stale_session
+        .verify(IngestCommitGuardPhase::BeforeCommit, &descriptor)
+        .await
+        .is_err();
+    let pointer_before = meta_store.read_partition_checkpoint_pointer(&key).await?;
+    let stale_pointer_publish_rejected = meta_store
+        .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+            expected_previous: pointer_before.clone(),
+            candidate: PartitionCheckpointPointer {
+                key: key.clone(),
+                checkpoint_key: "v1/diagnostics/stale-token-pointer".to_string(),
+            },
+            authority: token_a,
+        })
+        .await
+        .is_err();
+    let pointer_unchanged =
+        meta_store.read_partition_checkpoint_pointer(&key).await? == pointer_before;
+    let session_fenced = stale_session.fenced.load(Ordering::SeqCst);
+    stale_session.shutdown().await;
+    if !before_admission_rejected
+        || !before_commit_rejected
+        || !stale_pointer_publish_rejected
+        || !pointer_unchanged
+        || !session_fenced
+    {
+        bail!("stale-token probe did not fail closed");
+    }
+    Ok(MetaStaleTokenProbeArtifactV1 {
+        schema_version: 1,
+        evidence_kind: "ingest_writer_meta_stale_token_probe".to_string(),
+        status: "pass".to_string(),
+        owner_a_epoch,
+        owner_b_epoch: token_b.owner_epoch,
+        owner_b_epoch_higher: true,
+        before_admission_rejected,
+        before_commit_rejected,
+        stale_pointer_publish_rejected,
+        pointer_unchanged,
+        session_fenced,
+    })
+}
+
 #[derive(Clone)]
 struct LeaseLossDuringReservationCommitGuard {
     lease_client: KubernetesPartitionLeaseClient<KubeLeaseApi>,
@@ -1048,6 +1200,29 @@ async fn main() -> anyhow::Result<()> {
                     acquire_lease,
                     expected_outcome,
                 },
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&artifact)?);
+        }
+        Command::ProbeMetaStaleToken {
+            namespace,
+            view_id,
+            stream_id,
+            partition_id,
+            ttl_ms,
+            takeover_ttl_ms,
+            json: _,
+        } => {
+            let artifact = run_meta_stale_token_probe(
+                grpc_meta_store_from_env().await?,
+                PartitionAuthorityKey {
+                    namespace,
+                    view_id,
+                    stream_id,
+                    partition_id,
+                },
+                ttl_ms,
+                takeover_ttl_ms,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&artifact)?);
@@ -2702,6 +2877,89 @@ mod tests {
             .unwrap();
         assert_eq!(binding, expected);
         drop(token_lock);
+    }
+
+    #[tokio::test]
+    async fn stale_meta_token_rejects_both_guard_phases_and_pointer_publish() {
+        let store = Arc::new(velorix_meta::InMemoryMetaStore::default());
+        store.set_partition_authority_clock_for_test(10).await;
+        let key = PartitionAuthorityKey {
+            namespace: "tenant-a".to_string(),
+            view_id: "scores-view".to_string(),
+            stream_id: "scores".to_string(),
+            partition_id: 0,
+        };
+        let AcquirePartitionAuthorityOutcome::Acquired(token_a) = store
+            .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "owner-a".to_string(),
+                current_token: None,
+                ttl_ms: 10,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("owner A should acquire");
+        };
+        store.set_partition_authority_clock_for_test(21).await;
+        let AcquirePartitionAuthorityOutcome::Acquired(token_b) = store
+            .acquire_partition_authority(AcquirePartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "owner-b".to_string(),
+                current_token: None,
+                ttl_ms: 60_000,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("owner B should take over");
+        };
+        assert!(token_b.owner_epoch > token_a.owner_epoch);
+        let (cancellation, _) = watch::channel(false);
+        let session = PartitionAuthoritySession {
+            meta_store: Arc::clone(&store) as Arc<dyn MetaStore>,
+            key: key.clone(),
+            owner_id: "owner-a".to_string(),
+            token: Arc::new(RwLock::new(token_a.clone())),
+            admission_binding: IngestCommitGuardBindingV1::new(
+                "meta_partition_authority",
+                partition_authority_identity(&key),
+                "owner-a",
+                token_a.owner_epoch,
+            ),
+            fenced: Arc::new(AtomicBool::new(false)),
+            safety_deadline: Arc::new(RwLock::new(Instant::now() + Duration::from_secs(60))),
+            cancellation,
+            renewal_task: Arc::new(Mutex::new(None)),
+            ttl: Duration::from_secs(60),
+            rpc_timeout: Duration::from_secs(1),
+        };
+        let descriptor = test_partition_descriptor();
+        assert!(session
+            .verify(IngestCommitGuardPhase::BeforeAdmission, &descriptor)
+            .await
+            .is_err());
+        assert!(session
+            .verify(IngestCommitGuardPhase::BeforeCommit, &descriptor)
+            .await
+            .is_err());
+        assert!(session.fenced.load(Ordering::SeqCst));
+        let before = store.read_partition_checkpoint_pointer(&key).await.unwrap();
+        assert!(store
+            .publish_partition_checkpoint_pointer(PublishPartitionCheckpointPointerRequest {
+                expected_previous: before.clone(),
+                candidate: PartitionCheckpointPointer {
+                    key: key.clone(),
+                    checkpoint_key: "v1/diagnostics/stale".to_string()
+                },
+                authority: token_a,
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            store.read_partition_checkpoint_pointer(&key).await.unwrap(),
+            before
+        );
     }
 
     #[test]

@@ -852,8 +852,8 @@ for field in [
     "multi_pod_overlap_conflict_rejected",
     "adjacent_append_succeeded",
     "crash_restart_reconstruction_checked",
-    "kubernetes_lease_handoff_checked",
-    "lease_held_through_append_checked",
+    "meta_partition_authority_handoff_checked",
+    "meta_authority_held_through_append_checked",
     "commit_guard_checked",
     "admission_commit_guard_bound_checked",
     "lease_loss_during_reservation_checked",
@@ -1460,6 +1460,10 @@ case "$hiqlite_deploy" in
 esac
 if [ "$hiqlite_deploy" = "1" ] && { [ "$meta_enabled" != "1" ] || [ "$meta_backend" != "hiqlite" ]; }; then
   echo "VELORIX_HIQLITE_DEPLOY=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite" >&2
+  exit 64
+fi
+if [ "$ingest_writer_smoke" = "1" ] && { [ "$meta_enabled" != "1" ] || [ "$meta_backend" != "hiqlite" ]; }; then
+  echo "VELORIX_INGEST_WRITER_SMOKE=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite for production-safe partition authority" >&2
   exit 64
 fi
 if [ "$hiqlite_deploy" = "1" ]; then
@@ -3141,7 +3145,7 @@ spec:
         app: velorix-ingest-writer-smoke
         velorix.dev/run-id: "${run_id}"
     spec:
-      serviceAccountName: velorix-ingest-writer-lease-probe
+      serviceAccountName: velorix-ingest-writer-append
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -3172,18 +3176,25 @@ spec:
               value: "/var/lib/velorix-ingest-writer/payload.vlxingest"
             - name: VELORIX_INGEST_WRITER_NAMESPACE
               value: "${namespace}"
-            - name: VELORIX_INGEST_WRITER_LEASE_VIEW_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_VIEW_ID
               value: "positive_scores_by_user"
-            - name: VELORIX_INGEST_WRITER_LEASE_STREAM_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_STREAM_ID
               value: "scores"
-            - name: VELORIX_INGEST_WRITER_LEASE_PARTITION_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_ID
               value: "0"
-            - name: VELORIX_INGEST_WRITER_LEASE_OWNER_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_OWNER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
-            - name: VELORIX_INGEST_WRITER_LEASE_TTL_MS
+            - name: VELORIX_INGEST_WRITER_PARTITION_TTL_MS
               value: "60000"
+            - name: VELORIX_META_GRPC_ENDPOINT
+              value: "http://velorix-meta:9090"
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-auth
+                  key: bearer-token
             - name: VELORIX_S3_COMPAT
               value: "1"
             - name: VELORIX_S3_FORCE_PATH_STYLE
@@ -3346,7 +3357,7 @@ spec:
         app: velorix-ingest-writer-lifecycle
         velorix.dev/run-id: "${run_id}"
     spec:
-      serviceAccountName: velorix-ingest-writer-lease-probe
+      serviceAccountName: velorix-ingest-writer-append
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -3377,18 +3388,25 @@ spec:
               value: "/var/lib/velorix-ingest-writer/payload.vlxingest"
             - name: VELORIX_INGEST_WRITER_NAMESPACE
               value: "${namespace}"
-            - name: VELORIX_INGEST_WRITER_LEASE_VIEW_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_VIEW_ID
               value: "positive_scores_by_user"
-            - name: VELORIX_INGEST_WRITER_LEASE_STREAM_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_STREAM_ID
               value: "scores"
-            - name: VELORIX_INGEST_WRITER_LEASE_PARTITION_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_ID
               value: "0"
-            - name: VELORIX_INGEST_WRITER_LEASE_OWNER_ID
+            - name: VELORIX_INGEST_WRITER_PARTITION_OWNER_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
-            - name: VELORIX_INGEST_WRITER_LEASE_TTL_MS
+            - name: VELORIX_INGEST_WRITER_PARTITION_TTL_MS
               value: "60000"
+            - name: VELORIX_META_GRPC_ENDPOINT
+              value: "http://velorix-meta:9090"
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-auth
+                  key: bearer-token
             - name: VELORIX_S3_COMPAT
               value: "1"
             - name: VELORIX_S3_FORCE_PATH_STYLE
@@ -3636,6 +3654,13 @@ spec:
               drop:
                 - ALL
           env:
+            - name: VELORIX_META_GRPC_ENDPOINT
+              value: "http://velorix-meta:9090"
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-auth
+                  key: bearer-token
             - name: VELORIX_S3_COMPAT
               value: "1"
             - name: VELORIX_S3_FORCE_PATH_STYLE
@@ -3930,6 +3955,39 @@ if descriptor.get("start_offset_inclusive") != start_offset or descriptor.get("e
 PY
 }
 
+snapshot_ingest_writer_partition_state() {
+  local start_offset="$1"
+  local output_file="$2"
+  local end_offset="$((start_offset + 1))"
+  local partition="0000000000"
+  local start_padded
+  local end_padded
+  start_padded="$(printf '%020d' "$start_offset")"
+  end_padded="$(printf '%020d' "$end_offset")"
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  local prefix="${s3_prefix#/}"
+  prefix="${prefix%/}"
+  local relative_key
+  local object_key
+  : >"$output_file"
+  for relative_key in \
+    "v1/ingest/scores/p=${partition}/${start_padded}-${end_padded}.batch" \
+    "v1/ingest-admission/scores/p=${partition}/ranges/${start_padded}-${end_padded}.admission.json" \
+    "v1/ingest-admission-head/scores/p=${partition}"; do
+    object_key="$relative_key"
+    if [ -n "$prefix" ]; then
+      object_key="${prefix}/${relative_key}"
+    fi
+    AWS_ACCESS_KEY_ID="$aws_access_key_id" AWS_SECRET_ACCESS_KEY="$aws_secret_access_key" \
+      AWS_SESSION_TOKEN="$aws_session_token" AWS_REGION="$aws_region" \
+      aws --endpoint-url "$s3_endpoint" s3api get-object --bucket "$bucket" --key "$object_key" \
+      "${temp_dir}/object" >/dev/null
+    shasum -a 256 "${temp_dir}/object" | awk -v key="$relative_key" '{print key " " $1}' >>"$output_file"
+  done
+  rm -rf "$temp_dir"
+}
+
 run_ingest_writer_lifecycle_handoff_probe_job() {
   local job_name="$1"
   local schema_fingerprint="$2"
@@ -3944,6 +4002,8 @@ run_ingest_writer_lifecycle_handoff_probe_job() {
   local payload_b64
   local config_map="${job_name}-payload"
   local start_offset
+  local stale_state_before="${output_dir}/${job_name}-stale-before.sha256"
+  local stale_state_after="${output_dir}/${job_name}-stale-after.sha256"
 
   start_offset="$(($(ingest_writer_run_offset_base) + 5))"
   cargo run --locked -p velorix-ingest-writer --quiet -- encode-default-scores-payload \
@@ -4023,29 +4083,18 @@ EOF
   kubectl --context "$context" -n "$namespace" logs "job/${acquire_job}" >"${output_dir}/${acquire_job}-log.json"
   kubectl --context "$context" -n "$namespace" get "job/${acquire_job}" -o json >"${output_dir}/${acquire_job}.json"
   kubectl --context "$context" -n "$namespace" get pods -l "job-name=${acquire_job}" -o json >"${output_dir}/${acquire_job}-pods.json"
-  local owner_a_epoch
-  owner_a_epoch="$(python3 - "${output_dir}/${acquire_job}-log.json" <<'PY'
-import json
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    print(json.load(f)["owner_epoch"])
-PY
-)"
-  sleep 3
-
-  for guarded_job in "$owner_b_job" "$stale_job"; do
+  for guarded_job in "$acquire_job" "$owner_b_job" "$stale_job"; do
     local guarded_owner="$owner_b"
-    local expected_outcome="appended"
+    local expected_outcome="duplicate"
+    local guarded_ttl_ms="60000"
     local acquire_flag='            - --acquire-lease'
-    if [ "$guarded_job" = "$stale_job" ]; then
+    if [ "$guarded_job" = "$acquire_job" ]; then
       guarded_owner="$owner_a"
-      expected_outcome="stale-owner-rejected"
-      acquire_flag=""
-    fi
-    local expected_epoch_args=""
-    if [ "$guarded_job" = "$stale_job" ]; then
-      expected_epoch_args="            - --expected-owner-epoch
-            - \"${owner_a_epoch}\""
+      expected_outcome="appended"
+      guarded_ttl_ms="2000"
+    elif [ "$guarded_job" = "$stale_job" ]; then
+      guarded_owner="$owner_a"
+      expected_outcome="appended"
     fi
     cat >"${output_dir}/${guarded_job}.yaml" <<EOF
 apiVersion: batch/v1
@@ -4064,7 +4113,7 @@ spec:
         app: velorix-ingest-writer-lifecycle
         velorix.dev/run-id: "${run_id}"
     spec:
-      serviceAccountName: velorix-ingest-writer-lease-probe
+      serviceAccountName: velorix-ingest-writer-append
       restartPolicy: Never
       containers:
         - name: ingest-writer
@@ -4092,9 +4141,8 @@ spec:
             - "0"
             - --owner-id
             - "${guarded_owner}"
-${expected_epoch_args}
             - --ttl-ms
-            - "60000"
+            - "${guarded_ttl_ms}"
 ${acquire_flag}
             - --expected-outcome
             - "${expected_outcome}"
@@ -4109,6 +4157,13 @@ ${acquire_flag}
               drop:
                 - ALL
           env:
+            - name: VELORIX_META_GRPC_ENDPOINT
+              value: "http://velorix-meta:9090"
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-auth
+                  key: bearer-token
             - name: VELORIX_S3_COMPAT
               value: "1"
             - name: VELORIX_S3_FORCE_PATH_STYLE
@@ -4146,96 +4201,158 @@ ${acquire_flag}
           configMap:
             name: ${config_map}
 EOF
+    if [ "$guarded_job" = "$stale_job" ]; then
+      snapshot_ingest_writer_partition_state "$start_offset" "$stale_state_before"
+    fi
     kubectl --context "$context" -n "$namespace" delete job "$guarded_job" --ignore-not-found
     kubectl --context "$context" apply -f "${output_dir}/${guarded_job}.yaml"
-    wait_for_job_complete "$guarded_job"
+    if [ "$guarded_job" = "$stale_job" ]; then
+      wait_for_job_failed "$guarded_job"
+    else
+      wait_for_job_complete "$guarded_job"
+    fi
     kubectl --context "$context" -n "$namespace" logs "job/${guarded_job}" >"${output_dir}/${guarded_job}-log.json"
     kubectl --context "$context" -n "$namespace" get "job/${guarded_job}" -o json >"${output_dir}/${guarded_job}.json"
     kubectl --context "$context" -n "$namespace" get pods -l "job-name=${guarded_job}" -o json >"${output_dir}/${guarded_job}-pods.json"
+    if [ "$guarded_job" = "$stale_job" ]; then
+      snapshot_ingest_writer_partition_state "$start_offset" "$stale_state_after"
+      cmp -s "$stale_state_before" "$stale_state_after" || {
+        echo "stale Meta re-acquire changed batch/admission/log object state" >&2
+        return 1
+      }
+    fi
+    if [ "$guarded_job" = "$acquire_job" ]; then
+      sleep 3
+    fi
   done
+
+  local stale_token_job="${job_name}-stale-token"
+  cat >"${output_dir}/${stale_token_job}.yaml" <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${stale_token_job}
+  namespace: ${namespace}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: velorix-ingest-writer-append
+      restartPolicy: Never
+      containers:
+        - name: ingest-writer
+          image: ${ingest_writer_image}
+          args:
+            - probe-meta-stale-token
+            - --namespace
+            - "${namespace}"
+            - --view-id
+            - positive_scores_by_user
+            - --stream-id
+            - scores
+            - --partition-id
+            - "0"
+            - --ttl-ms
+            - "2000"
+            - --takeover-ttl-ms
+            - "60000"
+            - --json
+          env:
+            - name: VELORIX_META_GRPC_ENDPOINT
+              value: "http://velorix-meta:9090"
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-auth
+                  key: bearer-token
+EOF
+  kubectl --context "$context" -n "$namespace" delete job "$stale_token_job" --ignore-not-found
+  kubectl --context "$context" apply -f "${output_dir}/${stale_token_job}.yaml"
+  wait_for_job_complete "$stale_token_job"
+  kubectl --context "$context" -n "$namespace" logs "job/${stale_token_job}" >"${output_dir}/${stale_token_job}-log.json"
+  kubectl --context "$context" -n "$namespace" get "job/${stale_token_job}" -o json >"${output_dir}/${stale_token_job}.json"
+  kubectl --context "$context" -n "$namespace" get pods -l "job-name=${stale_token_job}" -o json >"${output_dir}/${stale_token_job}-pods.json"
 
   python3 - \
     "$job_log" \
     "${output_dir}/${acquire_job}-log.json" \
     "${output_dir}/${owner_b_job}-log.json" \
     "${output_dir}/${stale_job}-log.json" \
+    "${output_dir}/${stale_token_job}-log.json" \
     "$owner_a" \
     "$owner_b" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 
-output_path, acquire_path, owner_b_path, stale_path, owner_a, owner_b = sys.argv[1:]
+output_path, acquire_path, owner_b_path, stale_path, stale_token_path, owner_a, owner_b = sys.argv[1:]
 with open(acquire_path, "r", encoding="utf-8") as f:
     acquired_a = json.load(f)
 with open(owner_b_path, "r", encoding="utf-8") as f:
     owner_b_append = json.load(f)
 with open(stale_path, "r", encoding="utf-8") as f:
-    stale_attempt = json.load(f)
-if acquired_a.get("evidence_kind") != "ingest_writer_kubernetes_lease_acquire_probe":
+    stale_log = f.read()
+with open(stale_token_path, "r", encoding="utf-8") as f:
+    stale_token = json.load(f)
+if acquired_a.get("evidence_kind") != "ingest_writer_lease_guarded_append_probe":
     raise SystemExit(f"unexpected owner A acquire evidence: {acquired_a}")
-if acquired_a.get("owner_id") != owner_a or acquired_a.get("released") is not False:
-    raise SystemExit(f"owner A did not hold an unreleased lease before simulated death: {acquired_a}")
+if acquired_a.get("owner_id") != owner_a or acquired_a.get("outcome") != "appended":
+    raise SystemExit(f"owner A did not acquire Meta authority and append: {acquired_a}")
 if owner_b_append.get("evidence_kind") != "ingest_writer_lease_guarded_append_probe":
     raise SystemExit(f"unexpected owner B append evidence: {owner_b_append}")
-if owner_b_append.get("owner_id") != owner_b or owner_b_append.get("outcome") != "appended":
-    raise SystemExit(f"owner B did not append after handoff: {owner_b_append}")
+if owner_b_append.get("owner_id") != owner_b or owner_b_append.get("outcome") != "duplicate":
+    raise SystemExit(f"owner B did not preserve the owner-A append as an identical duplicate retry: {owner_b_append}")
 if owner_b_append.get("append_completed") is not True:
     raise SystemExit(f"owner B guarded append did not report append completion: {owner_b_append}")
-if owner_b_append.get("lease_held_through_append") is not True:
-    raise SystemExit(f"owner B did not prove lease ownership through append completion: {owner_b_append}")
 if owner_b_append.get("commit_guard_enforced") is not True:
-    raise SystemExit(f"owner B did not enforce lease ownership inside the commit path: {owner_b_append}")
+    raise SystemExit(f"owner B did not enforce Meta authority inside the commit path: {owner_b_append}")
 if owner_b_append.get("admission_commit_guard_bound") is not True:
     raise SystemExit(f"owner B did not bind admission reservation to the commit guard: {owner_b_append}")
 owner_b_epoch = ((owner_b_append.get("acquired_grant") or {}).get("owner_epoch"))
-if not isinstance(owner_b_epoch, int) or owner_b_epoch <= acquired_a.get("owner_epoch", 0):
-    raise SystemExit(f"owner B did not acquire a higher lease epoch: owner_a={acquired_a} owner_b={owner_b_append}")
+owner_a_epoch = ((acquired_a.get("acquired_grant") or {}).get("owner_epoch"))
+if not isinstance(owner_b_epoch, int) or not isinstance(owner_a_epoch, int) or owner_b_epoch <= owner_a_epoch:
+    raise SystemExit(f"owner B did not acquire a higher Meta epoch: owner_a={acquired_a} owner_b={owner_b_append}")
 owner_b_binding = owner_b_append.get("admission_commit_guard_binding") or {}
-if owner_b_binding.get("binding_kind") != "kubernetes_partition_lease":
-    raise SystemExit(f"owner B did not report a Kubernetes lease admission binding: {owner_b_append}")
+if owner_b_binding.get("binding_kind") != "meta_partition_authority":
+    raise SystemExit(f"owner B did not report a Meta authority admission binding: {owner_b_append}")
 if owner_b_binding.get("owner_id") != owner_b or owner_b_binding.get("owner_epoch") != owner_b_epoch:
     raise SystemExit(f"owner B admission binding is not bound to owner B epoch: {owner_b_append}")
 descriptor = owner_b_append.get("descriptor") or {}
 if descriptor.get("stream_id") != "scores" or descriptor.get("partition_id") != 0:
     raise SystemExit(f"owner B append did not use the expected data stream/partition: {owner_b_append}")
-if stale_attempt.get("evidence_kind") != "ingest_writer_lease_guarded_append_probe":
-    raise SystemExit(f"unexpected stale owner evidence: {stale_attempt}")
-if stale_attempt.get("owner_id") != owner_a:
-    raise SystemExit(f"stale attempt did not use owner A: {stale_attempt}")
-if stale_attempt.get("expected_owner_epoch") != acquired_a.get("owner_epoch"):
-    raise SystemExit(f"stale attempt was not bound to owner A epoch: {stale_attempt}")
-if stale_attempt.get("outcome") != "stale-owner-rejected":
-    raise SystemExit(f"stale owner append was not rejected: {stale_attempt}")
-if stale_attempt.get("stale_owner_rejected") is not True or stale_attempt.get("append_completed") is not False:
-    raise SystemExit(f"stale owner evidence did not prove pre-append rejection: {stale_attempt}")
-current_owner = stale_attempt.get("current_owner") or {}
-if current_owner.get("owner_id") != owner_b or current_owner.get("owner_epoch") != owner_b_epoch:
-    raise SystemExit(f"stale attempt did not observe owner B as current holder: {stale_attempt}")
+if "partition authority is held by" not in stale_log:
+    raise SystemExit(f"stale owner did not fail closed during Meta acquire: {stale_log}")
+for field in ["owner_b_epoch_higher", "before_admission_rejected", "before_commit_rejected", "stale_pointer_publish_rejected", "pointer_unchanged", "session_fenced"]:
+    if stale_token.get(field) is not True:
+        raise SystemExit(f"stale-token probe did not prove {field}: {stale_token}")
 artifact = {
     "schema_version": 1,
-    "evidence_kind": "ingest_writer_two_pod_lease_handoff_probe",
+    "evidence_kind": "ingest_writer_meta_partition_authority_handoff_probe",
     "status": "pass",
     "leader_handoff_checked": False,
-    "kubernetes_lease_handoff_checked": True,
+    "meta_partition_authority_handoff_checked": True,
     "commit_guard_checked": True,
     "admission_commit_guard_bound_checked": True,
     "owner_a": owner_a,
-    "owner_a_epoch": acquired_a["owner_epoch"],
+    "owner_a_epoch": owner_a_epoch,
     "owner_b": owner_b,
     "owner_b_epoch": owner_b_epoch,
     "owner_a_pod_terminated_before_release": True,
     "owner_b_append_completed": True,
-    "owner_b_lease_held_through_append": True,
+    "owner_b_meta_authority_held_through_append": True,
     "stale_owner_rejected": True,
-    "same_stream_partition_lease_checked": True,
-    "lease_identity": owner_b_append.get("lease_identity"),
+    "stale_owner_rejected_before_append": True,
+    "stale_owner_object_and_log_state_unchanged": True,
+    "meta_stale_token_probe_checked": True,
+    "same_stream_partition_meta_authority_checked": True,
+    "meta_partition_authority_identity": owner_b_append.get("lease_identity"),
     "descriptor": descriptor,
     "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "evidence_files": {
         "owner_a_acquire": acquire_path,
         "owner_b_guarded_append": owner_b_path,
         "stale_owner_attempt": stale_path,
+        "stale_token_probe": stale_token_path,
     },
 }
 with open(output_path, "w", encoding="utf-8") as f:
@@ -4434,18 +4551,20 @@ for field in [
 ]:
     if lease_loss.get(field) is not True:
         raise SystemExit(f"lease-loss probe did not prove {field}: {lease_loss}")
-if handoff.get("evidence_kind") != "ingest_writer_two_pod_lease_handoff_probe":
-    raise SystemExit(f"handoff probe evidence kind is not a two-Pod Lease handoff probe: {handoff}")
-if handoff.get("kubernetes_lease_handoff_checked") is not True:
-    raise SystemExit(f"handoff probe did not check Kubernetes Lease handoff: {handoff}")
+if handoff.get("evidence_kind") != "ingest_writer_meta_partition_authority_handoff_probe":
+    raise SystemExit(f"handoff probe evidence kind is not a Meta authority handoff probe: {handoff}")
+if handoff.get("meta_partition_authority_handoff_checked") is not True:
+    raise SystemExit(f"handoff probe did not check Meta authority handoff: {handoff}")
 if handoff.get("owner_b_epoch", 0) <= handoff.get("owner_a_epoch", 0):
     raise SystemExit(f"handoff probe did not advance lease epoch: {handoff}")
 if handoff.get("owner_b_append_completed") is not True:
     raise SystemExit(f"handoff probe did not prove owner B guarded append: {handoff}")
-if handoff.get("owner_b_lease_held_through_append") is not True:
-    raise SystemExit(f"handoff probe did not prove owner B held the lease through append: {handoff}")
+if handoff.get("owner_b_meta_authority_held_through_append") is not True:
+    raise SystemExit(f"handoff probe did not prove owner B held Meta authority through append: {handoff}")
 if handoff.get("stale_owner_rejected") is not True:
     raise SystemExit(f"handoff probe did not reject stale owner A before append: {handoff}")
+if handoff.get("stale_owner_object_and_log_state_unchanged") is not True:
+    raise SystemExit(f"handoff probe did not prove stale owner A left object/log state unchanged: {handoff}")
 
 attestation = {
     "schema_version": 1,
@@ -4458,8 +4577,8 @@ attestation = {
     "adjacent_append_succeeded": True,
     "crash_restart_reconstruction_checked": True,
     "leader_handoff_checked": False,
-    "kubernetes_lease_handoff_checked": True,
-    "lease_held_through_append_checked": True,
+    "meta_partition_authority_handoff_checked": True,
+    "meta_authority_held_through_append_checked": True,
     "commit_guard_checked": True,
     "admission_commit_guard_bound_checked": True,
     "lease_loss_during_reservation_checked": True,
@@ -5680,11 +5799,11 @@ if ingest_writer_lifecycle_attestation_file:
             "crash_restart_reconstruction_checked"
         ),
         "leader_handoff_checked": raw_attestation.get("leader_handoff_checked"),
-        "kubernetes_lease_handoff_checked": raw_attestation.get(
-            "kubernetes_lease_handoff_checked"
+        "meta_partition_authority_handoff_checked": raw_attestation.get(
+            "meta_partition_authority_handoff_checked"
         ),
-        "lease_held_through_append_checked": raw_attestation.get(
-            "lease_held_through_append_checked"
+        "meta_authority_held_through_append_checked": raw_attestation.get(
+            "meta_authority_held_through_append_checked"
         ),
         "commit_guard_checked": raw_attestation.get("commit_guard_checked"),
         "admission_commit_guard_bound_checked": raw_attestation.get(
