@@ -1,12 +1,13 @@
 # Supported materialized-view SQL
 
-**Status: 2026-09-04.** This is the canonical contract for `POST /v1/views`.
+**Status: 2026-09-05 (HEAD `4954d57`).** This is the canonical contract for
+`POST /v1/views`.
 It is deliberately narrower than parser acceptance and than SQL accepted by a
 read-only query over an already materialized output. A view is admitted only
 when registered input catalogs resolve, output-schema derivation succeeds, a
 typed `VelorixLogicalViewPlanV1` is built, the native runtime accepts it, and
-public-policy checks pass. Any failure is a 400-class admission failure; there
-is no source-recomputation fallback.
+public-policy checks pass. Unsupported SQL or view shapes fail closed with a
+clear 4xx admission error; there is no source-recomputation fallback.
 
 ## Product flow
 
@@ -25,6 +26,10 @@ state is materialization progress, not an alternate query implementation.
 “Experimental-gated” requires `experimental_advanced_view_features=true`.
 “Internal but publicly unreachable” means a runtime test exists but public
 schema derivation/admission does not expose it; it is not a product capability.
+“Default public path; API E2E/restart verification pending” means the default
+API can reach the validator and runtime, but an API
+admission-to-materialization-to-restart test has not yet supplied end-to-end
+evidence for that family.
 
 | SQL family | Status | Exact bounded scope / evidence |
 | --- | --- | --- |
@@ -43,11 +48,11 @@ schema derivation/admission does not expose it; it is not a product capability.
 | Self join | Default public | Two aliases of one relation, one non-primary scalar equality, global `COUNT(*)` only. `rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract`. |
 | Semi / anti join | Default public | Direct correlated `EXISTS`/`NOT EXISTS` equality over two single, non-null scalar primary keys; not general subquery support. `correlated_exists_*` and `rest_exists_and_not_exists_views_survive_restart_and_match_transitions`. |
 | Three-way join | Default public | Exactly three inputs, left-deep inner joins, complete composite-PK equalities, root-PK projection/grouping, and one `COUNT(*)`. `rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart`. |
-| Cross join | Default public | The specifically validated two-input cross-join projection shape only; it is not a general join-composition escape hatch. `validate_supported_cross_join_sql`. |
+| Cross join | Default public path; API E2E/restart verification pending | The default API can reach the specifically validated two-input cross-join projection path (`validate_supported_cross_join_sql`), but it lacks API admission-to-materialization-to-restart evidence. It is not a general join-composition escape hatch. |
 | Event-time windows | Default public | `TUMBLE`, `HOP`, and `SESSION` over the validated aggregate shape and declared event-time/watermark contract. `tumbling_event_time_aggregate_sql_accepts_subsecond_interval_units` and `rest_hopping_window_advanced_aggregate_view_survives_api_restart`. |
-| Recursive CTE | Default public | Only the validated positive `UNION DISTINCT` fixpoint grammar; arbitrary recursive SQL is rejected. Factory evidence: `validate_supported_recursive_cte_sql`; runtime: `recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`. |
-| Interval join | Default public | Two-input inner overlap join with exact strict endpoint comparisons and bounded projection; no grouping or `HAVING`. `interval_join_materializes_overlap_retraction_and_restart`. |
-| Temporal/as-of join | Default public | The validator’s two-input temporal/equality/projection shape only. `temporal_join_materializes_asof_match_and_retracts`. |
+| Recursive CTE | Default public path; API E2E/restart verification pending | The default API can reach the validated positive `UNION DISTINCT` fixpoint grammar; arbitrary recursive SQL is rejected. Runtime evidence: `recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`; API admission-to-restart evidence is still required. |
+| Interval join | Default public path; API E2E/restart verification pending | The default API can reach the two-input inner overlap validator/runtime for exact strict endpoint comparisons and bounded projection, with no grouping or `HAVING`. Runtime evidence: `interval_join_materializes_overlap_retraction_and_restart`; API admission-to-restart coverage is still required. |
+| Temporal/as-of join | Default public path; API E2E/restart verification pending | The default API can reach the bounded two-input temporal/equality/projection validator/runtime. Runtime evidence: `temporal_join_materializes_asof_match_and_retracts`; API admission-to-restart coverage is still required. |
 | Percentile and median | Default public | Grouped `median`, `percentile_disc`, and `percentile_cont` use direct Int64 input columns and validated numeric literal percentiles in `[0, 1]`; global median, string/Decimal128 inputs, and invalid percentile shapes/types fail closed during admission. They are not supported in join output-schema construction. Public factory evidence: `rest_grouped_median_and_percentiles_materialize_and_survive_api_restart`; rejection evidence: `rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs`; runtime evidence: `percentile_aggregates_are_exact_across_retract_and_restart`. |
 | `ROW_NUMBER`, `RANK`, `DENSE_RANK` | Experimental-gated | One relation with validated partition/order/tie-breaker and bounded rank-filter form. Default admission returns an explicit experimental-disabled error; `public_1_0_rejects_experimental_view_surfaces_by_default`. |
 | Scalar aggregate subquery filter | Internal but publicly unreachable | `ScalarAggregateFilter` runtime coverage exists (`scalar_aggregate_filter_materializes_and_restores`), but the public output-schema factory has no corresponding branch. |
@@ -65,16 +70,20 @@ expands materialization support.
 
 ## Operational boundaries
 
-Recovery is intentionally jarless and no-PVC: the intended architecture uses
-relation metadata plus immutable object/local-storage checkpoints so a
-replacement process can recover a standing runtime. Production and adversarial
-proof of that recovery contract remains pending. Do not introduce PVC-backed
-view state, package-loaded runtimes, or a source-query fallback as a shortcut.
+Recovery is intentionally jarless and no-PVC. A replacement pod must recover
+from durable remote object storage plus metadata; node-local storage can support
+only a same-host restart and is not replacement-pod durability. The committed
+materialized output/checkpoint must be recovered and queried without scanning
+source ingest. Production and adversarial proof of that contract remains
+pending. Do not introduce PVC-backed view state, package-loaded runtimes, or a
+source-query fallback as a shortcut.
 
-GitHub Actions provides build/test/release gates, and a separate GHCR workflow
-publishes immutable product images. Those delivery controls are not evidence
-that an internal runtime is a public SQL capability; this matrix and its named
-tests are the capability authority.
+GitHub Actions provides build/test/release gates. The GHCR workflow records
+digest-pinned image references; SHA-named tags remain mutable and provenance is
+disabled, so neither tag spelling nor workflow completion alone is immutable
+provenance evidence. Those delivery controls are not evidence that an internal
+runtime is a public SQL capability; this matrix and its named tests are the
+capability authority.
 
 ## Focused validation
 
