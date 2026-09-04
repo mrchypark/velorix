@@ -15601,6 +15601,11 @@ fn typed_expr_node_from_expr(
             ..
         }) => {
             let name = function_name.to_string();
+            if name.eq_ignore_ascii_case("ltrim") || name.eq_ignore_ascii_case("rtrim") {
+                return unsupported(
+                    "LTRIM/RTRIM are not supported by the typed runtime; use TRIM until directional trim semantics are implemented",
+                );
+            }
             // Phase 8.4: compiled-in UDF names always route to the typed
             // surface with their pinned identity.
             if let Some(identity) = builtin_udf_identity_for_name(name.as_str()) {
@@ -15663,6 +15668,7 @@ fn typed_expr_node_from_expr(
                 arg_nodes.push(node);
             }
             let function = typed_function_with_field(name.as_str(), function, &arg_nodes)?;
+            normalize_typed_temporal_unit_literal(function, &mut arg_nodes);
             let result_type = typed_call_result_type(function, &arg_nodes)?;
             Ok(Some(TypedExprNodeV1 {
                 result_type,
@@ -15801,12 +15807,33 @@ fn typed_expr_node_from_expr(
             ..
         } => {
             let mut arg_nodes = Vec::new();
-            for arg_expr in std::iter::once(&**expr)
-                .chain(substring_from.iter().map(|arg| &**arg))
-                .chain(substring_for.iter().map(|arg| &**arg))
-            {
-                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
-                else {
+            let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
+                return unsupported(
+                    "SUBSTRING arguments must be columns, literals, or typed functions",
+                );
+            };
+            arg_nodes.push(node);
+            if let Some(start) = substring_from {
+                let Some(node) = typed_expr_node_from_expr(start, catalog, relation_alias)? else {
+                    return unsupported(
+                        "SUBSTRING arguments must be columns, literals, or typed functions",
+                    );
+                };
+                arg_nodes.push(node);
+            } else if substring_for.is_some() {
+                // SQL `SUBSTRING(expr FOR n)` is the one-based shorthand for
+                // `SUBSTRING(expr FROM 1 FOR n)`. Persist the explicit start
+                // so all accepted forms share one runtime program shape.
+                arg_nodes.push(TypedExprNodeV1 {
+                    result_type: RuntimeScalarTypeV1::Int64,
+                    nullable: false,
+                    kind: TypedExprKindV1::Literal {
+                        value: ScalarLiteralV1::Int64(1),
+                    },
+                });
+            }
+            if let Some(length) = substring_for {
+                let Some(node) = typed_expr_node_from_expr(length, catalog, relation_alias)? else {
                     return unsupported(
                         "SUBSTRING arguments must be columns, literals, or typed functions",
                     );
@@ -15846,14 +15873,12 @@ fn typed_expr_node_from_expr(
                     "TRIM with LEADING/TRAILING is not supported; use TRIM(x) or TRIM(chars FROM x)",
                 );
             }
-            if trim_where.is_some() && trim_what.is_none() {
-                return unsupported("TRIM with BOTH requires a FROM character expression");
-            }
-            if trim_characters
-                .as_ref()
-                .is_some_and(|characters| !characters.is_empty())
+            if trim_what.is_some()
+                && trim_characters
+                    .as_ref()
+                    .is_some_and(|characters| !characters.is_empty())
             {
-                return unsupported("TRIM comma-separated characters are not supported");
+                return unsupported("TRIM accepts only one character-set expression");
             }
             let mut arg_nodes = Vec::new();
             for arg_expr in std::iter::once(&**expr).chain(trim_what.iter().map(|arg| &**arg)) {
@@ -15864,6 +15889,21 @@ fn typed_expr_node_from_expr(
                     );
                 };
                 arg_nodes.push(node);
+            }
+            if let Some(characters) = trim_characters.as_ref() {
+                if characters.len() > 1 {
+                    return unsupported("TRIM accepts at most one comma-separated character set");
+                }
+                if let [characters] = characters.as_slice() {
+                    let Some(node) =
+                        typed_expr_node_from_expr(characters, catalog, relation_alias)?
+                    else {
+                        return unsupported(
+                            "TRIM arguments must be columns, literals, or typed functions",
+                        );
+                    };
+                    arg_nodes.push(node);
+                }
             }
             for arg in arg_nodes.iter().skip(1) {
                 if arg.result_type != RuntimeScalarTypeV1::Utf8 {
@@ -16281,6 +16321,34 @@ fn typed_function_with_field(
         };
     }
     Ok(function)
+}
+
+fn normalize_typed_temporal_unit_literal(
+    function: BuiltinScalarFunctionV1,
+    args: &mut [TypedExprNodeV1],
+) {
+    if !matches!(
+        function,
+        BuiltinScalarFunctionV1::ExtractYear
+            | BuiltinScalarFunctionV1::ExtractMonth
+            | BuiltinScalarFunctionV1::ExtractDay
+            | BuiltinScalarFunctionV1::ExtractHour
+            | BuiltinScalarFunctionV1::ExtractMinute
+            | BuiltinScalarFunctionV1::ExtractSecond
+            | BuiltinScalarFunctionV1::DateTruncDay
+            | BuiltinScalarFunctionV1::DateTruncHour
+            | BuiltinScalarFunctionV1::DateTruncMinute
+            | BuiltinScalarFunctionV1::DateTruncSecond
+    ) || args.len() != 2
+    {
+        return;
+    }
+    if let TypedExprKindV1::Literal {
+        value: ScalarLiteralV1::Utf8 { value },
+    } = &mut args[0].kind
+    {
+        *value = value.to_ascii_lowercase();
+    }
 }
 
 /// Phase 7.1: inlines a single aggregate CTE into the outer query.

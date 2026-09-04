@@ -25,18 +25,20 @@ use velorix_core::{
         validate_supported_filter_project_sql, validate_supported_join_view_sql,
         validate_supported_latest_by_key_sql, validate_supported_temporal_join_sql,
         validate_supported_tumbling_window_sql, validate_supported_view_sql,
-        AggregateOutputPredicateExpr, JoinPredicateExpr, LogicalPlanAggregateFunctionV1,
-        LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef, LogicalPlanCompositeJoinEqualityV1,
-        LogicalPlanJoinKeyPairV1, LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1,
-        PredicateOp, RowPredicateExpr, SupportedAggregateInputRelationSide,
+        AggregateOutputPredicateExpr, BuiltinScalarFunctionV1, JoinPredicateExpr,
+        LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
+        LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
+        LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
+        RuntimeScalarTypeV1, ScalarLiteralV1, SupportedAggregateInputRelationSide,
         SupportedAggregateOutputIdentity, SupportedAnalyticWindowFunction,
         SupportedCompositeJoinEqualityV1, SupportedEventTimeWindowKind, SupportedJoinKeyDomainV1,
         SupportedJoinKeyPairV1, SupportedJoinKind, SupportedProjectionExpr,
-        SupportedSemiAntiJoinKindV1, VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1,
-        VelorixLogicalViewPlanV1, ViewPlanError,
-        COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1, INCREMENTAL_BAG_SEMANTICS_VERSION_V1,
-        INCREMENTAL_KEY_SEMANTICS_VERSION_V1, LEFT_JOIN_INPUT_INSTANCE_ID_V1,
-        LOGICAL_VIEW_PLAN_HASH_PREFIX, LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
+        SupportedSemiAntiJoinKindV1, TypedExprKindV1, TypedExprNodeV1, TypedExprProgramV1,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1,
+        ViewPlanError, COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1,
+        INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
+        LEFT_JOIN_INPUT_INSTANCE_ID_V1, LOGICAL_VIEW_PLAN_HASH_PREFIX,
+        LOGICAL_VIEW_PLAN_VERSION_V1, LOGICAL_VIEW_PLAN_VERSION_V2,
         NON_PRIMARY_NON_NULL_SCALAR_JOIN_KEY_CODEC_V1, RIGHT_JOIN_INPUT_INSTANCE_ID_V1,
         SELF_JOIN_ATOMIC_FANOUT_PROTOCOL_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
         THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
@@ -11303,6 +11305,224 @@ fn concat_variadic_arguments_are_type_checked_during_public_admission() {
             .contains("function Concat argument 7 type mismatch"),
         "{error}"
     );
+}
+
+/// Every public multi-argument scalar admission path must reject a malformed
+/// signature before a materialized plan can be produced. Keep this table at
+/// the SQL boundary so it covers both parser AST variants and typed-program
+/// validation, rather than only constructing IR directly.
+#[test]
+fn multi_argument_scalar_signatures_fail_closed_during_public_admission() {
+    let catalog = scores_catalog();
+    let rejects = [
+        // SUBSTRING/SUBSTR: text, positive Int64 start, optional Int64 length.
+        "select user_id, substring(user_id) as value from scores",
+        "select user_id, substring(score, 1) as value from scores",
+        "select user_id, substring(user_id, user_id) as value from scores",
+        "select user_id, substring(user_id, 1, user_id) as value from scores",
+        "select user_id, substring(user_id, 1, 2, 3) as value from scores",
+        "select user_id, substring(user_id, 9223372036854775808) as value from scores",
+        // TRIM accepts at most one optional string character set.
+        "select user_id, trim(user_id, score) as value from scores",
+        "select user_id, trim(user_id, '-', '.') as value from scores",
+        // COALESCE and IF remain deliberately narrow Int64 legacy forms.
+        "select user_id, coalesce(score) as value from scores",
+        "select user_id, coalesce(user_id, 0) as value from scores",
+        "select user_id, coalesce(score, 'fallback') as value from scores",
+        "select user_id, coalesce(score, 0, 1) as value from scores",
+        "select user_id, coalesce(score, 9223372036854775808) as value from scores",
+        "select user_id, if(user_id, score, 0) as value from scores",
+        "select user_id, if(score > 0, user_id, 0) as value from scores",
+        "select user_id, if(score > 0, score, user_id) as value from scores",
+        "select user_id, if(score > 0, score, 0, 1) as value from scores",
+        "select user_id, if(score > 0, score, 9223372036854775808) as value from scores",
+        // Compiled UDFs have pinned fixed signatures too.
+        "select user_id, vx_clamp(score, 0) as value from scores",
+        "select user_id, vx_clamp(user_id, 0, 1) as value from scores",
+        "select user_id, vx_clamp(score, user_id, 1) as value from scores",
+        "select user_id, vx_clamp(score, 0, user_id) as value from scores",
+        "select user_id, vx_clamp(score, 0, 1, 2) as value from scores",
+        "select user_id, vx_clamp(score, 0, 9223372036854775808) as value from scores",
+    ];
+    for sql in rejects {
+        assert!(
+            validate_supported_filter_project_sql(sql, &catalog).is_err(),
+            "malformed multi-argument scalar expression was admitted: {sql}"
+        );
+    }
+
+    // CONCAT is variadic but bounded; test every position, including the
+    // upper bound, rather than trusting the first bad argument alone.
+    for bad_position in 0..8 {
+        let mut args = ["'x'"; 8];
+        args[bad_position] = "score";
+        let sql = format!(
+            "select user_id, concat({}) as value from scores",
+            args.join(", ")
+        );
+        assert!(
+            validate_supported_filter_project_sql(&sql, &catalog).is_err(),
+            "CONCAT bad argument {bad_position} was admitted"
+        );
+    }
+    for sql in [
+        "select user_id, concat() as value from scores",
+        "select user_id, concat('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i') as value from scores",
+    ] {
+        assert!(
+            validate_supported_filter_project_sql(sql, &catalog).is_err(),
+            "{sql}"
+        );
+    }
+
+    // Float GREATEST/LEAST are variadic and bounded independently of their
+    // legacy Int64 aggregate/projection forms. Probe each supported position.
+    for function in ["greatest", "least"] {
+        for bad_position in 0..8 {
+            let mut args = ["score * 1.0"; 8];
+            args[bad_position] = "user_id";
+            let sql = format!(
+                "select user_id, {function}({}) as value from scores",
+                args.join(", ")
+            );
+            assert!(
+                validate_supported_filter_project_sql(&sql, &catalog).is_err(),
+                "{function} bad argument {bad_position} was admitted"
+            );
+        }
+        for sql in [
+            format!("select user_id, {function}(score * 1.0) as value from scores"),
+            format!(
+                "select user_id, {function}(score * 1.0, score * 1.0, score * 1.0, score * 1.0, score * 1.0, score * 1.0, score * 1.0, score * 1.0, score * 1.0) as value from scores"
+            ),
+        ] {
+            assert!(validate_supported_filter_project_sql(&sql, &catalog).is_err(), "{sql}");
+        }
+    }
+
+    // A nullable control argument would otherwise reach a runtime branch with
+    // non-strict NULL behavior. Admission must not persist that ambiguity.
+    let mut nullable_score_catalog = scores_catalog();
+    nullable_score_catalog.relation_schema.columns[1].nullable = true;
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nullable_score_catalog.relation_schema)
+            .expect("nullable score catalog should fingerprint");
+    nullable_score_catalog.schema_fingerprint = fingerprint.clone();
+    nullable_score_catalog
+        .incremental_relation
+        .schema_fingerprint = fingerprint;
+    assert!(
+        validate_supported_filter_project_sql(
+            "select user_id, substring(user_id, score) as value from scores",
+            &nullable_score_catalog,
+        )
+        .is_err(),
+        "nullable SUBSTRING start was admitted"
+    );
+}
+
+#[test]
+fn substring_ast_forms_and_supported_trim_forms_are_admitted_without_sql_rewriting() {
+    let catalog = scores_catalog();
+    for sql in [
+        "select user_id, substring(user_id from 2 for 2) as value from scores",
+        "select user_id, substring(user_id for 2) as value from scores",
+        "select user_id, substring(user_id, 2, 2) as value from scores",
+        "select user_id, trim(user_id) as value from scores",
+        "select user_id, trim(user_id, '-') as value from scores",
+        "select user_id, concat(user_id, 'trim(both from user_id)') as value from scores",
+        "select user_id, upper(user_id) as \"trim(both from marker\" from scores",
+        "select user_id, trim(user_id) as value from scores -- trim(both from user_id)\n",
+    ] {
+        let result = validate_supported_filter_project_sql(sql, &catalog);
+        assert!(
+            result.is_ok(),
+            "supported normalized form was rejected: {sql}: {result:?}"
+        );
+    }
+    for sql in [
+        "select user_id, ltrim(user_id) as value from scores",
+        "select user_id, rtrim(user_id) as value from scores",
+        "select user_id, trim(both from user_id) as value from scores",
+    ] {
+        assert!(
+            validate_supported_filter_project_sql(sql, &catalog).is_err(),
+            "unsupported trim form was admitted: {sql}"
+        );
+    }
+}
+
+#[test]
+fn persisted_two_argument_temporal_calls_require_matching_normalized_units() {
+    fn literal(value: &str) -> TypedExprNodeV1 {
+        TypedExprNodeV1 {
+            result_type: RuntimeScalarTypeV1::Utf8,
+            nullable: false,
+            kind: TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Utf8 {
+                    value: value.to_string(),
+                },
+            },
+        }
+    }
+    fn timestamp() -> TypedExprNodeV1 {
+        TypedExprNodeV1 {
+            result_type: RuntimeScalarTypeV1::TimestampNanosecond,
+            nullable: false,
+            kind: TypedExprKindV1::Column {
+                column_id: "event_time".to_string(),
+            },
+        }
+    }
+    let program = |function, first| TypedExprProgramV1 {
+        encoding_version: 1,
+        root: TypedExprNodeV1 {
+            result_type: match function {
+                BuiltinScalarFunctionV1::ExtractYear => RuntimeScalarTypeV1::Int64,
+                BuiltinScalarFunctionV1::DateTruncHour => RuntimeScalarTypeV1::TimestampNanosecond,
+                _ => unreachable!(),
+            },
+            nullable: false,
+            kind: TypedExprKindV1::Call {
+                function,
+                args: vec![first, timestamp()],
+            },
+        },
+    };
+    assert!(
+        program(BuiltinScalarFunctionV1::ExtractYear, literal("year"))
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        program(BuiltinScalarFunctionV1::DateTruncHour, literal("hour"))
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        program(BuiltinScalarFunctionV1::DateTruncHour, literal("HOUR"))
+            .validate()
+            .is_ok(),
+        "legacy uppercase checkpoints remain valid"
+    );
+    for program in [
+        program(BuiltinScalarFunctionV1::ExtractYear, literal("month")),
+        program(
+            BuiltinScalarFunctionV1::ExtractYear,
+            TypedExprNodeV1 {
+                result_type: RuntimeScalarTypeV1::Utf8,
+                nullable: false,
+                kind: TypedExprKindV1::Column {
+                    column_id: "unit_column".to_string(),
+                },
+            },
+        ),
+    ] {
+        assert!(
+            program.validate().is_err(),
+            "invalid persisted unit was accepted"
+        );
+    }
 }
 
 /// Phase 6.4: AGE_DAYS expression admission and type checking.

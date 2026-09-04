@@ -22083,6 +22083,11 @@ fn typed_family_matrix_output_schema() -> RelationSchema {
                 nullable: true,
             },
             ColumnSchema {
+                name: "user_sub_for".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: true,
+            },
+            ColumnSchema {
                 name: "user_sub_fn".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: true,
@@ -22157,7 +22162,7 @@ fn type_family_test_matrix_covers_null_overflow_boundary_restart() {
     let catalog = purchases_event_time_catalog_with_nullable_amount();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
     let output_schema = typed_family_matrix_output_schema();
-    let sql = "select user_id, lower(user_id) as user_lower, substring(user_id from 1 for 3) as user_sub_ast, substr(user_id, 2, 3) as user_sub_fn, trim('x' from user_id) as user_trim, length(user_id) as user_len, extract(month from event_time) as event_month, extract(hour from event_time) as event_hour, extract(second from event_time) as event_second, date_trunc('day', event_time) as day_trunc, date_trunc('minute', event_time) as minute_trunc, event_time - interval '30 minutes' as minus_half_hour, ceil(amount * 1.5) as amount_ceil, floor(amount * 1.5) as amount_floor, greatest(amount * 1.0, amount * 1.5) as amount_greatest, least(amount * 1.0, amount * 1.5) as amount_least from purchases";
+    let sql = "select user_id, lower(user_id) as user_lower, substring(user_id from 1 for 3) as user_sub_ast, substring(user_id for 3) as user_sub_for, substr(user_id, 2, 3) as user_sub_fn, trim('x' from user_id) as user_trim, length(user_id) as user_len, extract(month from event_time) as event_month, extract(hour from event_time) as event_hour, extract(second from event_time) as event_second, date_trunc('day', event_time) as day_trunc, date_trunc('minute', event_time) as minute_trunc, event_time - interval '30 minutes' as minus_half_hour, ceil(amount * 1.5) as amount_ceil, floor(amount * 1.5) as amount_floor, greatest(amount * 1.0, amount * 1.5) as amount_greatest, least(amount * 1.0, amount * 1.5) as amount_least from purchases";
     let identity = standing_identity_with_view(sql, "typed_family_matrix");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -22231,6 +22236,7 @@ fn alice_matrix_row() -> Vec<String> {
         "xAvier".to_string(),
         "xavier".to_string(),
         "xAv".to_string(),
+        "xAv".to_string(),
         "Avi".to_string(),
         "Avier".to_string(),
         "6".to_string(),
@@ -22249,6 +22255,7 @@ fn alice_matrix_row() -> Vec<String> {
 
 fn bob_matrix_row() -> Vec<String> {
     vec![
+        "bob".to_string(),
         "bob".to_string(),
         "bob".to_string(),
         "bob".to_string(),
@@ -22273,6 +22280,7 @@ fn carol_matrix_row() -> Vec<String> {
         "carol".to_string(),
         "carol".to_string(),
         "car".to_string(),
+        "car".to_string(),
         "aro".to_string(),
         "carol".to_string(),
         "5".to_string(),
@@ -22293,6 +22301,7 @@ fn null_amount_matrix_row() -> Vec<String> {
     vec![
         "nullam".to_string(),
         "nullam".to_string(),
+        "nul".to_string(),
         "nul".to_string(),
         "ull".to_string(),
         "nullam".to_string(),

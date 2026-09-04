@@ -218,7 +218,9 @@ fn evaluate_call(
                     RuntimeScalarValue::Utf8(chars) => {
                         value.trim_matches(|c| chars.contains(c)).to_string()
                     }
-                    RuntimeScalarValue::Null(_) => value,
+                    RuntimeScalarValue::Null(_) => {
+                        return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Utf8))
+                    }
                     other => {
                         return Err(ExpressionEvaluationError::Failed(format!(
                             "TRIM characters must be utf8, got {:?}",
@@ -722,5 +724,52 @@ pub fn evaluate_udf(
         other => Err(ExpressionEvaluationError::Failed(format!(
             "builtin UDF `{other}` has no compiled implementation"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velorix_core::view_plan::{
+        BuiltinScalarFunctionV1, RuntimeScalarTypeV1, ScalarLiteralV1, TypedExprKindV1,
+        TypedExprNodeV1, TypedExprProgramV1, TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
+    };
+
+    #[test]
+    fn trim_with_a_nullable_character_control_propagates_null() {
+        let program = TypedExprProgramV1 {
+            encoding_version: TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
+            root: TypedExprNodeV1 {
+                result_type: RuntimeScalarTypeV1::Utf8,
+                nullable: true,
+                kind: TypedExprKindV1::Call {
+                    function: BuiltinScalarFunctionV1::Trim,
+                    args: vec![
+                        TypedExprNodeV1 {
+                            result_type: RuntimeScalarTypeV1::Utf8,
+                            nullable: false,
+                            kind: TypedExprKindV1::Literal {
+                                value: ScalarLiteralV1::Utf8 {
+                                    value: "xxvaluexx".to_string(),
+                                },
+                            },
+                        },
+                        TypedExprNodeV1 {
+                            result_type: RuntimeScalarTypeV1::Utf8,
+                            nullable: true,
+                            kind: TypedExprKindV1::Literal {
+                                value: ScalarLiteralV1::Null {
+                                    data_type: RuntimeScalarTypeV1::Utf8,
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+        };
+        assert_eq!(
+            evaluate_typed_expr(&program, &|_| None).unwrap(),
+            RuntimeScalarValue::Null(RuntimeScalarTypeV1::Utf8)
+        );
     }
 }

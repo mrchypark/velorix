@@ -223,17 +223,8 @@ pub fn validate_typed_expr_node(node: &TypedExprNodeV1) -> Result<(), TypedExprE
         }
         TypedExprKindV1::Call { function, args } => {
             validate_call_arity(*function, args)?;
-            let (expected_arg_types, expected_result) = builtin_call_spec(*function);
-            for (idx, arg) in args.iter().enumerate() {
-                if let Some(allowed) = expected_arg_types.get(idx) {
-                    if !allowed.contains(&arg.result_type) {
-                        return Err(TypedExprError::Invalid(format!(
-                            "function {function:?} argument {idx} type mismatch: expected one of {allowed:?}, got {:?}",
-                            arg.result_type
-                        )));
-                    }
-                }
-            }
+            validate_call_argument_types(*function, args)?;
+            let expected_result = builtin_call_result_type(*function);
             if node.result_type != expected_result {
                 return Err(TypedExprError::Invalid(format!(
                     "function {function:?} result type mismatch: expected {expected_result:?}, got {:?}",
@@ -378,47 +369,157 @@ fn validate_literal_type(
     Ok(())
 }
 
-fn builtin_call_spec(
-    function: BuiltinScalarFunctionV1,
-) -> (Vec<Vec<RuntimeScalarTypeV1>>, RuntimeScalarTypeV1) {
+fn builtin_call_result_type(function: BuiltinScalarFunctionV1) -> RuntimeScalarTypeV1 {
     use RuntimeScalarTypeV1::*;
     match function {
-        BuiltinScalarFunctionV1::Concat => (vec![vec![Utf8]; 8], Utf8),
-        BuiltinScalarFunctionV1::Substring => (vec![vec![Utf8]], Utf8),
-        BuiltinScalarFunctionV1::Upper | BuiltinScalarFunctionV1::Lower => (vec![vec![Utf8]], Utf8),
-        BuiltinScalarFunctionV1::Trim => (vec![vec![Utf8]], Utf8),
-        BuiltinScalarFunctionV1::Length => (vec![vec![Utf8]], Int64),
+        BuiltinScalarFunctionV1::Concat
+        | BuiltinScalarFunctionV1::Substring
+        | BuiltinScalarFunctionV1::Upper
+        | BuiltinScalarFunctionV1::Lower
+        | BuiltinScalarFunctionV1::Trim => Utf8,
+        BuiltinScalarFunctionV1::Length => Int64,
         BuiltinScalarFunctionV1::ExtractYear
         | BuiltinScalarFunctionV1::ExtractMonth
         | BuiltinScalarFunctionV1::ExtractDay
         | BuiltinScalarFunctionV1::ExtractHour
         | BuiltinScalarFunctionV1::ExtractMinute
-        | BuiltinScalarFunctionV1::ExtractSecond => (vec![vec![TimestampNanosecond, Utf8]], Int64),
+        | BuiltinScalarFunctionV1::ExtractSecond => Int64,
         BuiltinScalarFunctionV1::DateTruncDay
         | BuiltinScalarFunctionV1::DateTruncHour
         | BuiltinScalarFunctionV1::DateTruncMinute
-        | BuiltinScalarFunctionV1::DateTruncSecond => {
-            (vec![vec![TimestampNanosecond, Utf8]], TimestampNanosecond)
-        }
+        | BuiltinScalarFunctionV1::DateTruncSecond => TimestampNanosecond,
         BuiltinScalarFunctionV1::TimestampAddNanoseconds
-        | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => (
-            vec![vec![TimestampNanosecond], vec![Int64]],
-            TimestampNanosecond,
-        ),
-        BuiltinScalarFunctionV1::DateAddDays => (vec![vec![Date32], vec![Int64]], Date32),
+        | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => TimestampNanosecond,
+        BuiltinScalarFunctionV1::DateAddDays => Date32,
         BuiltinScalarFunctionV1::AbsFloat64
         | BuiltinScalarFunctionV1::CeilFloat64
         | BuiltinScalarFunctionV1::FloorFloat64
-        | BuiltinScalarFunctionV1::RoundFloat64 => (vec![vec![Float64]], Float64),
-        BuiltinScalarFunctionV1::GreatestFloat64 | BuiltinScalarFunctionV1::LeastFloat64 => {
-            (vec![vec![Float64]], Float64)
-        }
-        BuiltinScalarFunctionV1::AddFloat64
+        | BuiltinScalarFunctionV1::RoundFloat64
+        | BuiltinScalarFunctionV1::GreatestFloat64
+        | BuiltinScalarFunctionV1::LeastFloat64
+        | BuiltinScalarFunctionV1::AddFloat64
         | BuiltinScalarFunctionV1::SubtractFloat64
         | BuiltinScalarFunctionV1::MultiplyFloat64
-        | BuiltinScalarFunctionV1::DivideFloat64 => (vec![vec![Float64, Int64]], Float64),
-        BuiltinScalarFunctionV1::AgeDays => (vec![vec![Int64, TimestampNanosecond]], Int64),
+        | BuiltinScalarFunctionV1::DivideFloat64 => Float64,
+        BuiltinScalarFunctionV1::AgeDays => Int64,
     }
+}
+
+fn validate_call_argument_types(
+    function: BuiltinScalarFunctionV1,
+    args: &[TypedExprNodeV1],
+) -> Result<(), TypedExprError> {
+    use RuntimeScalarTypeV1::*;
+
+    let allowed_at = |idx: usize| -> &[RuntimeScalarTypeV1] {
+        match function {
+            BuiltinScalarFunctionV1::Concat | BuiltinScalarFunctionV1::Trim => &[Utf8],
+            BuiltinScalarFunctionV1::Substring => match idx {
+                0 => &[Utf8],
+                _ => &[Int64],
+            },
+            BuiltinScalarFunctionV1::Upper
+            | BuiltinScalarFunctionV1::Lower
+            | BuiltinScalarFunctionV1::Length => &[Utf8],
+            BuiltinScalarFunctionV1::ExtractYear
+            | BuiltinScalarFunctionV1::ExtractMonth
+            | BuiltinScalarFunctionV1::ExtractDay
+            | BuiltinScalarFunctionV1::ExtractHour
+            | BuiltinScalarFunctionV1::ExtractMinute
+            | BuiltinScalarFunctionV1::ExtractSecond
+            | BuiltinScalarFunctionV1::DateTruncDay
+            | BuiltinScalarFunctionV1::DateTruncHour
+            | BuiltinScalarFunctionV1::DateTruncMinute
+            | BuiltinScalarFunctionV1::DateTruncSecond => {
+                if args.len() == 1 || idx == 1 {
+                    &[TimestampNanosecond]
+                } else {
+                    &[Utf8]
+                }
+            }
+            BuiltinScalarFunctionV1::TimestampAddNanoseconds
+            | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => match idx {
+                0 => &[TimestampNanosecond],
+                _ => &[Int64],
+            },
+            BuiltinScalarFunctionV1::DateAddDays => match idx {
+                0 => &[Date32],
+                _ => &[Int64],
+            },
+            BuiltinScalarFunctionV1::AbsFloat64
+            | BuiltinScalarFunctionV1::CeilFloat64
+            | BuiltinScalarFunctionV1::FloorFloat64
+            | BuiltinScalarFunctionV1::RoundFloat64
+            | BuiltinScalarFunctionV1::GreatestFloat64
+            | BuiltinScalarFunctionV1::LeastFloat64 => &[Float64],
+            BuiltinScalarFunctionV1::AddFloat64
+            | BuiltinScalarFunctionV1::SubtractFloat64
+            | BuiltinScalarFunctionV1::MultiplyFloat64
+            | BuiltinScalarFunctionV1::DivideFloat64 => &[Float64, Int64],
+            BuiltinScalarFunctionV1::AgeDays => &[Int64, TimestampNanosecond],
+        }
+    };
+
+    for (idx, arg) in args.iter().enumerate() {
+        let allowed = allowed_at(idx);
+        if !allowed.contains(&arg.result_type) {
+            return Err(TypedExprError::Invalid(format!(
+                "function {function:?} argument {idx} type mismatch: expected one of {allowed:?}, got {:?}",
+                arg.result_type
+            )));
+        }
+        // The runtime treats a NULL start/length differently from the
+        // strict-null string-input contract, so do not admit an ambiguous
+        // nullable control argument until that behavior is represented in
+        // the persisted expression semantics.
+        if function == BuiltinScalarFunctionV1::Substring && idx > 0 && arg.nullable {
+            return Err(TypedExprError::Invalid(format!(
+                "function {function:?} argument {idx} must be non-null"
+            )));
+        }
+    }
+    validate_temporal_unit_literal(function, args)?;
+    Ok(())
+}
+
+fn validate_temporal_unit_literal(
+    function: BuiltinScalarFunctionV1,
+    args: &[TypedExprNodeV1],
+) -> Result<(), TypedExprError> {
+    let expected = match function {
+        BuiltinScalarFunctionV1::ExtractYear => "year",
+        BuiltinScalarFunctionV1::ExtractMonth => "month",
+        BuiltinScalarFunctionV1::ExtractDay => "day",
+        BuiltinScalarFunctionV1::ExtractHour => "hour",
+        BuiltinScalarFunctionV1::ExtractMinute => "minute",
+        BuiltinScalarFunctionV1::ExtractSecond => "second",
+        BuiltinScalarFunctionV1::DateTruncDay => "day",
+        BuiltinScalarFunctionV1::DateTruncHour => "hour",
+        BuiltinScalarFunctionV1::DateTruncMinute => "minute",
+        BuiltinScalarFunctionV1::DateTruncSecond => "second",
+        _ => return Ok(()),
+    };
+    if args.len() == 1 {
+        return Ok(());
+    }
+    let Some(TypedExprNodeV1 {
+        kind:
+            TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Utf8 { value },
+            },
+        ..
+    }) = args.first()
+    else {
+        return Err(TypedExprError::Invalid(format!(
+            "function {function:?} requires its first two-argument field/unit to be the normalized `{expected}` literal"
+        )));
+    };
+    if !value.eq_ignore_ascii_case(expected) {
+        return Err(TypedExprError::Invalid(format!(
+            "function {function:?} field/unit literal must name `{expected}`, got `{value}`"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_call_arity(
@@ -427,7 +528,8 @@ fn validate_call_arity(
 ) -> Result<(), TypedExprError> {
     let expected = match function {
         BuiltinScalarFunctionV1::Concat => 1..=8,
-        BuiltinScalarFunctionV1::Substring | BuiltinScalarFunctionV1::Trim => 1..=3,
+        BuiltinScalarFunctionV1::Substring => 2..=3,
+        BuiltinScalarFunctionV1::Trim => 1..=2,
         BuiltinScalarFunctionV1::Upper | BuiltinScalarFunctionV1::Lower => 1..=1,
         BuiltinScalarFunctionV1::Length => 1..=1,
         BuiltinScalarFunctionV1::ExtractYear
