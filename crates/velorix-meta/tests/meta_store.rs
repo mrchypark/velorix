@@ -15,9 +15,10 @@ use velorix_meta::{
     FixViewBootstrapActivationCutRequest, InMemoryMetaStore, IngestRangeReservation,
     IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreCapabilities,
     OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
-    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
+    PublishPartitionCheckpointPointerRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, ReserveAuthoritativeIngestRangeRequest,
     ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
     StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
@@ -849,6 +850,71 @@ async fn partition_authority_takeover_fences_stale_tokens_and_key_mismatches() {
 }
 
 #[tokio::test]
+async fn authoritative_ingest_publication_is_fenced_idempotent_and_uses_server_clock() {
+    let store = InMemoryMetaStore::default();
+    let key = partition_key();
+    let reservation = reservation("orders", 0, 0, 100, "sha256:payload");
+    store.set_partition_authority_clock_for_test(10).await;
+    let a = acquire_partition(&store, key.clone(), "writer-a", None).await;
+    assert_eq!(
+        store
+            .reserve_authoritative_ingest_range(ReserveAuthoritativeIngestRangeRequest {
+                reservation: reservation.clone(),
+                authority: a.clone(),
+            })
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    store
+        .set_partition_authority_clock_for_test(a.expires_at_unix_ms)
+        .await;
+    let b = acquire_partition(&store, key, "writer-b", None).await;
+    assert_eq!(b.owner_epoch, a.owner_epoch + 1);
+
+    let stale = publication_request(reservation.clone(), a, "request-a", "digest-a");
+    assert_eq!(
+        store.publish_ingest_reservation(stale).await.unwrap(),
+        PublishIngestReservationOutcome::InvalidAuthority
+    );
+    // A failed stale publication leaves this exact reservation eligible for B.
+    let request = publication_request(reservation, b, "request-b", "digest-b");
+    assert_eq!(
+        store
+            .publish_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    assert_eq!(
+        store
+            .publish_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Duplicate
+    );
+    let mut conflicting = request;
+    conflicting.request_digest = "digest-b-mismatch".to_string();
+    assert_eq!(
+        store.publish_ingest_reservation(conflicting).await.unwrap(),
+        PublishIngestReservationOutcome::Conflict
+    );
+    let recovered = store
+        .read_authoritative_ingest_publication("request-b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.object_key, "v1/objects/payload.parquet");
+    assert_eq!(
+        store
+            .list_authoritative_ingest_publications(&recovered.authority_key)
+            .await
+            .unwrap(),
+        vec![recovered]
+    );
+}
+
+#[tokio::test]
 async fn partition_checkpoint_pointer_cas_has_one_winner_and_idempotent_retry() {
     let store = Arc::new(InMemoryMetaStore::default());
     let key = partition_key();
@@ -1375,6 +1441,22 @@ fn reservation(
         schema_fingerprint:
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         writer_epoch: 7,
+    }
+}
+
+fn publication_request(
+    reservation: IngestRangeReservation,
+    authority: PartitionAuthorityToken,
+    request_id: &str,
+    request_digest: &str,
+) -> PublishIngestReservationRequest {
+    PublishIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: request_id.to_string(),
+        request_digest: request_digest.to_string(),
+        object_key: "v1/objects/payload.parquet".to_string(),
+        object_digest: "sha256:object".to_string(),
     }
 }
 

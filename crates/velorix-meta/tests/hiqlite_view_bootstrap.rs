@@ -15,9 +15,10 @@ use velorix_meta::{
     FixViewBootstrapActivationCutRequest, HiqliteMetaStore, IngestRangeReservation,
     IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
     PartitionAuthorityKey, PartitionAuthorityToken, PromoteViewBootstrapOutcome,
-    PromoteViewBootstrapRequest, PublishPartitionCheckpointPointerOutcome,
-    PublishPartitionCheckpointPointerRequest, PublishStandingRuntimeCheckpointOutcome,
-    PublishStandingRuntimeCheckpointRequest, ReserveIngestRangeOutcome,
+    PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
+    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, ViewBootstrapLifecycleV1,
 };
 
@@ -115,6 +116,236 @@ async fn hiqlite_partition_authority_concurrent_claim_has_one_winner() {
             .count(),
         1
     );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_authoritative_ingest_publication_is_bound_idempotent_and_recoverable() {
+    let (_dir, store, client) = start_store().await;
+    let authority = match store
+        .acquire_partition_authority(partition_authority_request("worker-a", None))
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let reservation = reservation(0, 0, 100, "sha256:payload");
+    assert_eq!(
+        store
+            .reserve_authoritative_ingest_range(ReserveAuthoritativeIngestRangeRequest {
+                reservation: reservation.clone(),
+                authority: authority.clone(),
+            })
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    let request = PublishIngestReservationRequest {
+        reservation: reservation.clone(),
+        authority: authority.clone(),
+        request_id: "publication-one".to_string(),
+        request_digest: "sha256:request-one".to_string(),
+        object_key: "objects/one".to_string(),
+        object_digest: "sha256:object-one".to_string(),
+    };
+    assert_eq!(
+        store
+            .publish_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    client
+        .execute(
+            "UPDATE velorix_partition_authorities SET expires_at_unix_ms = 0 WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4",
+            vec![hiqlite::Param::from("default"), hiqlite::Param::from("view"), hiqlite::Param::from("orders"), hiqlite::Param::from(0_i64)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .publish_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Duplicate
+    );
+    let mut conflict = request;
+    conflict.request_digest = "sha256:request-two".to_string();
+    assert_eq!(
+        store.publish_ingest_reservation(conflict).await.unwrap(),
+        PublishIngestReservationOutcome::Conflict
+    );
+    let publication = store
+        .read_authoritative_ingest_publication("publication-one")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publication.reservation, reservation);
+    assert_eq!(publication.object_key, "objects/one");
+    assert_eq!(
+        store
+            .list_authoritative_ingest_publications(&authority.key)
+            .await
+            .unwrap(),
+        vec![publication]
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiqlite_concurrent_authoritative_publication_has_one_commit() {
+    let (_dir, store, client) = start_store().await;
+    let authority = match store
+        .acquire_partition_authority(partition_authority_request("worker-a", None))
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let reservation = reservation(0, 0, 100, "sha256:payload");
+    store
+        .reserve_authoritative_ingest_range(ReserveAuthoritativeIngestRangeRequest {
+            reservation: reservation.clone(),
+            authority: authority.clone(),
+        })
+        .await
+        .unwrap();
+    let request = PublishIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: "publication-concurrent".to_string(),
+        request_digest: "sha256:request".to_string(),
+        object_key: "objects/concurrent".to_string(),
+        object_digest: "sha256:object".to_string(),
+    };
+    let store = Arc::new(store);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let request = request.clone();
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.publish_ingest_reservation(request).await.unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let outcomes = [
+        workers.remove(0).await.unwrap(),
+        workers.remove(0).await.unwrap(),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == PublishIngestReservationOutcome::Committed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == PublishIngestReservationOutcome::Duplicate)
+            .count(),
+        1
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiqlite_competing_authoritative_publications_have_one_commit_and_no_loser_phantom() {
+    let (_dir, store, client) = start_store().await;
+    let authority = match store
+        .acquire_partition_authority(partition_authority_request("worker-a", None))
+        .await
+        .unwrap()
+    {
+        AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let reservation = reservation(0, 0, 100, "sha256:payload");
+    store
+        .reserve_authoritative_ingest_range(ReserveAuthoritativeIngestRangeRequest {
+            reservation: reservation.clone(),
+            authority: authority.clone(),
+        })
+        .await
+        .unwrap();
+    let winner_candidate = PublishIngestReservationRequest {
+        reservation: reservation.clone(),
+        authority: authority.clone(),
+        request_id: "publication-winner".to_string(),
+        request_digest: "sha256:winner-request".to_string(),
+        object_key: "objects/winner".to_string(),
+        object_digest: "sha256:winner-object".to_string(),
+    };
+    let loser_candidate = PublishIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: "publication-loser".to_string(),
+        request_digest: "sha256:loser-request".to_string(),
+        object_key: "objects/loser".to_string(),
+        object_digest: "sha256:loser-object".to_string(),
+    };
+    let store = Arc::new(store);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let left_store = Arc::clone(&store);
+    let left_barrier = Arc::clone(&barrier);
+    let left = tokio::spawn(async move {
+        left_barrier.wait().await;
+        left_store
+            .publish_ingest_reservation(winner_candidate)
+            .await
+            .unwrap()
+    });
+    let right_store = Arc::clone(&store);
+    let right_barrier = Arc::clone(&barrier);
+    let right = tokio::spawn(async move {
+        right_barrier.wait().await;
+        right_store
+            .publish_ingest_reservation(loser_candidate)
+            .await
+            .unwrap()
+    });
+    barrier.wait().await;
+    let left_outcome = left.await.unwrap();
+    let right_outcome = right.await.unwrap();
+    let outcomes = [left_outcome.clone(), right_outcome.clone()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == PublishIngestReservationOutcome::Committed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == PublishIngestReservationOutcome::Conflict)
+            .count(),
+        1
+    );
+    let winner = store
+        .read_authoritative_ingest_publication("publication-winner")
+        .await
+        .unwrap();
+    let loser = store
+        .read_authoritative_ingest_publication("publication-loser")
+        .await
+        .unwrap();
+    match (left_outcome, right_outcome) {
+        (PublishIngestReservationOutcome::Committed, PublishIngestReservationOutcome::Conflict) => {
+            assert_eq!(winner.unwrap().object_key, "objects/winner");
+            assert_eq!(loser, None);
+        }
+        (PublishIngestReservationOutcome::Conflict, PublishIngestReservationOutcome::Committed) => {
+            assert_eq!(winner, None);
+            assert_eq!(loser.unwrap().object_key, "objects/loser");
+        }
+        outcomes => panic!("unexpected competing outcomes: {outcomes:?}"),
+    }
     client.shutdown().await.unwrap();
 }
 

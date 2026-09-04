@@ -30,9 +30,10 @@ use velorix_meta::{
     FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
     InMemoryMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1, MetaGrpcService,
     MetaStore, OssMetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
-    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
-    PublishStandingRuntimeCheckpointOutcome, ReserveIngestRangeOutcome,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
+    PublishPartitionCheckpointPointerRequest, PublishStandingRuntimeCheckpointOutcome,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 
@@ -754,6 +755,80 @@ async fn grpc_partition_authority_round_trips_acquire_renew_and_fenced_pointer_p
             .await
             .unwrap()
             .partition_scoped_authority
+    );
+}
+
+#[tokio::test]
+async fn grpc_authoritative_ingest_publication_round_trips_and_recovers() {
+    let backend = InMemoryMetaStore::default();
+    backend.set_partition_authority_clock_for_test(100).await;
+    let endpoint = spawn_meta_service_for(backend).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let key = PartitionAuthorityKey {
+        namespace: "tenant-a".to_string(),
+        view_id: "view-a".to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+    };
+    let authority = match store
+        .acquire_partition_authority(velorix_meta::AcquirePartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".to_string(),
+            current_token: None,
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap()
+    {
+        velorix_meta::AcquirePartitionAuthorityOutcome::Acquired(token) => token,
+        outcome => panic!("expected acquire, got {outcome:?}"),
+    };
+    let catalog = common::orders_relation_catalog("v1");
+    let reservation = ingest_range_reservation(&catalog);
+    assert_eq!(
+        store
+            .reserve_authoritative_ingest_range(ReserveAuthoritativeIngestRangeRequest {
+                reservation: reservation.clone(),
+                authority: authority.clone(),
+            })
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    let request = PublishIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: "publication-one".to_string(),
+        request_digest: "sha256:request-one".to_string(),
+        object_key: "objects/one".to_string(),
+        object_digest: "sha256:object-one".to_string(),
+    };
+    assert_eq!(
+        store
+            .publish_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    assert_eq!(
+        store
+            .publish_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Duplicate
+    );
+    let publication = store
+        .read_authoritative_ingest_publication("publication-one")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publication.object_key, "objects/one");
+    assert_eq!(
+        store
+            .list_authoritative_ingest_publications(&key)
+            .await
+            .unwrap(),
+        vec![publication]
     );
 }
 

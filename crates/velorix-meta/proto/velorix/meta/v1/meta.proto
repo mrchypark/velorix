@@ -7,7 +7,11 @@ service VelorixMeta {
   rpc StoreRelationCatalog(StoreRelationCatalogRequest) returns (StoreRelationCatalogResponse);
   rpc ReadRelationCatalog(ReadRelationCatalogRequest) returns (ReadRelationCatalogResponse);
   rpc ReserveIngestRange(ReserveIngestRangeRequest) returns (ReserveIngestRangeResponse);
+  rpc ReserveAuthoritativeIngestRange(ReserveAuthoritativeIngestRangeRequest) returns (ReserveIngestRangeResponse);
   rpc CommitIngestRange(ReserveIngestRangeRequest) returns (CommitIngestRangeResponse);
+  rpc PublishIngestReservation(PublishIngestReservationRequest) returns (PublishIngestReservationResponse);
+  rpc ReadAuthoritativeIngestPublication(ReadAuthoritativeIngestPublicationRequest) returns (ReadAuthoritativeIngestPublicationResponse);
+  rpc ListAuthoritativeIngestPublications(ListAuthoritativeIngestPublicationsRequest) returns (ListAuthoritativeIngestPublicationsResponse);
   rpc CaptureIngestSourceCut(CaptureIngestSourceCutRequest) returns (CaptureIngestSourceCutResponse);
   rpc BeginViewBootstrap(BeginViewBootstrapRequest) returns (BeginViewBootstrapResponse);
   rpc ReadViewBootstrap(ReadViewBootstrapRequest) returns (ReadViewBootstrapResponse);
@@ -173,9 +177,41 @@ message ReserveIngestRangeResponse {
   string outcome = 1;
 }
 
+message ReserveAuthoritativeIngestRangeRequest {
+  ReserveIngestRangeRequest reservation = 1;
+  PartitionAuthorityToken authority = 2;
+}
+
 message CommitIngestRangeResponse {
   string outcome = 1;
 }
+
+message PublishIngestReservationRequest {
+  ReserveIngestRangeRequest reservation = 1;
+  PartitionAuthorityToken authority = 2;
+  string request_id = 3;
+  string request_digest = 4;
+  string object_key = 5;
+  string object_digest = 6;
+}
+
+message PublishIngestReservationResponse {
+  string outcome = 1;
+}
+
+message AuthoritativeIngestPublication {
+  ReserveIngestRangeRequest reservation = 1;
+  PartitionAuthorityKey authority_key = 2;
+  string request_id = 3;
+  string request_digest = 4;
+  string object_key = 5;
+  string object_digest = 6;
+}
+
+message ReadAuthoritativeIngestPublicationRequest { string request_id = 1; }
+message ReadAuthoritativeIngestPublicationResponse { bool found = 1; AuthoritativeIngestPublication publication = 2; }
+message ListAuthoritativeIngestPublicationsRequest { PartitionAuthorityKey key = 1; }
+message ListAuthoritativeIngestPublicationsResponse { repeated AuthoritativeIngestPublication publications = 1; }
 
 message CaptureIngestSourceCutRequest {
   bytes request_json = 1;

@@ -83,11 +83,51 @@ pub enum ReserveIngestRangeOutcome {
     Conflict,
 }
 
+/// Reserves an ingest range under the independent authority domain that will
+/// later authorize its object publication.  This prevents a reservation made
+/// for one namespace/view from being published with another scope's token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveAuthoritativeIngestRangeRequest {
+    pub reservation: IngestRangeReservation,
+    pub authority: PartitionAuthorityToken,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommitIngestRangeOutcome {
     Committed,
     Duplicate,
     Conflict,
+}
+
+/// Authoritatively binds a reserved ingest range to the immutable object that
+/// contains its payload.  `request_id` is caller supplied; reusing it with a
+/// different digest is a conflict, never a second publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishIngestReservationRequest {
+    pub reservation: IngestRangeReservation,
+    pub authority: PartitionAuthorityToken,
+    pub request_id: String,
+    pub request_digest: String,
+    pub object_key: String,
+    pub object_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublishIngestReservationOutcome {
+    Committed,
+    Duplicate,
+    Conflict,
+    InvalidAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoritativeIngestPublication {
+    pub reservation: IngestRangeReservation,
+    pub authority_key: PartitionAuthorityKey,
+    pub request_id: String,
+    pub request_digest: String,
+    pub object_key: String,
+    pub object_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -125,7 +165,7 @@ pub struct StandingRuntimeFencingCapability {
     pub production_bounded_failover_safe: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IngestRangeReservation {
     pub stream_id: String,
     pub partition_id: u32,
@@ -398,6 +438,16 @@ pub trait MetaStore: Send + Sync + 'static {
         reservation: IngestRangeReservation,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError>;
 
+    async fn reserve_authoritative_ingest_range(
+        &self,
+        request: ReserveAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_ingest_publication",
+        ))
+    }
+
     async fn commit_ingest_range(
         &self,
         reservation: IngestRangeReservation,
@@ -405,6 +455,38 @@ pub trait MetaStore: Send + Sync + 'static {
         reservation.validate()?;
         Err(MetaStoreError::UnsupportedCapability(
             "committed_ingest_source_cut",
+        ))
+    }
+
+    /// Atomically validates a reservation and its partition authority, then
+    /// records the authoritative object reference.  There is deliberately no
+    /// fallback to `commit_ingest_range`: that would leave a stale writer able
+    /// to publish an object after losing its partition authority.
+    async fn publish_ingest_reservation(
+        &self,
+        request: PublishIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_ingest_publication",
+        ))
+    }
+
+    async fn read_authoritative_ingest_publication(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<AuthoritativeIngestPublication>, MetaStoreError> {
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_ingest_publication",
+        ))
+    }
+
+    async fn list_authoritative_ingest_publications(
+        &self,
+        _key: &PartitionAuthorityKey,
+    ) -> Result<Vec<AuthoritativeIngestPublication>, MetaStoreError> {
+        Err(MetaStoreError::UnsupportedCapability(
+            "authoritative_ingest_publication",
         ))
     }
 
@@ -605,11 +687,41 @@ where
         (**self).reserve_ingest_range(reservation).await
     }
 
+    async fn reserve_authoritative_ingest_range(
+        &self,
+        request: ReserveAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        (**self).reserve_authoritative_ingest_range(request).await
+    }
+
     async fn commit_ingest_range(
         &self,
         reservation: IngestRangeReservation,
     ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
         (**self).commit_ingest_range(reservation).await
+    }
+
+    async fn publish_ingest_reservation(
+        &self,
+        request: PublishIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        (**self).publish_ingest_reservation(request).await
+    }
+
+    async fn read_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<AuthoritativeIngestPublication>, MetaStoreError> {
+        (**self)
+            .read_authoritative_ingest_publication(request_id)
+            .await
+    }
+
+    async fn list_authoritative_ingest_publications(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Vec<AuthoritativeIngestPublication>, MetaStoreError> {
+        (**self).list_authoritative_ingest_publications(key).await
     }
 
     async fn commit_ingest_ranges(
@@ -733,7 +845,9 @@ pub struct InMemoryMetaStore {
 struct InMemoryMetaState {
     relation_catalogs: HashMap<(String, String), VelorixRelationCatalogV1>,
     ingest_reservations: HashMap<(String, u32), Vec<IngestRangeReservation>>,
+    authoritative_ingest_reservation_keys: HashMap<IngestRangeReservation, PartitionAuthorityKey>,
     committed_ingest_batch_keys: BTreeSet<String>,
+    authoritative_ingest_publications: HashMap<String, InMemoryIngestPublication>,
     ingest_catalog_epoch: u64,
     view_bootstraps: HashMap<(String, String, String), ViewBootstrapControlV1>,
     view_dependency_graph_revisions: HashMap<String, u64>,
@@ -743,6 +857,11 @@ struct InMemoryMetaState {
     partition_authority_now_unix_ms: u64,
     partition_authorities: HashMap<PartitionAuthorityKey, PartitionAuthorityToken>,
     partition_checkpoint_pointers: HashMap<PartitionAuthorityKey, PartitionCheckpointPointer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InMemoryIngestPublication {
+    publication: AuthoritativeIngestPublication,
 }
 
 impl InMemoryMetaStore {
@@ -885,6 +1004,164 @@ impl MetaStore for InMemoryMetaStore {
             return Ok(CommitIngestRangeOutcome::Duplicate);
         }
         Ok(CommitIngestRangeOutcome::Committed)
+    }
+
+    async fn reserve_authoritative_ingest_range(
+        &self,
+        request: ReserveAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        let mut guard = self.inner.write().await;
+        let now = guard.partition_authority_now_unix_ms;
+        if validate_current_partition_authority(
+            guard.partition_authorities.get(&request.authority.key),
+            &request.authority,
+            now,
+        )
+        .is_err()
+        {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
+        let key = (
+            request.reservation.stream_id.clone(),
+            request.reservation.partition_id,
+        );
+        let reservations = guard.ingest_reservations.entry(key).or_default();
+        let outcome = if reservations
+            .iter()
+            .any(|entry| entry == &request.reservation)
+        {
+            ReserveIngestRangeOutcome::Duplicate
+        } else if reservations
+            .iter()
+            .any(|entry| entry.overlaps(&request.reservation))
+        {
+            ReserveIngestRangeOutcome::Conflict
+        } else {
+            reservations.push(request.reservation.clone());
+            reservations.sort_by_key(|entry| entry.start_offset_inclusive);
+            ReserveIngestRangeOutcome::Reserved
+        };
+        if !matches!(
+            outcome,
+            ReserveIngestRangeOutcome::Reserved | ReserveIngestRangeOutcome::Duplicate
+        ) {
+            return Ok(outcome);
+        }
+        match guard
+            .authoritative_ingest_reservation_keys
+            .get(&request.reservation)
+        {
+            Some(existing) if existing != &request.authority.key => {
+                Ok(ReserveIngestRangeOutcome::Conflict)
+            }
+            Some(_) => Ok(outcome),
+            None => {
+                guard
+                    .authoritative_ingest_reservation_keys
+                    .insert(request.reservation, request.authority.key);
+                Ok(outcome)
+            }
+        }
+    }
+
+    async fn publish_ingest_reservation(
+        &self,
+        request: PublishIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        let key = (
+            request.reservation.stream_id.clone(),
+            request.reservation.partition_id,
+        );
+        let mut guard = self.inner.write().await;
+        let replay = InMemoryIngestPublication {
+            publication: AuthoritativeIngestPublication {
+                reservation: request.reservation.clone(),
+                authority_key: request.authority.key.clone(),
+                request_id: request.request_id.clone(),
+                request_digest: request.request_digest.clone(),
+                object_key: request.object_key.clone(),
+                object_digest: request.object_digest.clone(),
+            },
+        };
+        if let Some(existing) = guard
+            .authoritative_ingest_publications
+            .get(&request.request_id)
+        {
+            return Ok(if existing == &replay {
+                PublishIngestReservationOutcome::Duplicate
+            } else {
+                PublishIngestReservationOutcome::Conflict
+            });
+        }
+        let now = guard.partition_authority_now_unix_ms;
+        if validate_current_partition_authority(
+            guard.partition_authorities.get(&request.authority.key),
+            &request.authority,
+            now,
+        )
+        .is_err()
+        {
+            return Ok(PublishIngestReservationOutcome::InvalidAuthority);
+        }
+        if guard
+            .authoritative_ingest_reservation_keys
+            .get(&request.reservation)
+            != Some(&request.authority.key)
+        {
+            return Ok(PublishIngestReservationOutcome::Conflict);
+        }
+        if !guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| reservations.contains(&request.reservation))
+        {
+            return Ok(PublishIngestReservationOutcome::Conflict);
+        }
+        if guard
+            .committed_ingest_batch_keys
+            .contains(&request.reservation.batch_key)
+        {
+            return Ok(PublishIngestReservationOutcome::Conflict);
+        }
+        guard
+            .committed_ingest_batch_keys
+            .insert(request.reservation.batch_key.clone());
+        guard
+            .authoritative_ingest_publications
+            .insert(request.request_id, replay);
+        Ok(PublishIngestReservationOutcome::Committed)
+    }
+
+    async fn read_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<AuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .authoritative_ingest_publications
+            .get(request_id)
+            .map(|publication| publication.publication.clone()))
+    }
+
+    async fn list_authoritative_ingest_publications(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Vec<AuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .authoritative_ingest_publications
+            .values()
+            .filter(|publication| publication.publication.authority_key == *key)
+            .map(|publication| publication.publication.clone())
+            .collect())
     }
 
     async fn commit_ingest_ranges(
@@ -1734,6 +2011,36 @@ impl PartitionAuthorityToken {
     }
 }
 
+impl PublishIngestReservationRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.reservation.validate()?;
+        self.authority.validate()?;
+        require_non_empty("request_id", &self.request_id)?;
+        require_non_empty("request_digest", &self.request_digest)?;
+        require_non_empty("object_key", &self.object_key)?;
+        require_non_empty("object_digest", &self.object_digest)?;
+        if self.authority.key.stream_id != self.reservation.stream_id
+            || self.authority.key.partition_id != self.reservation.partition_id
+        {
+            return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl ReserveAuthoritativeIngestRangeRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.reservation.validate()?;
+        self.authority.validate()?;
+        if self.authority.key.stream_id != self.reservation.stream_id
+            || self.authority.key.partition_id != self.reservation.partition_id
+        {
+            return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
 impl AcquirePartitionAuthorityRequest {
     fn validate(&self) -> Result<(), MetaStoreError> {
         self.key.validate()?;
@@ -2255,6 +2562,68 @@ where
         }))
     }
 
+    async fn publish_ingest_reservation(
+        &self,
+        request: Request<proto::PublishIngestReservationRequest>,
+    ) -> Result<Response<proto::PublishIngestReservationResponse>, Status> {
+        self.authorize(&request)?;
+        let request = publish_ingest_reservation_request_from_proto(request.into_inner())
+            .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .publish_ingest_reservation(request)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(proto::PublishIngestReservationResponse {
+            outcome: publish_ingest_reservation_outcome(&outcome).to_string(),
+        }))
+    }
+
+    async fn read_authoritative_ingest_publication(
+        &self,
+        request: Request<proto::ReadAuthoritativeIngestPublicationRequest>,
+    ) -> Result<Response<proto::ReadAuthoritativeIngestPublicationResponse>, Status> {
+        self.authorize(&request)?;
+        let publication = self
+            .store
+            .read_authoritative_ingest_publication(&request.into_inner().request_id)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ReadAuthoritativeIngestPublicationResponse {
+                found: publication.is_some(),
+                publication: publication.map(authoritative_ingest_publication_to_proto),
+            },
+        ))
+    }
+
+    async fn list_authoritative_ingest_publications(
+        &self,
+        request: Request<proto::ListAuthoritativeIngestPublicationsRequest>,
+    ) -> Result<Response<proto::ListAuthoritativeIngestPublicationsResponse>, Status> {
+        self.authorize(&request)?;
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("partition authority key is required"))
+            .and_then(|key| {
+                partition_authority_key_from_proto(key).map_err(partition_authority_status)
+            })?;
+        let publications = self
+            .store
+            .list_authoritative_ingest_publications(&key)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ListAuthoritativeIngestPublicationsResponse {
+                publications: publications
+                    .into_iter()
+                    .map(authoritative_ingest_publication_to_proto)
+                    .collect(),
+            },
+        ))
+    }
+
     async fn capture_ingest_source_cut(
         &self,
         request: Request<proto::CaptureIngestSourceCutRequest>,
@@ -2432,6 +2801,23 @@ where
             .await
             .map_err(meta_status)?;
 
+        Ok(Response::new(proto::ReserveIngestRangeResponse {
+            outcome: reserve_ingest_range_outcome(&outcome).to_string(),
+        }))
+    }
+
+    async fn reserve_authoritative_ingest_range(
+        &self,
+        request: Request<proto::ReserveAuthoritativeIngestRangeRequest>,
+    ) -> Result<Response<proto::ReserveIngestRangeResponse>, Status> {
+        self.authorize(&request)?;
+        let request = reserve_authoritative_ingest_range_request_from_proto(request.into_inner())
+            .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .reserve_authoritative_ingest_range(request)
+            .await
+            .map_err(partition_authority_status)?;
         Ok(Response::new(proto::ReserveIngestRangeResponse {
             outcome: reserve_ingest_range_outcome(&outcome).to_string(),
         }))
@@ -2714,6 +3100,117 @@ fn ingest_range_reservation_to_proto(
         relation_version: reservation.relation_version,
         schema_fingerprint: reservation.schema_fingerprint,
         writer_epoch: reservation.writer_epoch,
+    }
+}
+
+fn publish_ingest_reservation_request_from_proto(
+    request: proto::PublishIngestReservationRequest,
+) -> Result<PublishIngestReservationRequest, MetaStoreError> {
+    let reservation = request
+        .reservation
+        .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+        .map(ingest_range_reservation_from_proto)?;
+    let authority = request
+        .authority
+        .ok_or_else(|| {
+            MetaStoreError::Serialization("partition authority token is required".into())
+        })
+        .and_then(partition_authority_token_from_proto)?;
+    let request = PublishIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: request.request_id,
+        request_digest: request.request_digest,
+        object_key: request.object_key,
+        object_digest: request.object_digest,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn reserve_authoritative_ingest_range_request_from_proto(
+    request: proto::ReserveAuthoritativeIngestRangeRequest,
+) -> Result<ReserveAuthoritativeIngestRangeRequest, MetaStoreError> {
+    let reservation = request
+        .reservation
+        .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+        .map(ingest_range_reservation_from_proto)?;
+    let authority = request
+        .authority
+        .ok_or_else(|| {
+            MetaStoreError::Serialization("partition authority token is required".into())
+        })
+        .and_then(partition_authority_token_from_proto)?;
+    let request = ReserveAuthoritativeIngestRangeRequest {
+        reservation,
+        authority,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn reserve_authoritative_ingest_range_request_to_proto(
+    request: ReserveAuthoritativeIngestRangeRequest,
+) -> proto::ReserveAuthoritativeIngestRangeRequest {
+    proto::ReserveAuthoritativeIngestRangeRequest {
+        reservation: Some(ingest_range_reservation_to_proto(request.reservation)),
+        authority: Some(partition_authority_token_to_proto(request.authority)),
+    }
+}
+
+fn authoritative_ingest_publication_to_proto(
+    publication: AuthoritativeIngestPublication,
+) -> proto::AuthoritativeIngestPublication {
+    proto::AuthoritativeIngestPublication {
+        reservation: Some(ingest_range_reservation_to_proto(publication.reservation)),
+        authority_key: Some(partition_authority_key_to_proto(publication.authority_key)),
+        request_id: publication.request_id,
+        request_digest: publication.request_digest,
+        object_key: publication.object_key,
+        object_digest: publication.object_digest,
+    }
+}
+
+fn authoritative_ingest_publication_from_proto(
+    publication: proto::AuthoritativeIngestPublication,
+) -> Result<AuthoritativeIngestPublication, MetaStoreError> {
+    Ok(AuthoritativeIngestPublication {
+        reservation: publication
+            .reservation
+            .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+            .map(ingest_range_reservation_from_proto)?,
+        authority_key: publication
+            .authority_key
+            .ok_or_else(|| {
+                MetaStoreError::Serialization("partition authority key is required".into())
+            })
+            .and_then(partition_authority_key_from_proto)?,
+        request_id: publication.request_id,
+        request_digest: publication.request_digest,
+        object_key: publication.object_key,
+        object_digest: publication.object_digest,
+    })
+}
+
+fn publish_ingest_reservation_request_to_proto(
+    request: PublishIngestReservationRequest,
+) -> proto::PublishIngestReservationRequest {
+    proto::PublishIngestReservationRequest {
+        reservation: Some(ingest_range_reservation_to_proto(request.reservation)),
+        authority: Some(partition_authority_token_to_proto(request.authority)),
+        request_id: request.request_id,
+        request_digest: request.request_digest,
+        object_key: request.object_key,
+        object_digest: request.object_digest,
+    }
+}
+
+fn publish_ingest_reservation_outcome(outcome: &PublishIngestReservationOutcome) -> &'static str {
+    match outcome {
+        PublishIngestReservationOutcome::Committed => "committed",
+        PublishIngestReservationOutcome::Duplicate => "duplicate",
+        PublishIngestReservationOutcome::Conflict => "conflict",
+        PublishIngestReservationOutcome::InvalidAuthority => "invalid_authority",
     }
 }
 
@@ -3265,6 +3762,59 @@ impl HiqliteMetaStore {
             )
             .await
             .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_ingest_publication_requests (
+                    request_id TEXT NOT NULL PRIMARY KEY,
+                    request_digest TEXT NOT NULL,
+                    outcome TEXT NOT NULL
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        for (column, definition) in [
+            ("request_digest", "TEXT NOT NULL DEFAULT ''"),
+            ("outcome", "TEXT NOT NULL DEFAULT 'pending'"),
+        ] {
+            if !self
+                .hiqlite_table_has_column(
+                    "PRAGMA table_info(velorix_ingest_publication_requests)",
+                    column,
+                )
+                .await?
+            {
+                self.client
+                    .execute(
+                        format!(
+                            "ALTER TABLE velorix_ingest_publication_requests ADD COLUMN {column} {definition}"
+                        ),
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)?;
+            }
+        }
+        for (column, definition) in [
+            ("object_key", "TEXT NOT NULL DEFAULT ''"),
+            ("object_digest", "TEXT NOT NULL DEFAULT ''"),
+            ("authoritative_request_id", "TEXT NOT NULL DEFAULT ''"),
+            ("authority_namespace", "TEXT NOT NULL DEFAULT ''"),
+            ("authority_view_id", "TEXT NOT NULL DEFAULT ''"),
+        ] {
+            if !self
+                .hiqlite_table_has_column("PRAGMA table_info(velorix_ingest_reservations)", column)
+                .await?
+            {
+                self.client
+                    .execute(
+                        format!("ALTER TABLE velorix_ingest_reservations ADD COLUMN {column} {definition}"),
+                        vec![],
+                    )
+                    .await
+                    .map_err(hiqlite_error)?;
+            }
+        }
         self.client
             .execute(
                 "CREATE TABLE IF NOT EXISTS velorix_view_bootstrap_controls (
@@ -4033,7 +4583,14 @@ impl MetaStore for HiqliteMetaStore {
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing: hiqlite_standing_runtime_fencing_capability(false),
-            partition_authority: PartitionAuthorityCapability::unsupported("hiqlite"),
+            partition_authority: PartitionAuthorityCapability {
+                backend_name: "hiqlite".to_string(),
+                partition_scoped_authority: true,
+                backend_owned_time: true,
+                fenced_checkpoint_pointer_publish: true,
+                durable_across_restart: true,
+                production_safe: true,
+            },
         })
     }
 
@@ -4219,6 +4776,53 @@ impl MetaStore for HiqliteMetaStore {
         }
     }
 
+    async fn reserve_authoritative_ingest_range(
+        &self,
+        request: ReserveAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        let reservation = &request.reservation;
+        let start = i64_from_u64("start_offset_inclusive", reservation.start_offset_inclusive)?;
+        let end = i64_from_u64("end_offset_exclusive", reservation.end_offset_exclusive)?;
+        let writer_epoch = i64_from_u64("writer_epoch", reservation.writer_epoch)?;
+        let authority_epoch = i64_from_u64("authority.owner_epoch", request.authority.owner_epoch)?;
+        let authority_expiry = i64_from_u64(
+            "authority.expires_at_unix_ms",
+            request.authority.expires_at_unix_ms,
+        )?;
+        let partition_id = i64::from(reservation.partition_id);
+        let inserted = self
+            .with_schema_repair(|| async {
+                self.client
+                    .txn_with_raft_serialized_timestamp([(
+                        "INSERT INTO velorix_ingest_reservations (stream_id, partition_id, start_offset_inclusive, end_offset_exclusive, batch_key, payload_digest, relation_id, relation_version, schema_fingerprint, writer_epoch, authority_namespace, authority_view_id) SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12 WHERE EXISTS (SELECT 1 FROM velorix_partition_authorities WHERE namespace = $11 AND view_id = $12 AND stream_id = $1 AND partition_id = $2 AND owner_id = $13 AND owner_epoch = $14 AND expires_at_unix_ms = $15 AND expires_at_unix_ms > $16) AND NOT EXISTS (SELECT 1 FROM velorix_ingest_reservations WHERE stream_id = $1 AND partition_id = $2 AND start_offset_inclusive < $4 AND $3 < end_offset_exclusive)",
+                        vec![hiqlite::Param::from(reservation.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(start), hiqlite::Param::from(end), hiqlite::Param::from(reservation.batch_key.clone()), hiqlite::Param::from(reservation.payload_digest.clone()), hiqlite::Param::from(reservation.relation_id.clone()), hiqlite::Param::from(reservation.relation_version.clone()), hiqlite::Param::from(reservation.schema_fingerprint.clone()), hiqlite::Param::from(writer_epoch), hiqlite::Param::from(request.authority.key.namespace.clone()), hiqlite::Param::from(request.authority.key.view_id.clone()), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms()],
+                    )])
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        if hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(inserted.result, 0)? == 1 {
+            return Ok(ReserveIngestRangeOutcome::Reserved);
+        }
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client.query_consistent_map::<AuthoritativeIngestPublicationRow, _>(
+                    "SELECT reservations.stream_id, reservations.partition_id, reservations.start_offset_inclusive, reservations.end_offset_exclusive, reservations.batch_key, reservations.payload_digest, reservations.relation_id, reservations.relation_version, reservations.schema_fingerprint, reservations.writer_epoch, reservations.authority_namespace, reservations.authority_view_id, reservations.authoritative_request_id AS request_id, COALESCE(requests.request_digest, '') AS request_digest, reservations.object_key, reservations.object_digest FROM velorix_ingest_reservations reservations LEFT JOIN velorix_ingest_publication_requests requests ON requests.request_id = reservations.authoritative_request_id WHERE reservations.stream_id = $1 AND reservations.partition_id = $2 AND reservations.start_offset_inclusive = $3 AND reservations.end_offset_exclusive = $4",
+                    vec![hiqlite::Param::from(reservation.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(start), hiqlite::Param::from(end)],
+                ).await.map_err(hiqlite_error)
+            }).await?;
+        for row in rows {
+            if row.reservation()? == *reservation
+                && row.authority_namespace == request.authority.key.namespace
+                && row.authority_view_id == request.authority.key.view_id
+            {
+                return Ok(ReserveIngestRangeOutcome::Duplicate);
+            }
+        }
+        Ok(ReserveIngestRangeOutcome::Conflict)
+    }
+
     async fn commit_ingest_range(
         &self,
         reservation: IngestRangeReservation,
@@ -4306,6 +4910,103 @@ impl MetaStore for HiqliteMetaStore {
         } else {
             Ok(CommitIngestRangeOutcome::Conflict)
         }
+    }
+
+    async fn publish_ingest_reservation(
+        &self,
+        request: PublishIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        let reservation = &request.reservation;
+        let start = i64_from_u64("start_offset_inclusive", reservation.start_offset_inclusive)?;
+        let end = i64_from_u64("end_offset_exclusive", reservation.end_offset_exclusive)?;
+        let writer_epoch = i64_from_u64("writer_epoch", reservation.writer_epoch)?;
+        let authority_epoch = i64_from_u64("authority.owner_epoch", request.authority.owner_epoch)?;
+        let authority_expiry = i64_from_u64(
+            "authority.expires_at_unix_ms",
+            request.authority.expires_at_unix_ms,
+        )?;
+        let partition_id = i64::from(reservation.partition_id);
+        let txn = self
+            .with_schema_repair(|| async {
+                self.client
+                    .txn_with_raft_serialized_timestamp([
+                        (
+                            "INSERT OR IGNORE INTO velorix_ingest_publication_requests (request_id, request_digest, outcome) VALUES ($1, $2, 'pending')",
+                            vec![hiqlite::Param::from(request.request_id.clone()), hiqlite::Param::from(request.request_digest.clone())],
+                        ),
+                        (
+                            "UPDATE velorix_ingest_reservations SET committed = 1, object_key = $1, object_digest = $2, authoritative_request_id = $3 WHERE stream_id = $4 AND partition_id = $5 AND start_offset_inclusive = $6 AND end_offset_exclusive = $7 AND batch_key = $8 AND payload_digest = $9 AND relation_id = $10 AND relation_version = $11 AND schema_fingerprint = $12 AND writer_epoch = $13 AND authority_namespace = $14 AND authority_view_id = $15 AND committed = 0 AND EXISTS (SELECT 1 FROM velorix_partition_authorities WHERE namespace = $14 AND view_id = $15 AND stream_id = $4 AND partition_id = $5 AND owner_id = $16 AND owner_epoch = $17 AND expires_at_unix_ms = $18 AND expires_at_unix_ms > $19) AND EXISTS (SELECT 1 FROM velorix_ingest_publication_requests WHERE request_id = $3 AND request_digest = $20 AND outcome = 'pending')",
+                            vec![hiqlite::Param::from(request.object_key.clone()), hiqlite::Param::from(request.object_digest.clone()), hiqlite::Param::from(request.request_id.clone()), hiqlite::Param::from(reservation.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(start), hiqlite::Param::from(end), hiqlite::Param::from(reservation.batch_key.clone()), hiqlite::Param::from(reservation.payload_digest.clone()), hiqlite::Param::from(reservation.relation_id.clone()), hiqlite::Param::from(reservation.relation_version.clone()), hiqlite::Param::from(reservation.schema_fingerprint.clone()), hiqlite::Param::from(writer_epoch), hiqlite::Param::from(request.authority.key.namespace.clone()), hiqlite::Param::from(request.authority.key.view_id.clone()), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(request.request_digest.clone())],
+                        ),
+                        (
+                            "UPDATE velorix_ingest_publication_requests SET outcome = CASE WHEN NOT EXISTS (SELECT 1 FROM velorix_partition_authorities WHERE namespace = $1 AND view_id = $2 AND stream_id = $3 AND partition_id = $4 AND owner_id = $5 AND owner_epoch = $6 AND expires_at_unix_ms = $7 AND expires_at_unix_ms > $8) THEN 'invalid_authority' WHEN EXISTS (SELECT 1 FROM velorix_ingest_reservations reservation WHERE reservation.authoritative_request_id = velorix_ingest_publication_requests.request_id AND reservation.authority_namespace = $1 AND reservation.authority_view_id = $2 AND reservation.stream_id = $3 AND reservation.partition_id = $4) THEN 'committed' ELSE 'conflict' END WHERE request_id = $9 AND request_digest = $10 AND outcome = 'pending'",
+                            vec![hiqlite::Param::from(request.authority.key.namespace.clone()), hiqlite::Param::from(request.authority.key.view_id.clone()), hiqlite::Param::from(reservation.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(request.request_id.clone()), hiqlite::Param::from(request.request_digest.clone())],
+                        ),
+                    ])
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        if hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(txn.result, 1)? == 1 {
+            return Ok(PublishIngestReservationOutcome::Committed);
+        }
+        let rows = self.client.query_consistent_map::<IngestPublicationRequestRow, _>(
+            "SELECT request_digest, outcome FROM velorix_ingest_publication_requests WHERE request_id = $1",
+            vec![hiqlite::Param::from(request.request_id)],
+        ).await.map_err(hiqlite_error)?;
+        match rows.first() {
+            Some(row) if row.request_digest != request.request_digest => {
+                Ok(PublishIngestReservationOutcome::Conflict)
+            }
+            Some(row) if row.outcome == "committed" => {
+                Ok(PublishIngestReservationOutcome::Duplicate)
+            }
+            Some(row) if row.outcome == "invalid_authority" => {
+                Ok(PublishIngestReservationOutcome::InvalidAuthority)
+            }
+            Some(_) => Ok(PublishIngestReservationOutcome::Conflict),
+            None => Err(MetaStoreError::Serialization(
+                "ingest publication request status disappeared".into(),
+            )),
+        }
+    }
+
+    async fn read_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<AuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client.query_consistent_map::<AuthoritativeIngestPublicationRow, _>(
+                    "SELECT reservations.stream_id, reservations.partition_id, reservations.start_offset_inclusive, reservations.end_offset_exclusive, reservations.batch_key, reservations.payload_digest, reservations.relation_id, reservations.relation_version, reservations.schema_fingerprint, reservations.writer_epoch, reservations.authority_namespace, reservations.authority_view_id, reservations.authoritative_request_id AS request_id, requests.request_digest, reservations.object_key, reservations.object_digest FROM velorix_ingest_reservations reservations JOIN velorix_ingest_publication_requests requests ON requests.request_id = reservations.authoritative_request_id WHERE reservations.authoritative_request_id = $1 AND requests.outcome = 'committed'",
+                    vec![hiqlite::Param::from(request_id.to_string())],
+                ).await.map_err(hiqlite_error)
+            })
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(AuthoritativeIngestPublicationRow::into_publication)
+            .transpose()
+    }
+
+    async fn list_authoritative_ingest_publications(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Vec<AuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client.query_consistent_map::<AuthoritativeIngestPublicationRow, _>(
+                    "SELECT reservations.stream_id, reservations.partition_id, reservations.start_offset_inclusive, reservations.end_offset_exclusive, reservations.batch_key, reservations.payload_digest, reservations.relation_id, reservations.relation_version, reservations.schema_fingerprint, reservations.writer_epoch, reservations.authority_namespace, reservations.authority_view_id, reservations.authoritative_request_id AS request_id, requests.request_digest, reservations.object_key, reservations.object_digest FROM velorix_ingest_reservations reservations JOIN velorix_ingest_publication_requests requests ON requests.request_id = reservations.authoritative_request_id WHERE reservations.authority_namespace = $1 AND reservations.authority_view_id = $2 AND reservations.stream_id = $3 AND reservations.partition_id = $4 AND requests.outcome = 'committed' ORDER BY reservations.start_offset_inclusive, reservations.end_offset_exclusive",
+                    vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.view_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(i64::from(key.partition_id))],
+                ).await.map_err(hiqlite_error)
+            })
+            .await?;
+        rows.into_iter()
+            .map(AuthoritativeIngestPublicationRow::into_publication)
+            .collect()
     }
 
     async fn capture_ingest_source_cut(
@@ -5612,6 +6313,131 @@ impl From<&mut hiqlite::Row<'_>> for PartitionCheckpointRequestRow {
         }
     }
 }
+
+#[cfg(feature = "hiqlite-backend")]
+struct IngestPublicationRequestRow {
+    request_digest: String,
+    outcome: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for IngestPublicationRequestRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            request_digest: row.get("request_digest"),
+            outcome: row.get("outcome"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct AuthoritativeIngestPublicationRow {
+    stream_id: String,
+    partition_id: i64,
+    start_offset_inclusive: i64,
+    end_offset_exclusive: i64,
+    batch_key: String,
+    payload_digest: String,
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+    writer_epoch: i64,
+    authority_namespace: String,
+    authority_view_id: String,
+    request_id: String,
+    request_digest: String,
+    object_key: String,
+    object_digest: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl AuthoritativeIngestPublicationRow {
+    fn reservation(&self) -> Result<IngestRangeReservation, MetaStoreError> {
+        Ok(IngestRangeReservation {
+            stream_id: self.stream_id.clone(),
+            partition_id: u32::try_from(self.partition_id).map_err(|_| {
+                MetaStoreError::Serialization("ingest publication partition_id is invalid".into())
+            })?,
+            start_offset_inclusive: u64::try_from(self.start_offset_inclusive).map_err(|_| {
+                MetaStoreError::Serialization("ingest publication start offset is invalid".into())
+            })?,
+            end_offset_exclusive: u64::try_from(self.end_offset_exclusive).map_err(|_| {
+                MetaStoreError::Serialization("ingest publication end offset is invalid".into())
+            })?,
+            batch_key: self.batch_key.clone(),
+            payload_digest: self.payload_digest.clone(),
+            relation_id: self.relation_id.clone(),
+            relation_version: self.relation_version.clone(),
+            schema_fingerprint: self.schema_fingerprint.clone(),
+            writer_epoch: u64::try_from(self.writer_epoch).map_err(|_| {
+                MetaStoreError::Serialization("ingest publication writer epoch is invalid".into())
+            })?,
+        })
+    }
+
+    fn into_publication(self) -> Result<AuthoritativeIngestPublication, MetaStoreError> {
+        let partition_id = u32::try_from(self.partition_id).map_err(|_| {
+            MetaStoreError::Serialization("ingest publication partition_id is invalid".into())
+        })?;
+        let start_offset_inclusive = u64::try_from(self.start_offset_inclusive).map_err(|_| {
+            MetaStoreError::Serialization("ingest publication start offset is invalid".into())
+        })?;
+        let end_offset_exclusive = u64::try_from(self.end_offset_exclusive).map_err(|_| {
+            MetaStoreError::Serialization("ingest publication end offset is invalid".into())
+        })?;
+        let writer_epoch = u64::try_from(self.writer_epoch).map_err(|_| {
+            MetaStoreError::Serialization("ingest publication writer epoch is invalid".into())
+        })?;
+        Ok(AuthoritativeIngestPublication {
+            reservation: IngestRangeReservation {
+                stream_id: self.stream_id.clone(),
+                partition_id,
+                start_offset_inclusive,
+                end_offset_exclusive,
+                batch_key: self.batch_key,
+                payload_digest: self.payload_digest,
+                relation_id: self.relation_id,
+                relation_version: self.relation_version,
+                schema_fingerprint: self.schema_fingerprint,
+                writer_epoch,
+            },
+            authority_key: PartitionAuthorityKey {
+                namespace: self.authority_namespace,
+                view_id: self.authority_view_id,
+                stream_id: self.stream_id,
+                partition_id,
+            },
+            request_id: self.request_id,
+            request_digest: self.request_digest,
+            object_key: self.object_key,
+            object_digest: self.object_digest,
+        })
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for AuthoritativeIngestPublicationRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            start_offset_inclusive: row.get("start_offset_inclusive"),
+            end_offset_exclusive: row.get("end_offset_exclusive"),
+            batch_key: row.get("batch_key"),
+            payload_digest: row.get("payload_digest"),
+            relation_id: row.get("relation_id"),
+            relation_version: row.get("relation_version"),
+            schema_fingerprint: row.get("schema_fingerprint"),
+            writer_epoch: row.get("writer_epoch"),
+            authority_namespace: row.get("authority_namespace"),
+            authority_view_id: row.get("authority_view_id"),
+            request_id: row.get("request_id"),
+            request_digest: row.get("request_digest"),
+            object_key: row.get("object_key"),
+            object_digest: row.get("object_digest"),
+        }
+    }
+}
 #[cfg(feature = "hiqlite-backend")]
 struct PartitionCheckpointPointerRow {
     namespace: String,
@@ -6140,6 +6966,71 @@ impl MetaStore for GrpcMetaStore {
         }
     }
 
+    async fn publish_ingest_reservation(
+        &self,
+        request: PublishIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .publish_ingest_reservation(
+                self.request(publish_ingest_reservation_request_to_proto(request)),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match response.outcome.as_str() {
+            "committed" => Ok(PublishIngestReservationOutcome::Committed),
+            "duplicate" => Ok(PublishIngestReservationOutcome::Duplicate),
+            "conflict" => Ok(PublishIngestReservationOutcome::Conflict),
+            "invalid_authority" => Ok(PublishIngestReservationOutcome::InvalidAuthority),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn read_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<AuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        let response = self
+            .client()
+            .read_authoritative_ingest_publication(self.request(
+                proto::ReadAuthoritativeIngestPublicationRequest {
+                    request_id: request_id.to_string(),
+                },
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        response
+            .publication
+            .map(authoritative_ingest_publication_from_proto)
+            .transpose()
+    }
+
+    async fn list_authoritative_ingest_publications(
+        &self,
+        key: &PartitionAuthorityKey,
+    ) -> Result<Vec<AuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        let response = self
+            .client()
+            .list_authoritative_ingest_publications(self.request(
+                proto::ListAuthoritativeIngestPublicationsRequest {
+                    key: Some(partition_authority_key_to_proto(key.clone())),
+                },
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        response
+            .publications
+            .into_iter()
+            .map(authoritative_ingest_publication_from_proto)
+            .collect()
+    }
+
     async fn read_relation_catalog(
         &self,
         relation_id: &str,
@@ -6176,6 +7067,27 @@ impl MetaStore for GrpcMetaStore {
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?
             .into_inner();
 
+        match response.outcome.as_str() {
+            "reserved" => Ok(ReserveIngestRangeOutcome::Reserved),
+            "duplicate" => Ok(ReserveIngestRangeOutcome::Duplicate),
+            "conflict" => Ok(ReserveIngestRangeOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn reserve_authoritative_ingest_range(
+        &self,
+        request: ReserveAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .reserve_authoritative_ingest_range(
+                self.request(reserve_authoritative_ingest_range_request_to_proto(request)),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
         match response.outcome.as_str() {
             "reserved" => Ok(ReserveIngestRangeOutcome::Reserved),
             "duplicate" => Ok(ReserveIngestRangeOutcome::Duplicate),
