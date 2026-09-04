@@ -109,6 +109,16 @@ impl OperatorAuthorityStartupComponents {
         Arc::clone(&self.store)
     }
 
+    pub(crate) fn ingest_log(
+        &self,
+    ) -> Result<velorix_storage::log::IngestLog, OperatorStartupError> {
+        velorix_storage::log::IngestLog::new_catalog_checked(
+            Arc::clone(&self.store),
+            &self.capabilities,
+        )
+        .map_err(OperatorStartupError::from)
+    }
+
     fn ingest_admission_coordinator(
         &self,
     ) -> Result<IngestAdmissionCoordinator, OperatorStartupError> {

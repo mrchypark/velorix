@@ -15,4 +15,5 @@ pub mod meta_admin;
 pub mod operator_authority;
 pub mod readiness;
 pub mod reconcile_plan;
+pub mod relation_ingest_publisher;
 pub mod storage_admin;
