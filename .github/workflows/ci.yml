@@ -17,8 +17,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt
 
@@ -41,6 +41,7 @@ jobs:
           bash -n scripts/check-release-evidence-copy-contract.sh
           bash -n scripts/check-rustfs-s3-gate-contract.sh
           bash -n scripts/check-no-external-runtime-artifacts.sh
+          sh -n scripts/check-rust-toolchain-contract.sh
           python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
 
       - name: Check first-E2E readiness contract
@@ -50,6 +51,7 @@ jobs:
           scripts/check-release-evidence-copy-contract.sh
           scripts/check-rustfs-s3-gate-contract.sh
           scripts/check-no-external-runtime-artifacts.sh
+          sh scripts/check-rust-toolchain-contract.sh
 
   msrv:
     name: MSRV check
@@ -74,8 +76,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
 
@@ -92,8 +94,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
@@ -108,8 +110,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -142,8 +144,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2

@@ -94,6 +94,15 @@ def scan_file(path, label, forbidden_terms):
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         lowered = line.lower()
         for term in forbidden_terms:
+            # The product build policy verifies the exact pinned Rust compiler
+            # selected by rustup. This is a builder-only assertion, not an
+            # external runtime/compiler path.
+            if (
+                term == "rustc"
+                and line.strip()
+                == "&& rustc --version | grep -Eq '^rustc 1\\.98\\.1 '"
+            ):
+                continue
             if term.lower() in lowered:
                 violations.append((label, line_number, term, line.strip()))
 

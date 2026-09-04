@@ -1,9 +1,20 @@
 # Dependency Governance
 
 Velorix runs `cargo-deny 0.20.2` with `cargo deny check -W unmaintained` in CI.
-CI also installs Rust `1.98.0` and runs
+The declared MSRV remains Rust `1.98.0`; CI installs that version and runs
 `cargo check --workspace --all-targets --locked` to enforce the declared MSRV
 against the locked dependency graph.
+
+Development and normal CI builds are pinned to Rust `1.98.1` in
+`rust-toolchain.toml` and every non-MSRV `dtolnay/rust-toolchain` action. The
+official `rust:1.98.1-bookworm` image tag was not available when this policy
+was updated, so product builders retain the verified digest-pinned
+`rust:1.98.0-bookworm` base and install/select Rust `1.98.1` through its
+bundled official `rustup`; each builder verifies `rustc 1.98.1` before compiling.
+The install disables rustup self-updates, so the builder does not replace its
+bootstrapping client with an unpinned version. This preserves a reproducible
+base image while keeping build output on the current stable toolchain. Revisit the base image pin when the exact official
+`1.98.1-bookworm` tag is published.
 
 Machine-readable local policy lives in `dependency-governance.json`. Validate it
 with:
