@@ -222,6 +222,18 @@ impl KeyedAggregateKernel {
         &mut self,
         prepared: PreparedKeyedAggregateEpoch,
     ) -> Result<DeltaBatch, EngineError> {
+        self.validate_prepared_epoch(&prepared)?;
+        let output = self.aggregate.commit(prepared.changes);
+        self.logical_epoch = prepared.logical_epoch;
+        Ok(output)
+    }
+
+    /// Validates an opaque token without changing aggregate state, enabling a
+    /// caller to fence every participant before an atomic publication step.
+    pub fn validate_prepared_epoch(
+        &self,
+        prepared: &PreparedKeyedAggregateEpoch,
+    ) -> Result<(), EngineError> {
         if prepared.kernel_instance_id != self.instance_id {
             return Err(EngineError::PreparedEpochWrongKernel);
         }
@@ -231,9 +243,7 @@ impl KeyedAggregateKernel {
                 prepared_base: prepared.base_epoch,
             });
         }
-        let output = self.aggregate.commit(prepared.changes);
-        self.logical_epoch = prepared.logical_epoch;
-        Ok(output)
+        Ok(())
     }
 }
 

@@ -1,8 +1,8 @@
 use serde_json::json;
 use velorix_core::delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue};
 use velorix_core::operator::{
-    filter_delta_batch, map_delta_batch, AggregateValueMode, KeyedEquiJoin, KeyedSumCountAggregate,
-    OperatorError,
+    filter_delta_batch, map_delta_batch, AggregateValueMode, JoinInputSide, KeyedEquiJoin,
+    KeyedSumCountAggregate, OperatorError,
 };
 
 #[test]
@@ -739,6 +739,123 @@ fn join_values(left: &DeltaValue, right: &DeltaValue) -> Result<DeltaValue, Oper
         "left": left.as_json(),
         "right": right.as_json(),
     })))
+}
+
+#[test]
+fn keyed_join_restore_invalidates_prepared_epoch_without_mutating_restored_state() {
+    let mut join = KeyedEquiJoin::new(join_values);
+    let pending = DeltaBatch::from_records([record("acct:1", json!(10), 1)]);
+    let prepared = join
+        .prepare_epoch(1, &[(JoinInputSide::Left, &pending)])
+        .unwrap();
+    let restored_left = DeltaBatch::from_records([record("acct:2", json!(20), 1)]);
+    join.restore_state(&restored_left, &DeltaBatch::default())
+        .unwrap();
+
+    assert!(join.commit_prepared_epoch(prepared).is_err());
+    assert_eq!(
+        join.left_state().net_rows().unwrap(),
+        restored_left.net_rows().unwrap()
+    );
+    assert!(join.right_state().records().is_empty());
+}
+
+#[test]
+fn keyed_join_prepared_epoch_rejects_stale_and_cross_instance_tokens_without_mutation() {
+    let mut join = KeyedEquiJoin::new(join_values);
+    let pending = DeltaBatch::from_records([record("acct:1", json!(10), 1)]);
+    let stale = join
+        .prepare_epoch(1, &[(JoinInputSide::Left, &pending)])
+        .unwrap();
+    join.apply_right(&DeltaBatch::from_records([record("acct:2", json!(20), 1)]))
+        .unwrap();
+    let before_stale = (join.left_state(), join.right_state());
+    assert_eq!(
+        join.commit_prepared_epoch(stale),
+        Err(OperatorError::WeightOverflow)
+    );
+    assert_eq!((join.left_state(), join.right_state()), before_stale);
+
+    let foreign = KeyedEquiJoin::new(join_values)
+        .prepare_epoch(2, &[(JoinInputSide::Left, &pending)])
+        .unwrap();
+    let before_foreign = (join.left_state(), join.right_state());
+    assert_eq!(
+        join.commit_prepared_epoch(foreign),
+        Err(OperatorError::WeightOverflow)
+    );
+    assert_eq!((join.left_state(), join.right_state()), before_foreign);
+}
+
+#[test]
+fn keyed_join_prepared_epoch_prunes_zero_weight_cells() {
+    let mut join = KeyedEquiJoin::new(join_values);
+    let inserted = DeltaBatch::from_records([record("acct:1", json!(10), 1)]);
+    join.apply_left(&inserted).unwrap();
+    let retracted = DeltaBatch::from_records([record("acct:1", json!(10), -1)]);
+    let prepared = join
+        .prepare_epoch(2, &[(JoinInputSide::Left, &retracted)])
+        .unwrap();
+    assert_eq!(
+        join.prepared_side_records(
+            &prepared,
+            JoinInputSide::Left,
+            &DeltaKey::from_json(json!("acct:1")),
+            true,
+        )
+        .unwrap(),
+        Vec::<DeltaRecord>::new()
+    );
+    join.commit_prepared_epoch(prepared).unwrap();
+    assert!(join.left_state().records().is_empty());
+}
+
+#[test]
+fn keyed_join_prepared_epoch_has_exact_ordered_delta_parity() {
+    let left = DeltaBatch::from_records([record("acct:1", json!(10), 1)]);
+    let right = DeltaBatch::from_records([record("acct:1", json!(20), 1)]);
+
+    let left_right = KeyedEquiJoin::new(join_values)
+        .prepare_epoch(
+            1,
+            &[(JoinInputSide::Left, &left), (JoinInputSide::Right, &right)],
+        )
+        .unwrap();
+    assert_eq!(
+        left_right.output_changes().net_rows().unwrap(),
+        vec![joined_record("acct:1", json!(10), json!(20), 1)]
+    );
+
+    let right_left = KeyedEquiJoin::new(join_values)
+        .prepare_epoch(
+            1,
+            &[(JoinInputSide::Right, &right), (JoinInputSide::Left, &left)],
+        )
+        .unwrap();
+    assert_eq!(
+        right_left.output_changes().records(),
+        left_right.output_changes().records()
+    );
+}
+
+#[test]
+fn keyed_join_mid_prepare_overflow_after_overlay_write_leaves_base_state_unchanged() {
+    let mut join = KeyedEquiJoin::new(join_values);
+    let right = DeltaBatch::from_records([record("acct:1", json!(20), i64::MAX)]);
+    join.apply_right(&right).unwrap();
+    let input = DeltaBatch::from_records([
+        record("acct:2", json!(10), 1),
+        record("acct:1", json!(10), 2),
+    ]);
+    let before = (join.left_state(), join.right_state());
+
+    assert!(matches!(
+        join.prepare_epoch(1, &[(JoinInputSide::Left, &input)]),
+        Err(OperatorError::WeightOverflow)
+    ));
+    assert_eq!((join.left_state(), join.right_state()), before);
+    assert!(join.left_state().records().is_empty());
+    assert_eq!(join.right_state().records(), right.records());
 }
 
 fn joined_record(

@@ -16,7 +16,7 @@ use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
     engine::{
         AggregateValueMode, EngineCheckpointPayload, IncrementalEngine, KeyedAggregateKernel,
-        LogicalEpoch,
+        LogicalEpoch, PreparedKeyedAggregateEpoch,
     },
     native_operator::{
         NativeAggregateOperator, NativeAntiJoinOperator, NativeBinaryJoinOperator,
@@ -25,7 +25,7 @@ use velorix_core::{
         NativeOperatorGraphCheckpointV1, NativeOperatorInputV1, NativeOperatorStateV1,
         NativeProjectOperator, NativeSemiJoinOperator,
     },
-    operator::{KeyedEquiJoin, OperatorError},
+    operator::{JoinInputSide, KeyedEquiJoin, OperatorError, PreparedKeyedEquiJoinEpoch},
     relation::{
         arrow_record_batches_to_key_latest_by_delta_batch,
         arrow_record_batches_to_key_multi_value_delta_batch,
@@ -1040,6 +1040,8 @@ struct LogicalPlanExecutorCommit {
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     output_delta: DeltaBatch,
+    prepared_join: Option<PreparedKeyedEquiJoinEpoch>,
+    prepared_engine: Option<PreparedKeyedAggregateEpoch>,
 }
 
 enum LogicalPlanExecutor<'a> {
@@ -1126,6 +1128,8 @@ impl LogicalPlanExecutor<'_> {
                     input_frontiers,
                     input_event_time_frontiers,
                     output_delta,
+                    prepared_join: None,
+                    prepared_engine: None,
                 })
             }
             Self::TwoInputJoin {
@@ -1141,9 +1145,9 @@ impl LogicalPlanExecutor<'_> {
                         attempted: logical_epoch,
                     });
                 }
-                let mut joined_changes = DeltaBatch::default();
                 let mut input_frontiers = current_frontiers.to_vec();
                 let mut input_event_time_frontiers = current_event_time_frontiers.to_vec();
+                let mut join_inputs = Vec::new();
                 for input in &input_changes {
                     validate_input_matches_one_schema(
                         input,
@@ -1158,25 +1162,11 @@ impl LogicalPlanExecutor<'_> {
                     if input.relation_id == plan.left_input_relation_id {
                         let delta = join_left_input_delta_batch(catalog, plan, &input)?;
                         let delta = prefilter_delta_batch_for_join_plan(&delta, plan, catalog)?;
-                        let joined = match plan.join_kind {
-                            SupportedJoinKind::Inner => join
-                                .apply_left(&delta)
-                                .map_err(|_| invalid_runtime_state())?,
-                            SupportedJoinKind::Left => apply_left_join_left_delta(join, &delta)?,
-                            SupportedJoinKind::Full => apply_full_join_left_delta(join, &delta)?,
-                        };
-                        joined_changes = joined_changes.combine(&joined);
+                        join_inputs.push((JoinInputSide::Left, delta));
                     } else if input.relation_id == plan.right_input_relation_id {
                         let delta = join_right_input_delta_batch(catalog, plan, &input)?;
                         let delta = prefilter_delta_batch_for_join_plan(&delta, plan, catalog)?;
-                        let joined = match plan.join_kind {
-                            SupportedJoinKind::Inner => join
-                                .apply_right(&delta)
-                                .map_err(|_| invalid_runtime_state())?,
-                            SupportedJoinKind::Left => apply_left_join_right_delta(join, &delta)?,
-                            SupportedJoinKind::Full => apply_full_join_right_delta(join, &delta)?,
-                        };
-                        joined_changes = joined_changes.combine(&joined);
+                        join_inputs.push((JoinInputSide::Right, delta));
                     } else {
                         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                             field: "generic_join_input_relation",
@@ -1184,16 +1174,27 @@ impl LogicalPlanExecutor<'_> {
                     }
                 }
 
+                let prepared_inputs = join_inputs
+                    .iter()
+                    .map(|(side, delta)| (*side, delta))
+                    .collect::<Vec<_>>();
+                let prepared_join = join
+                    .prepare_epoch(logical_epoch, &prepared_inputs)
+                    .map_err(|_| invalid_runtime_state())?;
+                let joined_changes = prepared_join.output_changes().clone();
                 let joined_changes =
                     filter_joined_delta_batch_for_join_plan(&joined_changes, plan, catalogs)?;
                 let joined_changes = project_joined_delta_batch_to_left_values(&joined_changes)?;
-                let output_delta = engine
-                    .push_changes(logical_epoch, &joined_changes)
+                let prepared_engine = engine
+                    .prepare_epoch(logical_epoch, &joined_changes)
                     .map_err(|_| invalid_runtime_state())?;
+                let output_delta = prepared_engine.output_changes().clone();
                 Ok(LogicalPlanExecutorCommit {
                     input_frontiers,
                     input_event_time_frontiers,
                     output_delta,
+                    prepared_join: Some(prepared_join),
+                    prepared_engine: Some(prepared_engine),
                 })
             }
         }
@@ -6062,6 +6063,7 @@ fn project_joined_delta_batch_to_left_values(
         .map(DeltaBatch::from_records)
 }
 
+#[allow(dead_code)]
 fn left_join_match_count(
     state: &DeltaBatch,
     key: &DeltaKey,
@@ -6083,6 +6085,7 @@ fn left_join_match_count(
     Ok(count)
 }
 
+#[allow(dead_code)]
 fn apply_left_join_left_delta(
     join: &mut JoinOperator,
     input: &DeltaBatch,
@@ -6107,6 +6110,7 @@ fn apply_left_join_left_delta(
         .map_err(|_| invalid_runtime_state())
 }
 
+#[allow(dead_code)]
 fn apply_left_join_right_delta(
     join: &mut JoinOperator,
     input: &DeltaBatch,
@@ -6155,6 +6159,7 @@ fn apply_left_join_right_delta(
         .map_err(|_| invalid_runtime_state())
 }
 
+#[allow(dead_code)]
 fn apply_full_join_left_delta(
     join: &mut JoinOperator,
     input: &DeltaBatch,
@@ -6211,6 +6216,7 @@ fn apply_full_join_left_delta(
         .map_err(|_| invalid_runtime_state())
 }
 
+#[allow(dead_code)]
 fn apply_full_join_right_delta(
     join: &mut JoinOperator,
     input: &DeltaBatch,

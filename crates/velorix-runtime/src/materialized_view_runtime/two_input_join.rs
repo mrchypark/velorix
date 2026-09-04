@@ -19,6 +19,90 @@ pub struct TwoInputJoinRuntime {
     applied_epochs: BTreeMap<String, LogicalEpoch>,
 }
 
+/// Adds the outer-join portion to the inner delta retained by the prepared
+/// join.  The sparse token lets this inspect only keys touched by the epoch;
+/// no side snapshot or reconstructed join is required.
+fn prepared_join_output_for_plan(
+    join: &JoinOperator,
+    prepared: &velorix_core::operator::PreparedKeyedEquiJoinEpoch,
+    kind: SupportedJoinKind,
+) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    let mut keys = BTreeMap::new();
+    for side in [JoinInputSide::Left, JoinInputSide::Right] {
+        for key in prepared.touched_keys(side) {
+            keys.insert(canonical_json(key.as_json()), key);
+        }
+    }
+    let mut output = prepared.output_changes().records().to_vec();
+    for key in keys.into_values() {
+        let left_before = join
+            .prepared_side_records(prepared, JoinInputSide::Left, &key, false)
+            .map_err(|_| invalid_runtime_state())?;
+        let right_before = join
+            .prepared_side_records(prepared, JoinInputSide::Right, &key, false)
+            .map_err(|_| invalid_runtime_state())?;
+        let left_after = join
+            .prepared_side_records(prepared, JoinInputSide::Left, &key, true)
+            .map_err(|_| invalid_runtime_state())?;
+        let right_after = join
+            .prepared_side_records(prepared, JoinInputSide::Right, &key, true)
+            .map_err(|_| invalid_runtime_state())?;
+        if kind != SupportedJoinKind::Inner {
+            if join_records_weight(&right_before)? == 0 {
+                append_unmatched_records(&mut output, &left_before, false, -1)?;
+            }
+            if join_records_weight(&right_after)? == 0 {
+                append_unmatched_records(&mut output, &left_after, false, 1)?;
+            }
+        }
+        if kind == SupportedJoinKind::Full {
+            if join_records_weight(&left_before)? == 0 {
+                append_unmatched_records(&mut output, &right_before, true, -1)?;
+            }
+            if join_records_weight(&left_after)? == 0 {
+                append_unmatched_records(&mut output, &right_after, true, 1)?;
+            }
+        }
+    }
+    DeltaBatch::from_records(output)
+        .net_rows()
+        .map(DeltaBatch::from_records)
+        .map_err(|_| invalid_runtime_state())
+}
+
+fn join_records_weight(records: &[DeltaRecord]) -> Result<i64, StandingProgramRuntimeError> {
+    records.iter().try_fold(0_i64, |total, row| {
+        if row.weight < 0 {
+            return Err(invalid_runtime_state());
+        }
+        total
+            .checked_add(row.weight)
+            .ok_or_else(invalid_runtime_state)
+    })
+}
+
+fn append_unmatched_records(
+    output: &mut Vec<DeltaRecord>,
+    records: &[DeltaRecord],
+    right: bool,
+    sign: i64,
+) -> Result<(), StandingProgramRuntimeError> {
+    for row in records {
+        let value = if right {
+            unmatched_right_join_output_value(&row.value)
+        } else {
+            unmatched_left_join_output_value(&row.value)
+        }
+        .map_err(|_| invalid_runtime_state())?;
+        let weight = row
+            .weight
+            .checked_mul(sign)
+            .ok_or_else(invalid_runtime_state)?;
+        output.push(DeltaRecord::new(row.key.clone(), value, weight));
+    }
+    Ok(())
+}
+
 impl TwoInputJoinRuntime {
     pub fn new_with_plan(
         identity: StandingProgramIdentity,
@@ -509,12 +593,9 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
         }
         if join_plan_uses_runtime_aggregate_state(&self.plan) {
             let self_join = supported_join_view_plan_is_self_join(&self.plan);
-            let mut staged_self_join = self_join
-                .then(|| restore_join_operator(&self.join.left_state(), &self.join.right_state()))
-                .transpose()?;
-            let mut joined_changes = DeltaBatch::default();
             let mut input_frontiers = self.input_frontiers.clone();
             let mut input_event_time_frontiers = self.input_event_time_frontiers.clone();
+            let mut join_inputs = Vec::new();
             for input in input_changes {
                 validate_input_matches_one_schema(
                     &input,
@@ -528,57 +609,22 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                             field: "generic_join_input_relation",
                         });
                     }
-                    let join = staged_self_join
-                        .as_mut()
-                        .ok_or_else(invalid_runtime_state)?;
                     let left_delta = join_left_input_delta_batch(catalog, &self.plan, &input)?;
                     let left_delta =
                         prefilter_delta_batch_for_join_plan(&left_delta, &self.plan, catalog)?;
-                    joined_changes = joined_changes.combine(
-                        &join
-                            .apply_left(&left_delta)
-                            .map_err(|_| invalid_runtime_state())?,
-                    );
+                    join_inputs.push((JoinInputSide::Left, left_delta));
                     let right_delta = join_right_input_delta_batch(catalog, &self.plan, &input)?;
                     let right_delta =
                         prefilter_delta_batch_for_join_plan(&right_delta, &self.plan, catalog)?;
-                    joined_changes = joined_changes.combine(
-                        &join
-                            .apply_right(&right_delta)
-                            .map_err(|_| invalid_runtime_state())?,
-                    );
+                    join_inputs.push((JoinInputSide::Right, right_delta));
                 } else if input.relation_id == self.plan.left_input_relation_id {
                     let delta = join_left_input_delta_batch(catalog, &self.plan, &input)?;
                     let delta = prefilter_delta_batch_for_join_plan(&delta, &self.plan, catalog)?;
-                    let joined = match self.plan.join_kind {
-                        SupportedJoinKind::Inner => self
-                            .join
-                            .apply_left(&delta)
-                            .map_err(|_| invalid_runtime_state())?,
-                        SupportedJoinKind::Left => {
-                            apply_left_join_left_delta(&mut self.join, &delta)?
-                        }
-                        SupportedJoinKind::Full => {
-                            apply_full_join_left_delta(&mut self.join, &delta)?
-                        }
-                    };
-                    joined_changes = joined_changes.combine(&joined);
+                    join_inputs.push((JoinInputSide::Left, delta));
                 } else if input.relation_id == self.plan.right_input_relation_id {
                     let delta = join_right_input_delta_batch(catalog, &self.plan, &input)?;
                     let delta = prefilter_delta_batch_for_join_plan(&delta, &self.plan, catalog)?;
-                    let joined = match self.plan.join_kind {
-                        SupportedJoinKind::Inner => self
-                            .join
-                            .apply_right(&delta)
-                            .map_err(|_| invalid_runtime_state())?,
-                        SupportedJoinKind::Left => {
-                            apply_left_join_right_delta(&mut self.join, &delta)?
-                        }
-                        SupportedJoinKind::Full => {
-                            apply_full_join_right_delta(&mut self.join, &delta)?
-                        }
-                    };
-                    joined_changes = joined_changes.combine(&joined);
+                    join_inputs.push((JoinInputSide::Right, delta));
                 } else {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "generic_join_input_relation",
@@ -587,6 +633,16 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                 advance_input_frontier(&mut input_frontiers, &input)?;
                 advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
             }
+            let prepared_inputs = join_inputs
+                .iter()
+                .map(|(side, delta)| (*side, delta))
+                .collect::<Vec<_>>();
+            let prepared_join = self
+                .join
+                .prepare_epoch(logical_epoch, &prepared_inputs)
+                .map_err(|_| invalid_runtime_state())?;
+            let joined_changes =
+                prepared_join_output_for_plan(&self.join, &prepared_join, self.plan.join_kind)?;
             let joined_changes = filter_joined_delta_batch_for_join_plan(
                 &joined_changes,
                 &self.plan,
@@ -616,8 +672,9 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                 .published_output
                 .diff(&visible_output)
                 .map_err(|_| invalid_runtime_state())?;
-            self.engine
-                .push_changes(logical_epoch, &DeltaBatch::default())
+            let prepared_engine = self
+                .engine
+                .prepare_epoch(logical_epoch, &DeltaBatch::default())
                 .map_err(|_| invalid_runtime_state())?;
             // Validate output before commit
             let output_batches = vec![ViewOutputBatch {
@@ -629,10 +686,19 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                     Some(&aggregate_outputs),
                 )?],
             }];
-            // Commit staged state
-            if let Some(staged_self_join) = staged_self_join {
-                self.join = staged_self_join;
-            }
+            // Fence both opaque epochs before either sparse mutation.
+            self.join
+                .validate_prepared_epoch(&prepared_join)
+                .map_err(|_| invalid_runtime_state())?;
+            self.engine
+                .validate_prepared_epoch(&prepared_engine)
+                .map_err(|_| invalid_runtime_state())?;
+            self.join
+                .commit_prepared_epoch(prepared_join)
+                .map_err(|_| invalid_runtime_state())?;
+            self.engine
+                .commit_prepared_epoch(prepared_engine)
+                .map_err(|_| invalid_runtime_state())?;
             self.filtered_aggregate_state = next_state;
             self.published_output = visible_output;
             self.input_frontiers = input_frontiers.clone();
@@ -654,19 +720,29 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                 output_batches,
             });
         }
-        let mut executor = LogicalPlanExecutor::TwoInputJoin {
-            catalogs: &self.catalogs,
-            input_schemas: &self.input_schemas,
-            plan: &self.plan,
-            engine: &mut self.engine,
-            join: &mut self.join,
+        let mut executor_commit = {
+            let mut executor = LogicalPlanExecutor::TwoInputJoin {
+                catalogs: &self.catalogs,
+                input_schemas: &self.input_schemas,
+                plan: &self.plan,
+                engine: &mut self.engine,
+                join: &mut self.join,
+            };
+            executor.apply_epoch(
+                logical_epoch,
+                &self.input_frontiers,
+                &self.input_event_time_frontiers,
+                input_changes,
+            )?
         };
-        let executor_commit = executor.apply_epoch(
-            logical_epoch,
-            &self.input_frontiers,
-            &self.input_event_time_frontiers,
-            input_changes,
-        )?;
+        let prepared_join = executor_commit
+            .prepared_join
+            .take()
+            .ok_or_else(invalid_runtime_state)?;
+        let prepared_engine = executor_commit
+            .prepared_engine
+            .take()
+            .ok_or_else(invalid_runtime_state)?;
         let output_delta = filter_output_delta_for_having(
             &executor_commit.output_delta,
             self.plan.having.as_ref(),
@@ -677,8 +753,12 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
         if self.plan.top_k.is_some() {
             let previous_output = self.published_output.clone();
             let aggregate_outputs = supported_join_view_plan_aggregate_outputs(&self.plan);
-            let full_output = filter_output_delta_for_having(
+            let staged_engine_state = apply_published_output_delta(
                 &self.engine.materialized_state(),
+                prepared_engine.output_changes(),
+            )?;
+            let full_output = filter_output_delta_for_having(
+                &staged_engine_state,
                 self.plan.having.as_ref(),
                 self.plan.having_expr.as_ref(),
                 &self.output_schema,
@@ -699,7 +779,19 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                     Some(&aggregate_outputs),
                 )?],
             }];
-            // Commit staged state
+            self.join
+                .validate_prepared_epoch(&prepared_join)
+                .map_err(|_| invalid_runtime_state())?;
+            self.engine
+                .validate_prepared_epoch(&prepared_engine)
+                .map_err(|_| invalid_runtime_state())?;
+            self.join
+                .commit_prepared_epoch(prepared_join)
+                .map_err(|_| invalid_runtime_state())?;
+            self.engine
+                .commit_prepared_epoch(prepared_engine)
+                .map_err(|_| invalid_runtime_state())?;
+            // Publish only after output and both state tokens validated.
             self.published_output = staged_output;
             self.input_frontiers = executor_commit.input_frontiers.clone();
             self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
@@ -734,7 +826,19 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
                     Some(&aggregate_outputs),
                 )?],
             }];
-            // Commit staged state
+            self.join
+                .validate_prepared_epoch(&prepared_join)
+                .map_err(|_| invalid_runtime_state())?;
+            self.engine
+                .validate_prepared_epoch(&prepared_engine)
+                .map_err(|_| invalid_runtime_state())?;
+            self.join
+                .commit_prepared_epoch(prepared_join)
+                .map_err(|_| invalid_runtime_state())?;
+            self.engine
+                .commit_prepared_epoch(prepared_engine)
+                .map_err(|_| invalid_runtime_state())?;
+            // Publish only after output and both state tokens validated.
             self.published_output = staged_output;
             self.input_frontiers = executor_commit.input_frontiers.clone();
             self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();

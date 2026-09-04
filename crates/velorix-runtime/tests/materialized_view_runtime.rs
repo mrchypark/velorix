@@ -8252,23 +8252,60 @@ fn runtime_materializes_atomic_self_join_fanout_across_retract_and_restart() {
     );
     assert_eq!(runtime.logical_epoch(), 0);
 
-    let inserted = runtime
+    let recovered = runtime
         .apply_changes(
             1,
-            EpochIdempotencyKey::new("self-join-epoch-1").unwrap(),
+            EpochIdempotencyKey::new("self-join-failed-fanout").unwrap(),
             vec![relation_input(
                 &scores,
                 "self-join-scores",
                 0,
-                4,
+                1,
+                scores_rows_batch(&[("recovered", 99, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_global_count_batch(&recovered.output_batches[0].batches[0], 1);
+    let recovered_checkpoint = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("self-join-failed-fanout").unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .output_deltas
+        .is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), recovered_checkpoint);
+
+    let inserted = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("self-join-epoch-1").unwrap(),
+            vec![relation_input(
+                &scores,
+                "self-join-scores",
+                1,
+                5,
                 scores_rows_batch(&[("left-a", 10, 2), ("left-b", 10, 1), ("left-c", 5, 1)]),
             )],
         )
         .unwrap();
-    assert_global_count_batch(&inserted.output_batches[0].batches[0], 10);
+    assert_global_count_batch(&inserted.output_batches[0].batches[0], 11);
     assert_eq!(inserted.input_frontiers.len(), 1);
+    let checkpoint_after_insert = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("self-join-epoch-1").unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .output_deltas
+        .is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_after_insert);
 
-    let checkpoint = runtime.checkpoint().unwrap();
+    let checkpoint = checkpoint_after_insert;
     let payload: Value =
         serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
     assert_eq!(payload["input_schemas"].as_array().unwrap().len(), 1);
@@ -8288,33 +8325,401 @@ fn runtime_materializes_atomic_self_join_fanout_across_retract_and_restart() {
 
     let retracted = restored
         .apply_changes(
-            2,
+            3,
             EpochIdempotencyKey::new("self-join-epoch-2").unwrap(),
             vec![relation_input(
                 &scores,
                 "self-join-scores",
-                4,
                 5,
+                6,
                 scores_rows_batch(&[("left-a", 10, -1)]),
             )],
         )
         .unwrap();
-    assert_global_count_batch(&retracted.output_batches[0].batches[0], 5);
+    assert_global_count_batch(&retracted.output_batches[0].batches[0], 6);
 
     let emptied = restored
         .apply_changes(
-            3,
+            4,
             EpochIdempotencyKey::new("self-join-epoch-3").unwrap(),
             vec![relation_input(
                 &scores,
                 "self-join-scores",
-                5,
-                8,
-                scores_rows_batch(&[("left-a", 10, -1), ("left-b", 10, -1), ("left-c", 5, -1)]),
+                6,
+                10,
+                scores_rows_batch(&[
+                    ("recovered", 99, -1),
+                    ("left-a", 10, -1),
+                    ("left-b", 10, -1),
+                    ("left-c", 5, -1),
+                ]),
             )],
         )
         .unwrap();
     assert_global_count_batch(&emptied.output_batches[0].batches[0], 0);
+}
+
+#[test]
+fn selected_left_join_rejects_invalid_right_atomically_and_retries_same_key() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output = join_output_schema();
+    let sql = "select s.user_id as account_id, sum(s.score) as sum, count(*) as count from scores s left join accounts a on s.user_id = a.account_id group by s.user_id";
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "scores_by_account"),
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("selected-left-1").unwrap(),
+            vec![relation_input(
+                &scores,
+                "selected-left-scores",
+                0,
+                1,
+                scores_rows_batch(&[("alice", 10, 1)]),
+            )],
+        )
+        .unwrap();
+    let before = runtime.checkpoint().unwrap();
+    let failed = runtime.apply_changes(
+        2,
+        EpochIdempotencyKey::new("selected-left-2").unwrap(),
+        vec![
+            relation_input(
+                &scores,
+                "selected-left-scores",
+                1,
+                2,
+                scores_rows_batch(&[("bob", 5, 1)]),
+            ),
+            relation_input(
+                &accounts,
+                "selected-left-accounts",
+                0,
+                1,
+                accounts_rows_batch(&[("missing", 1, "gold", -1)]),
+            ),
+        ],
+    );
+    assert!(failed.is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let retry = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("selected-left-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "selected-left-scores",
+                1,
+                2,
+                scores_rows_batch(&[("bob", 5, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_eq!(retry.output_deltas.len(), 1);
+    let after_retry = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("selected-left-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .output_deltas
+        .is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), after_retry);
+}
+
+#[test]
+fn selected_full_join_rolls_back_valid_left_and_invalid_right_with_checkpoint_retry_and_duplicate()
+{
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let mut output = join_output_schema();
+    output.columns[1].nullable = true;
+    let sql = "select coalesce(s.user_id, a.account_id) as account_id, sum(s.score) as sum, count(*) as count from scores s full outer join accounts a on s.user_id = a.account_id group by coalesce(s.user_id, a.account_id)";
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "scores_by_account"),
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("selected-full-1").unwrap(),
+            vec![relation_input(
+                &scores,
+                "selected-full-scores",
+                0,
+                1,
+                scores_rows_batch(&[("alice", 10, 1)]),
+            )],
+        )
+        .unwrap();
+    let before = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("selected-full-2").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "selected-full-scores",
+                    1,
+                    2,
+                    scores_rows_batch(&[("bob", 5, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "selected-full-accounts",
+                    0,
+                    1,
+                    accounts_rows_batch(&[("missing", 1, "gold", -1)]),
+                ),
+            ],
+        )
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("selected-full-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "selected-full-scores",
+                1,
+                2,
+                scores_rows_batch(&[("bob", 5, 1)]),
+            )],
+        )
+        .unwrap();
+    assert_nullable_join_page(
+        runtime.as_ref(),
+        2,
+        &[("alice", Some(10), 1), ("bob", Some(5), 1)],
+    );
+    let after_retry = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("selected-full-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .output_deltas
+        .is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), after_retry);
+}
+
+#[test]
+fn selected_inner_join_sum_overflow_after_valid_bob_mutation_rolls_back() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output = join_output_schema();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "scores_by_account"),
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("inner-sum-overflow-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "inner-sum-overflow-scores",
+                    0,
+                    1,
+                    scores_rows_batch(&[("bob", i64::MAX - 1, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "inner-sum-overflow-accounts",
+                    0,
+                    1,
+                    accounts_rows_batch(&[("bob", 50, "gold", 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("inner-sum-overflow-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "inner-sum-overflow-scores",
+                1,
+                2,
+                scores_rows_batch(&[("bob", 1, 1)]),
+            )],
+        )
+        .unwrap();
+    let before = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("inner-sum-overflow-3").unwrap(),
+            vec![relation_input(
+                &scores,
+                "inner-sum-overflow-scores",
+                2,
+                3,
+                scores_rows_batch(&[("bob", 1, 1)]),
+            )],
+        )
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    assert_join_page(runtime.as_ref(), 2, &[("bob", i64::MAX, 2)]);
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("inner-sum-overflow-3").unwrap(),
+            vec![relation_input(
+                &scores,
+                "inner-sum-overflow-scores",
+                2,
+                3,
+                scores_rows_batch(&[("bob", 1, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_join_page(runtime.as_ref(), 3, &[("bob", i64::MAX - 1, 1)]);
+    let recovered = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("inner-sum-overflow-3").unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .output_deltas
+        .is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), recovered);
+}
+
+#[test]
+fn selected_right_stats_sum_overflow_after_valid_bob_mutation_rolls_back() {
+    let scores = scores_catalog();
+    let accounts = accounts_catalog();
+    let schemas = vec![
+        catalog_input_relation_schema(&scores).unwrap(),
+        catalog_input_relation_schema(&accounts).unwrap(),
+    ];
+    let output = join_right_stats_output_schema();
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count, count(a.limit) as count_limit, count(distinct a.limit) as distinct_limits, sum(a.limit) as limit_sum, min(a.limit) as min_limit, max(a.limit) as max_limit, avg(a.limit) as avg_limit from scores s join accounts a on s.user_id = a.account_id group by a.account_id";
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(sql, "scores_by_account_limits"),
+        &[scores.clone(), accounts.clone()],
+        sql,
+        &schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("right-stats-overflow-1").unwrap(),
+            vec![
+                relation_input(
+                    &scores,
+                    "right-stats-overflow-scores",
+                    0,
+                    1,
+                    scores_rows_batch(&[("bob", 1, 1)]),
+                ),
+                relation_input(
+                    &accounts,
+                    "right-stats-overflow-accounts",
+                    0,
+                    1,
+                    accounts_rows_batch(&[("bob", i64::MAX - 1, "gold", 1)]),
+                ),
+            ],
+        )
+        .unwrap();
+    let before = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("right-stats-overflow-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "right-stats-overflow-scores",
+                1,
+                2,
+                scores_rows_batch(&[("bob", 1, 1)]),
+            )],
+        )
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    assert_join_right_stats_page(
+        runtime.as_ref(),
+        1,
+        &[(
+            "bob",
+            1,
+            1,
+            1,
+            1,
+            i64::MAX - 1,
+            i64::MAX - 1,
+            i64::MAX - 1,
+            (i64::MAX - 1) as f64,
+        )],
+    );
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("right-stats-overflow-2").unwrap(),
+            vec![relation_input(
+                &scores,
+                "right-stats-overflow-scores",
+                1,
+                2,
+                scores_rows_batch(&[("bob", 1, -1)]),
+            )],
+        )
+        .unwrap();
+    assert_join_right_stats_page(runtime.as_ref(), 2, &[]);
+    let recovered = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("right-stats-overflow-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .output_deltas
+        .is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), recovered);
 }
 
 #[test]
