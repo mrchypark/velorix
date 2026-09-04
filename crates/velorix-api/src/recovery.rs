@@ -61,13 +61,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             }
             None => replay_plan.clone(),
         };
-    let ingest_log =
-        IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
-            .map_err(ApiError::internal)?;
-    let batches = ingest_log
-        .replay_admitted_validated_envelopes_from(&replay_plan.replay_checkpoints)
-        .await
-        .map_err(ApiError::internal)?;
+    let batches = read_replay_ingest_batches(state, active, &replay_plan, range).await?;
 
     let mut outcome = StandingRuntimeBackfillReplayOutcome::default();
     let coalesce_replay = range.is_none() && scope.is_none();
@@ -337,13 +331,16 @@ pub(super) async fn committed_backfill_progress(
         }
         None => StandingRuntimeReplayPlan::default(),
     };
-    let ingest_log =
-        IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
-            .map_err(ApiError::internal)?;
-    let batches = ingest_log
-        .replay_admitted_validated_envelopes_from(&[])
-        .await
-        .map_err(ApiError::internal)?;
+    let empty_replay_plan;
+    let read_plan = if state.authoritative_relation_ingest_enabled() {
+        &replay_plan
+    } else {
+        // Progress counts all committed canonical batches; replay coverage is
+        // applied below when computing `remaining`.
+        empty_replay_plan = StandingRuntimeReplayPlan::default();
+        &empty_replay_plan
+    };
+    let batches = read_replay_ingest_batches(state, active, read_plan, None).await?;
     let mut total = 0usize;
     let mut remaining = 0usize;
     for batch in batches {
@@ -403,7 +400,13 @@ pub(super) async fn read_relation_catalog(
             .await
         {
             Ok(catalog) => return Ok(catalog),
-            Err(MetaStoreError::RelationCatalogNotFound { .. }) => {}
+            Err(MetaStoreError::RelationCatalogNotFound { .. }) => {
+                if state.authoritative_relation_ingest_enabled() {
+                    return Err(ApiError::bad_request(format!(
+                        "relation catalog `{relation_id}` version `{relation_version}` is not present in authoritative metadata"
+                    )));
+                }
+            }
             Err(error) => return Err(meta_error_to_api(error)),
         }
     }
@@ -412,6 +415,236 @@ pub(super) async fn read_relation_catalog(
         .read(relation_id, relation_version)
         .await
         .map_err(ApiError::bad_request)
+}
+
+/// Reads authoritative ingest only through Meta's committed relation source
+/// cut. Staging objects are opaque until a committed publication reference is
+/// returned, and every referenced object is read with its exact digest.
+async fn read_replay_ingest_batches(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    replay_plan: &StandingRuntimeReplayPlan,
+    range: Option<&BackfillRangeRequest>,
+) -> Result<Vec<IngestBatch>, ApiError> {
+    if !state.authoritative_relation_ingest_enabled() {
+        let ingest_log =
+            IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
+                .map_err(ApiError::internal)?;
+        return ingest_log
+            .replay_admitted_validated_envelopes_from(&replay_plan.replay_checkpoints)
+            .await
+            .map_err(ApiError::internal);
+    }
+    let Some(meta_store) = state.meta_store.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "authoritative relation ingest recovery requires metadata service",
+        ));
+    };
+    let mut keys = BTreeSet::new();
+    for checkpoint in &replay_plan.replay_checkpoints {
+        let Some(relation_id) = checkpoint.relation_id.as_deref() else {
+            return Err(ApiError::bad_request(
+                "authoritative replay checkpoint is missing relation identity",
+            ));
+        };
+        let Some(relation_version) = checkpoint.relation_version.as_deref() else {
+            return Err(ApiError::bad_request(format!(
+                "authoritative replay checkpoint for relation `{relation_id}` is missing relation version"
+            )));
+        };
+        let Some(input) = active.spec.input_relations.iter().find(|input| {
+            input.relation_id == relation_id && input.relation_version == relation_version
+        }) else {
+            return Err(ApiError::bad_request(format!(
+                "authoritative replay checkpoint relation identity does not match active view: {relation_id}/{relation_version}"
+            )));
+        };
+        keys.insert((
+            relation_id.to_string(),
+            relation_version.to_string(),
+            input.schema_fingerprint.clone(),
+            checkpoint.stream_id.clone(),
+            checkpoint.partition_id,
+        ));
+    }
+    for frontier in &replay_plan.input_frontiers {
+        if let Some(input) = active.spec.input_relations.iter().find(|input| {
+            input.relation_id == frontier.relation_id
+                && input.relation_version == frontier.relation_version
+        }) {
+            keys.insert((
+                frontier.relation_id.clone(),
+                frontier.relation_version.clone(),
+                input.schema_fingerprint.clone(),
+                frontier.stream_id.clone(),
+                frontier.partition_id,
+            ));
+        }
+    }
+    if let Some(range) = range {
+        if let Some(partition_id) = range.partition_id {
+            if let Some(input) = active.spec.input_relations.iter().find(|input| {
+                input.relation_id == range.relation_id
+                    && input.relation_version == range.relation_version
+            }) {
+                keys.insert((
+                    range.relation_id.clone(),
+                    range.relation_version.clone(),
+                    input.schema_fingerprint.clone(),
+                    range.stream_id.clone().unwrap_or_default(),
+                    partition_id,
+                ));
+            }
+        }
+    }
+    let mut batches = Vec::new();
+    for (relation_id, relation_version, schema_fingerprint, stream_id, partition_id) in keys {
+        if stream_id.is_empty() {
+            continue;
+        }
+        let cut = meta_store
+            .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+                authority: RelationPartitionAuthorityKey {
+                    namespace: state
+                        .relation_ingest_config
+                        .as_ref()
+                        .map(|config| config.namespace.clone())
+                        .unwrap_or_default(),
+                    relation_id: relation_id.clone(),
+                    stream_id: stream_id.clone(),
+                    partition_id,
+                },
+                relation_version: relation_version.clone(),
+                schema_fingerprint: schema_fingerprint.clone(),
+            })
+            .await
+            .map_err(meta_error_to_api)?;
+        if cut.schema_version != RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1
+            || cut.namespace
+                != state
+                    .relation_ingest_config
+                    .as_ref()
+                    .map(|config| config.namespace.as_str())
+                    .unwrap_or_default()
+            || cut.relation_id != relation_id
+            || cut.partitions.is_empty()
+        {
+            return Err(ApiError::service_unavailable(format!(
+                "authoritative relation source cut identity is invalid for `{relation_id}`"
+            )));
+        }
+        let Some(input) = active.spec.input_relations.iter().find(|input| {
+            input.relation_id == relation_id
+                && input.relation_version == relation_version
+                && input.schema_fingerprint == schema_fingerprint
+        }) else {
+            return Err(ApiError::bad_request(format!(
+                "authoritative relation `{relation_id}` is not an active view input"
+            )));
+        };
+        let catalog = read_relation_catalog(state, &relation_id, &relation_version).await?;
+        let catalog_schema =
+            catalog_input_relation_schema(&catalog).map_err(ApiError::bad_request)?;
+        if catalog_schema != *input {
+            return Err(ApiError::bad_request(format!(
+                "authoritative relation catalog identity does not match active view input `{relation_id}`"
+            )));
+        }
+        let Some(partition) = cut.partitions.into_iter().find(|partition| {
+            partition.stream_id == stream_id && partition.partition_id == partition_id
+        }) else {
+            return Err(ApiError::service_unavailable(format!(
+                "authoritative relation source cut is missing {relation_id}/{stream_id}/p={partition_id}"
+            )));
+        };
+        for publication in partition.publications {
+            let batch = validate_relation_publication_ref(
+                state,
+                &relation_id,
+                &input.relation_version,
+                &input.schema_fingerprint,
+                &stream_id,
+                partition_id,
+                &publication,
+            )
+            .await?;
+            batches.push(batch);
+        }
+    }
+    batches.sort_by_key(|batch| {
+        let descriptor = batch.descriptor();
+        (
+            descriptor.stream_id,
+            descriptor.partition_id,
+            descriptor.start_offset_inclusive,
+        )
+    });
+    Ok(batches)
+}
+
+/// Validates one committed relation publication all the way through its
+/// staged bytes. Both replay and checkpoint publication use this boundary so
+/// source-cut refs cannot silently point at another relation version, range,
+/// request, or digest.
+pub(super) async fn validate_relation_publication_ref(
+    state: &ApiState,
+    relation_id: &str,
+    relation_version: &str,
+    schema_fingerprint: &str,
+    stream_id: &str,
+    partition_id: u32,
+    publication: &RelationIngestPublicationRefV1,
+) -> Result<IngestBatch, ApiError> {
+    if publication.relation_version != relation_version
+        || publication.schema_fingerprint != schema_fingerprint
+    {
+        return Err(ApiError::bad_request(format!(
+            "authoritative relation publication `{}` has mismatched relation identity",
+            publication.request_id
+        )));
+    }
+    let (_, staging_parts) = ObjectKey::parse_ingest_staging(&publication.object_key)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let expected_batch_key = ObjectKey::ingest_batch(
+        &staging_parts.stream_id,
+        staging_parts.partition_id,
+        staging_parts.start_offset_inclusive,
+        staging_parts.end_offset_exclusive,
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let ingest_log =
+        IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
+            .map_err(ApiError::internal)?;
+    let payload = ingest_log
+        .read_staging(&publication.object_key, &publication.object_digest)
+        .await
+        .map_err(ApiError::internal)?;
+    let batch = IngestBatch::from_validated_envelope(payload).map_err(ApiError::bad_request)?;
+    let envelope =
+        IngestEnvelope::decode(batch.payload().clone()).map_err(ApiError::bad_request)?;
+    let header = envelope.header();
+    if header.relation_id != relation_id
+        || header.relation_version != relation_version
+        || header.schema_fingerprint != schema_fingerprint
+        || header.stream_id != stream_id
+        || header.partition_id != partition_id
+        || header.start_offset_inclusive != publication.start_offset_inclusive
+        || header.end_offset_exclusive != publication.end_offset_exclusive
+        || stable_bytes_hash(batch.payload().as_ref()) != publication.payload_digest
+        || publication.object_digest != publication.payload_digest
+        || publication.request_id != staging_parts.staging_id
+        || publication.batch_key != expected_batch_key.as_str()
+        || staging_parts.stream_id != stream_id
+        || staging_parts.partition_id != partition_id
+        || staging_parts.start_offset_inclusive != publication.start_offset_inclusive
+        || staging_parts.end_offset_exclusive != publication.end_offset_exclusive
+    {
+        return Err(ApiError::bad_request(format!(
+            "authoritative relation publication `{}` does not match its staged envelope",
+            publication.request_id
+        )));
+    }
+    Ok(batch)
 }
 
 pub(super) async fn read_relation_catalogs_for_input_schemas(

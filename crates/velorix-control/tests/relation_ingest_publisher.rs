@@ -354,13 +354,14 @@ async fn success_exact_retry_and_pre_publish_staging_invisibility() {
         .unwrap();
     assert!(first.object_key.as_str().starts_with("v1/ingest-staging/"));
     assert!(publisher.session().token().await.is_some());
-    assert_eq!(
-        publisher
-            .publish(0, 10, Bytes::from_static(b"payload"))
-            .await
-            .unwrap(),
-        first
-    );
+    let retry = publisher
+        .publish(0, 10, Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+    assert_eq!(retry.reservation, first.reservation);
+    assert_eq!(retry.request_id, first.request_id);
+    assert_eq!(retry.object_key, first.object_key);
+    assert_eq!(retry.outcome, PublishIngestReservationOutcome::Duplicate);
 
     assert!(publisher.list_committed().await.unwrap().is_empty());
     let staging = ObjectKey::parse_ingest_staging(first.object_key.as_str()).unwrap();

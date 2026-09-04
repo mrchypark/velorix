@@ -60,7 +60,9 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                     "required": true,
                     "content": {
                         "application/json": {
-                            "schema": openapi_ingest_relations_request_schema()
+                            "schema": openapi_ingest_relations_request_schema(
+                                state.authoritative_relation_ingest_enabled()
+                            )
                         }
                     }
                 },
@@ -168,7 +170,8 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         "openapi": "3.0.3",
         "info": {
             "title": "Velorix View APIs",
-            "version": "0.1.0"
+            "version": "0.1.0",
+            "x-velorix-relation-ingest-mode": state.relation_ingest_mode.as_str()
         },
         "paths": Value::Object(paths)
     })))
@@ -236,7 +239,8 @@ fn openapi_ingest_relation_rows_request_schema() -> Value {
             "start_offset_inclusive",
             "rows"
         ],
-        "properties": {
+                "properties": {
+            "relation_id": { "type": "string", "description": "Optional body relation identity; when present it must match the URL relation_id" },
             "relation_version": { "type": "string" },
             "stream_id": { "type": "string" },
             "partition_id": { "type": "integer", "minimum": 0 },
@@ -257,8 +261,8 @@ fn openapi_ingest_relation_rows_request_schema() -> Value {
     })
 }
 
-fn openapi_ingest_relations_request_schema() -> Value {
-    json!({
+fn openapi_ingest_relations_request_schema(authoritative: bool) -> Value {
+    let mut schema = json!({
         "type": "object",
         "required": ["batches"],
         "properties": {
@@ -297,7 +301,13 @@ fn openapi_ingest_relations_request_schema() -> Value {
                 }
             }
         }
-    })
+    });
+    if authoritative {
+        schema["properties"]["batches"]["maxItems"] = json!(1);
+        schema["properties"]["batches"]["description"] =
+            json!("Authoritative mode accepts exactly one relation batch per request");
+    }
+    schema
 }
 
 fn openapi_ingest_materialization_schema() -> Value {

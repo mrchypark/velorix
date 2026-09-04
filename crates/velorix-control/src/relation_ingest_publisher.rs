@@ -169,6 +169,7 @@ pub struct PublishedRelationIngest {
     pub request_digest: String,
     pub object_key: ObjectKey,
     pub object_digest: String,
+    pub outcome: PublishIngestReservationOutcome,
 }
 
 /// Reusable relation ingest publisher.
@@ -387,10 +388,13 @@ impl RelationIngestPublisher {
             .meta
             .publish_relation_ingest_reservation(request.clone())
             .await;
-        let _ = match outcome {
-            Ok(PublishIngestReservationOutcome::Committed)
-            | Ok(PublishIngestReservationOutcome::Duplicate) => {
-                self.verify_publication(&request, &mut token).await?
+        let publication_outcome = match outcome {
+            Ok(
+                outcome @ (PublishIngestReservationOutcome::Committed
+                | PublishIngestReservationOutcome::Duplicate),
+            ) => {
+                self.verify_publication(&request, &mut token).await?;
+                outcome
             }
             Ok(PublishIngestReservationOutcome::Conflict) => {
                 return Err(RelationIngestPublisherError::PublicationConflict { request_id });
@@ -405,7 +409,10 @@ impl RelationIngestPublisher {
             }
             Err(source) => {
                 self.verify_after_uncertain_publish(&request, source, &mut token)
-                    .await?
+                    .await?;
+                // An uncertain response is treated as committed after the
+                // bounded publication verification/retry succeeds.
+                PublishIngestReservationOutcome::Committed
             }
         };
 
@@ -415,6 +422,7 @@ impl RelationIngestPublisher {
             request_digest,
             object_key: staging_key,
             object_digest: payload_digest,
+            outcome: publication_outcome,
         })
     }
 

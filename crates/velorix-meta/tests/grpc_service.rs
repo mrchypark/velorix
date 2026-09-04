@@ -984,6 +984,8 @@ async fn grpc_relation_authority_round_trips_scope_fencing_and_publication() {
     let cut = store
         .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
             authority: key.clone(),
+            relation_version: "v1".into(),
+            schema_fingerprint: "sha256:schema".into(),
         })
         .await
         .unwrap();

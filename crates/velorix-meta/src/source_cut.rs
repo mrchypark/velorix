@@ -15,6 +15,10 @@ pub const RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct RelationIngestPublicationRefV1 {
     pub request_id: String,
+    #[serde(default)]
+    pub relation_version: String,
+    #[serde(default)]
+    pub schema_fingerprint: String,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
     pub batch_key: String,
@@ -45,11 +49,15 @@ pub struct RelationIngestSourceCutV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureRelationIngestSourceCutRequest {
     pub authority: RelationPartitionAuthorityKey,
+    pub relation_version: String,
+    pub schema_fingerprint: String,
 }
 
 impl CaptureRelationIngestSourceCutRequest {
     pub(crate) fn validate(&self) -> Result<(), MetaStoreError> {
-        self.authority.validate()
+        self.authority.validate()?;
+        require_non_empty("relation_version", &self.relation_version)?;
+        require_non_empty("schema_fingerprint", &self.schema_fingerprint)
     }
 }
 
@@ -60,7 +68,11 @@ pub(crate) fn build_relation_ingest_source_cut(
     request.validate()?;
     let mut publications = publications
         .into_iter()
-        .filter(|publication| publication.authority_key == request.authority)
+        .filter(|publication| {
+            publication.authority_key == request.authority
+                && publication.reservation.relation_version == request.relation_version
+                && publication.reservation.schema_fingerprint == request.schema_fingerprint
+        })
         .collect::<Vec<_>>();
     publications.sort_by_key(|publication| {
         (
@@ -88,6 +100,8 @@ pub(crate) fn build_relation_ingest_source_cut(
         frontier = reservation.end_offset_exclusive;
         refs.push(RelationIngestPublicationRefV1 {
             request_id: publication.request_id.clone(),
+            relation_version: reservation.relation_version.clone(),
+            schema_fingerprint: reservation.schema_fingerprint.clone(),
             start_offset_inclusive: reservation.start_offset_inclusive,
             end_offset_exclusive: reservation.end_offset_exclusive,
             batch_key: reservation.batch_key.clone(),

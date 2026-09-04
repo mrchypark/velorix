@@ -376,6 +376,8 @@ async fn relation_source_cut_uses_committed_publications_only_and_stops_at_holes
     let cut = store
         .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
             authority: key.clone(),
+            relation_version: "v1".into(),
+            schema_fingerprint: "sha256:schema".into(),
         })
         .await
         .unwrap();
@@ -397,6 +399,8 @@ async fn relation_source_cut_uses_committed_publications_only_and_stops_at_holes
                 namespace: "other".into(),
                 ..key
             },
+            relation_version: "v1".into(),
+            schema_fingerprint: "sha256:schema".into(),
         })
         .await
         .unwrap()

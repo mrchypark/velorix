@@ -16,8 +16,8 @@ pub use velorix_storage::{
     ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeHeader},
     log::{
         AppendValidatedEnvelopeOutcome, IngestAdmissionCoordinator,
-        IngestAdmissionReconstructionReport, IngestBatchDescriptor, IngestCommitGuard, IngestLog,
-        ReplayCheckpoint,
+        IngestAdmissionReconstructionReport, IngestBatch, IngestBatchDescriptor, IngestCommitGuard,
+        IngestLog, ReplayCheckpoint,
     },
     manifest::{CheckpointManifest, InputRange},
     materialized_view_registry::{

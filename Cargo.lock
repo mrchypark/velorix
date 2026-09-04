@@ -6957,6 +6957,7 @@ dependencies = [
  "tower",
  "velorix-control",
  "velorix-core",
+ "velorix-meta",
  "velorix-runtime",
 ]
 

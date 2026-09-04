@@ -340,6 +340,8 @@ async fn hiqlite_relation_authority_is_persistent_and_fenced() {
     let cut = store
         .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
             authority: key.clone(),
+            relation_version: "v1".into(),
+            schema_fingerprint: "sha256:schema".into(),
         })
         .await
         .unwrap();
@@ -434,6 +436,8 @@ async fn hiqlite_relation_authority_is_persistent_and_fenced() {
                     stream_id: "orders-stream".into(),
                     partition_id: 0,
                 },
+                relation_version: "v1".into(),
+                schema_fingerprint: "sha256:schema".into(),
             })
             .await
             .unwrap(),

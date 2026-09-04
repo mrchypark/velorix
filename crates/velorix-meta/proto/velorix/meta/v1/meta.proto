@@ -269,6 +269,8 @@ message RelationAuthoritativeIngestPublication {
   string request_digest = 4;
   string object_key = 5;
   string object_digest = 6;
+  string relation_version = 7;
+  string schema_fingerprint = 8;
 }
 
 message ReadRelationAuthoritativeIngestPublicationRequest { string request_id = 1; }
@@ -283,6 +285,8 @@ message ListRelationAuthoritativeIngestPublicationsResponse {
 
 message CaptureRelationIngestSourceCutRequest {
   RelationPartitionAuthorityKey authority = 1;
+  string relation_version = 2;
+  string schema_fingerprint = 3;
 }
 
 message CaptureRelationIngestSourceCutResponse {

@@ -186,6 +186,15 @@ pub(super) async fn ingest_relation_rows(
             "relation_id path segment is required",
         ));
     }
+    if request
+        .relation_id
+        .as_deref()
+        .is_some_and(|body_relation_id| body_relation_id != relation_id)
+    {
+        return Err(ApiError::bad_request(
+            "relation_id path segment does not match body relation_id",
+        ));
+    }
     ingest_epoch(
         State(state),
         Json(IngestEpochRequest {
@@ -223,6 +232,11 @@ pub(super) async fn ingest_epoch(
     if request.batches.is_empty() {
         return Err(ApiError::bad_request(
             "ingest epoch must contain at least one batch",
+        ));
+    }
+    if state.authoritative_relation_ingest_enabled() && request.batches.len() != 1 {
+        return Err(ApiError::bad_request(
+            "authoritative relation ingest accepts exactly one relation batch per request; atomic multi-batch publication is unsupported",
         ));
     }
     if request.batches.iter().any(|batch| batch.rows.is_empty()) {
@@ -280,6 +294,136 @@ pub(super) async fn ingest_epoch(
     validate_ingest_epoch_batch_ranges(&prepared_batches)?;
     let epoch_manifest = persist_ingest_epoch_manifest(&state, &prepared_batches).await?;
     timer.mark("epoch_manifest");
+
+    // Authoritative relation ingest is deliberately a separate admission
+    // protocol: metadata reserves the relation range, the publisher stages
+    // and publishes the immutable object reference, and only then does the
+    // native runtime apply the prepared envelope. The legacy path below keeps
+    // its existing object-store admission semantics while the gate is off.
+    if state.authoritative_relation_ingest_enabled() {
+        let mut publication_outcomes = Vec::with_capacity(prepared_batches.len());
+        for prepared in &prepared_batches {
+            let publisher = state
+                .relation_ingest_publisher(&prepared.catalog, &prepared.request)
+                .await?;
+            publisher
+                .start()
+                .await
+                .map_err(relation_ingest_publisher_error_to_api)?;
+            let publication = publisher
+                .publish(
+                    prepared.request.start_offset_inclusive,
+                    prepared.end_offset_exclusive,
+                    prepared.envelope.clone(),
+                )
+                .await
+                .map_err(relation_ingest_publisher_error_to_api)?;
+            publication_outcomes.push(publication.outcome);
+        }
+        timer.mark("authoritative_publish");
+        ensure_no_ingest_epoch_view_runtime_failures(&state, &epoch_manifest, &prepared_batches)
+            .await?;
+        let mut ensured_ingest_relations = BTreeSet::new();
+        for prepared in &prepared_batches {
+            let key = (
+                prepared.request.relation_id.as_str(),
+                prepared.request.relation_version.as_str(),
+            );
+            if ensured_ingest_relations.insert(key) {
+                ensure_standing_runtimes_for_ingest(&state, &prepared.request).await?;
+            }
+        }
+        timer.mark("ensure_runtime");
+        let mut preacquired_ingest_relations = BTreeSet::new();
+        for prepared in &prepared_batches {
+            let key = (
+                prepared.request.relation_id.as_str(),
+                prepared.request.relation_version.as_str(),
+            );
+            if preacquired_ingest_relations.insert(key) {
+                preacquire_standing_runtime_owners_for_ingest(&state, &prepared.request).await?;
+            }
+        }
+        timer.mark("preacquire_owner");
+        let materialization = materialize_prepared_ingest_epoch_for_ack_mode(
+            &state,
+            &epoch_manifest,
+            prepared_batches.clone(),
+            ack_mode,
+            &mut timer,
+        )
+        .await?;
+        drain_published_view_dependencies(&state).await?;
+        for active in state
+            .view_registry()?
+            .list_active()
+            .await
+            .map_err(materialized_view_registry_error_to_api)?
+        {
+            if let Some(identity) = active_standing_runtime_identity(&active) {
+                activate_authoritative_view_bootstrap(&state, identity, &active.spec.view_id)
+                    .await?;
+            }
+        }
+        timer.mark("materialize_view_dependencies");
+        let responses = prepared_batches
+            .iter()
+            .zip(publication_outcomes.iter())
+            .map(|(prepared, publication_outcome)| {
+                Ok(IngestResponse {
+                    outcome: match publication_outcome {
+                        PublishIngestReservationOutcome::Committed => "appended",
+                        PublishIngestReservationOutcome::Duplicate => "duplicate",
+                        PublishIngestReservationOutcome::Conflict
+                        | PublishIngestReservationOutcome::InvalidAuthority => "conflict",
+                    }
+                    .to_string(),
+                    descriptor: ingest_descriptor_response_from_prepared(prepared)?,
+                    epoch_manifest_id: epoch_manifest.epoch_manifest_id.clone(),
+                    ingest_epoch: epoch_manifest.epoch_manifest_id.clone(),
+                    materialized_through: materialization.materialized_through,
+                    ack_mode,
+                    materialization: materialization.clone(),
+                    timings: IngestTimingResponse {
+                        total_ms: 0,
+                        total_us: 0,
+                        avg_batch_us: None,
+                        avg_row_us: None,
+                        rows_per_second: None,
+                        batch_count,
+                        row_count: total_rows,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let all_duplicate = publication_outcomes
+            .iter()
+            .all(|outcome| *outcome == PublishIngestReservationOutcome::Duplicate);
+        let outcome = if all_duplicate {
+            "duplicate"
+        } else {
+            "appended"
+        };
+        return Ok((
+            if all_duplicate {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            Json(IngestEpochResponse {
+                outcome: outcome.to_string(),
+                epoch_manifest_id: epoch_manifest.epoch_manifest_id.clone(),
+                epoch_manifest_key: epoch_manifest.epoch_manifest_key,
+                ingest_epoch: epoch_manifest.epoch_manifest_id,
+                materialized_through: materialization.materialized_through,
+                ack_mode,
+                materialization,
+                timings: timer.finish(),
+                batches: responses,
+            }),
+        ));
+    }
+
     ensure_no_ingest_epoch_view_runtime_failures(&state, &epoch_manifest, &prepared_batches)
         .await?;
     let mut ensured_ingest_relations = BTreeSet::new();
@@ -1378,6 +1522,14 @@ pub(super) async fn standing_runtime_create_requires_backfill(
     spec: &StandingViewSpec,
 ) -> Result<bool, ApiError> {
     if spec.input_relations.is_empty() {
+        return Ok(false);
+    }
+    // An authoritative relation source cut is partition-scoped. At view
+    // admission there is no trusted stream/partition identity to query, so a
+    // positive backfill decision must not be inferred from canonical object
+    // listing. The first authoritative ingest (or an explicit backfill range)
+    // will establish the runtime frontier.
+    if state.authoritative_relation_ingest_enabled() {
         return Ok(false);
     }
     let ingest_log =

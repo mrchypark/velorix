@@ -1,4 +1,5 @@
 use super::*;
+use async_trait::async_trait;
 use axum::http::Method;
 use futures::{stream::BoxStream, StreamExt};
 use object_store::{
@@ -19,6 +20,7 @@ use velorix_core::{
         DurableStateRoot, RelationFrontier, RuntimeCheckpointStatePayload, ViewFrontier,
     },
 };
+use velorix_meta as meta;
 
 fn template_result_schema() -> RelationSchema {
     RelationSchema {
@@ -11289,6 +11291,493 @@ async fn append_admitted_ingest_without_runtime_apply(
         outcome,
         AppendValidatedEnvelopeOutcome::Appended { .. }
     ));
+}
+
+/// Test-only capability decorator.  The in-memory backend deliberately reports
+/// non-durable capabilities; this wrapper models the durable metadata contract
+/// while forwarding every operation to the real in-memory implementation.
+#[derive(Clone)]
+struct DurableCapabilityMetaStore {
+    inner: Arc<InMemoryMetaStore>,
+}
+
+impl DurableCapabilityMetaStore {
+    fn new(inner: InMemoryMetaStore) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[async_trait]
+impl MetaStore for DurableCapabilityMetaStore {
+    async fn read_meta_store_capabilities(
+        &self,
+    ) -> Result<meta::MetaStoreCapabilities, meta::MetaStoreError> {
+        let mut capabilities = self.inner.read_meta_store_capabilities().await?;
+        capabilities.relation_ingest.durable_across_restart = true;
+        Ok(capabilities)
+    }
+
+    async fn store_relation_catalog(
+        &self,
+        catalog: VelorixRelationCatalogV1,
+    ) -> Result<StoreRelationCatalogOutcome, MetaStoreError> {
+        self.inner.store_relation_catalog(catalog).await
+    }
+
+    async fn read_relation_catalog(
+        &self,
+        relation_id: &str,
+        relation_version: &str,
+    ) -> Result<VelorixRelationCatalogV1, MetaStoreError> {
+        self.inner
+            .read_relation_catalog(relation_id, relation_version)
+            .await
+    }
+
+    async fn reserve_ingest_range(
+        &self,
+        reservation: IngestRangeReservation,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        self.inner.reserve_ingest_range(reservation).await
+    }
+
+    async fn acquire_standing_runtime_owner(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        self.inner.acquire_standing_runtime_owner(request).await
+    }
+
+    async fn read_standing_runtime_owner(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<StandingRuntimeOwnerClaim>, MetaStoreError> {
+        self.inner
+            .read_standing_runtime_owner(tenant_id, program_id, view_id)
+            .await
+    }
+
+    async fn publish_standing_runtime_checkpoint(
+        &self,
+        request: PublishStandingRuntimeCheckpointRequest,
+    ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
+        self.inner
+            .publish_standing_runtime_checkpoint(request)
+            .await
+    }
+
+    async fn read_standing_runtime_checkpoint(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<StandingRuntimeCheckpointPointer>, MetaStoreError> {
+        self.inner
+            .read_standing_runtime_checkpoint(tenant_id, program_id, view_id)
+            .await
+    }
+
+    async fn read_view_dependency_graph_revision(
+        &self,
+        tenant_id: &str,
+    ) -> Result<u64, MetaStoreError> {
+        self.inner
+            .read_view_dependency_graph_revision(tenant_id)
+            .await
+    }
+
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: meta::AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<meta::AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        self.inner
+            .acquire_relation_partition_authority(request)
+            .await
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Option<meta::RelationPartitionAuthorityToken>, MetaStoreError> {
+        self.inner.read_relation_partition_authority(key).await
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: meta::ReserveRelationAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        self.inner
+            .reserve_relation_authoritative_ingest_range(request)
+            .await
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: meta::PublishRelationIngestReservationRequest,
+    ) -> Result<meta::PublishIngestReservationOutcome, MetaStoreError> {
+        self.inner
+            .publish_relation_ingest_reservation(request)
+            .await
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<meta::RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        self.inner
+            .read_relation_authoritative_ingest_publication(request_id)
+            .await
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Vec<meta::RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        self.inner
+            .list_relation_authoritative_ingest_publications(key)
+            .await
+    }
+
+    async fn capture_relation_ingest_source_cut(
+        &self,
+        request: CaptureRelationIngestSourceCutRequest,
+    ) -> Result<meta::RelationIngestSourceCutV1, MetaStoreError> {
+        self.inner.capture_relation_ingest_source_cut(request).await
+    }
+
+    async fn begin_view_bootstrap(
+        &self,
+        request: BeginViewBootstrapRequest,
+    ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
+        self.inner.begin_view_bootstrap(request).await
+    }
+
+    async fn read_view_bootstrap(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<Option<ViewBootstrapControlV1>, MetaStoreError> {
+        self.inner
+            .read_view_bootstrap(tenant_id, program_id, view_id)
+            .await
+    }
+
+    async fn fix_view_bootstrap_activation_cut(
+        &self,
+        request: FixViewBootstrapActivationCutRequest,
+    ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
+        self.inner.fix_view_bootstrap_activation_cut(request).await
+    }
+
+    async fn promote_view_bootstrap(
+        &self,
+        request: PromoteViewBootstrapRequest,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        self.inner.promote_view_bootstrap(request).await
+    }
+}
+
+async fn test_authoritative_api_state_with_store(
+    store: Arc<dyn ObjectStore>,
+    owner_id: &str,
+    meta_store: Arc<dyn MetaStore>,
+) -> ApiState {
+    let validated = validate_operator_authority(
+        ObjectStoreAuthorityRef {
+            store_id: "test-authoritative".to_string(),
+            namespace: "unit-authoritative".to_string(),
+        },
+        Arc::clone(&store),
+        "memory",
+        "api-authoritative-test",
+    )
+    .await
+    .unwrap();
+    ApiState::from_validated_authority_with_ingest_admission_startup(
+        validated,
+        "ignored",
+        "api-authoritative-process",
+        false,
+    )
+    .await
+    .unwrap()
+    .with_meta_store(meta_store)
+    .with_authoritative_relation_ingest(
+        owner_id,
+        "unit-authoritative",
+        "test-authoritative",
+        "memory",
+        "api-authoritative-test",
+        30_000,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn authoritative_relation_ingest_gate_rejects_missing_meta_capability() {
+    let meta = InMemoryMetaStore::default();
+    let error = validate_authoritative_relation_ingest_startup(&meta)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("metadata capability"));
+    assert!(error.to_string().contains("durable_across_restart"));
+}
+
+#[tokio::test]
+async fn authoritative_relation_ingest_requires_stable_owner_id() {
+    let state = test_api_state().await;
+    let error = match state.with_authoritative_relation_ingest(
+        " ",
+        "unit-authoritative",
+        "test-authoritative",
+        "memory",
+        "api-authoritative-test",
+        30_000,
+    ) {
+        Ok(_) => panic!("empty owner id unexpectedly enabled authoritative ingest"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("stable non-empty owner_id"));
+}
+
+#[tokio::test]
+async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta_refs() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta: Arc<dyn MetaStore> =
+        Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
+    let state = test_authoritative_api_state_with_store(
+        Arc::clone(&store),
+        "stable-authoritative-owner",
+        meta.clone(),
+    )
+    .await;
+    let router = app(state);
+
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let view = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "authoritative_scores_by_user",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as sum, count(*) as count from scores group by user_id",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "{view:?}");
+    let ingest = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "authoritative-scores-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+        }),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+    let retry = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "authoritative-scores-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+        }),
+    )
+    .await;
+    assert_eq!(retry.0, StatusCode::OK, "{retry:?}");
+    assert_eq!(retry.1["outcome"], "duplicate");
+
+    let canonical_key = ObjectKey::ingest_batch("authoritative-scores-stream", 0, 0, 1).unwrap();
+    assert!(store
+        .get(&Path::from(canonical_key.as_str()))
+        .await
+        .is_err());
+    let query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/authoritative_scores_by_user/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(
+        query.1["rows"],
+        json!([{"user_id": "alice", "sum": 10, "count": 1}])
+    );
+
+    let restarted = test_authoritative_api_state_with_store(
+        Arc::clone(&store),
+        "stable-authoritative-owner",
+        meta,
+    )
+    .await;
+    let restarted_query = call_json(
+        &app(restarted),
+        Method::POST,
+        "/v1/views/authoritative_scores_by_user/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+    assert_eq!(restarted_query.1["rows"], query.1["rows"]);
+}
+
+#[tokio::test]
+async fn authoritative_staging_visibility_and_digest_mismatch_fail_closed() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store.clone(), "visibility-owner", false).await;
+    let log =
+        IngestLog::new_catalog_checked(Arc::clone(&store), state.capabilities.as_ref()).unwrap();
+    let staged_key =
+        ObjectKey::ingest_staging("visibility-stream", 0, 0, 1, "uncommitted").unwrap();
+    log.stage_write(
+        staged_key.as_str(),
+        bytes::Bytes::from_static(b"uncommitted"),
+        stable_bytes_hash(b"uncommitted"),
+    )
+    .await
+    .unwrap();
+    assert!(log
+        .read_staging(
+            staged_key.as_str(),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+        .await
+        .is_err());
+    assert!(store.get(&Path::from(staged_key.as_str())).await.is_ok());
+}
+
+#[tokio::test]
+async fn authoritative_multi_batch_request_rejects_before_publication() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta: Arc<dyn MetaStore> =
+        Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
+    let state =
+        test_authoritative_api_state_with_store(Arc::clone(&store), "multi-batch-owner", meta)
+            .await;
+    let router = app(state);
+    let response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [
+                {"relation_id": "scores", "relation_version": "v1", "stream_id": "s0", "partition_id": 0, "start_offset_inclusive": 0, "rows": [{"user_id": "a", "score": 1, "delta": 1}]},
+                {"relation_id": "scores", "relation_version": "v1", "stream_id": "s1", "partition_id": 0, "start_offset_inclusive": 0, "rows": [{"user_id": "b", "score": 2, "delta": 1}]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::BAD_REQUEST, "{response:?}");
+    assert!(response.1["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("exactly one relation batch"));
+    let mut staged = store.list(Some(&Path::from("v1/ingest-staging")));
+    assert!(staged.next().await.is_none());
+}
+
+#[tokio::test]
+async fn authoritative_concurrent_same_scope_ingest_reuses_registry_publisher() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta: Arc<dyn MetaStore> =
+        Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
+    let state = test_authoritative_api_state_with_store(
+        Arc::clone(&store),
+        "concurrent-authoritative-owner",
+        meta,
+    )
+    .await;
+    let router = app(state);
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let request = || {
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "concurrent-authoritative-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+        })
+    };
+    let (first, second) = tokio::join!(
+        call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            request()
+        ),
+        call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/scores/ingest",
+            request()
+        )
+    );
+    for response in [first, second] {
+        assert!(
+            response.0 == StatusCode::CREATED || response.0 == StatusCode::OK,
+            "concurrent ingest unexpectedly failed: {response:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn authoritative_catalog_not_found_does_not_fallback_to_object_store() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store, "catalog-owner", false)
+        .await
+        .with_authoritative_relation_ingest(
+            "catalog-owner",
+            "unit-authoritative",
+            "test-authoritative",
+            "memory",
+            "api-authoritative-test",
+            30_000,
+        )
+        .unwrap();
+    let catalog = test_scores_catalog();
+    materialize_relation_catalog_to_object_store(&state, &catalog)
+        .await
+        .unwrap();
+    let state = state.with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    let error = read_relation_catalog(&state, "scores", "2026-05-24.v1")
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.to_string().contains("authoritative metadata"));
 }
 
 #[tokio::test]

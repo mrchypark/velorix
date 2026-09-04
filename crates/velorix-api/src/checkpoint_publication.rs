@@ -544,6 +544,105 @@ async fn standing_runtime_checkpoint_with_authoritative_input_coverage(
     else {
         return Ok(checkpoint.clone());
     };
+    if state.authoritative_relation_ingest_enabled() {
+        let Some(relation_ingest) = state.relation_ingest_config.as_ref() else {
+            return Err(ApiError::service_unavailable(
+                "authoritative relation ingest configuration is unavailable",
+            ));
+        };
+        let mut relations = Vec::new();
+        for relation in &control.bootstrap_cut.relations {
+            let mut partitions = Vec::new();
+            let frontiers = checkpoint.input_frontiers.iter().filter(|frontier| {
+                frontier.relation_id == relation.relation.relation_id
+                    && frontier.relation_version == relation.relation.relation_version
+            });
+            for frontier in frontiers {
+                let cut = meta_store
+                    .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+                        authority: RelationPartitionAuthorityKey {
+                            namespace: relation_ingest.namespace.clone(),
+                            relation_id: relation.relation.relation_id.clone(),
+                            stream_id: frontier.stream_id.clone(),
+                            partition_id: frontier.partition_id,
+                        },
+                        relation_version: relation.relation.relation_version.clone(),
+                        schema_fingerprint: relation.relation.schema_fingerprint.clone(),
+                    })
+                    .await
+                    .map_err(meta_error_to_api)?;
+                if cut.schema_version != RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1
+                    || cut.namespace != relation_ingest.namespace
+                    || cut.relation_id != relation.relation.relation_id
+                {
+                    return Err(ApiError::service_unavailable(format!(
+                        "authoritative relation source cut identity is invalid for `{}`",
+                        relation.relation.relation_id
+                    )));
+                }
+                let Some(partition) = cut.partitions.iter().find(|partition| {
+                    partition.stream_id == frontier.stream_id
+                        && partition.partition_id == frontier.partition_id
+                }) else {
+                    return Err(ApiError::service_unavailable(format!(
+                        "authoritative relation source cut is missing runtime frontier {}/{}/p={} for view `{view_id}`",
+                        relation.relation.relation_id, frontier.stream_id, frontier.partition_id
+                    )));
+                };
+                for publication in &partition.publications {
+                    super::recovery::validate_relation_publication_ref(
+                        state,
+                        &relation.relation.relation_id,
+                        &relation.relation.relation_version,
+                        &relation.relation.schema_fingerprint,
+                        &frontier.stream_id,
+                        frontier.partition_id,
+                        publication,
+                    )
+                    .await?;
+                }
+                if partition.committed_offset_exclusive < frontier.committed_offset_exclusive
+                    || (frontier.committed_offset_exclusive > partition.base_offset_inclusive
+                        && partition.publications.is_empty())
+                {
+                    return Err(ApiError::service_unavailable(format!(
+                        "authoritative relation source cut does not cover runtime frontier {}/{}/p={} through offset {} for view `{view_id}`",
+                        relation.relation.relation_id,
+                        frontier.stream_id,
+                        frontier.partition_id,
+                        frontier.committed_offset_exclusive
+                    )));
+                }
+                partitions.push(RuntimeCheckpointPartitionCoverageV1 {
+                    stream_id: partition.stream_id.clone(),
+                    stream_generation: 1,
+                    partition_id: partition.partition_id,
+                    partition_generation: 1,
+                    covered_from_offset_inclusive: partition.base_offset_inclusive,
+                    processed_offset_exclusive: frontier.committed_offset_exclusive,
+                });
+            }
+            relations.push(RuntimeCheckpointRelationCoverageV1 {
+                relation_id: relation.relation.relation_id.clone(),
+                relation_version: relation.relation.relation_version.clone(),
+                relation_generation: relation.relation.relation_generation,
+                schema_fingerprint: relation.relation.schema_fingerprint.clone(),
+                partitions,
+            });
+        }
+        let coverage = RuntimeCheckpointInputCoverageV1 {
+            schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+            view_generation: control.bootstrap_generation,
+            plan_hash: control.plan_hash,
+            input_catalog_epoch: control.bootstrap_cut.input_catalog_epoch,
+            relations,
+        }
+        .canonicalized()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let mut checkpoint = checkpoint.clone();
+        checkpoint.input_coverage = Some(coverage);
+        return Ok(checkpoint);
+    }
     let coverage_cut = meta_store
         .capture_ingest_source_cut(CaptureIngestSourceCutRequest {
             relations: control

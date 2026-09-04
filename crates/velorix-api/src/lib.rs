@@ -48,15 +48,18 @@ use velorix_control::{
     meta_admin::{
         validate_bearer_token, AcquireStandingRuntimeOwnerOutcome,
         AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
-        BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
+        BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest,
+        CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
         FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
         IngestRangeReservation, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
-        PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+        PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
         PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+        RelationIngestCapability, RelationIngestPublicationRefV1, RelationPartitionAuthorityKey,
         ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer,
         StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
         StoreRelationCatalogOutcome, ViewBootstrapControlV1, ViewBootstrapLifecycleV1,
-        INGEST_SOURCE_IDENTITY_GENERATION_V1, STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
+        INGEST_SOURCE_IDENTITY_GENERATION_V1, RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+        STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
         STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
@@ -70,9 +73,12 @@ use velorix_control::{
         validate_operator_authority, ObjectStoreAuthorityRef, OperatorAuthorityStartupComponents,
         ValidatedOperatorAuthority,
     },
+    relation_ingest_publisher::{
+        RelationIngestPublisher, RelationIngestPublisherConfig, RelationIngestPublisherError,
+    },
     storage_admin::{
         ActiveMaterializedView, AppendValidatedEnvelopeOutcome, AuthoritativeNamespace,
-        AuthoritativeObjectStoreCapabilitiesV1, CreateRelationCatalogOutcome,
+        AuthoritativeObjectStoreCapabilitiesV1, CreateRelationCatalogOutcome, IngestBatch,
         IngestBatchDescriptor, IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeHeader,
         IngestLog, InvalidExecutionModeReason, MaterializedViewAdmissionStatus,
         MaterializedViewApiMetadata, MaterializedViewDeploymentStatus,
@@ -178,6 +184,9 @@ pub struct ApiState {
     view_bootstrap_meta_store: Option<Arc<dyn MetaStore>>,
     meta_store_endpoint: Option<String>,
     owner_id: String,
+    relation_ingest_mode: RelationIngestMode,
+    relation_ingest_config: Option<RelationIngestApiConfig>,
+    relation_ingest_publishers: Arc<Mutex<HashMap<String, RelationIngestPublisher>>>,
     standing_runtime_owner_ttl_ms: u64,
     standing_runtime_fencing_required: bool,
     standing_runtime_fencing_mode: StandingRuntimeFencingMode,
@@ -200,6 +209,31 @@ pub struct ApiState {
     /// authoritative meta-store graph revision CAS extends this fence across
     /// processes.
     view_dependency_graph_mutex: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelationIngestMode {
+    Legacy,
+    Authoritative,
+}
+
+impl RelationIngestMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Authoritative => "authoritative",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RelationIngestApiConfig {
+    owner_id: String,
+    namespace: String,
+    authority_store_id: String,
+    backend_name: String,
+    probe_prefix: String,
+    authority_ttl_ms: u64,
 }
 
 type SharedStandingRuntime = Arc<Mutex<Box<dyn StandingProgramRuntime + Send>>>;
@@ -794,6 +828,9 @@ impl ApiState {
             view_bootstrap_meta_store: None,
             meta_store_endpoint: None,
             owner_id,
+            relation_ingest_mode: RelationIngestMode::Legacy,
+            relation_ingest_config: None,
+            relation_ingest_publishers: Arc::new(Mutex::new(HashMap::new())),
             standing_runtime_owner_ttl_ms: 30_000,
             standing_runtime_fencing_required: false,
             standing_runtime_fencing_mode: StandingRuntimeFencingMode::SingleWriter,
@@ -838,6 +875,107 @@ impl ApiState {
     pub fn with_meta_store_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.meta_store_endpoint = Some(endpoint.into());
         self
+    }
+
+    pub fn with_authoritative_relation_ingest(
+        mut self,
+        owner_id: impl Into<String>,
+        namespace: impl Into<String>,
+        authority_store_id: impl Into<String>,
+        backend_name: impl Into<String>,
+        probe_prefix: impl Into<String>,
+        authority_ttl_ms: u64,
+    ) -> Result<Self, ApiError> {
+        let owner_id = owner_id.into();
+        if owner_id.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "authoritative relation ingest requires a stable non-empty owner_id",
+            ));
+        }
+        if authority_ttl_ms == 0 {
+            return Err(ApiError::bad_request(
+                "authoritative relation ingest authority ttl must be greater than zero",
+            ));
+        }
+        self.relation_ingest_mode = RelationIngestMode::Authoritative;
+        self.relation_ingest_config = Some(RelationIngestApiConfig {
+            owner_id,
+            namespace: namespace.into(),
+            authority_store_id: authority_store_id.into(),
+            backend_name: backend_name.into(),
+            probe_prefix: probe_prefix.into(),
+            authority_ttl_ms,
+        });
+        Ok(self)
+    }
+
+    fn authoritative_relation_ingest_enabled(&self) -> bool {
+        self.relation_ingest_mode == RelationIngestMode::Authoritative
+    }
+
+    async fn relation_ingest_publisher(
+        &self,
+        catalog: &VelorixRelationCatalogV1,
+        request: &IngestRowsRequest,
+    ) -> Result<RelationIngestPublisher, ApiError> {
+        if !self.authoritative_relation_ingest_enabled() {
+            return Err(ApiError::internal(
+                "authoritative relation ingest publisher requested while gate is off",
+            ));
+        }
+        let Some(config) = self.relation_ingest_config.as_ref() else {
+            return Err(ApiError::service_unavailable(
+                "authoritative relation ingest configuration is unavailable",
+            ));
+        };
+        let Some(meta_store) = self.meta_store.as_ref() else {
+            return Err(ApiError::service_unavailable(
+                "authoritative relation ingest requires metadata service",
+            ));
+        };
+        let scope_key = format!(
+            "{}\0{}\0{}\0{}",
+            request.relation_id, request.relation_version, request.stream_id, request.partition_id
+        );
+        if let Some(publisher) = self
+            .relation_ingest_publishers
+            .lock()
+            .map_err(|_| ApiError::internal("relation ingest publisher registry poisoned"))?
+            .get(&scope_key)
+            .cloned()
+        {
+            return Ok(publisher);
+        }
+        let publisher = RelationIngestPublisher::from_store(
+            Arc::clone(meta_store),
+            ObjectStoreAuthorityRef {
+                store_id: config.authority_store_id.clone(),
+                namespace: config.namespace.clone(),
+            },
+            Arc::clone(&self.store),
+            &config.backend_name,
+            &config.probe_prefix,
+            RelationIngestPublisherConfig {
+                namespace: config.namespace.clone(),
+                relation_id: request.relation_id.clone(),
+                relation_version: request.relation_version.clone(),
+                schema_fingerprint: catalog.schema_fingerprint.as_str().to_string(),
+                stream_id: request.stream_id.clone(),
+                partition_id: request.partition_id,
+                owner_id: config.owner_id.clone(),
+                authority_ttl_ms: config.authority_ttl_ms,
+            },
+        )
+        .await
+        .map_err(relation_ingest_publisher_error_to_api)?;
+        let mut publishers = self
+            .relation_ingest_publishers
+            .lock()
+            .map_err(|_| ApiError::internal("relation ingest publisher registry poisoned"))?;
+        Ok(publishers
+            .entry(scope_key)
+            .or_insert_with(|| publisher.clone())
+            .clone())
     }
 
     pub fn with_standing_runtime_owner_ttl_ms(mut self, ttl_ms: u64) -> Self {
@@ -1515,12 +1653,20 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         }),
         None => None,
     };
+    if config.authoritative_relation_ingest {
+        let meta = meta_store.as_ref().ok_or_else(|| {
+            anyhow!(
+                "authoritative relation ingest requires VELORIX_META_GRPC_ENDPOINT and a metadata service"
+            )
+        })?;
+        validate_authoritative_relation_ingest_startup(meta.as_ref()).await?;
+    }
     enforce_standing_runtime_fencing_startup(&config, meta_store.as_ref()).await?;
     let reconstruct_ingest_admission = config.meta_grpc_endpoint.is_none();
     let mut state = ApiState::from_validated_authority_with_ingest_admission_startup(
         validated,
         config.state_path,
-        config.operator_id,
+        config.operator_id.clone(),
         reconstruct_ingest_admission,
     )
     .await?;
@@ -1549,6 +1695,19 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         if let Some(endpoint) = config.meta_grpc_endpoint {
             state = state.with_meta_store_endpoint(endpoint);
         }
+    }
+    if config.authoritative_relation_ingest {
+        state = state.with_authoritative_relation_ingest(
+            config
+                .relation_ingest_owner_id
+                .clone()
+                .expect("validated authoritative relation ingest owner id"),
+            config.authority_namespace.clone(),
+            config.authority_store_id.clone(),
+            config.backend_name.clone(),
+            format!("v1/api-probes/{}", config.operator_id),
+            config.standing_runtime_owner_ttl_ms,
+        )?;
     }
     state
         .restore_standing_program_runtimes_from_active_views()
@@ -1609,6 +1768,8 @@ pub struct IngestRowsRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestRelationRowsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_id: Option<String>,
     pub relation_version: String,
     pub stream_id: String,
     pub partition_id: u32,
@@ -2048,6 +2209,11 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
     };
     Ok(Json(json!({
         "status": "ready",
+        "relation_ingest": {
+            "mode": state.relation_ingest_mode.as_str(),
+            "authoritative": state.authoritative_relation_ingest_enabled(),
+            "owner_id_configured": state.relation_ingest_config.is_some(),
+        },
         "standing_runtime_fencing_required": state.standing_runtime_fencing_required,
         "standing_runtime_fencing_mode": state.standing_runtime_fencing_mode.as_str(),
         "object_store": object_store_capabilities_json(state.capabilities.as_ref()),
@@ -7226,6 +7392,28 @@ fn ingest_descriptor_response(
     }
 }
 
+fn ingest_descriptor_response_from_prepared(
+    prepared: &PreparedIngestBatch,
+) -> Result<IngestDescriptorResponse, ApiError> {
+    let descriptor = IngestBatchDescriptor {
+        stream_id: prepared.request.stream_id.clone(),
+        partition_id: prepared.request.partition_id,
+        start_offset_inclusive: prepared.request.start_offset_inclusive,
+        end_offset_exclusive: prepared.end_offset_exclusive,
+        object_key: ObjectKey::ingest_batch(
+            &prepared.request.stream_id,
+            prepared.request.partition_id,
+            prepared.request.start_offset_inclusive,
+            prepared.end_offset_exclusive,
+        )
+        .map_err(ApiError::bad_request)?,
+    };
+    Ok(ingest_descriptor_response(
+        &descriptor,
+        &prepared.request.relation_id,
+    ))
+}
+
 fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec<Value>, ApiError> {
     let mut rows = Vec::new();
     for batch in batches {
@@ -7595,6 +7783,32 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
     }
 }
 
+fn relation_ingest_publisher_error_to_api(error: RelationIngestPublisherError) -> ApiError {
+    match error {
+        RelationIngestPublisherError::UnsupportedRelationIngestCapability { .. }
+        | RelationIngestPublisherError::CapabilityNotValidated
+        | RelationIngestPublisherError::NotStarted
+        | RelationIngestPublisherError::AuthorityLost { .. }
+        | RelationIngestPublisherError::UncertainPublication { .. } => {
+            ApiError::service_unavailable(error)
+        }
+        RelationIngestPublisherError::AuthorityConflict { .. }
+        | RelationIngestPublisherError::RangeConflict { .. }
+        | RelationIngestPublisherError::PublicationConflict { .. }
+        | RelationIngestPublisherError::StagingConflict { .. }
+        | RelationIngestPublisherError::PublicationMismatch { .. } => ApiError::conflict(error),
+        RelationIngestPublisherError::InvalidConfig { .. }
+        | RelationIngestPublisherError::InvalidTtl
+        | RelationIngestPublisherError::PublicationMissing { .. } => ApiError::bad_request(error),
+        RelationIngestPublisherError::OperatorStartup(error) => {
+            ApiError::service_unavailable(error)
+        }
+        RelationIngestPublisherError::Meta(error) => meta_error_to_api(*error),
+        RelationIngestPublisherError::Storage(error) => ApiError::internal(*error),
+        RelationIngestPublisherError::ObjectKey(error) => ApiError::bad_request(*error),
+    }
+}
+
 fn materialized_view_registry_error_to_api(error: MaterializedViewRegistryError) -> ApiError {
     match error {
         MaterializedViewRegistryError::InvalidExecutionMode {
@@ -7685,6 +7899,8 @@ struct ApiConfig {
     standing_runtime_fencing: StandingRuntimeFencingMode,
     standing_runtime_owner_ttl_ms: u64,
     experimental_advanced_view_features: bool,
+    authoritative_relation_ingest: bool,
+    relation_ingest_owner_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7782,6 +7998,14 @@ impl ApiConfig {
             parse_positive_u64_env("VELORIX_STANDING_RUNTIME_OWNER_TTL_MS", 30_000)?;
         let experimental_advanced_view_features =
             parse_bool_env("VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES", false)?;
+        let authoritative_relation_ingest =
+            parse_bool_env("VELORIX_API_AUTHORITATIVE_RELATION_INGEST", false)?;
+        let relation_ingest_owner_id = optional_nonempty_env("VELORIX_RELATION_INGEST_OWNER_ID");
+        if authoritative_relation_ingest && relation_ingest_owner_id.is_none() {
+            return Err(anyhow!(
+                "VELORIX_RELATION_INGEST_OWNER_ID is required when VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1"
+            ));
+        }
         Ok(Self {
             bind,
             tls,
@@ -7810,6 +8034,8 @@ impl ApiConfig {
             standing_runtime_fencing,
             standing_runtime_owner_ttl_ms,
             experimental_advanced_view_features,
+            authoritative_relation_ingest,
+            relation_ingest_owner_id,
         })
     }
 
@@ -7995,6 +8221,37 @@ fn parse_bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(anyhow!("invalid {name}: {error}")),
     }
+}
+
+fn validate_relation_ingest_capability_for_api(
+    capability: &RelationIngestCapability,
+) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    if !capability.relation_scoped_authority {
+        missing.push("relation_scoped_authority");
+    }
+    if !capability.committed_publication_source_cut {
+        missing.push("committed_publication_source_cut");
+    }
+    if !capability.durable_across_restart {
+        missing.push("durable_across_restart");
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "authoritative relation ingest metadata capability is unavailable from `{}`; missing {}",
+            capability.backend_name,
+            missing.join(", ")
+        ))
+    }
+}
+
+async fn validate_authoritative_relation_ingest_startup(
+    meta_store: &dyn MetaStore,
+) -> anyhow::Result<()> {
+    let capabilities = meta_store.read_meta_store_capabilities().await?;
+    validate_relation_ingest_capability_for_api(&capabilities.relation_ingest)
 }
 
 fn parse_positive_usize_env(name: &str, default: usize) -> anyhow::Result<usize> {

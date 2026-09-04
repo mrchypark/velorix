@@ -3426,8 +3426,10 @@ where
         request: Request<proto::CaptureRelationIngestSourceCutRequest>,
     ) -> Result<Response<proto::CaptureRelationIngestSourceCutResponse>, Status> {
         self.authorize(&request)?;
+        let request = request.into_inner();
+        let relation_version = request.relation_version;
+        let schema_fingerprint = request.schema_fingerprint;
         let authority = request
-            .into_inner()
             .authority
             .ok_or_else(|| Status::invalid_argument("relation authority key is required"))
             .and_then(|key| {
@@ -3435,7 +3437,11 @@ where
             })?;
         let source_cut = self
             .store
-            .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest { authority })
+            .capture_relation_ingest_source_cut(CaptureRelationIngestSourceCutRequest {
+                authority,
+                relation_version,
+                schema_fingerprint,
+            })
             .await
             .map_err(meta_status)?;
         Ok(Response::new(
@@ -4257,6 +4263,8 @@ fn acquire_relation_partition_authority_request_from_proto(
 fn relation_authoritative_ingest_publication_to_proto(
     publication: RelationAuthoritativeIngestPublication,
 ) -> proto::RelationAuthoritativeIngestPublication {
+    let relation_version = publication.reservation.relation_version.clone();
+    let schema_fingerprint = publication.reservation.schema_fingerprint.clone();
     proto::RelationAuthoritativeIngestPublication {
         reservation: Some(ingest_range_reservation_to_proto(publication.reservation)),
         authority_key: Some(relation_partition_authority_key_to_proto(
@@ -4266,17 +4274,29 @@ fn relation_authoritative_ingest_publication_to_proto(
         request_digest: publication.request_digest,
         object_key: publication.object_key,
         object_digest: publication.object_digest,
+        relation_version,
+        schema_fingerprint,
     }
 }
 
 fn relation_authoritative_ingest_publication_from_proto(
     publication: proto::RelationAuthoritativeIngestPublication,
 ) -> Result<RelationAuthoritativeIngestPublication, MetaStoreError> {
+    let reservation = publication
+        .reservation
+        .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+        .map(ingest_range_reservation_from_proto)?;
+    if (!publication.relation_version.is_empty()
+        && publication.relation_version != reservation.relation_version)
+        || (!publication.schema_fingerprint.is_empty()
+            && publication.schema_fingerprint != reservation.schema_fingerprint)
+    {
+        return Err(MetaStoreError::Serialization(
+            "relation publication identity does not match reservation".into(),
+        ));
+    }
     let publication = RelationAuthoritativeIngestPublication {
-        reservation: publication
-            .reservation
-            .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
-            .map(ingest_range_reservation_from_proto)?,
+        reservation,
         authority_key: publication
             .authority_key
             .ok_or_else(|| {
@@ -8790,6 +8810,8 @@ impl MetaStore for GrpcMetaStore {
             .capture_relation_ingest_source_cut(self.request(
                 proto::CaptureRelationIngestSourceCutRequest {
                     authority: Some(relation_partition_authority_key_to_proto(request.authority)),
+                    relation_version: request.relation_version,
+                    schema_fingerprint: request.schema_fingerprint,
                 },
             ))
             .await
