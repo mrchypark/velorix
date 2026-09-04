@@ -25,10 +25,10 @@
 //! - Reduced heap allocation
 //! - Better CPU cache locality
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use velorix_core::standing_program::StandingProgramRuntimeError;
 
@@ -227,7 +227,7 @@ fn delta_records_to_record_batch(
     let arrays: Vec<ArrayRef> = columns
         .iter()
         .zip(schema.fields().iter())
-        .map(|(values, field)| json_values_to_array(values, field.data_type()))
+        .map(|(values, field)| json_values_to_array(values, field))
         .collect::<Result<Vec<_>, _>>()?;
 
     RecordBatch::try_new(schema.clone(), arrays).map_err(|_| invalid_runtime_state())
@@ -236,26 +236,130 @@ fn delta_records_to_record_batch(
 /// Convert JSON values to an Arrow array.
 fn json_values_to_array(
     values: &[serde_json::Value],
-    data_type: &DataType,
+    field: &Field,
 ) -> Result<ArrayRef, StandingProgramRuntimeError> {
-    match data_type {
+    match field.data_type() {
         DataType::Utf8 => {
-            let arr: Vec<Option<&str>> = values.iter().map(|v| v.as_str()).collect();
+            let arr = values
+                .iter()
+                .map(|value| json_string_value(value, field))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Arc::new(StringArray::from(arr)))
         }
         DataType::Int64 => {
-            let arr: Vec<Option<i64>> = values.iter().map(|v| v.as_i64()).collect();
+            let arr = values
+                .iter()
+                .map(|value| json_int64_value(value, field))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Arc::new(Int64Array::from(arr)))
         }
         DataType::Float64 => {
-            let arr: Vec<Option<f64>> = values.iter().map(|v| v.as_f64()).collect();
+            let arr = values
+                .iter()
+                .map(|value| json_float64_value(value, field))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Arc::new(Float64Array::from(arr)))
         }
         DataType::Boolean => {
-            let arr: Vec<Option<bool>> = values.iter().map(|v| v.as_bool()).collect();
+            let arr = values
+                .iter()
+                .map(|value| json_boolean_value(value, field))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Arc::new(BooleanArray::from(arr)))
         }
         _ => Err(invalid_runtime_state()),
+    }
+}
+
+fn json_string_value<'a>(
+    value: &'a serde_json::Value,
+    field: &Field,
+) -> Result<Option<&'a str>, StandingProgramRuntimeError> {
+    match value {
+        serde_json::Value::Null => nullable_json_null(field),
+        serde_json::Value::String(value) => Ok(Some(value)),
+        _ => Err(json_type_error(field, "Utf8", json_value_type(value))),
+    }
+}
+
+fn json_int64_value(
+    value: &serde_json::Value,
+    field: &Field,
+) -> Result<Option<i64>, StandingProgramRuntimeError> {
+    match value {
+        serde_json::Value::Null => nullable_json_null(field),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| json_type_error(field, "Int64", json_number_type(number))),
+        _ => Err(json_type_error(field, "Int64", json_value_type(value))),
+    }
+}
+
+fn json_float64_value(
+    value: &serde_json::Value,
+    field: &Field,
+) -> Result<Option<f64>, StandingProgramRuntimeError> {
+    match value {
+        serde_json::Value::Null => nullable_json_null(field),
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| json_type_error(field, "Float64", "number(out-of-range)")),
+        _ => Err(json_type_error(field, "Float64", json_value_type(value))),
+    }
+}
+
+fn json_boolean_value(
+    value: &serde_json::Value,
+    field: &Field,
+) -> Result<Option<bool>, StandingProgramRuntimeError> {
+    match value {
+        serde_json::Value::Null => nullable_json_null(field),
+        serde_json::Value::Bool(value) => Ok(Some(*value)),
+        _ => Err(json_type_error(field, "Boolean", json_value_type(value))),
+    }
+}
+
+fn nullable_json_null<T>(field: &Field) -> Result<Option<T>, StandingProgramRuntimeError> {
+    if field.is_nullable() {
+        Ok(None)
+    } else {
+        Err(json_type_error(
+            field,
+            field.data_type().to_string().as_str(),
+            "null",
+        ))
+    }
+}
+
+fn json_type_error(field: &Field, expected: &str, actual: &str) -> StandingProgramRuntimeError {
+    StandingProgramRuntimeError::InvalidProgramIdentityDynamic {
+        field: Cow::Owned(format!(
+            "arrow_json_type:field={}:expected={expected}:actual={actual}",
+            field.name()
+        )),
+    }
+}
+
+fn json_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) => json_number_type(number),
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn json_number_type(number: &serde_json::Number) -> &'static str {
+    if number.is_i64() {
+        "integer"
+    } else if number.is_u64() {
+        "integer(out-of-range)"
+    } else {
+        "float"
     }
 }
 
@@ -359,5 +463,129 @@ mod tests {
         assert_eq!(op.row_count(), 2);
         // Column index 2 is "value"
         assert_eq!(op.sum(2).unwrap(), 30);
+    }
+
+    #[test]
+    fn delta_records_reject_non_null_json_values_with_the_wrong_primitive_type() {
+        let cases = [
+            ("text", DataType::Utf8, json!(false), "Utf8", "boolean"),
+            ("integer", DataType::Int64, json!(1.5), "Int64", "float"),
+            (
+                "float",
+                DataType::Float64,
+                json!("1.0"),
+                "Float64",
+                "string",
+            ),
+            ("flag", DataType::Boolean, json!({}), "Boolean", "object"),
+        ];
+
+        for (field_name, data_type, value, expected, actual) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(field_name, data_type, true)]));
+            let records = vec![delta_record(json!({ field_name: value }))];
+
+            let error = conversion_error(&records, schema);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid standing program identity field: arrow_json_type:field={field_name}:expected={expected}:actual={actual}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn delta_records_reject_integer_values_outside_the_int64_range() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        let records = vec![delta_record(json!({ "id": u64::MAX }))];
+
+        let error = conversion_error(&records, schema);
+        assert_eq!(
+            error.to_string(),
+            "invalid standing program identity field: arrow_json_type:field=id:expected=Int64:actual=integer(out-of-range)"
+        );
+    }
+
+    #[test]
+    fn delta_records_preserve_int64_numeric_boundaries() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let records = vec![
+            delta_record(json!({ "id": i64::MIN })),
+            delta_record(json!({ "id": i64::MAX })),
+        ];
+
+        let op = ArrowBatchOperator::from_delta_records(&records, schema).unwrap();
+        let ids = op.batches()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[i64::MIN, i64::MAX]);
+    }
+
+    #[test]
+    fn delta_records_convert_json_integer_to_float64() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let records = vec![delta_record(json!({ "value": 1 }))];
+
+        let op = ArrowBatchOperator::from_delta_records(&records, schema).unwrap();
+        let values = op.batches()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(values.values(), &[1.0]);
+    }
+
+    #[test]
+    fn delta_records_preserve_explicit_null_for_nullable_fields() {
+        let schema = test_schema();
+        let records = vec![delta_record(json!({
+            "id": 1,
+            "name": "a",
+            "value": null,
+        }))];
+
+        let op = ArrowBatchOperator::from_delta_records(&records, schema).unwrap();
+        let values = op.batches()[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(values.is_null(0));
+    }
+
+    #[test]
+    fn delta_records_reject_explicit_null_for_non_nullable_fields() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let records = vec![delta_record(json!({ "id": null }))];
+
+        let error = conversion_error(&records, schema);
+        assert_eq!(
+            error.to_string(),
+            "invalid standing program identity field: arrow_json_type:field=id:expected=Int64:actual=null"
+        );
+    }
+
+    fn delta_record(value: serde_json::Value) -> velorix_core::delta::DeltaRecord {
+        velorix_core::delta::DeltaRecord::new(
+            velorix_core::delta::DeltaKey::from_json(json!({"id": 1})),
+            velorix_core::delta::DeltaValue::from_json(value),
+            1,
+        )
+    }
+
+    fn conversion_error(
+        records: &[velorix_core::delta::DeltaRecord],
+        schema: SchemaRef,
+    ) -> StandingProgramRuntimeError {
+        match ArrowBatchOperator::from_delta_records(records, schema) {
+            Ok(_) => panic!("expected JSON-to-Arrow conversion to fail"),
+            Err(error) => error,
+        }
     }
 }
