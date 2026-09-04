@@ -213,74 +213,89 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             });
         }
 
-        let mut next_frontiers = self.input_frontiers.clone();
-        let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
-        for input in input_changes {
-            validate_input_matches_schema(
-                &input,
-                &self.input_schema,
-                "tumbling_event_time_input_relation",
-            )?;
-            apply_tumbling_input(
-                &mut self.state,
-                &self.catalog,
-                &self.plan,
-                &self.input_event_time_frontiers,
-                &input,
-            )?;
-            advance_input_frontier(&mut next_frontiers, &input)?;
-            advance_input_event_time_frontier(&mut next_event_time_frontiers, &input)?;
-        }
-        let previous_output = self.published_output.clone();
-        // Finalization frontier: windows become final only once their end
-        // passes the watermark minus the allowed lateness. With the default
-        // StrictReject (allowance 0) this is exactly the watermark, so the
-        // behavior is byte-identical to the legacy contract.
-        let effective_watermark = finalization_frontier(
-            self.plan.late_row_policy,
-            min_event_time_watermark(&next_event_time_frontiers),
-        );
-        let full_output =
-            self.state
-                .closed_delta(&self.plan, &self.output_schema, effective_watermark)?;
-        self.published_output = apply_top_k_to_published_output(
-            full_output,
-            self.plan.top_k.as_ref(),
-            &self.plan.aggregate_outputs,
-        )?;
-        let output_delta = previous_output
-            .diff(&self.published_output)
-            .map_err(|_| invalid_runtime_state())?;
-        // Validate output before commit
-        let output_batches = vec![ViewOutputBatch {
-            view_id: self.identity.view_ids[0].clone(),
-            schema_fingerprint: self.output_schema_fingerprint(),
-            batches: vec![materialized_tumbling_delta_to_record_batch(
-                &self.output_schema,
-                &self.published_output,
+        let mut undo = TumblingEpochUndoLog::default();
+        let mut next_output = None;
+        let result = (|| {
+            let mut next_frontiers = self.input_frontiers.clone();
+            let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
+            for input in input_changes {
+                validate_input_matches_schema(
+                    &input,
+                    &self.input_schema,
+                    "tumbling_event_time_input_relation",
+                )?;
+                apply_tumbling_input(
+                    &mut self.state,
+                    &mut undo,
+                    &self.catalog,
+                    &self.plan,
+                    &self.input_event_time_frontiers,
+                    &input,
+                )?;
+                advance_input_frontier(&mut next_frontiers, &input)?;
+                advance_input_event_time_frontier(&mut next_event_time_frontiers, &input)?;
+            }
+            // Finalization frontier: windows become final only once their end
+            // passes the watermark minus the allowed lateness. With the default
+            // StrictReject (allowance 0) this is exactly the watermark, so the
+            // behavior is byte-identical to the legacy contract.
+            let effective_watermark = finalization_frontier(
+                self.plan.late_row_policy,
+                min_event_time_watermark(&next_event_time_frontiers),
+            );
+            let full_output =
+                self.state
+                    .closed_delta(&self.plan, &self.output_schema, effective_watermark)?;
+            let staged_output = apply_top_k_to_published_output(
+                full_output,
+                self.plan.top_k.as_ref(),
                 &self.plan.aggregate_outputs,
-            )?],
-        }];
-        // Commit staged state
-        self.input_frontiers = next_frontiers.clone();
-        self.input_event_time_frontiers = next_event_time_frontiers.clone();
-        self.applied_epochs
-            .insert(idempotency_key_text, logical_epoch);
-        retain_recent_applied_epochs(&mut self.applied_epochs);
-        self.logical_epoch = logical_epoch;
-
-        Ok(EpochCommit {
-            logical_epoch,
-            idempotency_key,
-            input_frontiers: next_frontiers,
-            input_event_time_frontiers: next_event_time_frontiers,
-            output_deltas: vec![ViewOutputDelta {
+            )?;
+            let output_delta = self
+                .published_output
+                .diff(&staged_output)
+                .map_err(|_| invalid_runtime_state())?;
+            // Validate output before commit
+            let output_batches = vec![ViewOutputBatch {
                 view_id: self.identity.view_ids[0].clone(),
                 schema_fingerprint: self.output_schema_fingerprint(),
-                delta: output_delta,
-            }],
-            output_batches,
-        })
+                batches: vec![materialized_tumbling_delta_to_record_batch(
+                    &self.output_schema,
+                    &staged_output,
+                    &self.plan.aggregate_outputs,
+                )?],
+            }];
+            // Commit staged state
+            next_output = Some(staged_output);
+            Ok(EpochCommit {
+                logical_epoch,
+                idempotency_key,
+                input_frontiers: next_frontiers,
+                input_event_time_frontiers: next_event_time_frontiers,
+                output_deltas: vec![ViewOutputDelta {
+                    view_id: self.identity.view_ids[0].clone(),
+                    schema_fingerprint: self.output_schema_fingerprint(),
+                    delta: output_delta,
+                }],
+                output_batches,
+            })
+        })();
+        match result {
+            Ok(commit) => {
+                self.published_output = next_output.expect("successful epoch stages output");
+                self.input_frontiers = commit.input_frontiers.clone();
+                self.input_event_time_frontiers = commit.input_event_time_frontiers.clone();
+                self.applied_epochs
+                    .insert(idempotency_key_text, logical_epoch);
+                retain_recent_applied_epochs(&mut self.applied_epochs);
+                self.logical_epoch = logical_epoch;
+                Ok(commit)
+            }
+            Err(error) => {
+                undo.rollback(&mut self.state);
+                Err(error)
+            }
+        }
     }
 
     fn materialized_view_page(

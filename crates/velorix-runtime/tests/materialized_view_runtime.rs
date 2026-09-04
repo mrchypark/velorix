@@ -14285,7 +14285,43 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
         )
         .unwrap();
 
+    let checkpoint_before = runtime.checkpoint().unwrap();
     let err = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("epoch-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(InputEventTimeWatermark {
+                    stream_id: "purchases-stream".to_string(),
+                    partition_id: 0,
+                    event_time_column_id: "event_time".to_string(),
+                    max_observed_event_time_ns: 120_000_000_000,
+                    watermark_ns: 120_000_000_000,
+                }),
+                batches: vec![purchases_event_time_batch(&[
+                    ("bob", 9, 70_000_000_000, 1),
+                    ("carol", 99, 30_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "tumbling_event_time_input_batch"
+        }
+    ));
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before);
+    let retry = runtime
         .apply_changes(
             2,
             EpochIdempotencyKey::new("epoch-2").unwrap(),
@@ -14302,20 +14338,19 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
                     stream_id: "purchases-stream".to_string(),
                     partition_id: 0,
                     event_time_column_id: "event_time".to_string(),
-                    max_observed_event_time_ns: 60_000_000_000,
-                    watermark_ns: 60_000_000_000,
+                    max_observed_event_time_ns: 120_000_000_000,
+                    watermark_ns: 120_000_000_000,
                 }),
-                batches: vec![purchases_event_time_batch(&[("bob", 9, 30_000_000_000, 1)])],
+                batches: vec![purchases_event_time_batch(&[("bob", 9, 70_000_000_000, 1)])],
             }],
         )
-        .unwrap_err();
-
-    assert!(matches!(
-        err,
-        StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "tumbling_event_time_input_batch"
-        }
-    ));
+        .unwrap();
+    assert!(!retry.output_deltas.is_empty());
+    assert!(runtime
+        .apply_changes(2, EpochIdempotencyKey::new("epoch-2").unwrap(), Vec::new())
+        .unwrap()
+        .output_deltas
+        .is_empty());
 }
 
 fn standing_identity(sql: &str) -> StandingProgramIdentity {
@@ -18720,6 +18755,183 @@ fn late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence() {
 }
 
 #[test]
+fn drop_with_evidence_failed_overflow_rolls_back_evidence_and_allows_same_key_retry() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::DropWithEvidence),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let watermark = |watermark_ns| InputEventTimeWatermark {
+        stream_id: "purchases-stream".to_string(),
+        partition_id: 0,
+        event_time_column_id: "event_time".to_string(),
+        max_observed_event_time_ns: watermark_ns,
+        watermark_ns,
+    };
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("drop-evidence-undo-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    i64::MAX,
+                    70_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    let checkpoint_before = runtime.checkpoint().unwrap();
+    let checkpoint_bytes_before = checkpoint_before
+        .state_payload
+        .as_ref()
+        .unwrap()
+        .payload
+        .clone();
+    let frontiers_before = checkpoint_before.input_event_time_frontiers.clone();
+    let payload_before: serde_json::Value = serde_json::from_str(&checkpoint_bytes_before).unwrap();
+
+    // The late row records evidence first; the following on-time row then
+    // overflows SUM(i64::MAX + 1), so both mutations must roll back.
+    let error = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("drop-evidence-undo-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 7, 20_000_000_000, 1),
+                    ("alice", 1, 80_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generic_runtime_state"),
+        "overflow must fail the epoch closed: {error}"
+    );
+    let checkpoint_after_failure = runtime.checkpoint().unwrap();
+    assert_eq!(checkpoint_after_failure, checkpoint_before);
+    assert_eq!(
+        checkpoint_after_failure
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload,
+        checkpoint_bytes_before
+    );
+    assert_eq!(
+        checkpoint_after_failure.input_event_time_frontiers,
+        frontiers_before
+    );
+    let payload_after_failure: serde_json::Value = serde_json::from_str(
+        &checkpoint_after_failure
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(
+        payload_after_failure["state"]["late_rows_dropped"],
+        payload_before["state"]["late_rows_dropped"]
+    );
+
+    let retry = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("drop-evidence-undo-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    -1,
+                    80_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_eq!(retry.output_deltas.len(), 1);
+    let checkpoint_after_retry = runtime.checkpoint().unwrap();
+    let duplicate = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("drop-evidence-undo-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_after_retry);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("drop-evidence-undo-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(watermark(120_000_000_000)),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[("alice", 60_000_000_000, 120_000_000_000, i64::MAX - 1, 2)],
+    );
+}
+
+#[test]
 fn late_row_policy_admit_within_allowance_defers_finalization_until_frontier() {
     let catalog = purchases_event_time_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -19104,6 +19316,157 @@ fn session_window_retraction_splits_merged_session_exactly_and_survives_restart(
             ("alice", 30_000_000_000, 30_000_000_000, 10, 1),
             ("alice", 50_000_000_000, 50_000_000_000, 9, 1),
         ],
+    );
+}
+
+#[test]
+fn session_window_failed_epoch_rolls_back_rebuild_and_allows_same_key_retry() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '10 seconds')";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let watermark = |watermark_ns| InputEventTimeWatermark {
+        stream_id: "purchases-stream".to_string(),
+        partition_id: 0,
+        event_time_column_id: "event_time".to_string(),
+        max_observed_event_time_ns: watermark_ns,
+        watermark_ns,
+    };
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("session-undo-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    10,
+                    30_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    let checkpoint_before = runtime.checkpoint().unwrap();
+    let checkpoint_bytes_before = checkpoint_before
+        .state_payload
+        .as_ref()
+        .unwrap()
+        .payload
+        .clone();
+
+    // The 40s event rebuilds alice's session before the following 10s event
+    // is rejected against the established 20s watermark.
+    let error = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("session-undo-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 3,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[
+                    ("alice", 5, 40_000_000_000, 1),
+                    ("alice", 99, 10_000_000_000, 1),
+                ])],
+            }],
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("tumbling_event_time_input_batch"));
+    let checkpoint_after_failure = runtime.checkpoint().unwrap();
+    assert_eq!(checkpoint_after_failure, checkpoint_before);
+    assert_eq!(
+        checkpoint_after_failure
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload,
+        checkpoint_bytes_before
+    );
+
+    let retry = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("session-undo-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(watermark(20_000_000_000)),
+                batches: vec![purchases_event_time_batch(&[(
+                    "alice",
+                    5,
+                    40_000_000_000,
+                    1,
+                )])],
+            }],
+        )
+        .unwrap();
+    assert_eq!(retry.output_deltas.len(), 1);
+    let checkpoint_after_retry = runtime.checkpoint().unwrap();
+    let duplicate = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("session-undo-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_after_retry);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("session-undo-3").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 2,
+                event_time_watermark: Some(watermark(60_000_000_000)),
+                batches: vec![],
+            }],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[("alice", 30_000_000_000, 40_000_000_000, 15, 2)],
     );
 }
 

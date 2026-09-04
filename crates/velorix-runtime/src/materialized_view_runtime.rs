@@ -760,6 +760,60 @@ struct TumblingWindowState {
     late_rows_dropped: u64,
 }
 
+/// Epoch-local, first-touch undo data for event-time state. It records only
+/// keys changed by the epoch, so rollback cost is proportional to the delta.
+#[derive(Default)]
+struct TumblingEpochUndoLog {
+    rows: BTreeMap<String, Option<TumblingWindowStateRow>>,
+    session_events: BTreeMap<String, Option<SessionWindowEvent>>,
+    late_rows_dropped: Option<u64>,
+}
+
+impl TumblingEpochUndoLog {
+    fn touch_row(&mut self, state: &TumblingWindowState, key: &str) {
+        self.rows
+            .entry(key.to_string())
+            .or_insert_with(|| state.rows.get(key).cloned());
+    }
+
+    fn touch_session_event(&mut self, state: &TumblingWindowState, key: &str) {
+        self.session_events
+            .entry(key.to_string())
+            .or_insert_with(|| state.session_events.get(key).cloned());
+    }
+
+    fn touch_late_rows_dropped(&mut self, state: &TumblingWindowState) {
+        self.late_rows_dropped
+            .get_or_insert(state.late_rows_dropped);
+    }
+
+    fn rollback(self, state: &mut TumblingWindowState) {
+        for (key, before) in self.rows {
+            match before {
+                Some(row) => {
+                    state.rows.insert(key, row);
+                }
+                None => {
+                    state.rows.remove(&key);
+                }
+            }
+        }
+        for (key, before) in self.session_events {
+            match before {
+                Some(event) => {
+                    state.session_events.insert(key, event);
+                }
+                None => {
+                    state.session_events.remove(&key);
+                }
+            }
+        }
+        if let Some(before) = self.late_rows_dropped {
+            state.late_rows_dropped = before;
+        }
+    }
+}
+
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
@@ -6811,6 +6865,7 @@ fn update_tumbling_extrema(
 
 fn apply_tumbling_input(
     state: &mut TumblingWindowState,
+    undo: &mut TumblingEpochUndoLog,
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedTumblingWindowPlan,
     current_event_time_frontiers: &[InputEventTimeFrontier],
@@ -6853,6 +6908,7 @@ fn apply_tumbling_input(
                         });
                     }
                     Some(LateRowPolicy::DropWithEvidence) => {
+                        undo.touch_late_rows_dropped(state);
                         state.late_rows_dropped = state
                             .late_rows_dropped
                             .checked_add(1)
@@ -6864,6 +6920,7 @@ fn apply_tumbling_input(
                             .map(|watermark| watermark.saturating_sub(allowance_ns))
                             .unwrap_or(i64::MAX);
                         if event_time_ns < admissible_until {
+                            undo.touch_late_rows_dropped(state);
                             state.late_rows_dropped = state
                                 .late_rows_dropped
                                 .checked_add(1)
@@ -6901,6 +6958,9 @@ fn apply_tumbling_input(
                     for (window_start_ns, window_end_ns) in
                         fixed_window_assignments(plan, event_time_ns)?
                     {
+                        let state_key =
+                            window_state_key(&group_key, window_start_ns, window_end_ns);
+                        undo.touch_row(state, &state_key);
                         let row = window_state_row_mut(
                             state,
                             group_key.clone(),
@@ -6921,6 +6981,7 @@ fn apply_tumbling_input(
                 SupportedEventTimeWindowKind::Session => {
                     apply_session_window_update(
                         state,
+                        undo,
                         catalog,
                         plan,
                         group_key,
@@ -7005,8 +7066,10 @@ fn window_state_key(group_key: &Value, window_start_ns: i64, window_end_ns: i64)
     ]))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_session_window_update(
     state: &mut TumblingWindowState,
+    undo: &mut TumblingEpochUndoLog,
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedTumblingWindowPlan,
     group_key: Value,
@@ -7014,12 +7077,20 @@ fn apply_session_window_update(
     amount: Option<i64>,
     weight: i64,
 ) -> Result<(), StandingProgramRuntimeError> {
-    update_session_event_index(state, group_key.clone(), event_time_ns, amount, weight)?;
-    rebuild_session_windows_for_group(state, catalog, plan, &group_key)
+    update_session_event_index(
+        state,
+        undo,
+        group_key.clone(),
+        event_time_ns,
+        amount,
+        weight,
+    )?;
+    rebuild_session_windows_for_group(state, undo, catalog, plan, &group_key)
 }
 
 fn update_session_event_index(
     state: &mut TumblingWindowState,
+    undo: &mut TumblingEpochUndoLog,
     group_key: Value,
     event_time_ns: i64,
     amount: Option<i64>,
@@ -7044,6 +7115,7 @@ fn update_session_event_index(
     if next_weight < 0 {
         return Err(invalid_runtime_state());
     }
+    undo.touch_session_event(state, &key);
     if next_weight == 0 {
         state.session_events.remove(&key);
         return Ok(());
@@ -7062,12 +7134,22 @@ fn update_session_event_index(
 
 fn rebuild_session_windows_for_group(
     state: &mut TumblingWindowState,
+    undo: &mut TumblingEpochUndoLog,
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedTumblingWindowPlan,
     group_key: &Value,
 ) -> Result<(), StandingProgramRuntimeError> {
     let gap_ns = plan.session_gap_ns.ok_or_else(invalid_runtime_state)?;
-    state.rows.retain(|_, row| row.group_key != *group_key);
+    state.rows.retain(|key, row| {
+        if row.group_key == *group_key {
+            undo.rows
+                .entry(key.clone())
+                .or_insert_with(|| Some(row.clone()));
+            false
+        } else {
+            true
+        }
+    });
 
     let mut events = state
         .session_events
@@ -7087,7 +7169,11 @@ fn rebuild_session_windows_for_group(
             event.event_time_ns > row.window_end_ns.checked_add(gap_ns).unwrap_or(i64::MAX)
         });
         if starts_new_session {
-            insert_session_window_row(state, current.take().ok_or_else(invalid_runtime_state)?)?;
+            insert_session_window_row(
+                state,
+                undo,
+                current.take().ok_or_else(invalid_runtime_state)?,
+            )?;
         }
         let row = current.get_or_insert_with(|| TumblingWindowStateRow {
             group_key: group_key.clone(),
@@ -7111,16 +7197,18 @@ fn rebuild_session_windows_for_group(
         )?;
     }
     if let Some(row) = current {
-        insert_session_window_row(state, row)?;
+        insert_session_window_row(state, undo, row)?;
     }
     Ok(())
 }
 
 fn insert_session_window_row(
     state: &mut TumblingWindowState,
+    undo: &mut TumblingEpochUndoLog,
     row: TumblingWindowStateRow,
 ) -> Result<(), StandingProgramRuntimeError> {
     let state_key = window_state_key(&row.group_key, row.window_start_ns, row.window_end_ns);
+    undo.touch_row(state, &state_key);
     if state.rows.insert(state_key, row).is_some() {
         return Err(invalid_runtime_state());
     }
