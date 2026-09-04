@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -12,7 +13,7 @@ use futures::stream::BoxStream;
 use object_store::{
     memory::InMemory, path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    Result as ObjectStoreResult,
+    RenameOptions, Result as ObjectStoreResult,
 };
 use tempfile::TempDir;
 use velorix_storage::{
@@ -59,6 +60,167 @@ fn all_namespace_profiles(
             )
         })
         .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObjectStoreOperationCounts {
+    put_count: Arc<AtomicUsize>,
+    multipart_put_count: Arc<AtomicUsize>,
+    get_count: Arc<AtomicUsize>,
+    get_ranges_count: Arc<AtomicUsize>,
+    list_count: Arc<AtomicUsize>,
+    list_with_offset_count: Arc<AtomicUsize>,
+    list_with_delimiter_count: Arc<AtomicUsize>,
+    delete_count: Arc<AtomicUsize>,
+    copy_count: Arc<AtomicUsize>,
+    rename_count: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObjectStoreOperationCountSnapshot {
+    put_count: usize,
+    multipart_put_count: usize,
+    get_count: usize,
+    get_ranges_count: usize,
+    list_count: usize,
+    list_with_offset_count: usize,
+    list_with_delimiter_count: usize,
+    delete_count: usize,
+    copy_count: usize,
+    rename_count: usize,
+}
+
+impl ObjectStoreOperationCountSnapshot {
+    fn total_count(&self) -> usize {
+        self.put_count
+            + self.multipart_put_count
+            + self.get_count
+            + self.get_ranges_count
+            + self.list_count
+            + self.list_with_offset_count
+            + self.list_with_delimiter_count
+            + self.delete_count
+            + self.copy_count
+            + self.rename_count
+    }
+}
+
+impl ObjectStoreOperationCounts {
+    fn snapshot(&self) -> ObjectStoreOperationCountSnapshot {
+        ObjectStoreOperationCountSnapshot {
+            put_count: self.put_count.load(Ordering::SeqCst),
+            multipart_put_count: self.multipart_put_count.load(Ordering::SeqCst),
+            get_count: self.get_count.load(Ordering::SeqCst),
+            get_ranges_count: self.get_ranges_count.load(Ordering::SeqCst),
+            list_count: self.list_count.load(Ordering::SeqCst),
+            list_with_offset_count: self.list_with_offset_count.load(Ordering::SeqCst),
+            list_with_delimiter_count: self.list_with_delimiter_count.load(Ordering::SeqCst),
+            delete_count: self.delete_count.load(Ordering::SeqCst),
+            copy_count: self.copy_count.load(Ordering::SeqCst),
+            rename_count: self.rename_count.load(Ordering::SeqCst),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CountingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    counts: ObjectStoreOperationCounts,
+}
+
+impl fmt::Display for CountingObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CountingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.counts.put_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.counts
+            .multipart_put_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.counts.get_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> ObjectStoreResult<Vec<Bytes>> {
+        self.counts.get_ranges_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.counts.list_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.counts
+            .list_with_offset_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.counts.delete_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete_stream(locations)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.counts
+            .list_with_delimiter_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.counts.copy_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> ObjectStoreResult<()> {
+        self.counts.rename_count.fetch_add(1, Ordering::SeqCst);
+        self.inner.rename_opts(from, to, options).await
+    }
 }
 
 fn profile_missing(
@@ -428,6 +590,55 @@ async fn authoritative_capability_probe_covers_every_namespace() {
         let profile = capabilities.profiles.get(&namespace).unwrap();
         assert_eq!(profile.backend_name, "local-test");
     }
+}
+
+#[tokio::test]
+async fn capability_probes_run_at_startup_and_checked_ingest_construction_reuses_evidence() {
+    let counts = ObjectStoreOperationCounts::default();
+    let store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore {
+        inner: Arc::new(InMemory::new()),
+        counts: counts.clone(),
+    });
+
+    let capabilities = probe_authoritative_object_store_capabilities(
+        store.as_ref(),
+        "counting-startup-store",
+        "v1/counting-startup-probes",
+    )
+    .await
+    .unwrap();
+
+    let namespace_count = AuthoritativeNamespace::all().len();
+    assert_eq!(
+        counts.snapshot(),
+        ObjectStoreOperationCountSnapshot {
+            put_count: namespace_count * 4,
+            multipart_put_count: 0,
+            get_count: namespace_count * 3,
+            get_ranges_count: 0,
+            list_count: namespace_count,
+            list_with_offset_count: 0,
+            list_with_delimiter_count: 0,
+            delete_count: namespace_count,
+            copy_count: 0,
+            rename_count: 0,
+        },
+        "one startup probe performs four PUTs, three GETs, one LIST, and one DELETE per authoritative namespace without multipart, ranged GET, offset/delimiter LIST, copy, or rename I/O"
+    );
+
+    let startup_counts = counts.snapshot();
+    IngestAdmissionCoordinator::new_checked(Arc::clone(&store), &capabilities).unwrap();
+    IngestAdmissionCoordinator::new_checked(store, &capabilities).unwrap();
+    assert_eq!(
+        counts.snapshot(),
+        startup_counts,
+        "checked ingest coordinator construction must only consume startup capability evidence and must not re-probe the object store"
+    );
+    assert_eq!(
+        counts.snapshot().total_count(),
+        startup_counts.total_count(),
+        "checked ingest coordinator construction must leave the total count for every object-store I/O entrypoint unchanged"
+    );
 }
 
 #[tokio::test]
