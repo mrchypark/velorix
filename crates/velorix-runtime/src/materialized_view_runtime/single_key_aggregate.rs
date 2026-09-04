@@ -15,6 +15,8 @@ pub struct SingleKeySumCountRuntime {
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     applied_epochs: BTreeMap<String, LogicalEpoch>,
+    #[cfg(test)]
+    fail_next_output_encoding: bool,
 }
 
 impl SingleKeySumCountRuntime {
@@ -99,6 +101,8 @@ impl SingleKeySumCountRuntime {
             input_frontiers: Vec::new(),
             input_event_time_frontiers: Vec::new(),
             applied_epochs: BTreeMap::new(),
+            #[cfg(test)]
+            fail_next_output_encoding: false,
         })
     }
 
@@ -112,6 +116,24 @@ impl SingleKeySumCountRuntime {
             &self.published_output,
             Some(&supported_view_plan_aggregate_outputs(&self.plan)),
         )
+    }
+
+    fn encode_output_batch(
+        &mut self,
+        output: &DeltaBatch,
+        aggregate_outputs: &[SupportedAggregateOutput],
+    ) -> Result<RecordBatch, StandingProgramRuntimeError> {
+        #[cfg(test)]
+        if std::mem::replace(&mut self.fail_next_output_encoding, false) {
+            return Err(invalid_runtime_state());
+        }
+        materialized_delta_to_record_batch(&self.output_schema, output, Some(aggregate_outputs))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // exercised by colocated runtime fault-injection harnesses.
+    fn arm_fail_next_output_encoding(&mut self) {
+        self.fail_next_output_encoding = true;
     }
 
     fn materialized_page_batch(
@@ -270,20 +292,18 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 .published_output
                 .diff(&visible_output)
                 .map_err(|_| invalid_runtime_state())?;
-            self.engine
-                .push_changes(logical_epoch, &DeltaBatch::default())
+            let prepared_epoch = self
+                .engine
+                .prepare_epoch(logical_epoch, &DeltaBatch::default())
                 .map_err(|_| invalid_runtime_state())?;
-            // Validate output before commit
             let output_batches = vec![ViewOutputBatch {
                 view_id: self.identity.view_ids[0].clone(),
                 schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![materialized_delta_to_record_batch(
-                    &self.output_schema,
-                    &visible_output,
-                    Some(&aggregate_outputs),
-                )?],
+                batches: vec![self.encode_output_batch(&visible_output, &aggregate_outputs)?],
             }];
-            // Commit staged state
+            self.engine
+                .commit_prepared_epoch(prepared_epoch)
+                .map_err(|_| invalid_runtime_state())?;
             self.filtered_aggregate_state = next_state;
             self.published_output = visible_output;
             self.input_frontiers = input_frontiers.clone();
@@ -305,21 +325,32 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 output_batches,
             });
         }
-        let mut executor = LogicalPlanExecutor::SingleKeyAggregate {
-            catalog: &self.catalog,
-            input_schema: &self.input_schema,
-            plan: &self.plan,
-            engine: &mut self.engine,
-        };
-        let executor_commit = executor.apply_epoch(
-            logical_epoch,
-            &self.input_frontiers,
-            &self.input_event_time_frontiers,
-            input_changes,
-        )?;
+        if logical_epoch <= self.engine.logical_epoch() {
+            return Err(StandingProgramRuntimeError::NonMonotonicLogicalEpoch {
+                current: self.engine.logical_epoch(),
+                attempted: logical_epoch,
+            });
+        }
+        let mut combined = DeltaBatch::default();
+        let mut input_frontiers = self.input_frontiers.clone();
+        let mut input_event_time_frontiers = self.input_event_time_frontiers.clone();
+        for input in &input_changes {
+            validate_input_matches_schema(input, &self.input_schema, "generic_input_relation")?;
+            advance_input_frontier(&mut input_frontiers, input)?;
+            advance_input_event_time_frontier(&mut input_event_time_frontiers, input)?;
+        }
+        for input in input_changes {
+            let delta = single_key_input_delta_batch(&self.catalog, &self.plan, &input)?;
+            let delta = filter_delta_batch_for_plan(&delta, &self.plan, &self.catalog)?;
+            combined = combined.combine(&delta);
+        }
+        let prepared_epoch = self
+            .engine
+            .prepare_epoch(logical_epoch, &combined)
+            .map_err(|_| invalid_runtime_state())?;
         let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
         let output_delta = filter_output_delta_for_having(
-            &executor_commit.output_delta,
+            prepared_epoch.output_changes(),
             self.plan.having.as_ref(),
             self.plan.having_expr.as_ref(),
             &self.output_schema,
@@ -327,9 +358,12 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         )?;
         let output_delta = project_aggregate_delta_outputs(output_delta, &aggregate_outputs)?;
         if self.plan.top_k.is_some() {
-            let previous_output = self.published_output.clone();
-            let full_output = filter_output_delta_for_having(
+            let full_state = apply_published_output_delta(
                 &self.engine.materialized_state(),
+                prepared_epoch.output_changes(),
+            )?;
+            let full_output = filter_output_delta_for_having(
+                &full_state,
                 self.plan.having.as_ref(),
                 self.plan.having_expr.as_ref(),
                 &self.output_schema,
@@ -341,62 +375,58 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 self.plan.top_k.as_ref(),
                 &aggregate_outputs,
             )?;
-            // Validate output before commit
+            let output_delta = self
+                .published_output
+                .diff(&staged_output)
+                .map_err(|_| invalid_runtime_state())?;
             let output_batches = vec![ViewOutputBatch {
                 view_id: self.identity.view_ids[0].clone(),
                 schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![materialized_delta_to_record_batch(
-                    &self.output_schema,
-                    &staged_output,
-                    Some(&aggregate_outputs),
-                )?],
+                batches: vec![self.encode_output_batch(&staged_output, &aggregate_outputs)?],
             }];
-            // Commit staged state
+            self.engine
+                .commit_prepared_epoch(prepared_epoch)
+                .map_err(|_| invalid_runtime_state())?;
             self.published_output = staged_output;
-            self.input_frontiers = executor_commit.input_frontiers.clone();
-            self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
+            self.input_frontiers = input_frontiers.clone();
+            self.input_event_time_frontiers = input_event_time_frontiers.clone();
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
             retain_recent_applied_epochs(&mut self.applied_epochs);
             Ok(EpochCommit {
                 logical_epoch,
                 idempotency_key,
-                input_frontiers: executor_commit.input_frontiers,
-                input_event_time_frontiers: executor_commit.input_event_time_frontiers,
+                input_frontiers,
+                input_event_time_frontiers,
                 output_deltas: vec![ViewOutputDelta {
                     view_id: self.identity.view_ids[0].clone(),
                     schema_fingerprint: self.output_schema_fingerprint(),
-                    delta: previous_output
-                        .diff(&self.published_output)
-                        .map_err(|_| invalid_runtime_state())?,
+                    delta: output_delta,
                 }],
                 output_batches,
             })
         } else {
             let staged_output =
                 apply_published_output_delta(&self.published_output, &output_delta)?;
-            // Validate output before commit
             let output_batches = vec![ViewOutputBatch {
                 view_id: self.identity.view_ids[0].clone(),
                 schema_fingerprint: self.output_schema_fingerprint(),
-                batches: vec![materialized_delta_to_record_batch(
-                    &self.output_schema,
-                    &staged_output,
-                    Some(&aggregate_outputs),
-                )?],
+                batches: vec![self.encode_output_batch(&staged_output, &aggregate_outputs)?],
             }];
-            // Commit staged state
+            self.engine
+                .commit_prepared_epoch(prepared_epoch)
+                .map_err(|_| invalid_runtime_state())?;
             self.published_output = staged_output;
-            self.input_frontiers = executor_commit.input_frontiers.clone();
-            self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
+            self.input_frontiers = input_frontiers.clone();
+            self.input_event_time_frontiers = input_event_time_frontiers.clone();
             self.applied_epochs
                 .insert(idempotency_key_text, logical_epoch);
             retain_recent_applied_epochs(&mut self.applied_epochs);
             Ok(EpochCommit {
                 logical_epoch,
                 idempotency_key,
-                input_frontiers: executor_commit.input_frontiers,
-                input_event_time_frontiers: executor_commit.input_event_time_frontiers,
+                input_frontiers,
+                input_event_time_frontiers,
                 output_deltas: vec![ViewOutputDelta {
                     view_id: self.identity.view_ids[0].clone(),
                     schema_fingerprint: self.output_schema_fingerprint(),
@@ -548,6 +578,252 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
             applied_epochs,
+            #[cfg(test)]
+            fail_next_output_encoding: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use velorix_core::{
+        relation::{
+            ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
+            IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+            RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+            VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
+            CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+        },
+        standing_program::{BuiltinRuntimeIdentity, NativeCodePolicy},
+        view_contract::ColumnSchema,
+    };
+
+    use super::*;
+
+    #[test]
+    fn output_encoding_failure_rolls_back_normal_single_key_epoch() {
+        assert_output_encoding_failure_rolls_back(
+            "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id",
+            aggregate_output_schema("sum", "count"),
+            "normal-output-failure",
+        );
+    }
+
+    #[test]
+    fn output_encoding_failure_rolls_back_runtime_aggregate_state_epoch() {
+        assert_output_encoding_failure_rolls_back(
+            "select user_id, sum(amount + 1) as total_amount, count(*) as event_count from purchases group by user_id",
+            aggregate_output_schema("total_amount", "event_count"),
+            "runtime-state-output-failure",
+        );
+    }
+
+    fn assert_output_encoding_failure_rolls_back(
+        sql: &str,
+        output_schema: RelationSchema,
+        key_prefix: &str,
+    ) {
+        let catalog = purchases_catalog();
+        let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+        let plan = validate_supported_view_sql(sql, &catalog).unwrap();
+        let logical_plan =
+            lower_supported_view_sql_to_logical_plan(sql, &catalog, &output_schema).unwrap();
+        let mut runtime = SingleKeySumCountRuntime::new_with_logical_plan(
+            test_identity(sql),
+            catalog.clone(),
+            input_schema,
+            output_schema,
+            sql.to_string(),
+            plan,
+            logical_plan,
+        )
+        .unwrap();
+
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new(format!("{key_prefix}-1")).unwrap(),
+                vec![purchases_input(&catalog, 0, 1, "alice", 10)],
+            )
+            .unwrap();
+        let checkpoint_before = runtime.checkpoint().unwrap();
+        let output_before = runtime.published_output.clone();
+        let frontiers_before = runtime.input_frontiers.clone();
+        let event_time_frontiers_before = runtime.input_event_time_frontiers.clone();
+        let idempotency_before = runtime.applied_epochs.clone();
+
+        runtime.arm_fail_next_output_encoding();
+        let failed_key = EpochIdempotencyKey::new(format!("{key_prefix}-2")).unwrap();
+        let failed_input = purchases_input(&catalog, 1, 2, "bob", 5);
+        let error = runtime
+            .apply_changes(2, failed_key.clone(), vec![failed_input.clone()])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("generic_runtime_state"),
+            "forced output encoding failure must fail closed: {error}"
+        );
+        assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before);
+        assert_eq!(runtime.published_output, output_before);
+        assert_eq!(runtime.input_frontiers, frontiers_before);
+        assert_eq!(
+            runtime.input_event_time_frontiers,
+            event_time_frontiers_before
+        );
+        assert_eq!(runtime.applied_epochs, idempotency_before);
+
+        let retry = runtime
+            .apply_changes(2, failed_key.clone(), vec![failed_input])
+            .unwrap();
+        assert_eq!(retry.output_deltas.len(), 1);
+        let checkpoint_after_retry = runtime.checkpoint().unwrap();
+        let duplicate = runtime.apply_changes(2, failed_key, Vec::new()).unwrap();
+        assert!(duplicate.output_deltas.is_empty());
+        assert_eq!(runtime.checkpoint().unwrap(), checkpoint_after_retry);
+    }
+
+    fn purchases_catalog() -> VelorixRelationCatalogV1 {
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "purchases".to_string(),
+            relation_name: "purchases".to_string(),
+            relation_version: "test.v1".to_string(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "user_id".to_string(),
+                    name: "user_id".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::Metadata,
+                },
+                RelationColumnV1 {
+                    column_id: "amount".to_string(),
+                    name: "amount".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Metadata,
+                },
+                RelationColumnV1 {
+                    column_id: "delta".to_string(),
+                    name: "delta".to_string(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["user_id".to_string()],
+            weight_column_id: "delta".to_string(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: None,
+        };
+        let schema_fingerprint =
+            SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+        VelorixRelationCatalogV1 {
+            relation_source: VelorixRelationSourceV1::SourceRelation,
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: schema_fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: "purchases".to_string(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "purchases".to_string(),
+                schema_fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
+            },
+        }
+    }
+
+    fn aggregate_output_schema(sum_name: &str, count_name: &str) -> RelationSchema {
+        RelationSchema {
+            relation_id: "purchases_by_user".to_string(),
+            relation_name: "purchases_by_user".to_string(),
+            relation_version: "test.v1".to_string(),
+            schema_fingerprint: "test-output-schema-v1".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "user_id".to_string(),
+                    data_type: SqlDataType::Utf8,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: sum_name.to_string(),
+                    data_type: SqlDataType::Int64,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: count_name.to_string(),
+                    data_type: SqlDataType::Int64,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["user_id".to_string()],
+        }
+    }
+
+    fn purchases_input(
+        catalog: &VelorixRelationCatalogV1,
+        start_offset_inclusive: u64,
+        end_offset_exclusive: u64,
+        user_id: &str,
+        amount: i64,
+    ) -> RelationInputBatch {
+        RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            stream_id: "test-stream".to_string(),
+            partition_id: 0,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            start_offset_inclusive,
+            end_offset_exclusive,
+            event_time_watermark: None,
+            batches: vec![RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("user_id", DataType::Utf8, false),
+                    Field::new("amount", DataType::Int64, false),
+                    Field::new("delta", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec![user_id])) as _,
+                    Arc::new(Int64Array::from(vec![amount])) as _,
+                    Arc::new(Int64Array::from(vec![1])) as _,
+                ],
+            )
+            .unwrap()],
+        }
+    }
+
+    fn test_identity(sql: &str) -> StandingProgramIdentity {
+        StandingProgramIdentity {
+            tenant_id: "tenant-a".to_string(),
+            program_id: "program-purchases".to_string(),
+            view_ids: vec!["purchases_by_user".to_string()],
+            sql_hash: stable_bytes_hash(sql.as_bytes()),
+            input_catalog_hash: format!("sha256:{}", "1".repeat(64)),
+            output_schema_hash: format!("sha256:{}", "2".repeat(64)),
+            planner_identity: "velorix-logical-view-planner@1".to_string(),
+            builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+                name: CRATE_NAME.to_string(),
+                version: "0.1.0".to_string(),
+            }],
+            runtime_capabilities: vec!["materialized-view-runtime-v1".to_string()],
+            runtime_compatibility: "velorix-materialized-view-runtime-v1".to_string(),
+            checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
+            native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+        }
     }
 }

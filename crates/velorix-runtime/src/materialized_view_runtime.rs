@@ -1043,12 +1043,6 @@ struct LogicalPlanExecutorCommit {
 }
 
 enum LogicalPlanExecutor<'a> {
-    SingleKeyAggregate {
-        catalog: &'a VelorixRelationCatalogV1,
-        input_schema: &'a RelationSchema,
-        plan: &'a SupportedViewPlan,
-        engine: &'a mut KeyedAggregateKernel,
-    },
     LatestByKey {
         catalog: &'a VelorixRelationCatalogV1,
         input_schema: &'a RelationSchema,
@@ -1075,40 +1069,6 @@ impl LogicalPlanExecutor<'_> {
         input_changes: Vec<RelationInputBatch>,
     ) -> Result<LogicalPlanExecutorCommit, StandingProgramRuntimeError> {
         match self {
-            Self::SingleKeyAggregate {
-                catalog,
-                input_schema,
-                plan,
-                engine,
-            } => {
-                if logical_epoch <= engine.logical_epoch() {
-                    return Err(StandingProgramRuntimeError::NonMonotonicLogicalEpoch {
-                        current: engine.logical_epoch(),
-                        attempted: logical_epoch,
-                    });
-                }
-                let mut combined = DeltaBatch::default();
-                let mut input_frontiers = current_frontiers.to_vec();
-                let mut input_event_time_frontiers = current_event_time_frontiers.to_vec();
-                for input in &input_changes {
-                    validate_input_matches_schema(input, input_schema, "generic_input_relation")?;
-                    advance_input_frontier(&mut input_frontiers, input)?;
-                    advance_input_event_time_frontier(&mut input_event_time_frontiers, input)?;
-                }
-                for input in input_changes {
-                    let delta = single_key_input_delta_batch(catalog, plan, &input)?;
-                    let delta = filter_delta_batch_for_plan(&delta, plan, catalog)?;
-                    combined = combined.combine(&delta);
-                }
-                let output_delta = engine
-                    .push_changes(logical_epoch, &combined)
-                    .map_err(|_| invalid_runtime_state())?;
-                Ok(LogicalPlanExecutorCommit {
-                    input_frontiers,
-                    input_event_time_frontiers,
-                    output_delta,
-                })
-            }
             Self::LatestByKey {
                 catalog,
                 input_schema,

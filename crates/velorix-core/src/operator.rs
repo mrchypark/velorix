@@ -166,6 +166,21 @@ pub struct KeyedSumCountAggregate {
     track_extrema: bool,
 }
 
+/// A validated, not-yet-applied aggregate update.  This intentionally keeps
+/// only the keys touched by an input epoch; callers must commit it exactly
+/// once, after all publication work that can fail has completed.
+#[derive(Debug)]
+pub(crate) struct PreparedAggregateChanges {
+    changes: BTreeMap<String, Option<AggregateEntry>>,
+    output: DeltaBatch,
+}
+
+impl PreparedAggregateChanges {
+    pub(crate) fn output_changes(&self) -> &DeltaBatch {
+        &self.output
+    }
+}
+
 impl KeyedSumCountAggregate {
     pub fn new() -> Self {
         Self::default()
@@ -238,7 +253,10 @@ impl KeyedSumCountAggregate {
         Ok(aggregate)
     }
 
-    pub fn apply(&mut self, input: &DeltaBatch) -> Result<DeltaBatch, OperatorError> {
+    pub(crate) fn prepare(
+        &self,
+        input: &DeltaBatch,
+    ) -> Result<PreparedAggregateChanges, OperatorError> {
         let mut changes: BTreeMap<String, AggregateChange> = BTreeMap::new();
 
         for record in input.records() {
@@ -252,7 +270,7 @@ impl KeyedSumCountAggregate {
         }
 
         let mut output = Vec::new();
-        let mut next_state = self.state.clone();
+        let mut prepared = BTreeMap::new();
 
         for (key, change) in changes {
             let before = self.state.get(&key).cloned();
@@ -269,16 +287,40 @@ impl KeyedSumCountAggregate {
             match after {
                 Some(after) => {
                     output.push(after.to_record(1, self.value_mode, self.track_extrema)?);
-                    next_state.insert(key, after);
+                    prepared.insert(key, Some(after));
                 }
                 None => {
-                    next_state.remove(&key);
+                    prepared.insert(key, None);
                 }
             }
         }
 
-        self.state = next_state;
-        Ok(DeltaBatch::from_records(output))
+        Ok(PreparedAggregateChanges {
+            changes: prepared,
+            output: DeltaBatch::from_records(output),
+        })
+    }
+
+    /// Applies a change set produced by [`Self::prepare`].  Preparation has
+    /// already performed every fallible calculation, so this operation is
+    /// deliberately infallible.
+    pub(crate) fn commit(&mut self, prepared: PreparedAggregateChanges) -> DeltaBatch {
+        for (key, after) in prepared.changes {
+            match after {
+                Some(entry) => {
+                    self.state.insert(key, entry);
+                }
+                None => {
+                    self.state.remove(&key);
+                }
+            }
+        }
+        prepared.output
+    }
+
+    pub fn apply(&mut self, input: &DeltaBatch) -> Result<DeltaBatch, OperatorError> {
+        let prepared = self.prepare(input)?;
+        Ok(self.commit(prepared))
     }
 
     pub fn state(&self) -> DeltaBatch {
