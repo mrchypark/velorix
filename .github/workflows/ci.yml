@@ -39,6 +39,7 @@ jobs:
           bash -n scripts/check-first-e2e-readiness-contract.sh
           bash -n scripts/check-vind-product-contract.sh
           bash -n scripts/check-release-evidence-copy-contract.sh
+          bash -n scripts/validate-nightly-output.sh
           bash -n scripts/check-rustfs-s3-gate-contract.sh
           bash -n scripts/check-no-external-runtime-artifacts.sh
           sh -n scripts/check-rust-toolchain-contract.sh
@@ -49,6 +50,7 @@ jobs:
           scripts/check-first-e2e-readiness-contract.sh
           scripts/check-vind-product-contract.sh
           scripts/check-release-evidence-copy-contract.sh
+          scripts/check-nightly-workflow-contract.sh
           scripts/check-rustfs-s3-gate-contract.sh
           scripts/check-no-external-runtime-artifacts.sh
           sh scripts/check-rust-toolchain-contract.sh

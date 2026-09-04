@@ -17,30 +17,85 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path || vars.S3_BENCHMARK_RESULT_PATH || secrets.S3_BENCHMARK_RESULT_PATH }}
-  WORKFLOW_DISPATCH_LIVE_S3_COMPAT: ${{ inputs.run-live-s3-compat || false }}
-  NIGHTLY_LIVE_S3_COMPAT: ${{ vars.VELORIX_RUN_LIVE_S3_COMPAT || 'false' }}
-  AWS_ENDPOINT_URL: ${{ vars.AWS_ENDPOINT_URL || secrets.AWS_ENDPOINT_URL }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
-  VELORIX_S3_BUCKET: ${{ vars.VELORIX_S3_BUCKET || secrets.VELORIX_S3_BUCKET }}
-  VELORIX_S3_PREFIX: ${{ vars.VELORIX_S3_PREFIX }}
 
 jobs:
+  local-nightly:
+    name: Local correctness and performance nightly gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run local correctness tests
+        run: cargo test --workspace
+
+      - name: Run local benchmark
+        run: |
+          mkdir -p target/velorix-bench
+          cargo bench -p velorix-runtime --bench local_incremental \
+            > target/velorix-bench/local-nightly.json
+
+      - name: Validate local benchmark result
+        run: |
+          cargo run -p velorix-cli -- benchmark-validate \
+            --result target/velorix-bench/local-nightly.json
+
+      - name: Run local benchmark gate
+        run: |
+          cargo run -p velorix-cli -- benchmark-gate \
+            --gate-level pr-smoke \
+            --backend local \
+            --baseline baselines/benchmark/local/pr-smoke.json \
+            --result target/velorix-bench/local-nightly.json \
+            --max-regression-fraction 0.25 \
+            --json > target/velorix-bench/local-nightly-gate.json
+
+      - name: Upload local nightly benchmark result
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: local-nightly-benchmark
+          path: target/velorix-bench/*.json
+          if-no-files-found: warn
+
   s3-nightly:
     name: S3-compatible nightly gate
     runs-on: ubuntu-latest
+    env:
+      S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path || vars.S3_BENCHMARK_RESULT_PATH || secrets.S3_BENCHMARK_RESULT_PATH }}
+      WORKFLOW_DISPATCH_LIVE_S3_COMPAT: ${{ inputs.run-live-s3-compat || false }}
+      NIGHTLY_LIVE_S3_COMPAT: ${{ vars.VELORIX_RUN_LIVE_S3_COMPAT || 'false' }}
+      AWS_ENDPOINT_URL: ${{ vars.AWS_ENDPOINT_URL || secrets.AWS_ENDPOINT_URL }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
+      VELORIX_S3_BUCKET: ${{ vars.VELORIX_S3_BUCKET || secrets.VELORIX_S3_BUCKET }}
+      VELORIX_S3_PREFIX: ${{ vars.VELORIX_S3_PREFIX }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Check S3-compatible nightly configuration
         id: config
         run: |
           if [ -n "$S3_BENCHMARK_RESULT_PATH" ]; then
-            echo "benchmark_configured=true" >> "$GITHUB_OUTPUT"
-            echo "benchmark_result_path=$S3_BENCHMARK_RESULT_PATH" >> "$GITHUB_OUTPUT"
+            {
+              echo "benchmark_configured=true"
+              echo "s3_gate_skipped=false"
+            } >> "$GITHUB_OUTPUT"
+            scripts/validate-nightly-output.sh benchmark_result_path "$S3_BENCHMARK_RESULT_PATH"
             echo "S3 benchmark gate configured"
           else
-            echo "benchmark_configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "benchmark_configured=false"
+              echo "s3_gate_skipped=true"
+            } >> "$GITHUB_OUTPUT"
             echo "skipping S3 benchmark gate; S3_BENCHMARK_RESULT_PATH is not set"
           fi
 
@@ -61,12 +116,15 @@ jobs:
           esac
 
           if [ "$live_requested" != "true" ]; then
-            echo "live_s3_configured=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "live_s3_configured=false"
+              echo "live_s3_skipped=true"
+            } >> "$GITHUB_OUTPUT"
             if [ -z "$S3_BENCHMARK_RESULT_PATH" ]; then
-              echo "nightly gate requires S3_BENCHMARK_RESULT_PATH or explicit live S3-compatible test opt-in"
-              exit 1
+              echo "skipping optional S3-compatible gate; no benchmark result or explicit live opt-in is configured"
+            else
+              echo "skipping live S3-compatible tests; explicit opt-in is not set"
             fi
-            echo "skipping live S3-compatible tests; explicit opt-in is not set"
             exit 0
           fi
 
@@ -82,15 +140,22 @@ jobs:
             exit 1
           fi
 
-          echo "live_s3_configured=true" >> "$GITHUB_OUTPUT"
-          if [ -z "$S3_BENCHMARK_RESULT_PATH" ]; then
-            echo "benchmark_result_path=target/velorix-bench/s3-nightly.json" >> "$GITHUB_OUTPUT"
-          fi
+          {
+            echo "live_s3_configured=true"
+            echo "live_s3_skipped=false"
+            if [ -z "$S3_BENCHMARK_RESULT_PATH" ]; then
+              echo "benchmark_result_path=target/velorix-bench/s3-nightly.json"
+            fi
+          } >> "$GITHUB_OUTPUT"
           echo "live S3-compatible tests configured"
 
-      - name: Checkout
-        if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
-        uses: actions/checkout@v5
+      - name: Mark optional S3-compatible gate skipped
+        if: steps.config.outputs.s3_gate_skipped == 'true'
+        run: echo "S3-compatible nightly gate skipped; local nightly gate remains authoritative"
+
+      - name: Mark live S3-compatible tests skipped
+        if: steps.config.outputs.live_s3_skipped == 'true'
+        run: echo "live S3-compatible tests skipped; explicit opt-in is not set"
 
       - name: Install Rust 1.98.1
         if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
@@ -109,14 +174,16 @@ jobs:
 
       - name: Run nightly benchmark gate
         if: steps.config.outputs.benchmark_configured == 'true'
+        env:
+          BENCHMARK_RESULT_PATH: ${{ steps.config.outputs.benchmark_result_path }}
         run: |
-          test -f "${{ steps.config.outputs.benchmark_result_path }}"
+          test -f "$BENCHMARK_RESULT_PATH"
           mkdir -p target/velorix-bench
           cargo run -p velorix-cli -- benchmark-gate \
             --gate-level nightly-integration \
             --backend s3-compatible \
             --baseline baselines/benchmark/s3/nightly.json \
-            --result "${{ steps.config.outputs.benchmark_result_path }}" \
+            --result "$BENCHMARK_RESULT_PATH" \
             --json > target/velorix-bench/s3-nightly-gate.json
 
       - name: Upload nightly benchmark result

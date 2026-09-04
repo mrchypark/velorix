@@ -69,11 +69,10 @@ accidental writes to shared MinIO or S3 buckets.
 `.github/workflows/nightly.yml` keeps benchmark evidence and live backend
 evidence independent:
 
-- `S3_BENCHMARK_RESULT_PATH` may be omitted only when live S3-compatible tests
-  are explicitly requested. When set, the workflow validates that existing JSON
-  against `baselines/benchmark/s3/nightly.json`. When omitted during explicit
-  live opt-in, the workflow generates a new S3-compatible benchmark JSON result
-  under `target/velorix-bench/s3-nightly.json`, gates it, and uploads it.
+- `S3_BENCHMARK_RESULT_PATH` is optional. When set, the workflow validates that
+  existing JSON against `baselines/benchmark/s3/nightly.json`. When omitted,
+  the benchmark gate is skipped; live S3-compatible storage/runtime tests remain
+  an independent, explicitly opted-in check.
 - Live S3-compatible tests and benchmark generation run only after explicit
   opt-in. Manual runs use the `run-live-s3-compat` input. Scheduled runs
   require the repository variable `VELORIX_RUN_LIVE_S3_COMPAT` set to `1`,
@@ -86,7 +85,9 @@ evidence independent:
   `VELORIX_S3_COMPAT=1`, so scheduled runs cannot write to S3-compatible storage
   only because credentials happen to exist.
 - If neither benchmark JSON nor live S3-compatible tests are configured, the
-  nightly gate fails closed instead of passing without S3 evidence.
+  optional S3-compatible gate is explicitly skipped and succeeds; the local
+  correctness/performance nightly gate still runs. An explicit live request
+  with missing credentials fails closed before any S3 test starts.
 
 ## RustFS S3-Compatible Gate
 
