@@ -11,6 +11,12 @@ esac
 
 repo_root="$(git rev-parse --show-toplevel)"
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+run_scope_suffix="$(printf '%s' "$run_id" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+if [ "${#run_scope_suffix}" -gt 40 ] \
+  || [[ ! "$run_scope_suffix" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+  echo "generated run scope suffix failed DNS-1123 validation" >&2
+  exit 64
+fi
 cluster_driver="${VELORIX_VIND_CLUSTER_DRIVER:-docker-vcluster}"
 cluster="${VELORIX_VIND_CLUSTER:-velorix-product-${run_id}}"
 product_deployment_id="${VELORIX_PRODUCT_DEPLOYMENT_ID:-${cluster}/${run_id}}"
@@ -39,6 +45,8 @@ meta_image_digest="${VELORIX_META_IMAGE_DIGEST:-}"
 build_meta_image="${VELORIX_BUILD_META_IMAGE:-1}"
 meta_mode="${VELORIX_META_MODE:-development}"
 meta_backend="${VELORIX_META_BACKEND:-memory}"
+meta_development_allow_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK:-0}"
+meta_development_allow_remote_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK:-0}"
 hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"
 hiqlite_image="${VELORIX_HIQLITE_IMAGE:-velorix-hiqlite:product-${run_id}}"
 hiqlite_image_digest="${VELORIX_HIQLITE_IMAGE_DIGEST:-}"
@@ -171,6 +179,8 @@ hiqlite_backend_time_attest="${VELORIX_HIQLITE_BACKEND_TIME_ATTEST:-auto}"
 hiqlite_backend_time_attestation_file="${output_dir}/hiqlite-backend-time-attestation.json"
 hiqlite_backend_time_attestation_validated=0
 meta_bearer_token="${VELORIX_META_BEARER_TOKEN:-}"
+meta_bind="127.0.0.1:9090"
+meta_development_insecure_transport=0
 hiqlite_nodes="${VELORIX_HIQLITE_NODES:-}"
 hiqlite_api_secret="${VELORIX_HIQLITE_API_SECRET:-}"
 hiqlite_raft_secret="${VELORIX_HIQLITE_RAFT_SECRET:-}"
@@ -187,6 +197,16 @@ hiqlite_authority_attestation_validated=0
 created_cluster=0
 created_namespace=0
 previous_context=""
+context_is_remote=0
+remote_ephemeral_test_mode=0
+meta_network_policy_validated=0
+meta_network_policy_probe_passed=0
+meta_network_policy_api_readyz_passed=0
+meta_network_policy_probe_evidence_file=""
+meta_network_policy_name=""
+meta_network_policy_created=0
+meta_network_policy_ownership_evidence_file=""
+meta_network_policy_probe_created=0
 port_forward_pid=""
 api_tls_port_forward_pid=""
 
@@ -245,6 +265,8 @@ Main overrides:
   VELORIX_META_IMAGE=velorix-meta:product
   VELORIX_BUILD_META_IMAGE=1
   VELORIX_META_MODE=development
+  VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=0  # set 1 only for ephemeral local-development RustFS + durable authenticated Meta
+  VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK=0  # set 1 only for a restricted existing remote context ephemeral test
   VELORIX_META_BACKEND=memory
   VELORIX_HIQLITE_DEPLOY=0  # set 1 with VELORIX_META_BACKEND=hiqlite to deploy a no-PVC 3-voter authority
   VELORIX_HIQLITE_IMAGE=velorix-hiqlite:product
@@ -367,6 +389,9 @@ sensitive_keys = {
     "pod_uid",
     "container_name",
     "node_name",
+    "network_policy_name",
+    "network_policy_ownership",
+    "network_policy_ownership_evidence",
     "service_name",
     "resource_name",
     "resource_uid",
@@ -1695,7 +1720,26 @@ case "$meta_mode" in
     exit 64
     ;;
 esac
+case "$meta_development_allow_non_loopback" in
+  0 | 1) ;;
+  *)
+    echo "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
+case "$meta_development_allow_remote_non_loopback" in
+  0 | 1) ;;
+  *)
+    echo "VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
 if [ "$meta_mode" = "production" ] || [ "$meta_mode" = "prod" ]; then
+  if [ "$meta_development_allow_non_loopback" = "1" ] \
+    || [ "$meta_development_allow_remote_non_loopback" = "1" ]; then
+    echo "Meta development non-loopback opt-ins require VELORIX_META_MODE=development" >&2
+    exit 64
+  fi
   echo "VELORIX_META_MODE=production is unsupported by this local runner until validated transport configuration exists" >&2
   exit 64
 fi
@@ -1836,6 +1880,25 @@ if any(ch.isspace() for ch in token):
 if any(ord(ch) < 32 or ord(ch) == 127 for ch in token):
     raise SystemExit("VELORIX_META_BEARER_TOKEN must not contain control characters")
 PY
+fi
+
+if { [ "$meta_mode" = "development" ] || [ "$meta_mode" = "dev" ]; } \
+  && [ "$meta_development_allow_non_loopback" = "1" ]; then
+  if [ "$preserve_state" != "0" ] \
+    || [ "$reuse_existing" != "0" ] \
+    || [ -n "${VELORIX_S3_PREFIX+x}" ] \
+    || [ -n "${VELORIX_META_S3_PREFIX+x}" ] \
+    || [ "$object_store_local_development_authority" != "1" ] \
+    || [ "$object_store_mode" != "rustfs" ] \
+    || [ "$meta_backend" = "memory" ] \
+    || [ "$meta_backend" = "in-memory" ] \
+    || [ -z "$meta_bearer_token" ]; then
+    echo "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1 requires ephemeral state (preserve_state=0 with no shared S3 prefix), local-development RustFS authority, a durable Meta backend, and bearer authentication" >&2
+    exit 64
+  fi
+  meta_bind="0.0.0.0:9090"
+  meta_development_insecure_transport=1
+  echo "warning: Meta development non-loopback transport is enabled only for ephemeral local-development validation; it is not production TLS or durability evidence" >&2
 fi
 
 if [ "$api_auth_mode" = "bearer-token" ]; then
@@ -1989,6 +2052,29 @@ cleanup_vind() {
     echo "wrote diagnostics to ${output_dir}/diagnostics.txt" >&2
   fi
 
+  if [ "$meta_network_policy_created" = "1" ] \
+    && { [ "$status" != "0" ] || [ "$cleanup" = "1" ]; }; then
+    if ! kubectl --context "$context" -n "$namespace" delete networkpolicy "$meta_network_policy_name" \
+      --ignore-not-found >"${output_dir}/meta-network-policy-cleanup.log" 2>&1; then
+      chmod 600 "${output_dir}/meta-network-policy-cleanup.log"
+      status=1
+    else
+      chmod 600 "${output_dir}/meta-network-policy-cleanup.log"
+    fi
+    meta_network_policy_created=0
+  fi
+  if [ "$meta_network_policy_probe_created" = "1" ] \
+    && { [ "$status" != "0" ] || [ "$cleanup" = "1" ]; }; then
+    if ! kubectl --context "$context" -n "$namespace" delete job "velorix-meta-network-policy-probe-${run_scope_suffix}" \
+      --ignore-not-found >"${output_dir}/meta-network-policy-probe-cleanup.log" 2>&1; then
+      chmod 600 "${output_dir}/meta-network-policy-probe-cleanup.log"
+      status=1
+    else
+      chmod 600 "${output_dir}/meta-network-policy-probe-cleanup.log"
+    fi
+    meta_network_policy_probe_created=0
+  fi
+
   if [ "$cleanup" = "1" ] && [ "$created_cluster" = "1" ] && [ "$cluster_driver" = "docker-vcluster" ]; then
     vcluster delete "$cluster" --driver docker >/dev/null 2>&1 || true
   fi
@@ -2112,6 +2198,34 @@ validate_local_vcluster_context() {
   esac
 }
 
+validate_remote_ephemeral_gate() {
+  if [ "$meta_development_allow_non_loopback" != "1" ]; then
+    if [ "$meta_development_allow_remote_non_loopback" = "1" ]; then
+      echo "VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK=1 requires VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$meta_development_allow_remote_non_loopback" != "1" ]; then
+    echo "remote non-loopback Meta validation requires VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK=1" >&2
+    return 1
+  fi
+  if [ "$reuse_existing" != "1" ] \
+    || [ "$preserve_state" != "0" ] \
+    || [ "$object_store_mode" != "rustfs" ] \
+    || [ "$object_store_local_development_authority" != "1" ] \
+    || [ -n "${VELORIX_S3_PREFIX+x}" ] \
+    || [ -n "${VELORIX_META_S3_PREFIX+x}" ] \
+    || [ "$meta_backend" = "memory" ] \
+    || [ "$meta_backend" = "in-memory" ] \
+    || [ -z "$meta_bearer_token" ] \
+    || [ "$api_replica_count" != "1" ]; then
+    echo "remote Meta non-loopback validation requires reuse_existing=1, preserve_state=0, internal ephemeral RustFS, no shared prefixes, durable authenticated Meta, and api_replica_count=1" >&2
+    return 1
+  fi
+  remote_ephemeral_test_mode=1
+}
+
 validate_existing_kubernetes_context() {
   local server
   if ! kubectl config get-contexts "$context" >/dev/null 2>&1; then
@@ -2125,9 +2239,11 @@ validate_existing_kubernetes_context() {
       *)
         echo "refusing existing-context driver for non-local Kubernetes API server; set VELORIX_EXISTING_CONTEXT_ALLOW_REMOTE=1 to override" >&2
         return 1
-        ;;
+      ;;
     esac
   fi
+  context_is_remote=1
+  validate_remote_ephemeral_gate
 }
 
 vcluster_container() {
@@ -2920,6 +3036,176 @@ PY
     done
   fi
   no_pvc_namespace_validated=1
+}
+
+validate_remote_meta_network_policy() {
+  if [ "$remote_ephemeral_test_mode" != "1" ]; then
+    return 0
+  fi
+  local policy_file="${output_dir}/velorix-meta-network-policy.yaml"
+  local policy_preflight_error="${output_dir}/meta-network-policy-preflight.log"
+  local ownership_file="${output_dir}/meta-network-policy-ownership.json"
+  local probe_job="velorix-meta-network-policy-probe-${run_scope_suffix}"
+  local probe_preflight_error="${output_dir}/meta-network-policy-probe-preflight.log"
+  local probe_file="${output_dir}/meta-network-policy-probe.json"
+  local probe_log="${output_dir}/meta-network-policy-probe.log"
+  local probe_status="pending"
+  local deadline=$((SECONDS + 120))
+
+  meta_network_policy_name="velorix-meta-ingress-${run_scope_suffix}"
+  if [ "${#meta_network_policy_name}" -gt 63 ] \
+    || [[ ! "$meta_network_policy_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+    echo "remote ephemeral Meta NetworkPolicy name failed validation" >&2
+    return 1
+  fi
+
+  cat >"$policy_file" <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ${meta_network_policy_name}
+  namespace: ${namespace}
+spec:
+  podSelector:
+    matchLabels:
+      app: velorix-meta
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: velorix-api
+      ports:
+        - protocol: TCP
+          port: 9090
+EOF
+  validate_rendered_no_pvc_manifest "$policy_file"
+  if ! kubectl --context "$context" -n "$namespace" get networkpolicy "$meta_network_policy_name" \
+    --ignore-not-found -o name >"${output_dir}/meta-network-policy-preflight.out" 2>"$policy_preflight_error"; then
+    chmod 600 "${output_dir}/meta-network-policy-preflight.out" "$policy_preflight_error"
+    echo "remote ephemeral Meta NetworkPolicy preflight failed" >&2
+    return 1
+  fi
+  if [ -s "${output_dir}/meta-network-policy-preflight.out" ]; then
+    chmod 600 "${output_dir}/meta-network-policy-preflight.out" "$policy_preflight_error"
+    echo "remote ephemeral Meta NetworkPolicy name already exists" >&2
+    return 1
+  fi
+  chmod 600 "${output_dir}/meta-network-policy-preflight.out" "$policy_preflight_error"
+  if ! kubectl --context "$context" create -f "$policy_file" >/dev/null 2>"$policy_preflight_error"; then
+    chmod 600 "$policy_preflight_error"
+    echo "remote ephemeral Meta NetworkPolicy could not be applied" >&2
+    return 1
+  fi
+  meta_network_policy_created=1
+  meta_network_policy_validated=1
+  cat >"$ownership_file" <<EOF
+{
+  "created_by": "velorix-product-runner",
+  "created_by_this_run": true,
+  "network_policy_name": "${meta_network_policy_name}",
+  "namespace": "${namespace}",
+  "run_id": "${run_id}"
+}
+EOF
+  chmod 600 "$ownership_file"
+  meta_network_policy_ownership_evidence_file="$ownership_file"
+
+  cat >"${output_dir}/meta-network-policy-probe.yaml" <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${probe_job}
+  namespace: ${namespace}
+  labels:
+    app: velorix-meta-network-policy-probe
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 120
+  template:
+    metadata:
+      labels:
+        app: velorix-meta-network-policy-probe
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: probe
+          image: busybox:1.36.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - >-
+              if nc -z -w 5 velorix-meta 9090; then
+                echo meta ingress unexpectedly reachable;
+                exit 42;
+              fi
+              exit 0
+EOF
+  validate_rendered_no_pvc_manifest "${output_dir}/meta-network-policy-probe.yaml"
+  if ! kubectl --context "$context" -n "$namespace" get job "$probe_job" \
+    --ignore-not-found -o name >"${output_dir}/meta-network-policy-probe-preflight.out" \
+    2>"$probe_preflight_error"; then
+    chmod 600 "${output_dir}/meta-network-policy-probe-preflight.out" "$probe_preflight_error"
+    echo "remote ephemeral Meta NetworkPolicy probe preflight failed" >&2
+    return 1
+  fi
+  if [ -s "${output_dir}/meta-network-policy-probe-preflight.out" ]; then
+    chmod 600 "${output_dir}/meta-network-policy-probe-preflight.out" "$probe_preflight_error"
+    echo "remote ephemeral Meta NetworkPolicy probe name already exists" >&2
+    return 1
+  fi
+  chmod 600 "${output_dir}/meta-network-policy-probe-preflight.out" "$probe_preflight_error"
+  if ! kubectl --context "$context" create -f "${output_dir}/meta-network-policy-probe.yaml" >/dev/null \
+    2>"$probe_preflight_error"; then
+    chmod 600 "$probe_preflight_error"
+    echo "remote ephemeral Meta NetworkPolicy probe could not be created" >&2
+    return 1
+  fi
+  meta_network_policy_probe_created=1
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! kubectl --context "$context" -n "$namespace" get job "$probe_job" -o json >"$probe_file" 2>/dev/null; then
+      sleep 2
+      continue
+    fi
+    probe_status="$(jq -r 'if (.status.succeeded // 0) == 1 then "passed" elif (.status.failed // 0) > 0 then "failed" else "pending" end' "$probe_file")"
+    case "$probe_status" in
+      passed) break ;;
+      failed)
+        kubectl --context "$context" -n "$namespace" logs "job/${probe_job}" >"$probe_log" 2>/dev/null || true
+        chmod 600 "$probe_file" "$probe_log"
+        echo "unlabeled Meta network-policy probe was not blocked" >&2
+        return 1
+        ;;
+    esac
+    sleep 2
+  done
+  if [ "$probe_status" != "passed" ]; then
+    kubectl --context "$context" -n "$namespace" logs "job/${probe_job}" >"$probe_log" 2>/dev/null || true
+    chmod 600 "$probe_file" "$probe_log"
+    echo "unlabeled Meta network-policy probe did not complete successfully" >&2
+    return 1
+  fi
+  kubectl --context "$context" -n "$namespace" logs "job/${probe_job}" >"$probe_log" 2>/dev/null || true
+  chmod 600 "$probe_file" "$probe_log"
+  meta_network_policy_probe_evidence_file="$probe_file"
+  meta_network_policy_probe_passed=1
+
+  local readyz_after_policy="${output_dir}/readyz-after-meta-network-policy.json"
+  if ! curl -fsS "http://127.0.0.1:${api_local_port}/readyz" >"$readyz_after_policy" 2>/dev/null; then
+    echo "API readyz failed after Meta NetworkPolicy application" >&2
+    return 1
+  fi
+  if ! jq -e '.status == "ready" and .metadata_store.configured == true' "$readyz_after_policy" >/dev/null; then
+    echo "API readyz did not confirm normal Meta connectivity after NetworkPolicy" >&2
+    return 1
+  fi
+  chmod 600 "$readyz_after_policy"
+  meta_network_policy_api_readyz_passed=1
+  kubectl --context "$context" -n "$namespace" delete job "$probe_job" --ignore-not-found \
+    >"${output_dir}/meta-network-policy-probe-cleanup.log" 2>&1
+  chmod 600 "${output_dir}/meta-network-policy-probe-cleanup.log"
+  meta_network_policy_probe_created=0
 }
 
 wait_for_api() {
@@ -5680,6 +5966,16 @@ write_product_evidence() {
     "$api_image_digest" \
     "$meta_enabled" \
     "$meta_backend" \
+    "$meta_development_allow_non_loopback" \
+    "$meta_development_insecure_transport" \
+    "$meta_development_allow_remote_non_loopback" \
+    "$context_is_remote" \
+    "$remote_ephemeral_test_mode" \
+    "$meta_network_policy_validated" \
+    "$meta_network_policy_probe_passed" \
+    "$meta_network_policy_api_readyz_passed" \
+    "$meta_network_policy_probe_evidence_file" \
+    "$meta_network_policy_ownership_evidence_file" \
     "$meta_image" \
     "$meta_image_digest" \
     "$api_replica_count" \
@@ -5776,6 +6072,16 @@ from datetime import datetime, timezone
     api_image_digest,
     meta_enabled,
     meta_backend,
+    meta_development_allow_non_loopback,
+    meta_development_insecure_transport,
+    meta_development_allow_remote_non_loopback,
+    context_is_remote,
+    remote_ephemeral_test_mode,
+    meta_network_policy_validated,
+    meta_network_policy_probe_passed,
+    meta_network_policy_api_readyz_passed,
+    meta_network_policy_probe_evidence_file,
+    meta_network_policy_ownership_evidence_file,
     meta_image,
     meta_image_digest,
     api_replica_count,
@@ -6330,6 +6636,30 @@ evidence = {
     "metadata_store": {
         "enabled": meta_enabled == "1",
         "backend": meta_backend,
+        "development_non_loopback_transport": {
+            "opt_in": meta_development_allow_non_loopback == "1",
+            "insecure": meta_development_insecure_transport == "1",
+            "scope": "ephemeral-local-development-only"
+            if meta_development_insecure_transport == "1"
+            else "disabled",
+        },
+        "remote_ephemeral_test": {
+            "mode": "remote-ephemeral-test-only-plaintext-networkpolicy-restricted"
+            if remote_ephemeral_test_mode == "1"
+            else "disabled",
+            "production_durable": False,
+            "tls": False,
+            "remote_opt_in": meta_development_allow_remote_non_loopback == "1",
+            "network_policy_validated": meta_network_policy_validated == "1",
+            "unlabeled_probe_blocked": meta_network_policy_probe_passed == "1",
+            "api_readyz_after_policy": meta_network_policy_api_readyz_passed == "1",
+            "probe_evidence": meta_network_policy_probe_evidence_file
+            if meta_network_policy_probe_passed == "1"
+            else None,
+            "network_policy_ownership_evidence": meta_network_policy_ownership_evidence_file
+            if meta_network_policy_validated == "1"
+            else None,
+        },
         "meta_s3_prefix": meta_s3_prefix if meta_enabled == "1" else None,
         "hiqlite_authority_attestation": hiqlite_authority_attestation,
         "hiqlite_backend_time_assessment": hiqlite_backend_time_assessment,
@@ -7288,8 +7618,10 @@ $(image_pull_secrets_yaml)
           env:
             - name: VELORIX_META_MODE
               value: "${meta_mode}"
+            - name: VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK
+              value: "${meta_development_allow_non_loopback}"
             - name: VELORIX_META_BIND
-              value: "0.0.0.0:9090"
+              value: "${meta_bind}"
             - name: VELORIX_META_BACKEND
               value: "${meta_backend}"
             - name: VELORIX_META_BEARER_TOKEN
@@ -7745,6 +8077,8 @@ if fencing == "unsafe-dev-only" and readyz.get("standing_runtime_fencing_require
 print(f"{api_auth.get('mode', '')}\t{namespace_count}\t1\t{relation_ingest_mode}\t{str(relation_ingest_authoritative).lower()}")
 PY
 )
+
+validate_remote_meta_network_policy
 
 if [ "$api_auth_mode" = "bearer-token" ]; then
   check_api_auth_rejection "${output_dir}/auth-missing-response.json" "missing bearer token" \

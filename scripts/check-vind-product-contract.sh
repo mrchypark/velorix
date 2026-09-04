@@ -4269,6 +4269,11 @@ checks["metadata server production startup fails closed"] = (
     and "production VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes" in meta
     and "serve_config_requires_explicit_mode_and_backend" in meta
     and "development_memory_config_defaults_to_loopback_only" in meta
+    and "development_hiqlite_config_allows_authenticated_cluster_bind" in meta
+    and "development_durable_cluster_bind_requires_bearer_authentication" in meta
+    and "development_non_loopback_opt_in_requires_exact_boolean_value" in meta
+    and "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK must be exactly 0 or 1" in meta
+    and "MetaBackendKind::Memory || bearer_token.is_none()" in meta
     and "production_config_rejects_missing_durable_backend_and_memory_backend" in meta
     and "production_config_requires_auth_and_transport_security_attestation" in meta
     and "production_hiqlite_requires_exactly_three_unique_voter_nodes" in meta
@@ -4277,6 +4282,77 @@ checks["metadata server production startup fails closed"] = (
     in architecture_critique
     and "requires exactly three unique Hiqlite voter nodes" in architecture_critique
     and "development mode defaults to loopback-only binding" in architecture_critique
+)
+
+checks["development Meta non-loopback is explicit ephemeral opt-in"] = (
+    'meta_development_allow_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK:-0}"'
+    in script
+    and 'meta_bind="127.0.0.1:9090"' in script
+    and 'meta_development_insecure_transport=0' in script
+    and 'VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK must be 0 or 1' in script
+    and 'VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1 requires ephemeral state (preserve_state=0 with no shared S3 prefix)'
+    in script
+    and 'meta_bind="0.0.0.0:9090"' in script
+    and 'development non-loopback transport is enabled only for ephemeral local-development validation'
+    in script
+    and '- name: VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK' in script
+    and 'value: "${meta_bind}"' in script
+    and '"development_non_loopback_transport"' in script
+)
+
+checks["remote ephemeral Meta validation is gated and NetworkPolicy-probed"] = (
+    'meta_development_allow_remote_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK:-0}"'
+    in script
+    and 'VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK must be 0 or 1' in script
+    and "validate_remote_ephemeral_gate()" in script
+    and '"$reuse_existing" != "1"' in script
+    and '"$preserve_state" != "0"' in script
+    and '"$object_store_mode" != "rustfs"' in script
+    and '"$object_store_local_development_authority" != "1"' in script
+    and '"${VELORIX_S3_PREFIX+x}"' in script
+    and '"${VELORIX_META_S3_PREFIX+x}"' in script
+    and '"$api_replica_count" != "1"' in script
+    and "velorix-meta-network-policy.yaml" in script
+    and "networking.k8s.io/v1" in script
+    and "matchLabels:\n              app: velorix-api" in script
+    and "unlabeled Meta network-policy probe was not blocked" in script
+    and "readyz-after-meta-network-policy.json" in script
+    and "remote-ephemeral-test-only-plaintext-networkpolicy-restricted" in script
+    and '"production_durable": False' in script
+    and '"tls": False' in script
+    and "run_scope_suffix=\"$(printf '%s' \"$run_id\" | LC_ALL=C tr '[:upper:]' '[:lower:]')\"" in script
+    and 'meta_network_policy_name="velorix-meta-ingress-${run_scope_suffix}"' in script
+    and 'local probe_job="velorix-meta-network-policy-probe-${run_scope_suffix}"' in script
+    and "kubectl --context \"$context\" create -f \"$policy_file\"" in script
+    and "kubectl --context \"$context\" create -f \"${output_dir}/meta-network-policy-probe.yaml\"" in script
+    and "meta-network-policy-probe-preflight.out" in script
+    and "meta-network-policy-ownership.json" in script
+    and '"created_by_this_run": true' in script
+    and 'meta_network_policy_created=1' in script
+    and 'meta_network_policy_created" = "1"' in script
+    and 'meta_network_policy_probe_created=1' in script
+    and 'meta_network_policy_probe_created" = "1"' in script
+    and 'delete networkpolicy "$meta_network_policy_name"' in script
+    and 'delete job "velorix-meta-network-policy-probe-${run_scope_suffix}"' in script
+)
+
+checks["local non-loopback development opt-in is ephemeral and non-reusable"] = (
+    '"$reuse_existing" != "0"' in script
+    and '"${VELORIX_META_S3_PREFIX+x}"' in script
+    and "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1 requires ephemeral state" in script
+)
+
+checks["public evidence redacts NetworkPolicy ownership identifiers"] = (
+    '"network_policy_name"' in script
+    and '"network_policy_ownership"' in script
+    and '"network_policy_ownership_evidence"' in script
+)
+
+checks["NetworkPolicy and probe names reject uppercase and concurrent residuals"] = (
+    "generated run scope suffix failed DNS-1123 validation" in script
+    and 'if [ -s "${output_dir}/meta-network-policy-preflight.out" ]' in script
+    and 'if [ -s "${output_dir}/meta-network-policy-probe-preflight.out" ]' in script
+    and "run_scope_suffix" in script
 )
 
 checks["public 1.0 exposes only materialized ingest acknowledgement"] = (

@@ -108,6 +108,14 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
             "unsupported VELORIX_META_MODE `{other}`; expected `production` or `development`"
         ),
     };
+    let allow_development_non_loopback =
+        match optional_config(vars, "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => {
+                anyhow::bail!("VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK must be exactly 0 or 1")
+            }
+        };
     let backend = parse_meta_backend(&required_nonempty_config(vars, "VELORIX_META_BACKEND")?)?;
     let bind = parse_meta_bind(vars, &mode)?;
     let bearer_token = optional_raw_config(vars, "VELORIX_META_BEARER_TOKEN");
@@ -141,8 +149,22 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
             &hiqlite_nodes,
         )?,
         MetaServeMode::Development => {
+            if !bind.ip().is_loopback() && !allow_development_non_loopback {
+                anyhow::bail!(
+                    "development VELORIX_META_BIND must use a loopback address unless VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1"
+                );
+            }
+            if !bind.ip().is_loopback()
+                && (backend == MetaBackendKind::Memory || bearer_token.is_none())
+            {
+                anyhow::bail!(
+                    "development VELORIX_META_BIND must use a loopback address unless a durable backend has bearer authentication"
+                );
+            }
             if !bind.ip().is_loopback() {
-                anyhow::bail!("development VELORIX_META_BIND must use a loopback address");
+                eprintln!(
+                    "warning: development non-loopback Meta transport is enabled for ephemeral local validation only; this is not production TLS or durability evidence"
+                );
             }
         }
     }
@@ -978,6 +1000,58 @@ mod tests {
         ])
         .unwrap_err();
         assert!(public_bind_error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn development_hiqlite_config_allows_authenticated_cluster_bind() {
+        let config = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "hiqlite"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK", "1"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_HIQLITE_API_SECRET", "api-secret"),
+            (
+                "VELORIX_HIQLITE_NODES",
+                "node-a:8200,node-b:8200,node-c:8200",
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(config.mode, MetaServeMode::Development);
+        assert_eq!(config.backend, MetaBackendKind::Hiqlite);
+        assert_eq!(config.bind, "0.0.0.0:9090".parse::<SocketAddr>().unwrap());
+        assert_eq!(config.hiqlite_nodes.len(), 3);
+    }
+
+    #[test]
+    fn development_durable_cluster_bind_requires_bearer_authentication() {
+        let error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "hiqlite"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK", "1"),
+            ("VELORIX_HIQLITE_API_SECRET", "api-secret"),
+            (
+                "VELORIX_HIQLITE_NODES",
+                "node-a:8200,node-b:8200,node-c:8200",
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn development_non_loopback_opt_in_requires_exact_boolean_value() {
+        let error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "hiqlite"),
+            ("VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK", "true"),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be exactly 0 or 1"));
     }
 
     #[test]
