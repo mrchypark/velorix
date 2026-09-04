@@ -249,6 +249,68 @@ pub struct PartitionAuthorityToken {
     pub expires_at_unix_ms: u64,
 }
 
+/// Identifies the authority domain for relation ingest. This is intentionally
+/// a distinct type from `PartitionAuthorityKey`: view/worker leases must not
+/// be usable to reserve or publish a relation batch.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationPartitionAuthorityKey {
+    pub namespace: String,
+    pub relation_id: String,
+    pub stream_id: String,
+    pub partition_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationPartitionAuthorityToken {
+    pub key: RelationPartitionAuthorityKey,
+    pub owner_id: String,
+    pub owner_epoch: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcquireRelationPartitionAuthorityRequest {
+    pub key: RelationPartitionAuthorityKey,
+    pub owner_id: String,
+    pub current_token: Option<RelationPartitionAuthorityToken>,
+    pub ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AcquireRelationPartitionAuthorityOutcome {
+    Acquired(RelationPartitionAuthorityToken),
+    Renewed(RelationPartitionAuthorityToken),
+    Conflict(RelationPartitionAuthorityToken),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveRelationAuthoritativeIngestRangeRequest {
+    pub reservation: IngestRangeReservation,
+    pub authority: RelationPartitionAuthorityToken,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishRelationIngestReservationRequest {
+    pub reservation: IngestRangeReservation,
+    pub authority: RelationPartitionAuthorityToken,
+    pub request_id: String,
+    pub request_digest: String,
+    pub object_key: String,
+    pub object_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationAuthoritativeIngestPublication {
+    pub reservation: IngestRangeReservation,
+    pub authority_key: RelationPartitionAuthorityKey,
+    pub request_id: String,
+    pub request_digest: String,
+    pub object_key: String,
+    pub object_digest: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcquirePartitionAuthorityRequest {
     pub key: PartitionAuthorityKey,
@@ -612,6 +674,66 @@ pub trait MetaStore: Send + Sync + 'static {
         Err(MetaStoreError::UnsupportedCapability("partition_authority"))
     }
 
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_partition_authority",
+        ))
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_partition_authority",
+        ))
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: ReserveRelationAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_authoritative_ingest_publication",
+        ))
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: PublishRelationIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_authoritative_ingest_publication",
+        ))
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_authoritative_ingest_publication",
+        ))
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Vec<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_authoritative_ingest_publication",
+        ))
+    }
+
     async fn publish_partition_checkpoint_pointer(
         &self,
         request: PublishPartitionCheckpointPointerRequest,
@@ -821,6 +943,54 @@ where
         (**self).read_partition_authority(key).await
     }
 
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        (**self).acquire_relation_partition_authority(request).await
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
+        (**self).read_relation_partition_authority(key).await
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: ReserveRelationAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        (**self)
+            .reserve_relation_authoritative_ingest_range(request)
+            .await
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: PublishRelationIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        (**self).publish_relation_ingest_reservation(request).await
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        (**self)
+            .read_relation_authoritative_ingest_publication(request_id)
+            .await
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Vec<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        (**self)
+            .list_relation_authoritative_ingest_publications(key)
+            .await
+    }
+
     async fn publish_partition_checkpoint_pointer(
         &self,
         request: PublishPartitionCheckpointPointerRequest,
@@ -845,6 +1015,7 @@ pub struct InMemoryMetaStore {
 struct InMemoryMetaState {
     relation_catalogs: HashMap<(String, String), VelorixRelationCatalogV1>,
     ingest_reservations: HashMap<(String, u32), Vec<IngestRangeReservation>>,
+    legacy_batch_keys: HashMap<String, IngestRangeReservation>,
     authoritative_ingest_reservation_keys: HashMap<IngestRangeReservation, PartitionAuthorityKey>,
     committed_ingest_batch_keys: BTreeSet<String>,
     authoritative_ingest_publications: HashMap<String, InMemoryIngestPublication>,
@@ -857,6 +1028,15 @@ struct InMemoryMetaState {
     partition_authority_now_unix_ms: u64,
     partition_authorities: HashMap<PartitionAuthorityKey, PartitionAuthorityToken>,
     partition_checkpoint_pointers: HashMap<PartitionAuthorityKey, PartitionCheckpointPointer>,
+    relation_partition_authorities:
+        HashMap<RelationPartitionAuthorityKey, RelationPartitionAuthorityToken>,
+    relation_ingest_reservations: HashMap<(String, u32), Vec<IngestRangeReservation>>,
+    relation_authority_reservation_keys:
+        HashMap<IngestRangeReservation, RelationPartitionAuthorityKey>,
+    relation_batch_keys: HashMap<String, IngestRangeReservation>,
+    relation_authoritative_ingest_publications:
+        HashMap<String, RelationAuthoritativeIngestPublication>,
+    relation_reservation_publications: HashMap<IngestRangeReservation, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -962,18 +1142,31 @@ impl MetaStore for InMemoryMetaStore {
         if below_sealed_base {
             return Ok(ReserveIngestRangeOutcome::Conflict);
         }
-        let reservations = guard.ingest_reservations.entry(key).or_default();
-
-        if reservations.iter().any(|existing| existing == &reservation) {
+        let exact = guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| {
+                reservations.iter().any(|existing| existing == &reservation)
+            });
+        if exact {
             return Ok(ReserveIngestRangeOutcome::Duplicate);
         }
-        if reservations
-            .iter()
-            .any(|existing| existing.overlaps(&reservation))
+        if guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| {
+                reservations
+                    .iter()
+                    .any(|existing| existing.overlaps(&reservation))
+            })
         {
             return Ok(ReserveIngestRangeOutcome::Conflict);
         }
 
+        guard
+            .legacy_batch_keys
+            .insert(reservation.batch_key.clone(), reservation.clone());
+        let reservations = guard.ingest_reservations.entry(key).or_default();
         reservations.push(reservation);
         reservations.sort_by_key(|entry| entry.start_offset_inclusive);
         guard.ingest_catalog_epoch = guard
@@ -1026,43 +1219,47 @@ impl MetaStore for InMemoryMetaStore {
             request.reservation.stream_id.clone(),
             request.reservation.partition_id,
         );
+        let exact = guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| {
+                reservations
+                    .iter()
+                    .any(|entry| entry == &request.reservation)
+            });
+        if exact {
+            return match guard
+                .authoritative_ingest_reservation_keys
+                .get(&request.reservation)
+            {
+                Some(existing) if existing == &request.authority.key => {
+                    Ok(ReserveIngestRangeOutcome::Duplicate)
+                }
+                _ => Ok(ReserveIngestRangeOutcome::Conflict),
+            };
+        }
+        let overlapping = guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| {
+                reservations
+                    .iter()
+                    .any(|entry| entry.overlaps(&request.reservation))
+            });
+        if overlapping {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
+        guard.legacy_batch_keys.insert(
+            request.reservation.batch_key.clone(),
+            request.reservation.clone(),
+        );
         let reservations = guard.ingest_reservations.entry(key).or_default();
-        let outcome = if reservations
-            .iter()
-            .any(|entry| entry == &request.reservation)
-        {
-            ReserveIngestRangeOutcome::Duplicate
-        } else if reservations
-            .iter()
-            .any(|entry| entry.overlaps(&request.reservation))
-        {
-            ReserveIngestRangeOutcome::Conflict
-        } else {
-            reservations.push(request.reservation.clone());
-            reservations.sort_by_key(|entry| entry.start_offset_inclusive);
-            ReserveIngestRangeOutcome::Reserved
-        };
-        if !matches!(
-            outcome,
-            ReserveIngestRangeOutcome::Reserved | ReserveIngestRangeOutcome::Duplicate
-        ) {
-            return Ok(outcome);
-        }
-        match guard
+        reservations.push(request.reservation.clone());
+        reservations.sort_by_key(|entry| entry.start_offset_inclusive);
+        guard
             .authoritative_ingest_reservation_keys
-            .get(&request.reservation)
-        {
-            Some(existing) if existing != &request.authority.key => {
-                Ok(ReserveIngestRangeOutcome::Conflict)
-            }
-            Some(_) => Ok(outcome),
-            None => {
-                guard
-                    .authoritative_ingest_reservation_keys
-                    .insert(request.reservation, request.authority.key);
-                Ok(outcome)
-            }
-        }
+            .insert(request.reservation, request.authority.key);
+        Ok(ReserveIngestRangeOutcome::Reserved)
     }
 
     async fn publish_ingest_reservation(
@@ -1635,6 +1832,265 @@ impl MetaStore for InMemoryMetaStore {
             .cloned())
     }
 
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let mut guard = self.inner.write().await;
+        let now = guard.partition_authority_now_unix_ms;
+        let expires_at_unix_ms = now
+            .checked_add(request.ttl_ms)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        match guard
+            .relation_partition_authorities
+            .get(&request.key)
+            .cloned()
+        {
+            Some(current) if current.expires_at_unix_ms > now => {
+                if current.owner_id == request.owner_id
+                    && request.current_token.as_ref() == Some(&current)
+                {
+                    let renewed = RelationPartitionAuthorityToken {
+                        expires_at_unix_ms,
+                        ..current
+                    };
+                    guard
+                        .relation_partition_authorities
+                        .insert(request.key, renewed.clone());
+                    Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(renewed))
+                } else {
+                    Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(current))
+                }
+            }
+            Some(current) => {
+                let owner_epoch = current
+                    .owner_epoch
+                    .checked_add(1)
+                    .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
+                let token = RelationPartitionAuthorityToken {
+                    key: request.key.clone(),
+                    owner_id: request.owner_id,
+                    owner_epoch,
+                    expires_at_unix_ms,
+                };
+                guard
+                    .relation_partition_authorities
+                    .insert(request.key, token.clone());
+                Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
+            }
+            None => {
+                let token = RelationPartitionAuthorityToken {
+                    key: request.key.clone(),
+                    owner_id: request.owner_id,
+                    owner_epoch: 1,
+                    expires_at_unix_ms,
+                };
+                guard
+                    .relation_partition_authorities
+                    .insert(request.key, token.clone());
+                Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
+            }
+        }
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        let guard = self.inner.read().await;
+        Ok(guard
+            .relation_partition_authorities
+            .get(key)
+            .filter(|token| token.expires_at_unix_ms > guard.partition_authority_now_unix_ms)
+            .cloned())
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: ReserveRelationAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        let mut guard = self.inner.write().await;
+        if validate_current_relation_partition_authority(
+            guard
+                .relation_partition_authorities
+                .get(&request.authority.key),
+            &request.authority,
+            guard.partition_authority_now_unix_ms,
+        )
+        .is_err()
+        {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
+        let key = (
+            request.reservation.stream_id.clone(),
+            request.reservation.partition_id,
+        );
+        let legacy_conflict = guard
+            .ingest_reservations
+            .get(&key)
+            .is_some_and(|reservations| {
+                reservations
+                    .iter()
+                    .any(|existing| existing.overlaps(&request.reservation))
+            });
+        let relation_key = (
+            request.reservation.stream_id.clone(),
+            request.reservation.partition_id,
+        );
+        if let Some(existing_authority) = guard
+            .relation_authority_reservation_keys
+            .get(&request.reservation)
+        {
+            return Ok(if existing_authority == &request.authority.key {
+                ReserveIngestRangeOutcome::Duplicate
+            } else {
+                ReserveIngestRangeOutcome::Conflict
+            });
+        }
+        let relation_overlap = guard
+            .relation_ingest_reservations
+            .get(&relation_key)
+            .is_some_and(|reservations| {
+                reservations
+                    .iter()
+                    .any(|existing| existing.overlaps(&request.reservation))
+            });
+        if legacy_conflict
+            || relation_overlap
+            || guard
+                .legacy_batch_keys
+                .contains_key(&request.reservation.batch_key)
+            || guard
+                .relation_batch_keys
+                .contains_key(&request.reservation.batch_key)
+        {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
+        guard.relation_batch_keys.insert(
+            request.reservation.batch_key.clone(),
+            request.reservation.clone(),
+        );
+        guard
+            .relation_ingest_reservations
+            .entry(relation_key)
+            .or_default()
+            .push(request.reservation.clone());
+        guard
+            .relation_authority_reservation_keys
+            .insert(request.reservation.clone(), request.authority.key);
+        Ok(ReserveIngestRangeOutcome::Reserved)
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: PublishRelationIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        let mut guard = self.inner.write().await;
+        let publication = RelationAuthoritativeIngestPublication {
+            reservation: request.reservation.clone(),
+            authority_key: request.authority.key.clone(),
+            request_id: request.request_id.clone(),
+            request_digest: request.request_digest.clone(),
+            object_key: request.object_key.clone(),
+            object_digest: request.object_digest.clone(),
+        };
+        if validate_current_relation_partition_authority(
+            guard
+                .relation_partition_authorities
+                .get(&request.authority.key),
+            &request.authority,
+            guard.partition_authority_now_unix_ms,
+        )
+        .is_err()
+        {
+            return Ok(PublishIngestReservationOutcome::InvalidAuthority);
+        }
+        if let Some(existing) = guard
+            .relation_authoritative_ingest_publications
+            .get(&request.request_id)
+        {
+            return Ok(if existing == &publication {
+                PublishIngestReservationOutcome::Duplicate
+            } else {
+                PublishIngestReservationOutcome::Conflict
+            });
+        }
+        if guard
+            .relation_reservation_publications
+            .get(&request.reservation)
+            .is_some_and(|request_id| request_id != &request.request_id)
+        {
+            return Ok(PublishIngestReservationOutcome::Conflict);
+        }
+        if guard
+            .relation_authority_reservation_keys
+            .get(&request.reservation)
+            != Some(&request.authority.key)
+        {
+            return Ok(PublishIngestReservationOutcome::Conflict);
+        }
+        if guard
+            .relation_batch_keys
+            .get(&request.reservation.batch_key)
+            .is_some_and(|existing| existing != &request.reservation)
+        {
+            return Ok(PublishIngestReservationOutcome::Conflict);
+        }
+        guard
+            .relation_authoritative_ingest_publications
+            .insert(request.request_id.clone(), publication);
+        guard
+            .relation_reservation_publications
+            .insert(request.reservation, request.request_id);
+        Ok(PublishIngestReservationOutcome::Committed)
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        Ok(self
+            .inner
+            .read()
+            .await
+            .relation_authoritative_ingest_publications
+            .get(request_id)
+            .cloned())
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Vec<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        let mut publications = self
+            .inner
+            .read()
+            .await
+            .relation_authoritative_ingest_publications
+            .values()
+            .filter(|publication| publication.authority_key == *key)
+            .cloned()
+            .collect::<Vec<_>>();
+        publications.sort_by(|a, b| {
+            a.reservation
+                .start_offset_inclusive
+                .cmp(&b.reservation.start_offset_inclusive)
+                .then_with(|| {
+                    a.reservation
+                        .end_offset_exclusive
+                        .cmp(&b.reservation.end_offset_exclusive)
+                })
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+        Ok(publications)
+    }
+
     async fn publish_partition_checkpoint_pointer(
         &self,
         request: PublishPartitionCheckpointPointerRequest,
@@ -2001,6 +2457,77 @@ impl PartitionAuthorityKey {
     }
 }
 
+impl RelationPartitionAuthorityKey {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        require_non_empty("namespace", &self.namespace)?;
+        require_non_empty("relation_id", &self.relation_id)?;
+        require_non_empty("stream_id", &self.stream_id)?;
+        Ok(())
+    }
+}
+
+impl RelationPartitionAuthorityToken {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.key.validate()?;
+        if self.owner_id.is_empty() || self.owner_epoch == 0 {
+            return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+        }
+        Ok(())
+    }
+}
+
+impl AcquireRelationPartitionAuthorityRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.key.validate()?;
+        require_non_empty("owner_id", &self.owner_id)?;
+        if self.ttl_ms == 0 {
+            return Err(MetaStoreError::InvalidDuration { field: "ttl_ms" });
+        }
+        if let Some(token) = &self.current_token {
+            token.validate()?;
+            if token.key != self.key {
+                return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+            }
+            if token.owner_id != self.owner_id {
+                return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ReserveRelationAuthoritativeIngestRangeRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.reservation.validate()?;
+        self.authority.validate()?;
+        if self.authority.key.stream_id != self.reservation.stream_id
+            || self.authority.key.partition_id != self.reservation.partition_id
+            || self.authority.key.relation_id != self.reservation.relation_id
+        {
+            return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl PublishRelationIngestReservationRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        self.reservation.validate()?;
+        self.authority.validate()?;
+        require_non_empty("request_id", &self.request_id)?;
+        require_non_empty("request_digest", &self.request_digest)?;
+        require_non_empty("object_key", &self.object_key)?;
+        require_non_empty("object_digest", &self.object_digest)?;
+        if self.authority.key.stream_id != self.reservation.stream_id
+            || self.authority.key.partition_id != self.reservation.partition_id
+            || self.authority.key.relation_id != self.reservation.relation_id
+        {
+            return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+        }
+        Ok(())
+    }
+}
+
 impl PartitionAuthorityToken {
     fn validate(&self) -> Result<(), MetaStoreError> {
         self.key.validate()?;
@@ -2269,6 +2796,32 @@ fn validate_current_partition_authority(
         return Err(MetaStoreError::PartitionAuthorityInvalidToken);
     }
     Ok(())
+}
+
+fn validate_current_relation_partition_authority(
+    current: Option<&RelationPartitionAuthorityToken>,
+    authority: &RelationPartitionAuthorityToken,
+    now_unix_ms: u64,
+) -> Result<(), MetaStoreError> {
+    let Some(current) = current else {
+        return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+    };
+    if current.expires_at_unix_ms <= now_unix_ms || current != authority {
+        return Err(MetaStoreError::PartitionAuthorityInvalidToken);
+    }
+    Ok(())
+}
+
+fn relation_publication_matches_request(
+    publication: &RelationAuthoritativeIngestPublication,
+    request: &PublishRelationIngestReservationRequest,
+) -> bool {
+    publication.reservation == request.reservation
+        && publication.authority_key == request.authority.key
+        && publication.request_id == request.request_id
+        && publication.request_digest == request.request_digest
+        && publication.object_key == request.object_key
+        && publication.object_digest == request.object_digest
 }
 
 struct StandingRuntimeFencingCapabilityInput {
@@ -2545,6 +3098,141 @@ where
                 capabilities.partition_authority,
             )),
         }))
+    }
+
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: Request<proto::AcquireRelationPartitionAuthorityRequest>,
+    ) -> Result<Response<proto::AcquireRelationPartitionAuthorityResponse>, Status> {
+        self.authorize(&request)?;
+        let request = acquire_relation_partition_authority_request_from_proto(request.into_inner())
+            .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .acquire_relation_partition_authority(request)
+            .await
+            .map_err(partition_authority_status)?;
+        let token = match &outcome {
+            AcquireRelationPartitionAuthorityOutcome::Acquired(token)
+            | AcquireRelationPartitionAuthorityOutcome::Renewed(token)
+            | AcquireRelationPartitionAuthorityOutcome::Conflict(token) => token.clone(),
+        };
+        let outcome_name = match outcome {
+            AcquireRelationPartitionAuthorityOutcome::Acquired(_) => "acquired",
+            AcquireRelationPartitionAuthorityOutcome::Renewed(_) => "renewed",
+            AcquireRelationPartitionAuthorityOutcome::Conflict(_) => "conflict",
+        };
+        Ok(Response::new(
+            proto::AcquireRelationPartitionAuthorityResponse {
+                outcome: outcome_name.to_string(),
+                token: Some(relation_partition_authority_token_to_proto(token)),
+            },
+        ))
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        request: Request<proto::ReadRelationPartitionAuthorityRequest>,
+    ) -> Result<Response<proto::ReadRelationPartitionAuthorityResponse>, Status> {
+        self.authorize(&request)?;
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("relation authority key is required"))
+            .and_then(|key| {
+                relation_partition_authority_key_from_proto(key).map_err(partition_authority_status)
+            })?;
+        let token = self
+            .store
+            .read_relation_partition_authority(&key)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ReadRelationPartitionAuthorityResponse {
+                found: token.is_some(),
+                token: token.map(relation_partition_authority_token_to_proto),
+            },
+        ))
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: Request<proto::ReserveRelationAuthoritativeIngestRangeRequest>,
+    ) -> Result<Response<proto::ReserveIngestRangeResponse>, Status> {
+        self.authorize(&request)?;
+        let request =
+            reserve_relation_authoritative_ingest_range_request_from_proto(request.into_inner())
+                .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .reserve_relation_authoritative_ingest_range(request)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(proto::ReserveIngestRangeResponse {
+            outcome: reserve_ingest_range_outcome(&outcome).to_string(),
+        }))
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: Request<proto::PublishRelationIngestReservationRequest>,
+    ) -> Result<Response<proto::PublishIngestReservationResponse>, Status> {
+        self.authorize(&request)?;
+        let request = publish_relation_ingest_reservation_request_from_proto(request.into_inner())
+            .map_err(partition_authority_status)?;
+        let outcome = self
+            .store
+            .publish_relation_ingest_reservation(request)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(proto::PublishIngestReservationResponse {
+            outcome: publish_ingest_reservation_outcome(&outcome).to_string(),
+        }))
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request: Request<proto::ReadRelationAuthoritativeIngestPublicationRequest>,
+    ) -> Result<Response<proto::ReadRelationAuthoritativeIngestPublicationResponse>, Status> {
+        self.authorize(&request)?;
+        let publication = self
+            .store
+            .read_relation_authoritative_ingest_publication(&request.into_inner().request_id)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ReadRelationAuthoritativeIngestPublicationResponse {
+                found: publication.is_some(),
+                publication: publication.map(relation_authoritative_ingest_publication_to_proto),
+            },
+        ))
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        request: Request<proto::ListRelationAuthoritativeIngestPublicationsRequest>,
+    ) -> Result<Response<proto::ListRelationAuthoritativeIngestPublicationsResponse>, Status> {
+        self.authorize(&request)?;
+        let key = request
+            .into_inner()
+            .key
+            .ok_or_else(|| Status::invalid_argument("relation authority key is required"))
+            .and_then(|key| {
+                relation_partition_authority_key_from_proto(key).map_err(partition_authority_status)
+            })?;
+        let publications = self
+            .store
+            .list_relation_authoritative_ingest_publications(&key)
+            .await
+            .map_err(partition_authority_status)?;
+        Ok(Response::new(
+            proto::ListRelationAuthoritativeIngestPublicationsResponse {
+                publications: publications
+                    .into_iter()
+                    .map(relation_authoritative_ingest_publication_to_proto)
+                    .collect(),
+            },
+        ))
     }
 
     async fn commit_ingest_range(
@@ -3355,6 +4043,190 @@ fn partition_authority_token_from_proto(
     };
     token.validate()?;
     Ok(token)
+}
+
+fn relation_partition_authority_key_to_proto(
+    key: RelationPartitionAuthorityKey,
+) -> proto::RelationPartitionAuthorityKey {
+    proto::RelationPartitionAuthorityKey {
+        namespace: key.namespace,
+        relation_id: key.relation_id,
+        stream_id: key.stream_id,
+        partition_id: key.partition_id,
+    }
+}
+
+fn relation_partition_authority_key_from_proto(
+    key: proto::RelationPartitionAuthorityKey,
+) -> Result<RelationPartitionAuthorityKey, MetaStoreError> {
+    let key = RelationPartitionAuthorityKey {
+        namespace: key.namespace,
+        relation_id: key.relation_id,
+        stream_id: key.stream_id,
+        partition_id: key.partition_id,
+    };
+    key.validate()?;
+    Ok(key)
+}
+
+fn relation_partition_authority_token_to_proto(
+    token: RelationPartitionAuthorityToken,
+) -> proto::RelationPartitionAuthorityToken {
+    proto::RelationPartitionAuthorityToken {
+        key: Some(relation_partition_authority_key_to_proto(token.key)),
+        owner_id: token.owner_id,
+        owner_epoch: token.owner_epoch,
+        expires_at_unix_ms: token.expires_at_unix_ms,
+    }
+}
+
+fn relation_partition_authority_token_from_proto(
+    token: proto::RelationPartitionAuthorityToken,
+) -> Result<RelationPartitionAuthorityToken, MetaStoreError> {
+    let key = token
+        .key
+        .ok_or_else(|| MetaStoreError::Serialization("relation authority key is required".into()))
+        .and_then(relation_partition_authority_key_from_proto)?;
+    let token = RelationPartitionAuthorityToken {
+        key,
+        owner_id: token.owner_id,
+        owner_epoch: token.owner_epoch,
+        expires_at_unix_ms: token.expires_at_unix_ms,
+    };
+    token.validate()?;
+    Ok(token)
+}
+
+fn acquire_relation_partition_authority_request_from_proto(
+    request: proto::AcquireRelationPartitionAuthorityRequest,
+) -> Result<AcquireRelationPartitionAuthorityRequest, MetaStoreError> {
+    let key = request
+        .key
+        .ok_or_else(|| MetaStoreError::Serialization("relation authority key is required".into()))
+        .and_then(relation_partition_authority_key_from_proto)?;
+    let request = AcquireRelationPartitionAuthorityRequest {
+        key,
+        owner_id: request.owner_id,
+        current_token: request
+            .current_token
+            .map(relation_partition_authority_token_from_proto)
+            .transpose()?,
+        ttl_ms: request.ttl_ms,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn relation_authoritative_ingest_publication_to_proto(
+    publication: RelationAuthoritativeIngestPublication,
+) -> proto::RelationAuthoritativeIngestPublication {
+    proto::RelationAuthoritativeIngestPublication {
+        reservation: Some(ingest_range_reservation_to_proto(publication.reservation)),
+        authority_key: Some(relation_partition_authority_key_to_proto(
+            publication.authority_key,
+        )),
+        request_id: publication.request_id,
+        request_digest: publication.request_digest,
+        object_key: publication.object_key,
+        object_digest: publication.object_digest,
+    }
+}
+
+fn relation_authoritative_ingest_publication_from_proto(
+    publication: proto::RelationAuthoritativeIngestPublication,
+) -> Result<RelationAuthoritativeIngestPublication, MetaStoreError> {
+    let publication = RelationAuthoritativeIngestPublication {
+        reservation: publication
+            .reservation
+            .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+            .map(ingest_range_reservation_from_proto)?,
+        authority_key: publication
+            .authority_key
+            .ok_or_else(|| {
+                MetaStoreError::Serialization("relation authority key is required".into())
+            })
+            .and_then(relation_partition_authority_key_from_proto)?,
+        request_id: publication.request_id,
+        request_digest: publication.request_digest,
+        object_key: publication.object_key,
+        object_digest: publication.object_digest,
+    };
+    publication.reservation.validate()?;
+    if publication.authority_key.relation_id != publication.reservation.relation_id
+        || publication.authority_key.stream_id != publication.reservation.stream_id
+        || publication.authority_key.partition_id != publication.reservation.partition_id
+    {
+        return Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch);
+    }
+    Ok(publication)
+}
+
+fn reserve_relation_authoritative_ingest_range_request_from_proto(
+    request: proto::ReserveRelationAuthoritativeIngestRangeRequest,
+) -> Result<ReserveRelationAuthoritativeIngestRangeRequest, MetaStoreError> {
+    let reservation = request
+        .reservation
+        .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+        .map(ingest_range_reservation_from_proto)?;
+    let authority = request
+        .authority
+        .ok_or_else(|| MetaStoreError::Serialization("relation authority token is required".into()))
+        .and_then(relation_partition_authority_token_from_proto)?;
+    let request = ReserveRelationAuthoritativeIngestRangeRequest {
+        reservation,
+        authority,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn reserve_relation_authoritative_ingest_range_request_to_proto(
+    request: ReserveRelationAuthoritativeIngestRangeRequest,
+) -> proto::ReserveRelationAuthoritativeIngestRangeRequest {
+    proto::ReserveRelationAuthoritativeIngestRangeRequest {
+        reservation: Some(ingest_range_reservation_to_proto(request.reservation)),
+        authority: Some(relation_partition_authority_token_to_proto(
+            request.authority,
+        )),
+    }
+}
+
+fn publish_relation_ingest_reservation_request_from_proto(
+    request: proto::PublishRelationIngestReservationRequest,
+) -> Result<PublishRelationIngestReservationRequest, MetaStoreError> {
+    let reservation = request
+        .reservation
+        .ok_or_else(|| MetaStoreError::Serialization("ingest reservation is required".into()))
+        .map(ingest_range_reservation_from_proto)?;
+    let authority = request
+        .authority
+        .ok_or_else(|| MetaStoreError::Serialization("relation authority token is required".into()))
+        .and_then(relation_partition_authority_token_from_proto)?;
+    let request = PublishRelationIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: request.request_id,
+        request_digest: request.request_digest,
+        object_key: request.object_key,
+        object_digest: request.object_digest,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
+fn publish_relation_ingest_reservation_request_to_proto(
+    request: PublishRelationIngestReservationRequest,
+) -> proto::PublishRelationIngestReservationRequest {
+    proto::PublishRelationIngestReservationRequest {
+        reservation: Some(ingest_range_reservation_to_proto(request.reservation)),
+        authority: Some(relation_partition_authority_token_to_proto(
+            request.authority,
+        )),
+        request_id: request.request_id,
+        request_digest: request.request_digest,
+        object_key: request.object_key,
+        object_digest: request.object_digest,
+    }
 }
 
 fn partition_checkpoint_pointer_to_proto(
@@ -4183,6 +5055,66 @@ impl HiqliteMetaStore {
         }
         self.client
             .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_relation_partition_authorities (
+                    namespace TEXT NOT NULL,
+                    relation_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    partition_id INTEGER NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    owner_epoch INTEGER NOT NULL,
+                    expires_at_unix_ms INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, relation_id, stream_id, partition_id)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_relation_ingest_reservations (
+                    stream_id TEXT NOT NULL,
+                    partition_id INTEGER NOT NULL,
+                    start_offset_inclusive INTEGER NOT NULL,
+                    end_offset_exclusive INTEGER NOT NULL,
+                    batch_key TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    relation_id TEXT NOT NULL,
+                    relation_version TEXT NOT NULL,
+                    schema_fingerprint TEXT NOT NULL,
+                    writer_epoch INTEGER NOT NULL,
+                    authority_namespace TEXT NOT NULL,
+                    authority_relation_id TEXT NOT NULL,
+                    committed INTEGER NOT NULL DEFAULT 0,
+                    authoritative_request_id TEXT NOT NULL DEFAULT '',
+                    object_key TEXT NOT NULL DEFAULT '',
+                    object_digest TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (stream_id, partition_id, start_offset_inclusive, end_offset_exclusive)
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE TABLE IF NOT EXISTS velorix_relation_ingest_publication_requests (
+                    request_id TEXT NOT NULL PRIMARY KEY,
+                    request_digest TEXT NOT NULL,
+                    outcome TEXT NOT NULL
+                )",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS velorix_relation_ingest_reservations_batch_key_idx
+                 ON velorix_relation_ingest_reservations (batch_key)",
+                vec![],
+            )
+            .await
+            .map_err(hiqlite_error)?;
+        self.client
+            .execute(
                 "CREATE TABLE IF NOT EXISTS velorix_partition_checkpoint_pointers (
                     namespace TEXT NOT NULL, view_id TEXT NOT NULL, stream_id TEXT NOT NULL,
                     partition_id INTEGER NOT NULL, checkpoint_key TEXT NOT NULL,
@@ -4580,6 +5512,209 @@ impl HiqliteMetaStore {
 #[cfg(feature = "hiqlite-backend")]
 #[async_trait]
 impl MetaStore for HiqliteMetaStore {
+    // Relation-scoped ingest authority uses additive tables and never writes
+    // the legacy view-scoped authority table.
+
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let previous = self.read_relation_partition_authority(&request.key).await?;
+        let partition_id = i64::from(request.key.partition_id);
+        let ttl_ms = i64_from_u64("ttl_ms", request.ttl_ms)?;
+        let current = request.current_token.as_ref();
+        let current_epoch = current
+            .map(|token| i64_from_u64("current_token.owner_epoch", token.owner_epoch))
+            .transpose()?
+            .unwrap_or(0);
+        let current_expiry = current
+            .map(|token| i64_from_u64("current_token.expires_at_unix_ms", token.expires_at_unix_ms))
+            .transpose()?
+            .unwrap_or(0);
+        self.with_schema_repair(|| async {
+            self.client.txn_with_raft_serialized_timestamp([
+                ("INSERT OR IGNORE INTO velorix_relation_partition_authorities (namespace, relation_id, stream_id, partition_id, owner_id, owner_epoch, expires_at_unix_ms) VALUES ($1, $2, $3, $4, $5, 1, $6 + $7)", vec![hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.relation_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.owner_id.clone()), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(ttl_ms)]),
+                ("UPDATE velorix_relation_partition_authorities SET owner_id = $1, owner_epoch = owner_epoch + 1, expires_at_unix_ms = $2 + $3 WHERE namespace = $4 AND relation_id = $5 AND stream_id = $6 AND partition_id = $7 AND expires_at_unix_ms <= $2 AND owner_epoch < 9223372036854775807", vec![hiqlite::Param::from(request.owner_id.clone()), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(ttl_ms), hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.relation_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id)]),
+                ("UPDATE velorix_relation_partition_authorities SET expires_at_unix_ms = $1 + $2 WHERE namespace = $3 AND relation_id = $4 AND stream_id = $5 AND partition_id = $6 AND owner_id = $7 AND owner_epoch = $8 AND expires_at_unix_ms = $9 AND expires_at_unix_ms > $1", vec![hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(ttl_ms), hiqlite::Param::from(request.key.namespace.clone()), hiqlite::Param::from(request.key.relation_id.clone()), hiqlite::Param::from(request.key.stream_id.clone()), hiqlite::Param::from(partition_id), hiqlite::Param::from(request.owner_id.clone()), hiqlite::Param::from(current_epoch), hiqlite::Param::from(current_expiry)]),
+            ]).await.map(|_| ()).map_err(hiqlite_error)
+        }).await?;
+        let token = self
+            .read_relation_partition_authority(&request.key)
+            .await?
+            .ok_or_else(|| {
+                MetaStoreError::Serialization("relation authority disappeared after acquire".into())
+            })?;
+        if let Some(previous) = previous.as_ref() {
+            if previous.owner_id == request.owner_id
+                && request.current_token.as_ref() != Some(previous)
+            {
+                return Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(token));
+            }
+        }
+        if token.owner_id != request.owner_id {
+            return Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(token));
+        }
+        if current.is_some()
+            && previous.as_ref() == current
+            && token.owner_epoch == current.unwrap().owner_epoch
+        {
+            Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(token))
+        } else {
+            Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
+        }
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        let txn = self.with_schema_repair(|| async { self.client.txn_with_raft_serialized_timestamp([("UPDATE velorix_relation_partition_authorities SET expires_at_unix_ms = expires_at_unix_ms WHERE 0", vec![])]).await.map_err(hiqlite_error) }).await?;
+        txn.result.map_err(hiqlite_error)?;
+        let now = txn.timestamp.unix_ms;
+        let rows = self.with_schema_repair(|| async { self.client.query_consistent_map::<RelationPartitionAuthorityRow, _>("SELECT namespace, relation_id, stream_id, partition_id, owner_id, owner_epoch, expires_at_unix_ms FROM velorix_relation_partition_authorities WHERE namespace = $1 AND relation_id = $2 AND stream_id = $3 AND partition_id = $4", vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.relation_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(i64::from(key.partition_id))]).await.map_err(hiqlite_error) }).await?;
+        let token = rows
+            .into_iter()
+            .next()
+            .map(RelationPartitionAuthorityRow::into_token)
+            .transpose()?;
+        Ok(token.filter(|token| token.expires_at_unix_ms > u64::try_from(now).unwrap_or(0)))
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: ReserveRelationAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        if self
+            .read_relation_partition_authority(&request.authority.key)
+            .await?
+            .as_ref()
+            != Some(&request.authority)
+        {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
+        let r = &request.reservation;
+        let start = i64_from_u64("start_offset_inclusive", r.start_offset_inclusive)?;
+        let end = i64_from_u64("end_offset_exclusive", r.end_offset_exclusive)?;
+        let writer_epoch = i64_from_u64("writer_epoch", r.writer_epoch)?;
+        let authority_epoch = i64_from_u64("authority.owner_epoch", request.authority.owner_epoch)?;
+        let authority_expiry = i64_from_u64(
+            "authority.expires_at_unix_ms",
+            request.authority.expires_at_unix_ms,
+        )?;
+        let changed = self.with_schema_repair(|| async { self.client.txn_with_raft_serialized_timestamp([("INSERT INTO velorix_relation_ingest_reservations (stream_id, partition_id, start_offset_inclusive, end_offset_exclusive, batch_key, payload_digest, relation_id, relation_version, schema_fingerprint, writer_epoch, authority_namespace, authority_relation_id) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12 WHERE EXISTS (SELECT 1 FROM velorix_relation_partition_authorities WHERE namespace=$11 AND relation_id=$12 AND stream_id=$1 AND partition_id=$2 AND owner_id=$13 AND owner_epoch=$14 AND expires_at_unix_ms=$15 AND expires_at_unix_ms > $16) AND NOT EXISTS (SELECT 1 FROM velorix_ingest_reservations WHERE stream_id=$1 AND partition_id=$2 AND (start_offset_inclusive < $4 AND $3 < end_offset_exclusive OR batch_key = $5)) AND NOT EXISTS (SELECT 1 FROM velorix_relation_ingest_reservations WHERE stream_id=$1 AND partition_id=$2 AND (start_offset_inclusive < $4 AND $3 < end_offset_exclusive OR batch_key = $5))", vec![hiqlite::Param::from(r.stream_id.clone()), hiqlite::Param::from(i64::from(r.partition_id)), hiqlite::Param::from(start), hiqlite::Param::from(end), hiqlite::Param::from(r.batch_key.clone()), hiqlite::Param::from(r.payload_digest.clone()), hiqlite::Param::from(r.relation_id.clone()), hiqlite::Param::from(r.relation_version.clone()), hiqlite::Param::from(r.schema_fingerprint.clone()), hiqlite::Param::from(writer_epoch), hiqlite::Param::from(request.authority.key.namespace.clone()), hiqlite::Param::from(request.authority.key.relation_id.clone()), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms()])]).await.map_err(hiqlite_error) }).await?;
+        if hiqlite_txn_changed_rows_or_zero_for_missing_stmt_output(changed.result, 0)? == 1 {
+            return Ok(ReserveIngestRangeOutcome::Reserved);
+        }
+        if self
+            .read_relation_partition_authority(&request.authority.key)
+            .await?
+            .as_ref()
+            != Some(&request.authority)
+        {
+            return Ok(ReserveIngestRangeOutcome::Conflict);
+        }
+        let rows = self.with_schema_repair(|| async { self.client.query_consistent_map::<RelationIngestReservationRow, _>("SELECT stream_id, partition_id, start_offset_inclusive, end_offset_exclusive, batch_key, payload_digest, relation_id, relation_version, schema_fingerprint, writer_epoch, authority_namespace, authority_relation_id, committed, authoritative_request_id, object_key, object_digest FROM velorix_relation_ingest_reservations WHERE stream_id=$1 AND partition_id=$2 AND start_offset_inclusive=$3 AND end_offset_exclusive=$4", vec![hiqlite::Param::from(r.stream_id.clone()), hiqlite::Param::from(i64::from(r.partition_id)), hiqlite::Param::from(start), hiqlite::Param::from(end)]).await.map_err(hiqlite_error) }).await?;
+        let mut duplicate = false;
+        for row in rows {
+            let authority_matches = row.authority_namespace == request.authority.key.namespace
+                && row.authority_relation_id == request.authority.key.relation_id;
+            if authority_matches && row.into_reservation()? == *r {
+                duplicate = true;
+                break;
+            }
+        }
+        if duplicate {
+            Ok(ReserveIngestRangeOutcome::Duplicate)
+        } else {
+            Ok(ReserveIngestRangeOutcome::Conflict)
+        }
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: PublishRelationIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        if self
+            .read_relation_partition_authority(&request.authority.key)
+            .await?
+            .as_ref()
+            != Some(&request.authority)
+        {
+            return Ok(PublishIngestReservationOutcome::InvalidAuthority);
+        }
+        let r = &request.reservation;
+        let start = i64_from_u64("start_offset_inclusive", r.start_offset_inclusive)?;
+        let end = i64_from_u64("end_offset_exclusive", r.end_offset_exclusive)?;
+        let writer_epoch = i64_from_u64("writer_epoch", r.writer_epoch)?;
+        let authority_epoch = i64_from_u64("authority.owner_epoch", request.authority.owner_epoch)?;
+        let authority_expiry = i64_from_u64(
+            "authority.expires_at_unix_ms",
+            request.authority.expires_at_unix_ms,
+        )?;
+        let txn = self.with_schema_repair(|| async { self.client.txn_with_raft_serialized_timestamp([
+            ("INSERT OR IGNORE INTO velorix_relation_ingest_publication_requests (request_id, request_digest, outcome) VALUES ($1,$2,'pending')", vec![hiqlite::Param::from(request.request_id.clone()), hiqlite::Param::from(request.request_digest.clone())]),
+            ("UPDATE velorix_relation_ingest_reservations SET committed=1, authoritative_request_id=$1, object_key=$2, object_digest=$3 WHERE stream_id=$4 AND partition_id=$5 AND start_offset_inclusive=$6 AND end_offset_exclusive=$7 AND batch_key=$8 AND payload_digest=$9 AND relation_id=$10 AND relation_version=$11 AND schema_fingerprint=$12 AND writer_epoch=$13 AND authority_namespace=$14 AND authority_relation_id=$15 AND committed=0 AND EXISTS (SELECT 1 FROM velorix_relation_partition_authorities WHERE namespace=$14 AND relation_id=$15 AND stream_id=$4 AND partition_id=$5 AND owner_id=$16 AND owner_epoch=$17 AND expires_at_unix_ms=$18 AND expires_at_unix_ms>$19) AND EXISTS (SELECT 1 FROM velorix_relation_ingest_publication_requests WHERE request_id=$1 AND request_digest=$20 AND outcome='pending')", vec![hiqlite::Param::from(request.request_id.clone()), hiqlite::Param::from(request.object_key.clone()), hiqlite::Param::from(request.object_digest.clone()), hiqlite::Param::from(r.stream_id.clone()), hiqlite::Param::from(i64::from(r.partition_id)), hiqlite::Param::from(start), hiqlite::Param::from(end), hiqlite::Param::from(r.batch_key.clone()), hiqlite::Param::from(r.payload_digest.clone()), hiqlite::Param::from(r.relation_id.clone()), hiqlite::Param::from(r.relation_version.clone()), hiqlite::Param::from(r.schema_fingerprint.clone()), hiqlite::Param::from(writer_epoch), hiqlite::Param::from(request.authority.key.namespace.clone()), hiqlite::Param::from(request.authority.key.relation_id.clone()), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(request.request_digest.clone())]),
+            ("UPDATE velorix_relation_ingest_publication_requests SET outcome=CASE WHEN NOT EXISTS (SELECT 1 FROM velorix_relation_partition_authorities WHERE namespace=$1 AND relation_id=$2 AND stream_id=$3 AND partition_id=$4 AND owner_id=$5 AND owner_epoch=$6 AND expires_at_unix_ms=$7 AND expires_at_unix_ms>$8) THEN 'invalid_authority' WHEN EXISTS (SELECT 1 FROM velorix_relation_ingest_reservations WHERE authoritative_request_id=$9 AND committed=1) THEN 'committed' ELSE 'conflict' END WHERE request_id=$9 AND request_digest=$10 AND outcome='pending'", vec![hiqlite::Param::from(request.authority.key.namespace.clone()), hiqlite::Param::from(request.authority.key.relation_id.clone()), hiqlite::Param::from(r.stream_id.clone()), hiqlite::Param::from(i64::from(r.partition_id)), hiqlite::Param::from(request.authority.owner_id.clone()), hiqlite::Param::from(authority_epoch), hiqlite::Param::from(authority_expiry), hiqlite::Param::raft_serialized_unix_ms(), hiqlite::Param::from(request.request_id.clone()), hiqlite::Param::from(request.request_digest.clone())]),
+        ]).await.map_err(hiqlite_error) }).await?;
+        let results = txn.result.map_err(hiqlite_error)?;
+        let request_inserted = hiqlite_txn_changed_rows(&results, 0)? == 1;
+        let reservation_committed = hiqlite_txn_changed_rows(&results, 1)? == 1;
+        let rows = self.client.query_consistent_map::<IngestPublicationRequestRow, _>("SELECT request_digest, outcome FROM velorix_relation_ingest_publication_requests WHERE request_id=$1", vec![hiqlite::Param::from(request.request_id.clone())]).await.map_err(hiqlite_error)?;
+        match rows.first() {
+            Some(row) if row.request_digest != request.request_digest => {
+                Ok(PublishIngestReservationOutcome::Conflict)
+            }
+            Some(row) if row.outcome == "committed" => {
+                if request_inserted && reservation_committed {
+                    Ok(PublishIngestReservationOutcome::Committed)
+                } else if self
+                    .read_relation_authoritative_ingest_publication(&request.request_id)
+                    .await?
+                    .is_some_and(|publication| {
+                        relation_publication_matches_request(&publication, &request)
+                    })
+                {
+                    Ok(PublishIngestReservationOutcome::Duplicate)
+                } else {
+                    Ok(PublishIngestReservationOutcome::Conflict)
+                }
+            }
+            Some(row) if row.outcome == "invalid_authority" => {
+                Ok(PublishIngestReservationOutcome::InvalidAuthority)
+            }
+            Some(_) => Ok(PublishIngestReservationOutcome::Conflict),
+            None => Err(MetaStoreError::Serialization(
+                "relation ingest publication status disappeared".into(),
+            )),
+        }
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        let rows = self.with_schema_repair(|| async { self.client.query_consistent_map::<RelationAuthoritativeIngestPublicationRow, _>("SELECT stream_id, partition_id, start_offset_inclusive, end_offset_exclusive, batch_key, payload_digest, relation_id, relation_version, schema_fingerprint, writer_epoch, authority_namespace, authority_relation_id, authoritative_request_id AS request_id, requests.request_digest, object_key, object_digest FROM velorix_relation_ingest_reservations reservations JOIN velorix_relation_ingest_publication_requests requests ON requests.request_id=reservations.authoritative_request_id WHERE reservations.authoritative_request_id=$1 AND reservations.committed=1 AND requests.outcome='committed'", vec![hiqlite::Param::from(request_id.to_string())]).await.map_err(hiqlite_error) }).await?;
+        rows.into_iter()
+            .next()
+            .map(RelationAuthoritativeIngestPublicationRow::into_publication)
+            .transpose()
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Vec<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        let rows = self.with_schema_repair(|| async { self.client.query_consistent_map::<RelationAuthoritativeIngestPublicationRow, _>("SELECT stream_id, partition_id, start_offset_inclusive, end_offset_exclusive, batch_key, payload_digest, relation_id, relation_version, schema_fingerprint, writer_epoch, authority_namespace, authority_relation_id, authoritative_request_id AS request_id, requests.request_digest, object_key, object_digest FROM velorix_relation_ingest_reservations reservations JOIN velorix_relation_ingest_publication_requests requests ON requests.request_id=reservations.authoritative_request_id WHERE reservations.authority_namespace=$1 AND reservations.authority_relation_id=$2 AND reservations.stream_id=$3 AND reservations.partition_id=$4 AND reservations.committed=1 AND requests.outcome='committed' ORDER BY reservations.start_offset_inclusive, reservations.end_offset_exclusive", vec![hiqlite::Param::from(key.namespace.clone()), hiqlite::Param::from(key.relation_id.clone()), hiqlite::Param::from(key.stream_id.clone()), hiqlite::Param::from(i64::from(key.partition_id))]).await.map_err(hiqlite_error) }).await?;
+        rows.into_iter()
+            .map(RelationAuthoritativeIngestPublicationRow::into_publication)
+            .collect()
+    }
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         Ok(MetaStoreCapabilities {
             standing_runtime_fencing: hiqlite_standing_runtime_fencing_capability(false),
@@ -6249,6 +7384,57 @@ struct PartitionAuthorityRow {
 }
 
 #[cfg(feature = "hiqlite-backend")]
+struct RelationPartitionAuthorityRow {
+    namespace: String,
+    relation_id: String,
+    stream_id: String,
+    partition_id: i64,
+    owner_id: String,
+    owner_epoch: i64,
+    expires_at_unix_ms: i64,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl RelationPartitionAuthorityRow {
+    fn into_token(self) -> Result<RelationPartitionAuthorityToken, MetaStoreError> {
+        Ok(RelationPartitionAuthorityToken {
+            key: RelationPartitionAuthorityKey {
+                namespace: self.namespace,
+                relation_id: self.relation_id,
+                stream_id: self.stream_id,
+                partition_id: u32::try_from(self.partition_id).map_err(|_| {
+                    MetaStoreError::Serialization(
+                        "relation authority partition_id is invalid".into(),
+                    )
+                })?,
+            },
+            owner_id: self.owner_id,
+            owner_epoch: u64::try_from(self.owner_epoch).map_err(|_| {
+                MetaStoreError::Serialization("relation authority owner_epoch is invalid".into())
+            })?,
+            expires_at_unix_ms: u64::try_from(self.expires_at_unix_ms).map_err(|_| {
+                MetaStoreError::Serialization("relation authority expiry is invalid".into())
+            })?,
+        })
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for RelationPartitionAuthorityRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            namespace: row.get("namespace"),
+            relation_id: row.get("relation_id"),
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            owner_id: row.get("owner_id"),
+            owner_epoch: row.get("owner_epoch"),
+            expires_at_unix_ms: row.get("expires_at_unix_ms"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
 impl PartitionAuthorityRow {
     fn into_token(self) -> Result<PartitionAuthorityToken, MetaStoreError> {
         Ok(PartitionAuthorityToken {
@@ -6348,6 +7534,150 @@ struct AuthoritativeIngestPublicationRow {
     request_digest: String,
     object_key: String,
     object_digest: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct RelationIngestReservationRow {
+    stream_id: String,
+    partition_id: i64,
+    start_offset_inclusive: i64,
+    end_offset_exclusive: i64,
+    batch_key: String,
+    payload_digest: String,
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+    writer_epoch: i64,
+    authority_namespace: String,
+    authority_relation_id: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl RelationIngestReservationRow {
+    fn into_reservation(self) -> Result<IngestRangeReservation, MetaStoreError> {
+        Ok(IngestRangeReservation {
+            stream_id: self.stream_id,
+            partition_id: u32::try_from(self.partition_id).map_err(|_| {
+                MetaStoreError::Serialization("relation ingest partition_id is invalid".into())
+            })?,
+            start_offset_inclusive: u64::try_from(self.start_offset_inclusive).map_err(|_| {
+                MetaStoreError::Serialization("relation ingest start offset is invalid".into())
+            })?,
+            end_offset_exclusive: u64::try_from(self.end_offset_exclusive).map_err(|_| {
+                MetaStoreError::Serialization("relation ingest end offset is invalid".into())
+            })?,
+            batch_key: self.batch_key,
+            payload_digest: self.payload_digest,
+            relation_id: self.relation_id,
+            relation_version: self.relation_version,
+            schema_fingerprint: self.schema_fingerprint,
+            writer_epoch: u64::try_from(self.writer_epoch).map_err(|_| {
+                MetaStoreError::Serialization("relation ingest writer epoch is invalid".into())
+            })?,
+        })
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for RelationIngestReservationRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            start_offset_inclusive: row.get("start_offset_inclusive"),
+            end_offset_exclusive: row.get("end_offset_exclusive"),
+            batch_key: row.get("batch_key"),
+            payload_digest: row.get("payload_digest"),
+            relation_id: row.get("relation_id"),
+            relation_version: row.get("relation_version"),
+            schema_fingerprint: row.get("schema_fingerprint"),
+            writer_epoch: row.get("writer_epoch"),
+            authority_namespace: row.get("authority_namespace"),
+            authority_relation_id: row.get("authority_relation_id"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct RelationAuthoritativeIngestPublicationRow {
+    stream_id: String,
+    partition_id: i64,
+    start_offset_inclusive: i64,
+    end_offset_exclusive: i64,
+    batch_key: String,
+    payload_digest: String,
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+    writer_epoch: i64,
+    authority_namespace: String,
+    authority_relation_id: String,
+    request_id: String,
+    request_digest: String,
+    object_key: String,
+    object_digest: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl RelationAuthoritativeIngestPublicationRow {
+    fn into_publication(self) -> Result<RelationAuthoritativeIngestPublication, MetaStoreError> {
+        let reservation = RelationIngestReservationRow {
+            stream_id: self.stream_id.clone(),
+            partition_id: self.partition_id,
+            start_offset_inclusive: self.start_offset_inclusive,
+            end_offset_exclusive: self.end_offset_exclusive,
+            batch_key: self.batch_key,
+            payload_digest: self.payload_digest,
+            relation_id: self.relation_id,
+            relation_version: self.relation_version,
+            schema_fingerprint: self.schema_fingerprint,
+            writer_epoch: self.writer_epoch,
+            authority_namespace: self.authority_namespace.clone(),
+            authority_relation_id: self.authority_relation_id.clone(),
+        }
+        .into_reservation()?;
+        Ok(RelationAuthoritativeIngestPublication {
+            reservation,
+            authority_key: RelationPartitionAuthorityKey {
+                namespace: self.authority_namespace,
+                relation_id: self.authority_relation_id,
+                stream_id: self.stream_id,
+                partition_id: u32::try_from(self.partition_id).map_err(|_| {
+                    MetaStoreError::Serialization(
+                        "relation publication partition_id is invalid".into(),
+                    )
+                })?,
+            },
+            request_id: self.request_id,
+            request_digest: self.request_digest,
+            object_key: self.object_key,
+            object_digest: self.object_digest,
+        })
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for RelationAuthoritativeIngestPublicationRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            start_offset_inclusive: row.get("start_offset_inclusive"),
+            end_offset_exclusive: row.get("end_offset_exclusive"),
+            batch_key: row.get("batch_key"),
+            payload_digest: row.get("payload_digest"),
+            relation_id: row.get("relation_id"),
+            relation_version: row.get("relation_version"),
+            schema_fingerprint: row.get("schema_fingerprint"),
+            writer_epoch: row.get("writer_epoch"),
+            authority_namespace: row.get("authority_namespace"),
+            authority_relation_id: row.get("authority_relation_id"),
+            request_id: row.get("request_id"),
+            request_digest: row.get("request_digest"),
+            object_key: row.get("object_key"),
+            object_digest: row.get("object_digest"),
+        }
+    }
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -6919,6 +8249,155 @@ impl GrpcMetaStore {
 
 #[async_trait]
 impl MetaStore for GrpcMetaStore {
+    // Relation-scoped authority forwarding is kept separate from the legacy
+    // view-scoped methods below.
+
+    async fn acquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .acquire_relation_partition_authority(
+                self.request(proto::AcquireRelationPartitionAuthorityRequest {
+                    key: Some(relation_partition_authority_key_to_proto(request.key)),
+                    owner_id: request.owner_id,
+                    current_token: request
+                        .current_token
+                        .map(relation_partition_authority_token_to_proto),
+                    ttl_ms: request.ttl_ms,
+                }),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        let token = response
+            .token
+            .ok_or_else(|| {
+                MetaStoreError::UnexpectedOutcome("missing relation authority token".into())
+            })
+            .and_then(relation_partition_authority_token_from_proto)?;
+        match response.outcome.as_str() {
+            "acquired" => Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token)),
+            "renewed" => Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(token)),
+            "conflict" => Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(token)),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn read_relation_partition_authority(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
+        key.validate()?;
+        let response = self
+            .client()
+            .read_relation_partition_authority(self.request(
+                proto::ReadRelationPartitionAuthorityRequest {
+                    key: Some(relation_partition_authority_key_to_proto(key.clone())),
+                },
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match (response.found, response.token) {
+            (true, Some(token)) => relation_partition_authority_token_from_proto(token).map(Some),
+            (false, None) => Ok(None),
+            (true, None) => Err(MetaStoreError::UnexpectedOutcome(
+                "missing relation authority token".into(),
+            )),
+            (false, Some(_)) => Err(MetaStoreError::UnexpectedOutcome(
+                "relation authority response has a token without found".into(),
+            )),
+        }
+    }
+
+    async fn reserve_relation_authoritative_ingest_range(
+        &self,
+        request: ReserveRelationAuthoritativeIngestRangeRequest,
+    ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .reserve_relation_authoritative_ingest_range(
+                self.request(reserve_relation_authoritative_ingest_range_request_to_proto(request)),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match response.outcome.as_str() {
+            "reserved" => Ok(ReserveIngestRangeOutcome::Reserved),
+            "duplicate" => Ok(ReserveIngestRangeOutcome::Duplicate),
+            "conflict" => Ok(ReserveIngestRangeOutcome::Conflict),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn publish_relation_ingest_reservation(
+        &self,
+        request: PublishRelationIngestReservationRequest,
+    ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .publish_relation_ingest_reservation(self.request(
+                publish_relation_ingest_reservation_request_to_proto(request),
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        match response.outcome.as_str() {
+            "committed" => Ok(PublishIngestReservationOutcome::Committed),
+            "duplicate" => Ok(PublishIngestReservationOutcome::Duplicate),
+            "conflict" => Ok(PublishIngestReservationOutcome::Conflict),
+            "invalid_authority" => Ok(PublishIngestReservationOutcome::InvalidAuthority),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn read_relation_authoritative_ingest_publication(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        require_non_empty("request_id", request_id)?;
+        let response = self
+            .client()
+            .read_relation_authoritative_ingest_publication(self.request(
+                proto::ReadRelationAuthoritativeIngestPublicationRequest {
+                    request_id: request_id.to_string(),
+                },
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        response
+            .publication
+            .map(relation_authoritative_ingest_publication_from_proto)
+            .transpose()
+    }
+
+    async fn list_relation_authoritative_ingest_publications(
+        &self,
+        key: &RelationPartitionAuthorityKey,
+    ) -> Result<Vec<RelationAuthoritativeIngestPublication>, MetaStoreError> {
+        key.validate()?;
+        let response = self
+            .client()
+            .list_relation_authoritative_ingest_publications(self.request(
+                proto::ListRelationAuthoritativeIngestPublicationsRequest {
+                    key: Some(relation_partition_authority_key_to_proto(key.clone())),
+                },
+            ))
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        response
+            .publications
+            .into_iter()
+            .map(relation_authoritative_ingest_publication_from_proto)
+            .collect()
+    }
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
         let response = self
             .client()
@@ -8011,5 +9490,134 @@ mod hiqlite_capability_tests {
             STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
             "Hiqlite capability must advertise raft_replicated_authority_time only when the write path uses authority-time transactions"
         );
+    }
+}
+
+#[cfg(test)]
+mod relation_partition_authority_tests {
+    use super::*;
+
+    fn key(relation_id: &str) -> RelationPartitionAuthorityKey {
+        RelationPartitionAuthorityKey {
+            namespace: "tenant".into(),
+            relation_id: relation_id.into(),
+            stream_id: "stream".into(),
+            partition_id: 0,
+        }
+    }
+
+    fn reservation(relation_id: &str) -> IngestRangeReservation {
+        IngestRangeReservation {
+            stream_id: "stream".into(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            batch_key: format!("{relation_id}-batch"),
+            payload_digest: format!("{relation_id}-digest"),
+            relation_id: relation_id.into(),
+            relation_version: "v1".into(),
+            schema_fingerprint: "schema".into(),
+            writer_epoch: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn relation_authority_fences_scope_takeover_and_duplicate_publication() {
+        let store = InMemoryMetaStore::default();
+        store.set_partition_authority_clock_for_test(100).await;
+        let a = match store
+            .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+                key: key("relation-a"),
+                owner_id: "owner-a".into(),
+                current_token: None,
+                ttl_ms: 10,
+            })
+            .await
+            .unwrap()
+        {
+            AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+            other => panic!("unexpected acquire outcome: {other:?}"),
+        };
+        let mut wrong = reservation("relation-b");
+        wrong.batch_key = "wrong-batch".into();
+        assert!(matches!(
+            store
+                .reserve_relation_authoritative_ingest_range(
+                    ReserveRelationAuthoritativeIngestRangeRequest {
+                        reservation: wrong,
+                        authority: a.clone(),
+                    },
+                )
+                .await,
+            Err(MetaStoreError::PartitionAuthorityTokenScopeMismatch)
+        ));
+        let r = reservation("relation-a");
+        assert_eq!(
+            store
+                .reserve_relation_authoritative_ingest_range(
+                    ReserveRelationAuthoritativeIngestRangeRequest {
+                        reservation: r.clone(),
+                        authority: a.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            ReserveIngestRangeOutcome::Reserved
+        );
+        let publish = || PublishRelationIngestReservationRequest {
+            reservation: r.clone(),
+            authority: a.clone(),
+            request_id: "request-a".into(),
+            request_digest: "request-digest".into(),
+            object_key: "staging/a".into(),
+            object_digest: "object-a".into(),
+        };
+        assert_eq!(
+            store
+                .publish_relation_ingest_reservation(publish())
+                .await
+                .unwrap(),
+            PublishIngestReservationOutcome::Committed
+        );
+        assert_eq!(
+            store
+                .publish_relation_ingest_reservation(publish())
+                .await
+                .unwrap(),
+            PublishIngestReservationOutcome::Duplicate
+        );
+        store.set_partition_authority_clock_for_test(200).await;
+        let b = match store
+            .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+                key: key("relation-a"),
+                owner_id: "owner-b".into(),
+                current_token: None,
+                ttl_ms: 10,
+            })
+            .await
+            .unwrap()
+        {
+            AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+            other => panic!("unexpected takeover outcome: {other:?}"),
+        };
+        assert_ne!(a.owner_epoch, b.owner_epoch);
+        let mut stale_publish = publish();
+        stale_publish.request_id = "request-a-stale".into();
+        assert_eq!(
+            store
+                .publish_relation_ingest_reservation(stale_publish)
+                .await
+                .unwrap(),
+            PublishIngestReservationOutcome::InvalidAuthority
+        );
+    }
+
+    #[test]
+    fn relation_contract_is_present_in_hiqlite_and_grpc_paths() {
+        let source = include_str!("lib.rs");
+        assert!(source.contains("velorix_relation_partition_authorities"));
+        assert!(source.contains("velorix_relation_ingest_reservations"));
+        assert!(source.contains("async fn acquire_relation_partition_authority"));
+        assert!(source.contains("async fn list_relation_authoritative_ingest_publications"));
     }
 }

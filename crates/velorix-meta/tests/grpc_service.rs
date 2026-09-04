@@ -7,12 +7,16 @@ use std::{
 };
 
 use object_store::memory::InMemory as InMemoryObjectStore;
+#[cfg(feature = "hiqlite-backend")]
+use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{metadata::MetadataValue, transport::Server, Request};
 use velorix_core::standing_program::{
     RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
     RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
 };
+#[cfg(feature = "hiqlite-backend")]
+use velorix_meta::HiqliteMetaStore;
 use velorix_meta::{
     proto::{
         velorix_meta_server::{VelorixMeta, VelorixMetaServer},
@@ -25,15 +29,18 @@ use velorix_meta::{
         ReserveIngestRangeRequest, StandingRuntimeCheckpointPointer as ProtoCheckpointPointer,
         StandingRuntimeOwnerToken as ProtoOwnerToken, StoreRelationCatalogRequest,
     },
-    validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, BeginViewBootstrapOutcome,
-    BeginViewBootstrapRequest, CaptureIngestSourceCutRequest, CommitIngestRangeOutcome,
-    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
-    InMemoryMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1, MetaGrpcService,
-    MetaStore, OssMetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
-    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
-    PublishPartitionCheckpointPointerRequest, PublishStandingRuntimeCheckpointOutcome,
-    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
+    validate_bearer_token, AcquireRelationPartitionAuthorityOutcome,
+    AcquireRelationPartitionAuthorityRequest, AcquireStandingRuntimeOwnerOutcome,
+    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
+    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, GrpcMetaStore, InMemoryMetaStore, IngestRangeReservation,
+    IngestSourceRelationIdentityV1, MetaGrpcService, MetaStore, OssMetaStore,
+    PartitionAuthorityKey, PartitionCheckpointPointer, PromoteViewBootstrapOutcome,
+    PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    RelationPartitionAuthorityKey, ReserveAuthoritativeIngestRangeRequest,
+    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 
@@ -833,6 +840,235 @@ async fn grpc_authoritative_ingest_publication_round_trips_and_recovers() {
 }
 
 #[tokio::test]
+async fn grpc_relation_authority_round_trips_scope_fencing_and_publication() {
+    let backend = InMemoryMetaStore::default();
+    backend.set_partition_authority_clock_for_test(100).await;
+    let endpoint = spawn_meta_service_for(backend.clone()).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let key = RelationPartitionAuthorityKey {
+        namespace: "tenant-a".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 2,
+    };
+    let authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".into(),
+            current_token: None,
+            ttl_ms: 10,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        outcome => panic!("expected relation acquire, got {outcome:?}"),
+    };
+    let reservation = IngestRangeReservation {
+        stream_id: "orders-stream".into(),
+        partition_id: 2,
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 10,
+        batch_key: "batches/orders-0-10".into(),
+        payload_digest: "sha256:orders".into(),
+        relation_id: "orders".into(),
+        relation_version: "v1".into(),
+        schema_fingerprint: "sha256:schema".into(),
+        writer_epoch: 1,
+    };
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: reservation.clone(),
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    let mut collision = reservation.clone();
+    collision.start_offset_inclusive = 10;
+    collision.end_offset_exclusive = 20;
+    collision.payload_digest = "sha256:other".into();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: collision,
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    let request = PublishRelationIngestReservationRequest {
+        reservation: reservation.clone(),
+        authority: authority.clone(),
+        request_id: "relation-publication".into(),
+        request_digest: "sha256:request".into(),
+        object_key: "objects/relation".into(),
+        object_digest: "sha256:object".into(),
+    };
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Duplicate
+    );
+    let publication = store
+        .read_relation_authoritative_ingest_publication("relation-publication")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(publication.object_key, "objects/relation");
+    assert_eq!(
+        store
+            .list_relation_authoritative_ingest_publications(&key)
+            .await
+            .unwrap(),
+        vec![publication]
+    );
+    backend.set_partition_authority_clock_for_test(200).await;
+    let takeover = store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key,
+            owner_id: "writer-b".into(),
+            current_token: None,
+            ttl_ms: 10,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        takeover,
+        AcquireRelationPartitionAuthorityOutcome::Acquired(_)
+    ));
+    let stale_result = store.publish_relation_ingest_reservation(request).await;
+    assert!(matches!(
+        stale_result,
+        Ok(PublishIngestReservationOutcome::InvalidAuthority)
+    ));
+}
+
+#[cfg(feature = "hiqlite-backend")]
+#[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
+async fn grpc_relation_authority_round_trips_through_hiqlite_backend() {
+    let dir = TempDir::new().unwrap();
+    let raft_addr = free_addr();
+    let api_addr = free_addr();
+    let mut config = hiqlite::NodeConfig::default();
+    config.node_id = 1;
+    config.nodes = vec![hiqlite::Node {
+        id: 1,
+        addr_raft: raft_addr.clone(),
+        addr_api: api_addr.clone(),
+    }];
+    config.listen_addr_raft = "127.0.0.1".into();
+    config.listen_addr_api = "127.0.0.1".into();
+    config.data_dir = dir.path().to_string_lossy().into_owned().into();
+    config.filename_db = "velorix-meta.db".into();
+    config.secret_raft = "velorix-test-raft-secret".into();
+    config.secret_api = "velorix-test-api-secret".into();
+    config
+        .enc_keys
+        .append_new_random_with_id("velorix-test-key".into())
+        .unwrap();
+    config.health_check_delay_secs = 0;
+    config.raft_config = hiqlite::NodeConfig::default_raft_config(100);
+    let client = hiqlite::start_node(config).await.unwrap();
+    let backend = HiqliteMetaStore::new(client.clone()).await.unwrap();
+    let endpoint = spawn_meta_service_for(backend).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let key = RelationPartitionAuthorityKey {
+        namespace: "default".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+    };
+    let authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer".into(),
+            current_token: None,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        outcome => panic!("expected relation authority, got {outcome:?}"),
+    };
+    let reservation = IngestRangeReservation {
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 10,
+        batch_key: "batch/grpc-hiqlite".into(),
+        payload_digest: "sha256:payload".into(),
+        relation_id: "orders".into(),
+        relation_version: "v1".into(),
+        schema_fingerprint: "sha256:schema".into(),
+        writer_epoch: 1,
+    };
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: reservation.clone(),
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    let request = PublishRelationIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: "grpc-hiqlite-publication".into(),
+        request_digest: "sha256:request".into(),
+        object_key: "objects/grpc-hiqlite".into(),
+        object_digest: "sha256:object".into(),
+    };
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(request)
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    assert_eq!(
+        store
+            .read_relation_authoritative_ingest_publication("grpc-hiqlite-publication")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_key,
+        "objects/grpc-hiqlite"
+    );
+    assert_eq!(
+        store
+            .list_relation_authoritative_ingest_publications(&key)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn grpc_partition_authority_unsupported_backend_fails_closed() {
     let endpoint =
         spawn_meta_service_for(OssMetaStore::new(Arc::new(InMemoryObjectStore::new()))).await;
@@ -848,6 +1084,12 @@ async fn grpc_partition_authority_unsupported_backend_fails_closed() {
 
 async fn spawn_meta_service() -> String {
     spawn_meta_service_for(InMemoryMetaStore::default()).await
+}
+
+#[cfg(feature = "hiqlite-backend")]
+fn free_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
 }
 
 async fn spawn_meta_service_for<S>(store: S) -> String

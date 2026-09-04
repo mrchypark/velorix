@@ -25,6 +25,12 @@ service VelorixMeta {
   rpc ReadPartitionAuthorityCapability(ReadPartitionAuthorityCapabilityRequest) returns (ReadPartitionAuthorityCapabilityResponse);
   rpc AcquirePartitionAuthority(AcquirePartitionAuthorityRequest) returns (AcquirePartitionAuthorityResponse);
   rpc ReadPartitionAuthority(ReadPartitionAuthorityRequest) returns (ReadPartitionAuthorityResponse);
+  rpc AcquireRelationPartitionAuthority(AcquireRelationPartitionAuthorityRequest) returns (AcquireRelationPartitionAuthorityResponse);
+  rpc ReadRelationPartitionAuthority(ReadRelationPartitionAuthorityRequest) returns (ReadRelationPartitionAuthorityResponse);
+  rpc ReserveRelationAuthoritativeIngestRange(ReserveRelationAuthoritativeIngestRangeRequest) returns (ReserveIngestRangeResponse);
+  rpc PublishRelationIngestReservation(PublishRelationIngestReservationRequest) returns (PublishIngestReservationResponse);
+  rpc ReadRelationAuthoritativeIngestPublication(ReadRelationAuthoritativeIngestPublicationRequest) returns (ReadRelationAuthoritativeIngestPublicationResponse);
+  rpc ListRelationAuthoritativeIngestPublications(ListRelationAuthoritativeIngestPublicationsRequest) returns (ListRelationAuthoritativeIngestPublicationsResponse);
   rpc PublishPartitionCheckpointPointer(PublishPartitionCheckpointPointerRequest) returns (PublishPartitionCheckpointPointerResponse);
   rpc ReadPartitionCheckpointPointer(ReadPartitionCheckpointPointerRequest) returns (ReadPartitionCheckpointPointerResponse);
 }
@@ -90,6 +96,40 @@ message PartitionAuthorityToken {
   string owner_id = 2;
   uint64 owner_epoch = 3;
   uint64 expires_at_unix_ms = 4;
+}
+
+// Relation ingest authority is deliberately separate from view/worker
+// partition authority.  Field names are not aliases for PartitionAuthorityKey.
+message RelationPartitionAuthorityKey {
+  string namespace = 1;
+  string relation_id = 2;
+  string stream_id = 3;
+  uint32 partition_id = 4;
+}
+
+message RelationPartitionAuthorityToken {
+  RelationPartitionAuthorityKey key = 1;
+  string owner_id = 2;
+  uint64 owner_epoch = 3;
+  uint64 expires_at_unix_ms = 4;
+}
+
+message AcquireRelationPartitionAuthorityRequest {
+  RelationPartitionAuthorityKey key = 1;
+  string owner_id = 2;
+  RelationPartitionAuthorityToken current_token = 3;
+  uint64 ttl_ms = 4;
+}
+
+message AcquireRelationPartitionAuthorityResponse {
+  string outcome = 1;
+  RelationPartitionAuthorityToken token = 2;
+}
+
+message ReadRelationPartitionAuthorityRequest { RelationPartitionAuthorityKey key = 1; }
+message ReadRelationPartitionAuthorityResponse {
+  bool found = 1;
+  RelationPartitionAuthorityToken token = 2;
 }
 
 message PartitionCheckpointPointer {
@@ -197,6 +237,39 @@ message PublishIngestReservationRequest {
 
 message PublishIngestReservationResponse {
   string outcome = 1;
+}
+
+message ReserveRelationAuthoritativeIngestRangeRequest {
+  ReserveIngestRangeRequest reservation = 1;
+  RelationPartitionAuthorityToken authority = 2;
+}
+
+message PublishRelationIngestReservationRequest {
+  ReserveIngestRangeRequest reservation = 1;
+  RelationPartitionAuthorityToken authority = 2;
+  string request_id = 3;
+  string request_digest = 4;
+  string object_key = 5;
+  string object_digest = 6;
+}
+
+message RelationAuthoritativeIngestPublication {
+  ReserveIngestRangeRequest reservation = 1;
+  RelationPartitionAuthorityKey authority_key = 2;
+  string request_id = 3;
+  string request_digest = 4;
+  string object_key = 5;
+  string object_digest = 6;
+}
+
+message ReadRelationAuthoritativeIngestPublicationRequest { string request_id = 1; }
+message ReadRelationAuthoritativeIngestPublicationResponse {
+  bool found = 1;
+  RelationAuthoritativeIngestPublication publication = 2;
+}
+message ListRelationAuthoritativeIngestPublicationsRequest { RelationPartitionAuthorityKey key = 1; }
+message ListRelationAuthoritativeIngestPublicationsResponse {
+  repeated RelationAuthoritativeIngestPublication publications = 1;
 }
 
 message AuthoritativeIngestPublication {

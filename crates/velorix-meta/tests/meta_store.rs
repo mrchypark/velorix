@@ -9,6 +9,7 @@ use velorix_core::standing_program::{
 };
 use velorix_meta::{
     AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
+    AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
     CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
@@ -17,10 +18,12 @@ use velorix_meta::{
     OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
     PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
     PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
-    PublishPartitionCheckpointPointerRequest, PublishStandingRuntimeCheckpointOutcome,
-    PublishStandingRuntimeCheckpointRequest, ReserveAuthoritativeIngestRangeRequest,
-    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
-    StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
+    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
+    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
 };
@@ -103,6 +106,224 @@ async fn meta_store_capabilities_mark_in_memory_and_oss_as_not_production_multi_
     assert_eq!(oss.failover_time_bound_ms, 0);
     assert!(!oss.production_bounded_failover_safe);
     assert!(!oss.production_multi_writer_safe);
+}
+
+#[tokio::test]
+async fn relation_authority_rejects_scope_stale_and_batch_collisions_and_orders_publications() {
+    let store = InMemoryMetaStore::default();
+    store.set_partition_authority_clock_for_test(100).await;
+    let key = relation_authority_key("orders");
+    let token = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "owner-a".into(),
+            current_token: None,
+            ttl_ms: 10,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let first = relation_reservation(0, 10, "orders-a");
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: first.clone(),
+                    authority: token.clone()
+                }
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: first.clone(),
+                    authority: token.clone()
+                }
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Duplicate
+    );
+    let mut same_batch = relation_reservation(10, 20, "orders-a");
+    same_batch.payload_digest = "different".into();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: same_batch,
+                    authority: token.clone()
+                }
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    let publish = |reservation: IngestRangeReservation,
+                   authority: RelationPartitionAuthorityToken,
+                   id: &str| PublishRelationIngestReservationRequest {
+        reservation,
+        authority,
+        request_id: id.into(),
+        request_digest: format!("{id}-digest"),
+        object_key: format!("staging/{id}"),
+        object_digest: format!("{id}-object"),
+    };
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(publish(first.clone(), token.clone(), "a"))
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(publish(first.clone(), token.clone(), "other"))
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Conflict
+    );
+    store.set_partition_authority_clock_for_test(200).await;
+    let stale = publish(first, token, "stale");
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(stale)
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::InvalidAuthority
+    );
+    let relation_b = RelationPartitionAuthorityKey {
+        relation_id: "payments".into(),
+        ..key
+    };
+    let token_b = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: relation_b,
+            owner_id: "owner-b".into(),
+            current_token: None,
+            ttl_ms: 10,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let mut second = relation_reservation(20, 30, "orders-b");
+    second.relation_id = "payments".into();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: second.clone(),
+                    authority: token_b.clone()
+                }
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(publish(second, token_b, "b"))
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+}
+
+#[tokio::test]
+async fn relation_reservation_scopes_namespace_and_rejects_legacy_batch_collision() {
+    let store = InMemoryMetaStore::default();
+    let mut legacy = relation_reservation(100, 110, "shared");
+    legacy.relation_id = "orders".into();
+    assert_eq!(
+        store.reserve_ingest_range(legacy).await.unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    let relation_key = relation_authority_key("orders");
+    let relation_token = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: relation_key.clone(),
+            owner_id: "relation".into(),
+            current_token: None,
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let relation = relation_reservation(0, 10, "shared");
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: relation.clone(),
+                    authority: relation_token,
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    let relation = relation_reservation(0, 10, "relation-batch");
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: relation.clone(),
+                    authority: match store
+                        .read_relation_partition_authority(&relation_key)
+                        .await
+                        .unwrap()
+                    {
+                        Some(token) => token,
+                        None => panic!("relation authority should be live"),
+                    },
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+
+    let other_key = RelationPartitionAuthorityKey {
+        namespace: "other".into(),
+        ..relation_key
+    };
+    let other_token = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: other_key,
+            owner_id: "other".into(),
+            current_token: None,
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: relation,
+                    authority: other_token,
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
 }
 
 #[tokio::test]
@@ -1571,6 +1792,30 @@ fn partition_key() -> PartitionAuthorityKey {
         view_id: "orders-view".to_string(),
         stream_id: "orders".to_string(),
         partition_id: 0,
+    }
+}
+
+fn relation_authority_key(relation_id: &str) -> RelationPartitionAuthorityKey {
+    RelationPartitionAuthorityKey {
+        namespace: "default".to_string(),
+        relation_id: relation_id.to_string(),
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+    }
+}
+
+fn relation_reservation(start: u64, end: u64, batch: &str) -> IngestRangeReservation {
+    IngestRangeReservation {
+        stream_id: "orders".to_string(),
+        partition_id: 0,
+        start_offset_inclusive: start,
+        end_offset_exclusive: end,
+        batch_key: format!("batches/{batch}"),
+        payload_digest: format!("sha256:{batch}"),
+        relation_id: "orders".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint: "sha256:schema".to_string(),
+        writer_epoch: 1,
     }
 }
 

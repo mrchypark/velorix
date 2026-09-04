@@ -9,6 +9,7 @@ use velorix_core::standing_program::{
 };
 use velorix_meta::{
     AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
+    AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
     CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
@@ -17,9 +18,11 @@ use velorix_meta::{
     PartitionAuthorityKey, PartitionAuthorityToken, PromoteViewBootstrapOutcome,
     PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
     PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, RelationPartitionAuthorityKey,
     ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, ViewBootstrapLifecycleV1,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerToken, ViewBootstrapLifecycleV1,
 };
 
 #[tokio::test]
@@ -189,6 +192,350 @@ async fn hiqlite_authoritative_ingest_publication_is_bound_idempotent_and_recove
             .await
             .unwrap(),
         vec![publication]
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_relation_authority_is_persistent_and_fenced() {
+    let dir = TempDir::new().unwrap();
+    let raft_addr = free_addr();
+    let api_addr = free_addr();
+    let (store, client) = start_store_with_addresses(&dir, &raft_addr, &api_addr).await;
+    let key = RelationPartitionAuthorityKey {
+        namespace: "default".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+    };
+    let authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "worker-a".into(),
+            current_token: None,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected relation authority outcome: {other:?}"),
+    };
+    let reservation = relation_reservation(0, 10, "batch-a", "orders");
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: reservation.clone(),
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: reservation.clone(),
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Duplicate
+    );
+    let mut collision = relation_reservation(10, 20, "batch-a", "orders");
+    collision.payload_digest = "sha256:other".into();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: collision,
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    let second = relation_reservation(10, 20, "batch-b", "orders");
+    store
+        .reserve_relation_authoritative_ingest_range(
+            ReserveRelationAuthoritativeIngestRangeRequest {
+                reservation: second.clone(),
+                authority: authority.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let first_request = PublishRelationIngestReservationRequest {
+        reservation: reservation.clone(),
+        authority: authority.clone(),
+        request_id: "relation-a".into(),
+        request_digest: "sha256:req-a".into(),
+        object_key: "objects/a".into(),
+        object_digest: "sha256:obj-a".into(),
+    };
+    let second_request = PublishRelationIngestReservationRequest {
+        reservation: second,
+        authority: authority.clone(),
+        request_id: "relation-b".into(),
+        request_digest: "sha256:req-b".into(),
+        object_key: "objects/b".into(),
+        object_digest: "sha256:obj-b".into(),
+    };
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(first_request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(first_request.clone())
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Duplicate
+    );
+    let mut alternate_request = first_request.clone();
+    alternate_request.request_id = "relation-a-other".into();
+    alternate_request.request_digest = "sha256:req-a-other".into();
+    alternate_request.object_key = "objects/a-other".into();
+    alternate_request.object_digest = "sha256:obj-a-other".into();
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(alternate_request)
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Conflict
+    );
+    store
+        .publish_relation_ingest_reservation(second_request)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_relation_authoritative_ingest_publications(&key)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|publication| publication.request_id)
+            .collect::<Vec<_>>(),
+        vec!["relation-a", "relation-b"]
+    );
+    client
+        .execute(
+            "UPDATE velorix_relation_partition_authorities SET expires_at_unix_ms = 0 WHERE namespace = $1 AND relation_id = $2 AND stream_id = $3 AND partition_id = $4",
+            vec![
+                hiqlite::Param::from("default"),
+                hiqlite::Param::from("orders"),
+                hiqlite::Param::from("orders-stream"),
+                hiqlite::Param::from(0_i64),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation,
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(first_request)
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::InvalidAuthority
+    );
+    let takeover = store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key,
+            owner_id: "worker-b".into(),
+            current_token: None,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        takeover,
+        AcquireRelationPartitionAuthorityOutcome::Acquired(_)
+    ));
+    drop(store);
+    client.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (restarted, restarted_client) = tokio::time::timeout(
+        Duration::from_secs(20),
+        start_store_with_addresses(&dir, &raft_addr, &api_addr),
+    )
+    .await
+    .expect("Hiqlite restart should complete within timeout");
+    assert_eq!(
+        restarted
+            .read_relation_authoritative_ingest_publication("relation-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .object_key,
+        "objects/a"
+    );
+    assert_eq!(
+        restarted
+            .list_relation_authoritative_ingest_publications(&RelationPartitionAuthorityKey {
+                namespace: "default".into(),
+                relation_id: "orders".into(),
+                stream_id: "orders-stream".into(),
+                partition_id: 0,
+            })
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    restarted_client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hiqlite_relation_reservation_rejects_legacy_batch_collision() {
+    let (_dir, store, client) = start_store().await;
+    let mut legacy = reservation(0, 0, 10, "sha256:shared");
+    legacy.batch_key = "shared-batch".into();
+    store.reserve_ingest_range(legacy).await.unwrap();
+    let relation_key = RelationPartitionAuthorityKey {
+        namespace: "default".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders".into(),
+        partition_id: 0,
+    };
+    let relation_authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: relation_key,
+            owner_id: "relation".into(),
+            current_token: None,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected relation authority outcome: {other:?}"),
+    };
+    let mut relation = relation_reservation(10, 20, "shared-batch", "orders");
+    relation.stream_id = "orders".into();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: relation,
+                    authority: relation_authority,
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Conflict
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hiqlite_relation_same_request_id_different_payload_has_one_commit() {
+    let (_dir, store, client) = start_store().await;
+    let key = RelationPartitionAuthorityKey {
+        namespace: "default".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+    };
+    let authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key,
+            owner_id: "writer".into(),
+            current_token: None,
+            ttl_ms: 60_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let first = relation_reservation(0, 10, "batch-concurrent-a", "orders");
+    let second = relation_reservation(10, 20, "batch-concurrent-b", "orders");
+    for reservation in [first.clone(), second.clone()] {
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation,
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let store = Arc::new(store);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let requests = [
+        PublishRelationIngestReservationRequest {
+            reservation: first,
+            authority: authority.clone(),
+            request_id: "same-relation-request".into(),
+            request_digest: "sha256:first-request".into(),
+            object_key: "objects/first".into(),
+            object_digest: "sha256:first-object".into(),
+        },
+        PublishRelationIngestReservationRequest {
+            reservation: second,
+            authority,
+            request_id: "same-relation-request".into(),
+            request_digest: "sha256:second-request".into(),
+            object_key: "objects/second".into(),
+            object_digest: "sha256:second-object".into(),
+        },
+    ];
+    let left_store = Arc::clone(&store);
+    let left_barrier = Arc::clone(&barrier);
+    let left_request = requests[0].clone();
+    let left = tokio::spawn(async move {
+        left_barrier.wait().await;
+        left_store
+            .publish_relation_ingest_reservation(left_request)
+            .await
+            .unwrap()
+    });
+    let right_store = Arc::clone(&store);
+    let right_barrier = Arc::clone(&barrier);
+    let right_request = requests[1].clone();
+    let right = tokio::spawn(async move {
+        right_barrier.wait().await;
+        right_store
+            .publish_relation_ingest_reservation(right_request)
+            .await
+            .unwrap()
+    });
+    barrier.wait().await;
+    let outcomes = [left.await.unwrap(), right.await.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PublishIngestReservationOutcome::Committed))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, PublishIngestReservationOutcome::Conflict))
+            .count(),
+        1
     );
     client.shutdown().await.unwrap();
 }
@@ -961,12 +1308,22 @@ async fn start_store() -> (TempDir, HiqliteMetaStore, hiqlite::Client) {
     let dir = TempDir::new().unwrap();
     let raft_addr = free_addr();
     let api_addr = free_addr();
+    let (store, client) = start_store_with_addresses(&dir, &raft_addr, &api_addr).await;
+    (dir, store, client)
+}
+
+#[allow(clippy::field_reassign_with_default)]
+async fn start_store_with_addresses(
+    dir: &TempDir,
+    raft_addr: &str,
+    api_addr: &str,
+) -> (HiqliteMetaStore, hiqlite::Client) {
     let mut config = hiqlite::NodeConfig::default();
     config.node_id = 1;
     config.nodes = vec![hiqlite::Node {
         id: 1,
-        addr_raft: raft_addr.clone(),
-        addr_api: api_addr.clone(),
+        addr_raft: raft_addr.to_string(),
+        addr_api: api_addr.to_string(),
     }];
     config.listen_addr_raft = "127.0.0.1".into();
     config.listen_addr_api = "127.0.0.1".into();
@@ -982,7 +1339,7 @@ async fn start_store() -> (TempDir, HiqliteMetaStore, hiqlite::Client) {
     config.raft_config = hiqlite::NodeConfig::default_raft_config(100);
     let client = hiqlite::start_node(config).await.unwrap();
     let store = HiqliteMetaStore::new(client.clone()).await.unwrap();
-    (dir, store, client)
+    (store, client)
 }
 
 fn free_addr() -> String {
@@ -1008,6 +1365,26 @@ fn partition_authority_request(
         owner_id: owner_id.to_string(),
         current_token,
         ttl_ms: 60_000,
+    }
+}
+
+fn relation_reservation(
+    start: u64,
+    end: u64,
+    batch_key: &str,
+    relation_id: &str,
+) -> IngestRangeReservation {
+    IngestRangeReservation {
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+        start_offset_inclusive: start,
+        end_offset_exclusive: end,
+        batch_key: batch_key.to_string(),
+        payload_digest: format!("sha256:{batch_key}"),
+        relation_id: relation_id.to_string(),
+        relation_version: "v1".into(),
+        schema_fingerprint: "sha256:schema".into(),
+        writer_epoch: 1,
     }
 }
 
