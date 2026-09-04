@@ -31,12 +31,12 @@ jobs:
             dockerfile: Dockerfile.hiqlite
     steps:
       - name: Checkout Velorix source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.VELORIX_SOURCE_REF }}
 
       - name: Checkout locked Hiqlite source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: mrchypark/hiqlite
           ref: 26c6d22a72d7bd0a1e2de073fc4c076ddad4e588
@@ -79,7 +79,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload immutable image digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: velorix-${{ matrix.name }}-image-digest
           path: image-digest-${{ matrix.name }}.txt

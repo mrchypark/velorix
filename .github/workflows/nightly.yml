@@ -90,7 +90,7 @@ jobs:
 
       - name: Checkout
         if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         if: steps.config.outputs.benchmark_configured == 'true' || steps.config.outputs.live_s3_configured == 'true'
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload nightly benchmark result
         if: always() && steps.config.outputs.benchmark_configured == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: s3-nightly-benchmark
           path: |

@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       rustfs-image:
-        description: RustFS container image to use for the S3-compatible gate.
+        description: RustFS image pinned to a sha256 digest for the S3-compatible gate.
         required: false
-        default: rustfs/rustfs:latest
+        default: rustfs/rustfs@sha256:f7cb98ef492fa3c3ed0dbd65df3ce2dd205c666e24e7d7234d9402c9ed1001f9
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -32,7 +32,7 @@ jobs:
 
       - name: Upload RustFS S3-compatible evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rustfs-s3-compatible-evidence
           path: |

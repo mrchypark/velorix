@@ -163,7 +163,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Fail if architecture critique still blocks 1.0
         run: |
@@ -354,7 +354,7 @@ jobs:
             > target/release-evidence/production-readiness-report.json
 
       - name: Upload release benchmark result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: s3-release-benchmark
           path: |
@@ -362,13 +362,13 @@ jobs:
             target/release-evidence/s3-release-benchmark-gate.json
 
       - name: Upload dependency governance evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dependency-governance-evidence
           path: target/dependency-governance/*
 
       - name: Upload release evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-evidence
           path: |

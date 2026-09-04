@@ -3546,7 +3546,8 @@ checks["GHCR deployment images use committed digest-pinned Rust builders and rec
     and "1.95.0-bookworm" not in ghcr_workflow
     and "steps.build.outputs.digest" in ghcr_workflow
     and "source_ref=" in ghcr_workflow
-    and "actions/upload-artifact@v4" in ghcr_workflow
+    and ghcr_workflow.count("actions/checkout@v5") == 2
+    and "actions/upload-artifact@v6" in ghcr_workflow
     and "VELORIX_SOURCE_REF: ${{ github.sha }}" in ghcr_workflow
     and 'test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"' in ghcr_workflow
 )
