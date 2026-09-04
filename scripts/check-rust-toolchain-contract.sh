@@ -19,14 +19,20 @@ for dockerfile in Dockerfile.api Dockerfile.all-in-one Dockerfile.meta Dockerfil
     grep -Fqx "    && rustc --version | grep -Eq '^rustc 1\\.98\\.1 '" "$dockerfile"
 done
 
-toolchain_refs=$(rg -o 'dtolnay/rust-toolchain@[^[:space:]]+' .github/workflows)
-if printf '%s\n' "$toolchain_refs" | rg -qv "dtolnay/rust-toolchain@($build_toolchain|$msrv)$"; then
+toolchain_refs=$(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -exec \
+    sed -n 's/^[[:space:]]*uses:[[:space:]]*\(dtolnay\/rust-toolchain@[^[:space:]#]*\)[[:space:]]*$/\1/p' {} +)
+if ! printf '%s\n' "$toolchain_refs" | awk -v build="$build_toolchain" -v minimum="$msrv" '
+    $0 != "dtolnay/rust-toolchain@" build && $0 != "dtolnay/rust-toolchain@" minimum {
+        invalid = 1
+    }
+    END { exit invalid }
+'; then
     echo "all Rust CI actions must use an explicit build or MSRV toolchain" >&2
     exit 1
 fi
 
-test "$(printf '%s\n' "$toolchain_refs" | rg -Fc "dtolnay/rust-toolchain@$build_toolchain")" -eq 9
-test "$(printf '%s\n' "$toolchain_refs" | rg -Fc "dtolnay/rust-toolchain@$msrv")" -eq 1
+test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$build_toolchain" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 9
+test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$msrv" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 1
 grep -Fqx "        uses: dtolnay/rust-toolchain@$msrv" .github/workflows/ci.yml
 
 echo "Rust toolchain contract passed: MSRV $msrv; build toolchain $build_toolchain"
