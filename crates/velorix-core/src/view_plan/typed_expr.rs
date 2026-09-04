@@ -383,7 +383,7 @@ fn builtin_call_spec(
 ) -> (Vec<Vec<RuntimeScalarTypeV1>>, RuntimeScalarTypeV1) {
     use RuntimeScalarTypeV1::*;
     match function {
-        BuiltinScalarFunctionV1::Concat => (vec![vec![Utf8]], Utf8),
+        BuiltinScalarFunctionV1::Concat => (vec![vec![Utf8]; 8], Utf8),
         BuiltinScalarFunctionV1::Substring => (vec![vec![Utf8]], Utf8),
         BuiltinScalarFunctionV1::Upper | BuiltinScalarFunctionV1::Lower => (vec![vec![Utf8]], Utf8),
         BuiltinScalarFunctionV1::Trim => (vec![vec![Utf8]], Utf8),

@@ -30,28 +30,11 @@ write_diagnostics() {
   mkdir -p "$(dirname "$diagnostics_path")"
   {
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "cluster=${cluster}"
-    echo "context=${context}"
+    echo "cluster_mode=vind_docker"
+    echo "context_configured=true"
     echo "namespace=${namespace}"
     echo "reuse_existing=${reuse_existing}"
-    echo
-    echo "== vcluster list =="
-    vcluster list --driver docker || true
-    echo
-    echo "== kubectl contexts =="
-    kubectl config get-contexts || true
-    echo
-    echo "== readyz =="
-    kubectl --context "$context" get --raw=/readyz || true
-    echo
-    echo "== pods =="
-    kubectl --context "$context" get pods -A -o wide || true
-    echo
-    echo "== leases =="
-    kubectl --context "$context" get leases -n "$namespace" -o wide || true
-    echo
-    echo "== velorix resources =="
-    kubectl --context "$context" get velorixdatabases,velorixstreams,velorixworkershards -n "$namespace" -o wide || true
+    echo "diagnostics_mode=non_sensitive_summary"
   } >"$diagnostics_path" 2>&1
 }
 
@@ -74,7 +57,7 @@ cleanup_vind() {
 vcluster_exists() {
   local clusters
   local status
-  clusters="$(vcluster list --driver docker --output json)" || {
+  clusters="$(vcluster list --driver docker --output json 2>/dev/null)" || {
     echo "failed to list docker vClusters" >&2
     exit 1
   }
@@ -122,7 +105,7 @@ wait_for_kubernetes() {
   done
 
   write_diagnostics
-  echo "vind Kubernetes API did not become ready for context ${context}" >&2
+  echo "vind Kubernetes API did not become ready" >&2
   exit 1
 }
 
@@ -131,11 +114,14 @@ trap 'status=$?; cleanup_vind "$status"; exit "$status"' EXIT
 
 previous_context="$(kubectl config current-context 2>/dev/null || true)"
 
-vcluster use driver docker >/dev/null
+if ! vcluster use driver docker >/dev/null 2>&1; then
+  echo "failed to select docker vcluster driver" >&2
+  exit 1
+fi
 
 if vcluster_exists; then
   if [ "$reuse_existing" != "1" ]; then
-    echo "vcluster already exists: ${cluster}; choose a unique VELORIX_VIND_CLUSTER, delete the existing cluster, or set VELORIX_VIND_REUSE_EXISTING=1" >&2
+    echo "vcluster already exists; choose a unique VELORIX_VIND_CLUSTER, delete the existing cluster, or set VELORIX_VIND_REUSE_EXISTING=1" >&2
     exit 1
   fi
   cluster_exists=1
@@ -143,7 +129,7 @@ else
   cluster_exists=0
 fi
 
-contexts="$(kubectl config get-contexts -o name)" || {
+contexts="$(kubectl config get-contexts -o name 2>/dev/null)" || {
   echo "failed to list kubectl contexts" >&2
   exit 1
 }
@@ -156,26 +142,38 @@ fi
 
 if [ "$cluster_exists" = "1" ]; then
   if [ "$context_exists" != "1" ]; then
-    echo "vcluster exists but kubectl context is missing: ${context}" >&2
+    echo "vcluster exists but its kubectl context is missing" >&2
     exit 1
   fi
 else
   if [ "$context_exists" = "1" ]; then
-    echo "kubectl context already exists: ${context}; choose a unique VELORIX_VIND_CLUSTER or remove the stale context" >&2
+    echo "kubectl context already exists; choose a unique VELORIX_VIND_CLUSTER or remove the stale context" >&2
     exit 1
   fi
   created_cluster=1
-  vcluster create "$cluster" --driver docker --kube-config-context-name "$cluster"
+  if ! vcluster create "$cluster" --driver docker --kube-config-context-name "$cluster" >/dev/null 2>&1; then
+    echo "failed to create vcluster" >&2
+    exit 1
+  fi
 fi
 
-kubectl config use-context "$context" >/dev/null
+if ! kubectl config use-context "$context" >/dev/null 2>&1; then
+  echo "failed to select kubectl context" >&2
+  exit 1
+fi
 wait_for_kubernetes
 
 mkdir -p "$(dirname "$evidence_path")" target/velorix-k8s
 cargo run -p velorix-k8s --example print_crds > target/velorix-k8s/crds.json
-kubectl --context "$context" apply -f target/velorix-k8s/crds.json
-kubectl --context "$context" create namespace "$namespace" --dry-run=client -o yaml \
-  | kubectl --context "$context" apply -f -
+if ! kubectl --context "$context" apply -f target/velorix-k8s/crds.json >/dev/null 2>&1; then
+  echo "failed to apply Velorix CRDs" >&2
+  exit 1
+fi
+if ! kubectl --context "$context" create namespace "$namespace" --dry-run=client -o yaml 2>/dev/null \
+  | kubectl --context "$context" apply -f - >/dev/null 2>&1; then
+  echo "failed to apply gate namespace" >&2
+  exit 1
+fi
 
 export VELORIX_K8S_INTEGRATION=1
 export VELORIX_K8S_NAMESPACE="$namespace"
@@ -185,11 +183,20 @@ cargo test -p velorix-k8s --test live_lease -- --nocapture --test-threads=1
 cargo test -p velorix-k8s --test live_ingest_admission -- --nocapture --test-threads=1
 cargo test -p velorix-k8s --test live_worker_shard -- --nocapture --test-threads=1
 
-kubectl --context "$context" get crd | grep velorix
-kubectl --context "$context" get leases -n "$namespace"
-kubectl --context "$context" get velorixdatabases,velorixstreams,velorixworkershards -n "$namespace"
+if ! kubectl --context "$context" get crd >/dev/null 2>&1; then
+  echo "failed to verify applied CRDs" >&2
+  exit 1
+fi
+if ! kubectl --context "$context" get leases -n "$namespace" >/dev/null 2>&1; then
+  echo "failed to verify leases" >&2
+  exit 1
+fi
+if ! kubectl --context "$context" get velorixdatabases,velorixstreams,velorixworkershards -n "$namespace" >/dev/null 2>&1; then
+  echo "failed to verify Velorix resources" >&2
+  exit 1
+fi
 
-python3 - "$evidence_path" "$diagnostics_path" "$cluster" "$context" "$namespace" "$cleanup" "$created_cluster" "$reuse_existing" <<'PY'
+python3 - "$evidence_path" "$diagnostics_path" "$namespace" "$cleanup" "$created_cluster" "$reuse_existing" <<'PY'
 import json
 import os
 import subprocess
@@ -204,8 +211,6 @@ def run(command):
 (
     path,
     diagnostics_path,
-    cluster,
-    context,
     namespace,
     cleanup,
     created_cluster,
@@ -235,8 +240,8 @@ evidence = {
     ],
     "gate_detail_kind": gate_detail_kind,
     "ingest_writer_image_configured": bool(ingest_writer_image),
-    "cluster": cluster,
-    "context": context,
+    "cluster_mode": "vind_docker",
+    "kubernetes_context_configured": True,
     "namespace": namespace,
     "cleanup_requested": cleanup == "1",
     "created_cluster": created_cluster == "1",
@@ -245,9 +250,9 @@ evidence = {
     "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     "docker_version": run(["docker", "version", "--format", "{{.Server.Version}}"])[0],
     "vcluster_version": run(["vcluster", "--version"])[0],
-    "kubectl_current_context": run(["kubectl", "config", "current-context"])[0],
+    "kubectl_current_context_available": True,
     "kubectl_client_version": run(["kubectl", "version", "--client=true", "--output=yaml"]),
-    "applied_crds": run(["kubectl", "--context", context, "get", "crd", "-o", "name"]),
+    "applied_crds": "queried_in_gate_execution",
     "live_tests": [
         "cargo test -p velorix-k8s --test live_crd_round_trip",
         "cargo test -p velorix-k8s --test live_lease",

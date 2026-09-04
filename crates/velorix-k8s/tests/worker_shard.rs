@@ -543,6 +543,39 @@ async fn worker_shard_operator_runtime_surfaces_authority_failures_without_start
 }
 
 #[tokio::test]
+async fn worker_shard_operator_runtime_stops_matching_worker_when_renewal_fails() {
+    let lease = FakeLeaseClient::default().with_current(Some(grant("worker-a", 1)));
+    lease.fail_acquire();
+    let executor = FakeCommandExecutor::default();
+    let runtime = WorkerShardOperatorRuntime::with_authority(
+        lease,
+        FakeEpochStore::default().with_record(epoch_record("worker-a", 1)),
+        executor.clone(),
+        authority(),
+    );
+
+    let error = runtime
+        .handle_event(
+            WorkerShardEvent::Applied(shard()),
+            input(Some(WorkerFact {
+                owner_id: "worker-a".to_string(),
+                owner_epoch: 1,
+            })),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, WorkerShardError::Authority { .. }));
+    assert_eq!(
+        executor.actions(),
+        vec![ExecutedWorkerCommand::Stop {
+            owner_id: "worker-a".to_string(),
+            owner_epoch: 1,
+        }]
+    );
+}
+
+#[tokio::test]
 async fn kubernetes_worker_shard_operator_runtime_uses_checked_epoch_store_from_startup_components()
 {
     let validated_authority = validate_operator_authority(
@@ -1200,7 +1233,10 @@ async fn worker_shard_lifecycle_runs_initial_resync_before_stream_events() {
         |_| input(None),
         WorkerShardLifecycleOptions {
             initial_resync: WorkerShardResyncOptions::default(),
-            periodic_resync: None,
+            periodic_resync: Some(WorkerShardPeriodicResyncSchedule {
+                interval: Duration::from_secs(60),
+                resync: WorkerShardResyncOptions::default(),
+            }),
         },
         stream::iter(vec![Ok(WorkerShardEvent::Applied(
             shard_with_stream_partition("payments", 1),
@@ -1265,6 +1301,90 @@ async fn worker_shard_lifecycle_runs_initial_resync_before_stream_events() {
                 .unwrap()
             ),
         ]
+    );
+    let pod_delete_paths = requests
+        .iter()
+        .filter(|request| request.method == Method::DELETE)
+        .map(|request| request.path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pod_delete_paths,
+        vec![
+            format!(
+                "/api/v1/namespaces/default/pods/{}",
+                worker_shard_pod_name_for_identity(
+                    &runtime_identity_from_worker_shard(&shard(), "worker-a", 1).unwrap()
+                )
+            ),
+            format!(
+                "/api/v1/namespaces/default/pods/{}",
+                worker_shard_pod_name_for_identity(
+                    &runtime_identity_from_worker_shard(
+                        &shard_with_stream_partition("payments", 1),
+                        "worker-a",
+                        1,
+                    )
+                    .unwrap()
+                )
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn worker_shard_lifecycle_fences_locally_started_workers_when_watch_errors() {
+    let validated_authority = validate_operator_authority(
+        authority(),
+        Arc::new(InMemory::new()),
+        "worker-shard-lifecycle-watch-error-authority",
+        "v1/probes/worker-shard-lifecycle-watch-error",
+    )
+    .await
+    .unwrap();
+    let components =
+        OperatorAuthorityStartupComponents::from_validated_authority(validated_authority);
+    let (client, requests) =
+        fake_worker_shard_startup_resync_client(vec![list_page(vec![shard()], None)]);
+    let runtime = build_kubernetes_worker_shard_operator_runtime(
+        client.clone(),
+        "default",
+        &components,
+        WorkerShardPodTemplate::new("ghcr.io/velorix/velorix-worker:1.0.0").unwrap(),
+    )
+    .unwrap();
+
+    let error = run_worker_shard_lifecycle_with_operator_event_stream(
+        client,
+        "default",
+        &runtime,
+        |_| input(None),
+        WorkerShardLifecycleOptions {
+            initial_resync: WorkerShardResyncOptions::default(),
+            periodic_resync: Some(WorkerShardPeriodicResyncSchedule {
+                interval: Duration::from_secs(60),
+                resync: WorkerShardResyncOptions::default(),
+            }),
+        },
+        stream::iter(vec![Err(WorkerShardError::Authority {
+            message: "watch failed".to_string(),
+        })]),
+        std::future::pending::<()>(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkerShardError::Authority { message } if message == "watch failed"
+    ));
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == Method::DELETE)
+            .count(),
+        1
     );
 }
 
@@ -2910,6 +3030,20 @@ fn fake_worker_shard_runtime_client() -> (kube::Client, Arc<Mutex<Vec<RecordedKu
                     (Method::POST, "/api/v1/namespaces/default/pods") => {
                         (StatusCode::CREATED, body)
                     }
+                    (Method::DELETE, path)
+                        if path.starts_with("/api/v1/namespaces/default/pods/") =>
+                    {
+                        (
+                            StatusCode::OK,
+                            json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "metadata": {},
+                                "status": "Success",
+                                "code": 200
+                            }),
+                        )
+                    }
                     _ => (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         json!({
@@ -3028,6 +3162,20 @@ fn fake_worker_shard_startup_resync_client_with_list_observer(
                     }
                     (Method::POST, "/api/v1/namespaces/default/pods") => {
                         (StatusCode::CREATED, body)
+                    }
+                    (Method::DELETE, path)
+                        if path.starts_with("/api/v1/namespaces/default/pods/") =>
+                    {
+                        (
+                            StatusCode::OK,
+                            json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "metadata": {},
+                                "status": "Success",
+                                "code": 200
+                            }),
+                        )
                     }
                     _ => (
                         StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,245 +1,92 @@
 # Supported materialized-view SQL
 
-This is the capability contract for the production `POST /v1/views` admission
-path. It describes SQL which is lowered by
-`velorix_core::view_plan::lower_supported_sql_to_logical_plan` and run by the
-built-in materialized-view runtime. It is deliberately narrower than the SQL
-accepted by the parser or by query-time DataFusion.
+**Status: 2026-09-04.** This is the canonical contract for `POST /v1/views`.
+It is deliberately narrower than parser acceptance and than SQL accepted by a
+read-only query over an already materialized output. A view is admitted only
+when registered input catalogs resolve, output-schema derivation succeeds, a
+typed `VelorixLogicalViewPlanV1` is built, the native runtime accepts it, and
+public-policy checks pass. Any failure is a 400-class admission failure; there
+is no source-recomputation fallback.
 
-Every admitted view has one output relation and either one or two registered
-input relations. Its input schemas, output schema, keys, nullability, and
-types are part of admission; a syntactically similar statement can therefore
-be rejected for a schema-specific reason. The output schema must match the
-admitted projection. Examples below show the SQL shape, not a complete DDL
-contract.
+## Product flow
 
-## Production admission (default API configuration)
+1. `POST /v1/relations` registers an explicit relation schema and key.
+2. An ingest endpoint validates schema-bound rows and commits an ingest epoch.
+3. `POST /v1/views` resolves registered schemas and admits a typed native plan.
+4. The standing runtime applies committed deltas and persists materialized output.
+5. The view query endpoint reads that published output, never source batches.
 
-| Family | Admitted shape and scope |
-| --- | --- |
-| Filter and projection | One relation; a primary-key projection plus one or more values. `WHERE` accepts the predicate forms validated by the plan (column/literal comparisons, Boolean combinations, `IN`, `BETWEEN`, `LIKE`, null and distinctness checks, and the supported Int64 scalar expressions). `SELECT DISTINCT`, `UNION DISTINCT`, `INTERSECT DISTINCT`, and `EXCEPT DISTINCT` are supported for this family. |
-| Computed Int64 projection | Integer literals and registered Int64 columns; `+`, `-`, `*`, `/`, `%`, `abs`, `greatest`, `least`, `coalesce(column, int_literal)`, searched `CASE`, simple `CASE column WHEN literal THEN ... ELSE ... END`, and `if(condition, then, else)`, subject to the validator's type/nullability rules. These expressions are also usable as supported aggregate inputs and predicates where the relevant validator admits them. |
-| Single-relation aggregate | One or more ordered group keys made from registered columns or supported deterministic Int64 scalar expressions, with `sum`, `count(*)`, `count(column)`, `count(DISTINCT column)`, `min`, `max`, and `avg`. A global aggregate with no `GROUP BY` is admitted only for `count(*)` or its normalized count of a registered non-null column. Aggregate `FILTER (WHERE ...)`, a supported aggregate-output `HAVING` predicate, `DISTINCT ON`, and Top-K are admitted only within their validator restrictions. |
-| Latest by key | One relation keyed by its primary key: `arg_max(value, ordering)` or `arg_min(value, ordering)`, optionally with supported source/filter predicates and Top-K. |
-| Two-relation join aggregate | Exactly two distinct registered relations. `INNER JOIN` accepts one equality between non-null scalar columns outside both primary keys, one primary-key equality, or a canonical conjunction/`USING` list that covers every column of both composite primary keys exactly once. Narrow outer joins remain single-key primary-key joins only. Aggregate outputs use the supported aggregate family, with supported qualified `WHERE`, `FILTER`, `HAVING`, and Top-K forms. A relation must be referred to unambiguously by its table alias when the join validator requires it. |
-| Three-relation composite-PK count | Exactly three distinct registered relations with explicit aliases and two left-deep `INNER JOIN` steps. Each step must add one relation and equate every root composite-PK position bijectively to every PK position of the new relation, using non-null columns with exact Arrow types. Projection and `GROUP BY` are the canonical root PK followed by one `COUNT(*)`. The root role is fixed and non-root roles use durable relation-ID order, so swapping the two JOIN clauses does not change the canonical join DAG or result. No residual predicate, `WHERE`, aggregate `FILTER`, `HAVING`, Top-K, CTE/derived source, outer join, or non-PK key is admitted. The runtime is two ordinary Foundation 0B binary joins, not a three-table state machine. |
-| Narrow self-join count | One registered relation scanned twice with two explicit aliases, one `INNER JOIN` equality between the same non-primary, non-null supported scalar column, and exactly one global `COUNT(*)` output. The runtime maintains two canonical role indexes from one physical input frontier and always publishes one row, including `count = 0`. |
-| Narrow left join | `LEFT [OUTER] JOIN` is admitted only when grouping by the left primary key. It preserves unmatched left rows and permits nullable right-side aggregate/filter inputs in the bounded grouped family. Right-referencing top-level `WHERE` runs after null extension. Residual `ON`, shared aggregate filters, right-side grouping, raw joined-row projection, and right-side CTE/derived-source filters remain unsupported. |
-| Narrow right join | `RIGHT [OUTER] JOIN` has the mirror restrictions: group by the SQL-right primary key and preserve its unmatched rows, while the bounded grouped family may aggregate/filter nullable values from either SQL side. Admission swaps operands and column bindings, then uses the narrow-left logical node and runtime state machine. |
-| Narrow full join | `FULL [OUTER] JOIN` admits exactly two relations joined by one complete scalar primary-key equality. The first output and grouping key must be `COALESCE(left_key, right_key)` (or its projection alias/ordinal for grouping). Both bags are retained and either side can contribute nullable aggregate/filter inputs. |
-| Top-K | `ORDER BY` plus positive integer `LIMIT` or `FETCH FIRST`, optionally non-negative integer `OFFSET`, for the supported family. Public API limits `LIMIT` to 1,000. `LIMIT` without `ORDER BY`, `LIMIT BY`, and simultaneous `LIMIT`/`FETCH` are rejected. |
-| CTE / derived source | The identity or single-source filter/projection forms admitted by the individual family validators. They are not general recursive or multi-source subqueries. |
+A late-created view is `backfill_required` until its backfill completes. That
+state is materialization progress, not an alternate query implementation.
 
-## Complete production shape matrix
+## Admission matrix
 
-The table above names the runtime families. The matrix below lists every SQL
-feature admitted inside those families. A query feature or combination not
-listed here is unsupported, even when the SQL parser accepts it.
+“Default public” means reachable through the default public API configuration.
+“Experimental-gated” requires `experimental_advanced_view_features=true`.
+“Internal but publicly unreachable” means a runtime test exists but public
+schema derivation/admission does not expose it; it is not a product capability.
 
-| Area | Supported forms | Required restrictions |
+| SQL family | Status | Exact bounded scope / evidence |
 | --- | --- | --- |
-| Statement | One parenthesized or unparenthesized `SELECT` | Exactly one statement and one output relation. |
-| Source | A registered table, an identity CTE, or an identity/single-source filter and direct-projection CTE or derived table | CTEs are non-recursive. Required key, value, ordering, and predicate columns must remain directly traceable to catalog columns. Source projection aliases are allowed when unambiguous. |
-| Projection | Direct columns, `*`, qualified `alias.*`, supported Int64 computed expressions, and aliases | `*` expands in catalog order and only over an identity source. Output columns, types, nullability, and output key must match the requested output schema. The weight column cannot be projected as an ordinary runtime value. |
-| Distinct projection | Plain `SELECT DISTINCT` | The resulting output must have a valid, non-duplicated output key. `DISTINCT ON` is not supported for filter/project views. |
-| Comparisons | `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=` between a supported column/expression and a compatible literal or expression | Columns must be runtime-visible and types must match. Expression-to-expression comparison is limited to supported Int64 expressions. |
-| Boolean predicates | `AND`, `OR`, parentheses, `IN`, `NOT IN`, `BETWEEN`, `NOT BETWEEN`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`, `IS DISTINCT FROM`, and `IS NOT DISTINCT FROM` | Predicate literals and columns must satisfy the family validator. A source weight column is never predicate-visible. |
-| Int64 scalar expressions | Integer literals and registered Int64 columns; unary sign; `+`, `-`, `*`, `/`, `%`; `CAST`, `TRY_CAST`, `SAFE_CAST`, and `::` to Int64; `abs`; `greatest`; `least`; `coalesce(nullable_column, integer_literal)`; searched and simple `CASE`; `if(condition, then, else)` | Branches/arguments must resolve to the supported Int64/nullability contract. Arithmetic is same-row only; join aggregate inputs cannot combine columns from both sides in one scalar expression. |
-| Set operations | `UNION DISTINCT`, `INTERSECT DISTINCT`, and `EXCEPT DISTINCT` for filter/project branches over the same relation | Both branches must preserve the same supported direct projection and compatible schema. Only the tested branch-filter combinations are admitted; `ALL`, cross-relation branches, and computed branch projections are rejected. |
-| Grouping | One or more ordered registered columns or supported deterministic Int64 scalar expressions; direct expressions, projected aliases, and ordinals are admitted in the validated forms. The legacy primary-key shape also accepts its supported `GROUP BY ALL` equivalent. No `GROUP BY` is admitted only for the global count shape. | Every grouping expression must be projected exactly once and bind unambiguously; the weight column, duplicate grouping expressions, volatile/unknown functions, `ROLLUP`, `CUBE`, and `GROUPING SETS` are rejected. Nullable direct columns use SQL NULL grouping semantics. The ordered projected grouping columns form the output primary key; global count has no public key column. |
-| Aggregates | `SUM(expr)`, `COUNT(*)`, `COUNT(column)`, `COUNT(DISTINCT column)`, `MIN(expr)`, `MAX(expr)`, and `AVG(expr)` | `expr` is a supported direct or computed input for that family. Other distinct aggregates are rejected. Decimal `AVG` has the validated Float64 output contract. |
-| Aggregate filters | Per-aggregate `FILTER (WHERE predicate)` | The predicate must use columns visible to that aggregate/family. Different filters may be used by different aggregates. Left joins impose the stricter left-only rule described below. |
-| `HAVING` | One supported Boolean predicate over a projected aggregate alias or an aggregate function exactly matching a projected aggregate, including its input and filter | An unprojected, ambiguous, or merely similar aggregate expression is rejected. `AND`/`OR` combinations are admitted only when every atom binds successfully. |
-| Latest by key | Exactly one `arg_max(value, ordering)` or `arg_min(value, ordering)` grouped by the primary key | Ordering must be a supported non-null column. Source/outer predicates, aliases, the standard grouping forms, and Top-K are supported. |
-| Inner join | Exactly two distinct registered relations; `INNER JOIN`/`JOIN` with equalities in `ON` or `USING` | Primary-key pairs must cover each input's complete primary key exactly once. Alternatively, one equality may join non-null, non-weight scalar columns outside both primary keys; duplicate matches retain SQL bag multiplicity. Every corresponding pair must have the exact same Arrow physical type; cross-type coercion is not admitted. Nested, nullable, composite non-primary, and partial-primary-key equality are rejected. Pairs are canonicalized deterministically; repeating the same pair is deduplicated. Composite PK keys use `velorix-composite-pk-positional-json-array-join-key-v1`; non-primary scalar keys use the separate `velorix-non-primary-non-null-scalar-join-key-v1` domain. Both identities are bound to execution and checkpoint restore. Supported residual `ON` predicates and qualified `WHERE` predicates may refer to either side, but an `ON` residual cannot be an `OR`, and a single scalar residual expression cannot mix sides. |
-| Three-relation inner join | Exactly three distinct registered relations; two explicit-alias, left-deep `INNER JOIN`/`JOIN` steps; complete composite-PK equalities; canonical root-PK projection and `GROUP BY`; one `COUNT(*)` | Every step adds one new relation and maps every root PK position bijectively to the new relation's complete PK with exact non-null Arrow types. Relation roles, permutations, `velorix-composite-pk-positional-json-array-join-key-v1`, and the versioned root-fixed/right-relation-ID order policy are durable plan identity. Field-absent schema-v1 plans retain legacy encounter-order restore semantics. Residuals, predicates, other aggregates, outer joins, non-PK keys, and source rewrites are rejected. |
-| Self join | One physical relation with two explicit aliases; `INNER JOIN`/`JOIN` on one equality between the same non-primary, non-null, non-weight supported scalar column; global `COUNT(*)` only | The binder emits canonical `scan_left` and `scan_right` input-instance identities independent of SQL alias spelling. One physical delta is applied atomically to both role indexes under `velorix-self-join-left-then-right-atomic-fanout-v1`, preserving SQL bag multiplicity. Primary-key or composite equality, residual `ON`, `WHERE`, grouping, projections, aggregate filters, `HAVING`, Top-K, CTE/derived sources, outer joins, and aggregates other than `COUNT(*)` are rejected. |
-| Inner-join aggregation | Group by the admitted lexicographically first join-key pair's component and use the supported aggregates over allowed left or right inputs | Qualified references must be unambiguous. Cross-side scalar aggregate inputs are rejected. Nullable and distinct counts are accepted only for the side/input combinations explicitly validated by the join plan. Composite grouping of the join result is not yet admitted. |
-| Left join | `LEFT [OUTER] JOIN` with the same single-key equality, grouped by the left primary key | Left- and right-side aggregate inputs are supported for the admitted grouped family. Right-referencing `WHERE` is evaluated after the join; aggregate null/empty behavior follows SQL. No right grouping, residual `ON`, shared aggregate filter, raw joined-row projection, or right-side CTE/derived-source filter. |
-| Right join | `RIGHT [OUTER] JOIN` with the same single-key equality, grouped by the SQL right primary key | The bounded grouped family mirrors left-join aggregate/filter support after swapping operands. Non-preserved SQL-left `WHERE` is evaluated after null extension; corresponding source filters, residual `ON`, shared filters, and raw projection remain unsupported. No right-join state machine exists. |
-| Full join | `FULL [OUTER] JOIN` with one complete scalar primary-key equality, projected/grouped by `COALESCE(left_key, right_key)` | Both unmatched sides are maintained with general-retract bag semantics. Composite/non-primary keys, residual `ON`, shared aggregate filters, and CTE/derived filters on either null-extending input are rejected. |
-| Semi/anti join | One direct outer `WHERE EXISTS (SELECT non_null_literal FROM right WHERE right.pk = left.pk)` or `WHERE NOT EXISTS (...)`, with either correlation orientation | Exactly two distinct registered relations with one non-null scalar primary-key column each; logical and Arrow key types must match exactly. The outer projection follows the keyed filter/project contract and must include at least one value column. `DISTINCT`, grouping, residual predicates, explicit joins, derived/CTE inputs, nonliteral inner projections, composite/non-primary/nullable keys, `IN`/`NOT IN` subqueries, and all other subquery shapes fail closed. The forms lower to ordinary `SemiEquiJoin`/`AntiEquiJoin` nodes and use the separate `velorix-native-semi-join-v1` and `velorix-native-anti-join-v1` checkpoint codecs. |
-| Ordering without a bound | A supported trailing `ORDER BY` | It does not change materialization unless paired with a supported bound. |
-| Top-K | One metric/order expression, optionally followed by the deterministic key tie-breaker; `LIMIT positive_integer` or `FETCH FIRST positive_integer ROWS ONLY`; optional `OFFSET non_negative_integer` | The order expression must be a projected output or an exactly bindable supported function/expression; hidden order columns are supported only for non-null direct filter/project inputs. Public admission caps the limit at 1,000. |
+| Filters and projections | Default public | One registered relation, key-preserving direct projection plus bounded `WHERE` predicates. `filter_project_*` plan tests and REST tests in `crates/velorix-api/src/tests.rs`. |
+| Computed Int64 projections | Default public | Registered Int64 columns/literals and the admitted deterministic arithmetic, casts, `abs`, `greatest`/`least`, `coalesce`, `CASE`, and `if` forms. Output key, type, and nullability must match the derived schema. `filter_project_sql_accepts_computed_int64_projection`. |
+| `SELECT DISTINCT` | Default public | Only when the output has a valid, non-duplicated output key; `DISTINCT ON` is rejected for filter/project views. The plan tests at `view_plan.rs:775` through `:887` cover admitted and rejected key shapes. |
+| Same-relation distinct set operations | Default public | `UNION DISTINCT`, `INTERSECT DISTINCT`, and `EXCEPT DISTINCT` only for validated filter/project branches over one relation with compatible direct projections; `ALL`, cross-relation branches, and unsupported computed branches fail closed. `filter_project_union_distinct_same_relation_lowers_to_filter_project_plan`, `filter_project_intersect_distinct_same_relation_lowers_to_filter_project_plan`, `filter_project_except_distinct_filtered_left_lowers_to_left_and_not_right`, and `rest_filter_project_union_distinct_view_materializes_outputs`. |
+| Bounded CTE / derived sources | Default public | Identity or single-source filter/direct-projection CTE and derived-table forms only, when required key/value/order/predicate columns remain traceable to catalog columns. They are not general, recursive, or multi-source subqueries. `filter_project_sql_accepts_identity_cte_source_filters`, `filter_project_sql_accepts_derived_table_source_filters`, and `rest_filter_project_derived_table_view_materializes_outputs`. |
+| Grouping and basic aggregates | Default public | Typed group keys plus `SUM`, `COUNT(*)`, `COUNT(column)`, `MIN`, `MAX`, `AVG`; global aggregation is limited to the admitted count shape. `single_key_aggregate_*` and `rest_composite_and_global_aggregates_survive_restart_and_final_retraction`. |
+| `COUNT(DISTINCT column)` | Default public | One supported aggregate input, including documented join restrictions; no multi-column or other distinct aggregates. `rest_two_relation_join_count_distinct_view_materializes_outputs`. |
+| `HAVING` and aggregate `FILTER` | Default public | Must bind exactly to a projected aggregate/admitted input. `rest_aggregate_having_view_materializes_outputs` and `rest_two_relation_join_having_view_materializes_outputs`. |
+| Latest / arg extrema | Default public | One `arg_min(value, ordering)` or `arg_max(value, ordering)`, grouped by the input primary key. `latest_by_key_*` plan tests. |
+| Top-K | Default public | `ORDER BY` plus literal positive `LIMIT`/`FETCH`, optional literal non-negative `OFFSET`; public limit is 1,000. |
+| Inner join | Default public | Two registered inputs with validated equality/key restrictions and admitted aggregate/project shapes. `rest_two_relation_join_view_materialized_output_survives_api_restart`. |
+| Outer joins | Default public | Narrow left/right grouped forms and a narrow full join with the required coalesced key; raw/general outer joins are rejected. `rest_left_join_left_group_key_view_materializes_unmatched_left_rows` and `rest_right_join_swaps_operands_and_materializes_unmatched_right_rows`. |
+| Self join | Default public | Two aliases of one relation, one non-primary scalar equality, global `COUNT(*)` only. `rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract`. |
+| Semi / anti join | Default public | Direct correlated `EXISTS`/`NOT EXISTS` equality over two single, non-null scalar primary keys; not general subquery support. `correlated_exists_*` and `rest_exists_and_not_exists_views_survive_restart_and_match_transitions`. |
+| Three-way join | Default public | Exactly three inputs, left-deep inner joins, complete composite-PK equalities, root-PK projection/grouping, and one `COUNT(*)`. `rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart`. |
+| Cross join | Default public | The specifically validated two-input cross-join projection shape only; it is not a general join-composition escape hatch. `validate_supported_cross_join_sql`. |
+| Event-time windows | Default public | `TUMBLE`, `HOP`, and `SESSION` over the validated aggregate shape and declared event-time/watermark contract. `tumbling_event_time_aggregate_sql_accepts_subsecond_interval_units` and `rest_hopping_window_advanced_aggregate_view_survives_api_restart`. |
+| Recursive CTE | Default public | Only the validated positive `UNION DISTINCT` fixpoint grammar; arbitrary recursive SQL is rejected. Factory evidence: `validate_supported_recursive_cte_sql`; runtime: `recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`. |
+| Interval join | Default public | Two-input inner overlap join with exact strict endpoint comparisons and bounded projection; no grouping or `HAVING`. `interval_join_materializes_overlap_retraction_and_restart`. |
+| Temporal/as-of join | Default public | The validator’s two-input temporal/equality/projection shape only. `temporal_join_materializes_asof_match_and_retracts`. |
+| Percentile and median | Default public, code-supported; API E2E gap | `median`, `percentile_disc`, and `percentile_cont` use validated literal percentiles and supported inputs. They are not supported in join output-schema construction. Runtime evidence is `percentile_aggregates_are_exact_across_retract_and_restart`; this pass found no named public REST admission-to-restart test, so do not represent that gap as completed E2E evidence. |
+| `ROW_NUMBER`, `RANK`, `DENSE_RANK` | Experimental-gated | One relation with validated partition/order/tie-breaker and bounded rank-filter form. Default admission returns an explicit experimental-disabled error; `public_1_0_rejects_experimental_view_surfaces_by_default`. |
+| Scalar aggregate subquery filter | Internal but publicly unreachable | `ScalarAggregateFilter` runtime coverage exists (`scalar_aggregate_filter_materializes_and_restores`), but the public output-schema factory has no corresponding branch. |
+| Analytic navigation frames | Internal but publicly unreachable | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE` runtime coverage exists (`analytic_window_frames_navigation_materializes_and_restores`), but public schema derivation does not expose it. |
 
-Representative admission evidence is named directly in
-`crates/velorix-core/tests/view_plan.rs`: `filter_project_*`,
-`single_key_aggregate_*`, `latest_by_key_*`, `two_input_join_*`, `self_join_*`,
-`left_join_*`, and `correlated_exists_*`. Those tests, not parser behavior, are
-authoritative. Public REST recovery evidence for both existence forms is
-`rest_exists_and_not_exists_views_survive_restart_and_match_transitions`.
+## Explicit rejection boundary
 
-The aggregate implementation has explicit incremental state for
-`COUNT(DISTINCT ...)`; it is not implemented as a source re-scan. In joins,
-the precise side/type restrictions are intentionally enforced by admission,
-especially for nullable `COUNT(column)` and distinct inputs.
+Everything outside the table is rejected during admission: arbitrary subqueries,
+general navigation frames, unbounded analytic windows, recursive forms outside
+the validated grammar, unsupported join compositions, four-or-more-input views,
+unsupported distinct aggregates, `UNION ALL`, `ROLLUP`/`CUBE`/`GROUPING SETS`,
+DDL/DML, multiple statements, and parser-only syntax. Query-time SQL is a
+separate read-only DataFusion surface over one published output table; it never
+expands materialization support.
 
-Global aggregation is intentionally narrower than grouped aggregation. Only
-`COUNT(*)` (including the admitted normalized count of a registered non-null
-column) has the required empty-input representation today. It always publishes
-one row, including `count = 0` for empty input, and exposes no synthetic SQL key
-column. Global `SUM`, `MIN`, `MAX`, and `AVG` remain rejected until their
-empty-set NULL state is represented by the runtime and public schema.
+## Operational boundaries
 
-## Experimental-gated materialized views
+Recovery is intentionally jarless and no-PVC: the intended architecture uses
+relation metadata plus immutable object/local-storage checkpoints so a
+replacement process can recover a standing runtime. Production and adversarial
+proof of that recovery contract remains pending. Do not introduce PVC-backed
+view state, package-loaded runtimes, or a source-query fallback as a shortcut.
 
-The runtime has implementations and API integration coverage for the following
-families. `POST /v1/views` admits **event-time windows by default** (public 1.0,
-see "Event-Time Semantics" below); analytic ranking stays gated and rejects by
-default with "analytic window SQL is experimental and disabled for the public
-1.0 API". Analytic ranking requires the server configuration that enables
-`experimental_advanced_view_features`:
+GitHub Actions provides build/test/release gates, and a separate GHCR workflow
+publishes immutable product images. Those delivery controls are not evidence
+that an internal runtime is a public SQL capability; this matrix and its named
+tests are the capability authority.
 
-| Family | Narrow admitted scope | Default |
-| --- | --- | --- |
-| Event-time aggregate windows | `TUMBLE`, `HOP`, and `SESSION` over one relation, with the same supported aggregate/filter/HAVING/Top-K concepts where their window validator permits them. Intervals and event-time columns are validated; this is not arbitrary window SQL. | **Admitted** (public 1.0) |
-| Analytic ranking | `ROW_NUMBER`, `RANK`, and `DENSE_RANK` with the required single partition column, sortable non-null order column, deterministic primary-key ascending tie-breaker, and optional bounded rank filter (`QUALIFY` or the supported wrapper form). | Experimental |
+## Focused validation
 
-The window aggregate table-function forms admitted are `TUMBLE`, `HOP`, and
-`SESSION`. Their event-time argument must resolve to the catalog's declared
-event-time column and their intervals must be positive, supported interval
-literals. Ranking admits one relation, no grouping or set operation, one
-non-null partition column, one non-null sortable order column, and the primary
-key as an ascending deterministic tie-breaker. A rank bound is `rank = 1` or
-`rank <= positive_integer` in the supported `QUALIFY` or wrapper shape;
-arbitrary window frames, named windows, and other rank predicates are rejected.
+```sh
+cargo test -p velorix-core --test view_plan
+cargo test -p velorix-runtime --test materialized_view_runtime
+cargo test -p velorix-api --lib
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-These shapes still go through the same typed logical-plan admission and runtime
-capability checks; enabling the flag does not turn parser acceptance into
-support.
-
-## Event-Time Semantics (public 1.0 contract)
-
-Event-time window SQL (`TUMBLE`, `HOP`, `SESSION`) is a public 1.0 capability.
-The following time behavior is the stable product contract.
-
-### Event-time extraction
-
-- The window's event-time argument must resolve to the catalog's declared
-  event-time column (`event_time_column_id`).
-- Supported physical types: `Int64` (nanoseconds since epoch), `Date32`,
-  `TimestampNanosecond` without timezone. Timezone-bearing timestamps are
-  rejected at admission.
-- Every input batch must carry an explicit `event_time_watermark`
-  (`stream_id`, `partition_id`, `event_time_column_id`,
-  `max_observed_event_time_ns`, `watermark_ns`). A batch without a watermark
-  is rejected.
-
-### Per-partition watermark behavior
-
-- Watermarks are tracked per `(relation, stream, partition, column)`.
-- A watermark may never regress: `watermark_ns` and
-  `max_observed_event_time_ns` are monotonic per partition; a regression
-  fails the whole epoch closed.
-- There is **no implicit idle** policy: a partition without input never
-  advances by wall clock, and a partition that has never emitted a watermark
-  pins the effective watermark to `None` (nothing finalizes).
-
-### Watermark combination (multi-input)
-
-- The effective operator watermark is the **minimum over every active
-  partition of every input**: `W_effective = min(partitions)`. No input can
-  finalize windows while another input is behind.
-
-### Window closure rules
-
-- A window becomes **final** only when its end passes the *finalization
-  frontier* `F = W - A`, where `W` is the effective watermark and `A` is the
-  configured late-row allowance (zero for `strict_reject` and
-  `drop_with_evidence`).
-- TUMBLE/HOP: `window_end <= F` closes the window.
-- SESSION: `window_end + session_gap <= F` closes the window.
-- Only closed windows are published; there is **no provisional emission** —
-  a window is never published and later corrected. With allowance 0 the
-  frontier equals the watermark exactly.
-
-### Late-row handling
-
-- A row is late when `event_time < W` (current partition watermark).
-- `LateRowPolicy` (default `strict_reject`):
-  - `strict_reject` (default): a late row fails the whole epoch closed.
-  - `drop_with_evidence`: late rows are dropped and a durable evidence
-    counter (`late_rows_dropped`) is persisted in the checkpoint.
-  - `admit_within_allowance { allowance_ns }`: rows with
-    `event_time >= W - allowance_ns` are admitted; rows older than the
-    finalization frontier are dropped with evidence. Finalization is
-    deferred to `F = W - allowance_ns`, so admitted late rows can still
-    update their window before it publishes.
-- The policy is part of the admitted plan and the checkpoint payload;
-  retractions and restart replay identical decisions.
-
-### State boundedness and retention
-
-- Window state is watermark-bounded: closed windows are not published
-  incrementally, and the published output is recomputed from closed state
-  each epoch.
-- `StateRetentionContractV1` bounds retained open-window state
-  (`max_open_windows`, `closed_window_retention_ns`,
-  `late_row_evidence_retention_ns`). State growth beyond the contract fails
-  the epoch closed; state is never silently evicted.
-
-### Determinism
-
-- For in-order, out-of-order (within allowance), late (per policy), restart,
-  and replay cases the outcomes are deterministic: the same signed input
-  sequence produces the same published deltas, window state, watermark
-  state, late-row evidence, and program identity.
-
-## Query-time SQL is a separate surface
-
-After a view has materialized its published output snapshot, a caller may provide
-raw SQL to the view-query API (or a registered API SQL template). That SQL is
-executed by DataFusion **against the one materialized output table**, under the
-view query policy. Raw SQL and templates are rejected if an explicit page bound
-or the policy cap would truncate their materialized input; they never execute
-against a partial page while presenting the result as complete. The optimized
-query plan is rejected if it scans any other table. This read-only query surface
-is not a way to register a new incremental view, and its DataFusion syntax
-support must not be read as materialization support.
-
-## Rejected rather than emulated
-
-Admission is fail-closed: parsing or planning failures become a 400 response;
-there is no full-source recomputation fallback. The rejected space is
-exhaustively defined as **everything outside the preceding matrices**. The
-following table makes the major rejection boundaries explicit.
-
-| Area | Rejected forms |
-| --- | --- |
-| Statements | `INSERT`, `UPDATE`, `DELETE`, DDL, commands, multiple statements, and any non-`SELECT` statement. |
-| Sources | Zero inputs, four or more inputs, every three-input shape outside the bounded composite-PK count family, recursive CTEs, correlated or arbitrary subqueries, multi-source CTEs/derived tables, comma joins, and sources whose required catalog columns are hidden or computed. |
-| Projection/key | A non-distinct filter/project output without its primary key; duplicate/ambiguous key outputs; unsupported `DISTINCT ON`; a projection or output schema whose names, order, types, nullability, or key do not match the logical plan. |
-| Predicates/expressions | Weight-column predicates, non-runtime-visible columns, arbitrary functions, nondeterministic functions, non-Int64 computed-expression families, incompatible literals/types, invalid nullable expressions, `IN`/`NOT IN` over nullable expressions or lists containing `NULL`, subquery `IN`/`NOT IN`, and unsupported mixed-side join scalar expressions. |
-| Sets | `UNION ALL`, `INTERSECT ALL`, `EXCEPT ALL`; cross-relation branches; incompatible projections; computed branch projections; and branch-filter arrangements outside the admitted same-relation forms. |
-| Grouping | An unprojected, duplicated, ambiguous, volatile, unknown, or weight-column grouping expression; mismatched projection/group expressions; an unsupported `GROUP BY ALL` expansion; `ROLLUP`, `CUBE`, `GROUPING SETS`, and `GROUP BY ALL WITH ROLLUP`. No group key is rejected except for the admitted global count shape. |
-| Aggregates | Every function outside `SUM`, `COUNT`, `MIN`, `MAX`, `AVG`, and latest-by-key `arg_min`/`arg_max`; global aggregates other than the admitted count shape; `SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`, `MIN/MAX(DISTINCT ...)`, multi-column distinct counts, and unsupported aggregate inputs. |
-| `HAVING`/aggregate `FILTER` | References that do not exactly bind to a projected aggregate; mismatched function input/filter/distinctness; unsupported predicate columns; right/shared filters in a left join. |
-| Joins | `CROSS` and `NATURAL` joins; four or more tables; every three-table join outside the bounded composite-PK count family; non-equality keys; partial-primary-key equality; nullable, nested, or multi-column non-primary keys; incompatible corresponding key types; composite outer joins; full joins without the exact coalesced output/group key; `OR` in `ON`; unsupported residuals; every self-join outside the narrow global-count shape above; and outer-join source/filter/projection shapes outside the bounded contracts above. |
-| Top-K | `LIMIT`/`FETCH` without `ORDER BY`; zero, negative, non-literal, or over-policy limits; negative/non-literal offsets; MySQL `LIMIT offset,count`; `WITH TIES`; percent fetch; `LIMIT BY`; simultaneous `LIMIT` and `FETCH`; multiple non-key order metrics; ambiguous, nullable hidden, unmatched, or unprojected order expressions. |
-| Analytic/window SQL | All analytic functions except the gated `ROW_NUMBER`, `RANK`, and `DENSE_RANK` shapes; arbitrary frames and named windows; nullable partition/order columns; descending/missing primary-key tie-breaker; grouping, set operations, or joins around ranking; unsupported rank bounds; all event-time windows when the experimental flag is off. |
-| Runtime capability | Any syntactically valid plan whose input/output schema, key, type, nullability, adapter, or incremental state requirement is not supported by the selected runtime family. |
-
-`VelorixLogicalViewPlanV1` is the only materialized-view admission and runtime
-plan surface. Product SQL capability claims derive solely from that plan and
-its validators.
-
-## Evidence and maintenance
-
-The authoritative checks are the plan lowerer and public API gates:
-
-- `crates/velorix-core/src/view_plan.rs`: logical plan families and their
-  family-specific validators;
-- `crates/velorix-api/src/lib.rs`: `create_view`,
-  `lower_materialized_view_runtime_sql_to_logical_plan`, and
-  `validate_public_*_admission`;
-- `crates/velorix-runtime/tests/materialized_view_runtime.rs`: incremental,
-  retraction, and restore coverage for the admitted runtime families;
-- `crates/velorix-api/src/lib.rs` tests: REST creation, ingest, query, and
-  restart coverage, including composite/global aggregate keys,
-  `COUNT(DISTINCT)`, left-join unmatched rows, and two-relation `WHERE`
-  filtering.
-
-When adding a SQL shape, update this document only after it has a typed plan,
-runtime implementation, and admission-to-restart test coverage. When removing
-one, update this document in the same change so callers do not infer a parser
-feature is executable incrementally.
+Authoritative paths: `crates/velorix-api/src/view_admission.rs`,
+`crates/velorix-api/src/lib.rs` (`MaterializedViewRuntimeFactory`), and
+`crates/velorix-core/src/view_plan/mod.rs`. Promote an internal runtime only
+after an admission-to-materialization-to-restart API test exists.

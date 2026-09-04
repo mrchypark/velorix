@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt};
@@ -1266,6 +1272,8 @@ pub struct WorkerShardOperatorRuntime<L, E, X> {
     epoch_store: E,
     executor: X,
     authority: Option<ObjectStoreAuthorityRef>,
+    execution_gate: Arc<tokio::sync::Mutex<()>>,
+    active_workers: Arc<Mutex<BTreeMap<String, WorkerShardRuntimeIdentity>>>,
 }
 
 impl<L, E, X> WorkerShardOperatorRuntime<L, E, X> {
@@ -1275,6 +1283,8 @@ impl<L, E, X> WorkerShardOperatorRuntime<L, E, X> {
             epoch_store,
             executor,
             authority: None,
+            execution_gate: Arc::new(tokio::sync::Mutex::new(())),
+            active_workers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1289,6 +1299,8 @@ impl<L, E, X> WorkerShardOperatorRuntime<L, E, X> {
             epoch_store,
             executor,
             authority: Some(authority),
+            execution_gate: Arc::new(tokio::sync::Mutex::new(())),
+            active_workers: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1446,7 +1458,13 @@ where
         event: WorkerShardEvent,
         input: WorkerShardReconcileInput,
     ) -> Result<Option<WorkerShardReconcileOutput>, WorkerShardError> {
-        handle_worker_shard_event_with_scoped_command_executor_and_authority(
+        let _execution_guard = self.execution_gate.lock().await;
+        let shard = match event {
+            WorkerShardEvent::Applied(ref shard) | WorkerShardEvent::Deleted(ref shard) => {
+                shard.clone()
+            }
+        };
+        let output = handle_worker_shard_event_with_scoped_command_executor_and_authority(
             event,
             &self.lease_client,
             &self.epoch_store,
@@ -1454,7 +1472,74 @@ where
             &self.executor,
             self.authority.as_ref(),
         )
-        .await
+        .await?;
+        if let Some(output) = &output {
+            self.record_active_workers(&shard, output)?;
+        }
+        Ok(output)
+    }
+
+    fn record_active_workers(
+        &self,
+        shard: &VelorixWorkerShard,
+        output: &WorkerShardReconcileOutput,
+    ) -> Result<(), WorkerShardError> {
+        let mut active_workers = self
+            .active_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for command in &output.commands {
+            match command {
+                WorkerShardCommand::StartWorker {
+                    owner_id,
+                    owner_epoch,
+                } => {
+                    let identity =
+                        runtime_identity_from_worker_shard(shard, owner_id, *owner_epoch)?;
+                    active_workers.insert(worker_shard_pod_name_for_identity(&identity), identity);
+                }
+                WorkerShardCommand::StopWorker {
+                    owner_id,
+                    owner_epoch,
+                } => {
+                    let identity =
+                        runtime_identity_from_worker_shard(shard, owner_id, *owner_epoch)?;
+                    active_workers.remove(&worker_shard_pod_name_for_identity(&identity));
+                }
+                WorkerShardCommand::AcquireLease { .. }
+                | WorkerShardCommand::PersistEpochRecord { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Best-effort local cleanup only. This tracks workers started by this
+    /// runtime and is not a replacement for durable, inherited-worker fencing.
+    pub async fn stop_locally_started_workers_best_effort(&self) -> Result<(), WorkerShardError> {
+        let _execution_guard = self.execution_gate.lock().await;
+        let active_workers = self
+            .active_workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut first_error = None;
+        for (pod_name, identity) in active_workers {
+            match self.executor.stop_worker(&identity).await {
+                Ok(()) => {
+                    self.active_workers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&pod_name);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(WorkerShardError::command_executor(error));
+        }
+        Ok(())
     }
 }
 
@@ -1492,7 +1577,13 @@ where
     let mut events = Box::pin(watcher::watcher(api, watcher::Config::default()));
 
     while let Some(event) = events.next().await {
-        let event = event.map_err(WorkerShardError::watcher)?;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                runtime.stop_locally_started_workers_best_effort().await?;
+                return Err(WorkerShardError::watcher(error));
+            }
+        };
         if let Some(event) = worker_shard_watch_event(event) {
             let input = match &event {
                 WorkerShardEvent::Applied(shard) | WorkerShardEvent::Deleted(shard) => {
@@ -1502,7 +1593,7 @@ where
             runtime.handle_event(event, input).await?;
         }
     }
-    Ok(())
+    runtime.stop_locally_started_workers_best_effort().await
 }
 
 pub async fn resync_worker_shards_once_with_operator_runtime<L, E, X>(
@@ -1727,8 +1818,14 @@ where
                     runtime.handle_event(event, input).await?;
                     tokio::task::yield_now().await;
                 }
-                Some(Err(error)) => return Err(error),
-                None => return Ok(WorkerShardLifecycleExit::WatchEnded),
+                Some(Err(error)) => {
+                    runtime.stop_locally_started_workers_best_effort().await?;
+                    return Err(error);
+                }
+                None => {
+                    runtime.stop_locally_started_workers_best_effort().await?;
+                    return Ok(WorkerShardLifecycleExit::WatchEnded);
+                }
             },
         }
     }
@@ -1769,8 +1866,14 @@ where
                     };
                     runtime.handle_event(event, input).await?;
                 }
-                Some(Err(error)) => return Err(error),
-                None => return Ok(WorkerShardLifecycleExit::WatchEnded),
+                Some(Err(error)) => {
+                    runtime.stop_locally_started_workers_best_effort().await?;
+                    return Err(error);
+                }
+                None => {
+                    runtime.stop_locally_started_workers_best_effort().await?;
+                    return Ok(WorkerShardLifecycleExit::WatchEnded);
+                }
             },
         }
     }
@@ -2260,6 +2363,16 @@ where
                 };
                 if let Err(err) = lease_client.acquire_or_renew(request).await {
                     output.command_error = Some(err.to_string());
+                    if let Some(worker) = worker_after_stops.take() {
+                        output.plan.actions.push(ReconcileAction::StopWorker {
+                            owner_id: worker.owner_id.clone(),
+                            owner_epoch: worker.owner_epoch,
+                        });
+                        output.commands.push(WorkerShardCommand::StopWorker {
+                            owner_id: worker.owner_id,
+                            owner_epoch: worker.owner_epoch,
+                        });
+                    }
                 }
             }
         }

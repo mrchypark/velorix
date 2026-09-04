@@ -11203,6 +11203,42 @@ fn exit_gate_no_lossy_implicit_conversion_across_type_surfaces() {
     assert_eq!(plan.typed_value_columns.len(), 1);
 }
 
+#[test]
+fn concat_variadic_arguments_are_type_checked_during_public_admission() {
+    let catalog = scores_catalog();
+
+    let plan = validate_supported_filter_project_sql(
+        "select user_id, concat(user_id, '-', 'member') as label from scores",
+        &catalog,
+    )
+    .expect("valid multi-argument CONCAT should be admitted");
+    assert_eq!(plan.typed_value_columns.len(), 1);
+
+    let error = validate_supported_filter_project_sql(
+        "select user_id, concat(user_id, '-', score) as label from scores",
+        &catalog,
+    )
+    .expect_err("CONCAT with a non-string trailing argument must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("function Concat argument 2 type mismatch"),
+        "{error}"
+    );
+
+    let error = validate_supported_filter_project_sql(
+        "select user_id, concat(user_id, '-', 'a', 'b', 'c', 'd', 'e', score) as label from scores",
+        &catalog,
+    )
+    .expect_err("CONCAT with a non-string eighth argument must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("function Concat argument 7 type mismatch"),
+        "{error}"
+    );
+}
+
 /// Phase 6.4: AGE_DAYS expression admission and type checking.
 #[test]
 fn age_days_expression_roundtrips_through_admission() {
