@@ -12275,6 +12275,331 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
 }
 
 #[test]
+fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
+    let catalog = device_status_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = latest_device_status_output_schema();
+    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
+    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("latest-undo-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[("device-a", true, 100, i64::MAX)])],
+            }],
+        )
+        .unwrap();
+    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    let checkpoint_before = runtime.checkpoint().unwrap();
+    let checkpoint_bytes_before = checkpoint_before
+        .state_payload
+        .as_ref()
+        .unwrap()
+        .payload
+        .clone();
+    let frontiers_before = checkpoint_before.input_frontiers.clone();
+    let event_time_frontiers_before = checkpoint_before.input_event_time_frontiers.clone();
+    let output_frontiers_before = checkpoint_before.output_frontiers.clone();
+    let payload_before: Value = serde_json::from_str(&checkpoint_bytes_before).unwrap();
+
+    // device-b mutates LatestByKey state before the same device-a
+    // key/order/value overflows i64::MAX + 1.
+    let error = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-undo-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[
+                    ("device-b", false, 200, 1),
+                    ("device-a", true, 100, 1),
+                ])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generic_runtime_state"),
+        "overflow must fail the epoch closed: {error}"
+    );
+    let checkpoint_after_failure = runtime.checkpoint().unwrap();
+    assert_eq!(checkpoint_after_failure, checkpoint_before);
+    assert_eq!(
+        checkpoint_after_failure
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload,
+        checkpoint_bytes_before
+    );
+    assert_eq!(checkpoint_after_failure.input_frontiers, frontiers_before);
+    assert_eq!(
+        checkpoint_after_failure.input_event_time_frontiers,
+        event_time_frontiers_before
+    );
+    assert_eq!(
+        checkpoint_after_failure.output_frontiers,
+        output_frontiers_before
+    );
+    let payload_after_failure: Value = serde_json::from_str(
+        &checkpoint_after_failure
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(
+        payload_after_failure["published_output"],
+        payload_before["published_output"]
+    );
+    assert_eq!(
+        payload_after_failure["applied_epochs"],
+        payload_before["applied_epochs"]
+    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+
+    let retry = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-undo-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[("device-b", false, 200, 1)])],
+            }],
+        )
+        .unwrap();
+    assert_eq!(retry.output_deltas.len(), 1);
+    assert_latest_status_page(
+        runtime.as_ref(),
+        2,
+        &[("device-a", true), ("device-b", false)],
+    );
+    let checkpoint_after_retry = runtime.checkpoint().unwrap();
+    let duplicate = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-undo-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_after_retry);
+}
+
+#[test]
+fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
+    let catalog = device_status_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = latest_device_status_output_schema();
+    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
+    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("latest-delta-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[
+                    ("device-a", true, 100, 1),
+                    ("device-b", false, 200, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+
+    let second = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-delta-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[("device-c", true, 300, 1)])],
+            }],
+        )
+        .unwrap();
+
+    assert_eq!(second.output_deltas.len(), 1);
+    assert_eq!(
+        second.output_deltas[0].delta.net_rows().unwrap(),
+        vec![DeltaRecord::new(
+            DeltaKey::from_json(json!("device-c")),
+            DeltaValue::from_json(json!({ "enabled": true })),
+            1,
+        )]
+    );
+    assert_latest_status_page(
+        runtime.as_ref(),
+        2,
+        &[("device-a", true), ("device-b", false), ("device-c", true)],
+    );
+}
+
+#[test]
+fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() {
+    let catalog = device_status_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = latest_device_status_output_schema();
+    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
+    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("latest-prune-1").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[
+                    ("device-a", true, 100, i64::MAX),
+                    ("device-b", false, 200, 1),
+                ])],
+            }],
+        )
+        .unwrap();
+    let checkpoint_before = runtime.checkpoint().unwrap();
+
+    // Retracting device-b first removes its only key/order/value entry and
+    // prunes the outer key. The later device-a addition then overflows.
+    let error = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-prune-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 4,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[
+                    ("device-b", false, 200, -1),
+                    ("device-a", true, 100, 1),
+                ])],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generic_runtime_state"),
+        "overflow must fail the epoch closed: {error}"
+    );
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before);
+    assert_latest_status_page(
+        runtime.as_ref(),
+        1,
+        &[("device-a", true), ("device-b", false)],
+    );
+
+    let retry = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-prune-2").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 2,
+                end_offset_exclusive: 3,
+                event_time_watermark: None,
+                batches: vec![device_status_batch(&[("device-b", false, 200, -1)])],
+            }],
+        )
+        .unwrap();
+    assert_eq!(retry.output_deltas.len(), 1);
+    assert_latest_status_page(runtime.as_ref(), 2, &[("device-a", true)]);
+    let checkpoint_after_retry = runtime.checkpoint().unwrap();
+    let duplicate = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("latest-prune-2").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint_after_retry);
+}
+
+#[test]
 fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
     let catalog = device_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();

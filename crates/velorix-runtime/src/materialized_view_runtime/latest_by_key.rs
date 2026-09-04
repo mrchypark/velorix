@@ -195,12 +195,13 @@ impl StandingProgramRuntime for LatestByKeyRuntime {
                 attempted_epoch: logical_epoch,
             });
         }
-        let previous_latest_state = self.latest_state.clone();
+        let mut undo = LatestEpochUndoLog::default();
         let mut executor = LogicalPlanExecutor::LatestByKey {
             catalog: &self.catalog,
             input_schema: &self.input_schema,
             plan: &self.plan,
             latest_state: &mut self.latest_state,
+            undo: &mut undo,
             current_logical_epoch: self.logical_epoch,
         };
         let executor_commit = match executor.apply_epoch(
@@ -211,65 +212,67 @@ impl StandingProgramRuntime for LatestByKeyRuntime {
         ) {
             Ok(commit) => commit,
             Err(e) => {
-                // Rollback state on failure
-                self.latest_state = previous_latest_state;
+                undo.rollback(&mut self.latest_state);
                 return Err(e);
             }
         };
-        let output_delta = if self.plan.top_k.is_some() {
-            let previous_output = self.published_output.clone();
-            let staged_output = apply_latest_top_k_to_published_output(
-                self.latest_state.materialized_delta(&self.plan),
-                self.plan.top_k.as_ref(),
-                &self.plan,
-            )?;
-            previous_output
-                .inverse()
-                .map_err(|_| invalid_runtime_state())?
-                .combine(&staged_output)
-        } else {
-            apply_published_output_delta(&self.published_output, &executor_commit.output_delta)?
-        };
-        // Compute staged_output for validation
-        let staged_output = if self.plan.top_k.is_some() {
-            apply_latest_top_k_to_published_output(
-                self.latest_state.materialized_delta(&self.plan),
-                self.plan.top_k.as_ref(),
-                &self.plan,
-            )?
-        } else {
-            apply_published_output_delta(&self.published_output, &executor_commit.output_delta)?
-        };
-        // Validate output before commit
-        let output_batches = vec![ViewOutputBatch {
-            view_id: self.identity.view_ids[0].clone(),
-            schema_fingerprint: self.output_schema_fingerprint(),
-            batches: vec![materialized_generic_delta_to_record_batch(
-                &self.output_schema,
-                &staged_output,
-            )?],
-        }];
-        // Commit staged state
-        self.published_output = staged_output;
-        self.input_frontiers = executor_commit.input_frontiers.clone();
-        self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
-        self.applied_epochs
-            .insert(idempotency_key_text, logical_epoch);
-        retain_recent_applied_epochs(&mut self.applied_epochs);
-        self.logical_epoch = logical_epoch;
-
-        Ok(EpochCommit {
-            logical_epoch,
-            idempotency_key,
-            input_frontiers: executor_commit.input_frontiers,
-            input_event_time_frontiers: executor_commit.input_event_time_frontiers,
-            output_deltas: vec![ViewOutputDelta {
+        let result = (|| {
+            let (staged_output, output_delta) = if self.plan.top_k.is_some() {
+                let staged_output = apply_latest_top_k_to_published_output(
+                    self.latest_state.materialized_delta(&self.plan),
+                    self.plan.top_k.as_ref(),
+                    &self.plan,
+                )?;
+                let output_delta = self
+                    .published_output
+                    .inverse()
+                    .map_err(|_| invalid_runtime_state())?
+                    .combine(&staged_output);
+                (staged_output, output_delta)
+            } else {
+                (
+                    apply_published_output_delta(
+                        &self.published_output,
+                        &executor_commit.output_delta,
+                    )?,
+                    executor_commit.output_delta.clone(),
+                )
+            };
+            // Validate output before commit
+            let output_batches = vec![ViewOutputBatch {
                 view_id: self.identity.view_ids[0].clone(),
                 schema_fingerprint: self.output_schema_fingerprint(),
-                delta: output_delta,
-            }],
-            output_batches,
-        })
+                batches: vec![materialized_generic_delta_to_record_batch(
+                    &self.output_schema,
+                    &staged_output,
+                )?],
+            }];
+            // Commit staged state
+            self.published_output = staged_output;
+            self.input_frontiers = executor_commit.input_frontiers.clone();
+            self.input_event_time_frontiers = executor_commit.input_event_time_frontiers.clone();
+            self.applied_epochs
+                .insert(idempotency_key_text, logical_epoch);
+            retain_recent_applied_epochs(&mut self.applied_epochs);
+            self.logical_epoch = logical_epoch;
+
+            Ok(EpochCommit {
+                logical_epoch,
+                idempotency_key,
+                input_frontiers: executor_commit.input_frontiers,
+                input_event_time_frontiers: executor_commit.input_event_time_frontiers,
+                output_deltas: vec![ViewOutputDelta {
+                    view_id: self.identity.view_ids[0].clone(),
+                    schema_fingerprint: self.output_schema_fingerprint(),
+                    delta: output_delta,
+                }],
+                output_batches,
+            })
+        })();
+        if result.is_err() {
+            undo.rollback(&mut self.latest_state);
+        }
+        result
     }
 
     fn materialized_view_page(

@@ -684,6 +684,82 @@ struct LatestValueCount {
     weight: i64,
 }
 
+#[derive(Default)]
+struct LatestEpochUndoLog {
+    outer_keys: BTreeMap<String, Option<Value>>,
+    values: BTreeMap<(String, i128, String), Option<LatestValueCount>>,
+}
+
+impl LatestEpochUndoLog {
+    fn touch(
+        &mut self,
+        state: &LatestByKeyState,
+        record: &DeltaRecord,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        let key = canonical_json(record.key.as_json());
+        let (ordering, value) = latest_delta_record_parts(record)?;
+        let value_key = canonical_json(&value);
+        self.outer_keys
+            .entry(key.clone())
+            .or_insert_with(|| state.rows.get(&key).map(|rows| rows.key.clone()));
+        self.values
+            .entry((key.clone(), ordering, value_key.clone()))
+            .or_insert_with(|| {
+                state
+                    .rows
+                    .get(&key)
+                    .and_then(|rows| rows.values.get(&ordering))
+                    .and_then(|values| values.get(&value_key))
+                    .cloned()
+            });
+        Ok(())
+    }
+
+    fn rollback(self, state: &mut LatestByKeyState) {
+        let Self { outer_keys, values } = self;
+        for ((key, ordering, value_key), before) in values {
+            let raw_key = outer_keys
+                .get(&key)
+                .and_then(Clone::clone)
+                .or_else(|| state.rows.get(&key).map(|rows| rows.key.clone()));
+            let Some(raw_key) = raw_key else { continue };
+            let rows = state
+                .rows
+                .entry(key.clone())
+                .or_insert_with(|| LatestKeyRows {
+                    key: raw_key,
+                    values: BTreeMap::new(),
+                });
+            let values = rows.values.entry(ordering).or_default();
+            match before {
+                Some(value) => {
+                    values.insert(value_key, value);
+                }
+                None => {
+                    values.remove(&value_key);
+                }
+            }
+            if values.is_empty() {
+                rows.values.remove(&ordering);
+            }
+        }
+        for (key, raw_key) in &outer_keys {
+            if raw_key.is_none() {
+                state.rows.remove(key);
+            }
+        }
+        for key in outer_keys.keys() {
+            if state
+                .rows
+                .get(key)
+                .is_some_and(|rows| rows.values.is_empty())
+            {
+                state.rows.remove(key);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LatestByKeyCheckpointPayload {
@@ -978,6 +1054,7 @@ enum LogicalPlanExecutor<'a> {
         input_schema: &'a RelationSchema,
         plan: &'a SupportedLatestByKeyPlan,
         latest_state: &'a mut LatestByKeyState,
+        undo: &'a mut LatestEpochUndoLog,
         current_logical_epoch: LogicalEpoch,
     },
     TwoInputJoin {
@@ -1037,6 +1114,7 @@ impl LogicalPlanExecutor<'_> {
                 input_schema,
                 plan,
                 latest_state,
+                undo,
                 current_logical_epoch,
             } => {
                 if logical_epoch <= *current_logical_epoch {
@@ -1083,7 +1161,7 @@ impl LogicalPlanExecutor<'_> {
                     let delta = filter_delta_batch_for_latest_plan(&delta, plan, catalog)?;
                     combined = combined.combine(&delta);
                 }
-                let output_delta = latest_state.apply_delta(&combined, plan)?;
+                let output_delta = latest_state.apply_delta_with_undo(&combined, plan, undo)?;
                 Ok(LogicalPlanExecutorCommit {
                     input_frontiers,
                     input_event_time_frontiers,
@@ -7600,6 +7678,7 @@ fn batch_event_time_ns(
 }
 
 impl LatestByKeyState {
+    #[allow(dead_code)]
     fn apply_delta(
         &mut self,
         delta: &DeltaBatch,
@@ -7617,6 +7696,36 @@ impl LatestByKeyState {
         let mut output = Vec::new();
         for (key_canonical, before) in affected {
             let after = self.current_record_for_key(&key_canonical, plan);
+            if before != after {
+                if let Some(before) = before {
+                    output.push(before.inverse().map_err(|_| invalid_runtime_state())?);
+                }
+                if let Some(after) = after {
+                    output.push(after);
+                }
+            }
+        }
+        Ok(DeltaBatch::from_records(output))
+    }
+
+    fn apply_delta_with_undo(
+        &mut self,
+        delta: &DeltaBatch,
+        plan: &SupportedLatestByKeyPlan,
+        undo: &mut LatestEpochUndoLog,
+    ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+        let mut affected = BTreeMap::new();
+        for record in delta.records() {
+            let key = canonical_json(record.key.as_json());
+            affected
+                .entry(key.clone())
+                .or_insert_with(|| self.current_record_for_key(&key, plan));
+            undo.touch(self, record)?;
+            self.apply_record(record)?;
+        }
+        let mut output = Vec::new();
+        for (key, before) in affected {
+            let after = self.current_record_for_key(&key, plan);
             if before != after {
                 if let Some(before) = before {
                     output.push(before.inverse().map_err(|_| invalid_runtime_state())?);
