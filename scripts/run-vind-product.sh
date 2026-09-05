@@ -7955,11 +7955,9 @@ curl -fsS "http://127.0.0.1:${api_local_port}/healthz" | tee "${output_dir}/heal
 api_healthz_unauthenticated=1
 curl -fsS "http://127.0.0.1:${api_local_port}/readyz" | tee "${output_dir}/readyz.json" >/dev/null
 api_readyz_unauthenticated=1
-if [ "$api_authoritative_relation_ingest" = "1" ]; then
-  require jq
-  jq -e '.relation_ingest.mode == "authoritative" and .relation_ingest.authoritative == true and .relation_ingest.owner_id_configured == true' "${output_dir}/readyz.json" >/dev/null
-fi
-IFS=$'\t' read -r api_auth_observed_readyz_mode object_store_namespace_count object_store_artifact_catalog_conditional_update api_relation_ingest_observed_mode api_relation_ingest_observed_authoritative < <(python3 - "${output_dir}/readyz.json" "$meta_enabled" "$meta_backend" "$standing_runtime_fencing" "$api_auth_mode" "$api_authoritative_relation_ingest" <<'PY'
+readyz_validation_output="${output_dir}/readyz-validation.tsv"
+readyz_validation_error="${output_dir}/readyz-validation.error"
+if ! python3 - "${output_dir}/readyz.json" "$meta_enabled" "$meta_backend" "$standing_runtime_fencing" "$api_auth_mode" "$api_authoritative_relation_ingest" >"$readyz_validation_output" 2>"$readyz_validation_error" <<'PY'
 import json
 import sys
 
@@ -8083,7 +8081,22 @@ if fencing == "unsafe-dev-only" and readyz.get("standing_runtime_fencing_require
     raise SystemExit(f"unsafe-dev-only should not require production fencing: {readyz}")
 print(f"{api_auth.get('mode', '')}\t{namespace_count}\t1\t{relation_ingest_mode}\t{str(relation_ingest_authoritative).lower()}")
 PY
-)
+then
+  chmod 600 "$readyz_validation_output" "$readyz_validation_error"
+  echo "API readyz capability validation failed; private diagnostics were retained" >&2
+  exit 1
+fi
+chmod 600 "$readyz_validation_output" "$readyz_validation_error"
+if [ "$api_authoritative_relation_ingest" = "1" ]; then
+  require jq
+  api_auth_observed_readyz_mode="$(jq -er '.api_auth.mode | strings' "${output_dir}/readyz.json")"
+  object_store_namespace_count="$(jq -er '.object_store.authoritative_namespace_count | select(type == "number" and floor == . and . > 0)' "${output_dir}/readyz.json")"
+  object_store_artifact_catalog_conditional_update="$(jq -er '.object_store.artifact_catalog.conditional_update | select(. == true) | "1"' "${output_dir}/readyz.json")"
+  api_relation_ingest_observed_mode="$(jq -er '.relation_ingest.mode | strings' "${output_dir}/readyz.json")"
+  api_relation_ingest_observed_authoritative="$(jq -er '.relation_ingest.authoritative | if type == "boolean" then tostring else error("authoritative capability must be boolean") end' "${output_dir}/readyz.json")"
+else
+  IFS=$'\t' read -r api_auth_observed_readyz_mode object_store_namespace_count object_store_artifact_catalog_conditional_update api_relation_ingest_observed_mode api_relation_ingest_observed_authoritative <"$readyz_validation_output"
+fi
 
 validate_remote_meta_network_policy
 

@@ -41,6 +41,7 @@ python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -265,6 +266,65 @@ def no_pvc_auth_can_i_fixture():
             (False, "no", 1),
         )
     )
+
+
+def readyz_authoritative_jq_fixture():
+    """Exercise the shell's individual jq assignments without a cluster."""
+    if shutil.which("jq") is None:
+        return False
+    required_source = (
+        'readyz_validation_output="${output_dir}/readyz-validation.tsv"',
+        'readyz_validation_error="${output_dir}/readyz-validation.error"',
+        'api_auth_observed_readyz_mode="$(jq -er',
+        'api_relation_ingest_observed_authoritative="$(jq -er',
+    )
+    readyz_section = script.split("readyz_validation_output=", 1)[1].split(
+        "validate_remote_meta_network_policy", 1
+    )[0]
+    if not all(fragment in script for fragment in required_source) or '< <(python3 ' in readyz_section:
+        return False
+    target_dir = repo_root / "target" / "vind-contract-fixtures"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="readyz-authoritative-", dir=target_dir) as raw_dir:
+        readyz_path = Path(raw_dir) / "readyz.json"
+        readyz = {
+            "api_auth": {"mode": "bearer-token"},
+            "object_store": {
+                "authoritative_namespace_count": 19,
+                "artifact_catalog": {"conditional_update": True},
+            },
+            "relation_ingest": {
+                "mode": "authoritative",
+                "authoritative": True,
+            },
+        }
+        readyz_path.write_text(json.dumps(readyz) + "\n", encoding="utf-8")
+        expressions = (
+            ('.api_auth.mode | strings', "bearer-token"),
+            ('.object_store.authoritative_namespace_count | select(type == "number" and floor == . and . > 0)', "19"),
+            ('.object_store.artifact_catalog.conditional_update | select(. == true) | "1"', "1"),
+            ('.relation_ingest.mode | strings', "authoritative"),
+            ('.relation_ingest.authoritative | if type == "boolean" then tostring else error("authoritative capability must be boolean") end', "true"),
+        )
+        for expression, expected in expressions:
+            result = subprocess.run(
+                ["jq", "-er", expression, str(readyz_path)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0 or result.stdout.strip() != expected:
+                return False
+        malformed = dict(readyz)
+        malformed["relation_ingest"] = {"mode": "authoritative", "authoritative": "true"}
+        readyz_path.write_text(json.dumps(malformed) + "\n", encoding="utf-8")
+        result = subprocess.run(
+            ["jq", "-er", expressions[-1][0], str(readyz_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.returncode != 0
 
 
 s3_checkpoint_fault_matrix_evidence_path = (
@@ -1864,6 +1924,7 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
 
 checks = {
     "product evidence redaction fixture removes environment identifiers": evidence_redaction_fixture(),
+    "authoritative readyz jq assignment fixture rejects malformed capability": readyz_authoritative_jq_fixture(),
     "rejects stale durability attestation false-ready fixture": durability_false_ready_fixture_rejected(),
     "Hiqlite release input-required gate wins over will-run fixture": hiqlite_release_input_required_wins_over_will_run_fixture(),
     "defines admin API curl helper": (
