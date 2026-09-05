@@ -105,6 +105,37 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  rhiza-backend:
+    name: Rhiza backend integration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - name: Install Go 1.27.0
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.0'
+          # The published SDK's Go module is bundled inside Cargo's registry;
+          # this repository has no Go module/sum path for setup-go to cache.
+          cache: false
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test Rhiza backend
+        run: cargo test -p velorix-meta --features rhiza-backend --lib --test rhiza_backend
+
+      - name: Lint Rhiza backend
+        run: cargo clippy -p velorix-meta --features rhiza-backend --all-targets -- -D warnings
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

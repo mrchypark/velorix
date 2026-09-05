@@ -32,6 +32,8 @@ pub mod proto {
     tonic::include_proto!("velorix.meta.v1");
 }
 
+#[cfg(feature = "rhiza-backend")]
+pub mod rhiza;
 mod source_cut;
 mod view_bootstrap;
 

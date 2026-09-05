@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 hiqlite-backend = ["dep:hiqlite"]
+rhiza-backend = ["dep:rhizadb"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -15,6 +16,7 @@ async-trait = { workspace = true }
 # The remote client and standalone server must compile the same streaming API
 # enum shape. The server image uses `--features server`, which enables `full`.
 hiqlite = { git = "https://github.com/mrchypark/hiqlite.git", rev = "26c6d22a72d7bd0a1e2de073fc4c076ddad4e588", package = "hiqlite", default-features = false, features = ["full"], optional = true }
+rhizadb = { version = "=0.12.0", optional = true }
 object_store = { workspace = true, features = ["aws"] }
 prost = { workspace = true }
 serde = { workspace = true }

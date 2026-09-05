@@ -5098,6 +5098,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhizadb"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54a3a715aa6660d0ca54e90b0a0ff00cd92662fc41148df567cd274c7cf58d53"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7075,6 +7086,7 @@ dependencies = [
  "object_store 0.14.1",
  "prost",
  "protoc-bin-vendored",
+ "rhizadb",
  "serde",
  "serde_json",
  "sha2 0.10.9",
