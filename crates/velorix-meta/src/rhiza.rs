@@ -1,9 +1,9 @@
 //! Minimal embedded Rhiza SQL transport.
 //!
-//! This is intentionally not a `MetaStore` implementation yet. Rhiza 0.12
-//! does not expose the replicated authority timestamp primitive required by
-//! Velorix fencing, so authority operations remain unavailable until that
-//! semantic gap is resolved.
+//! This SQL transport intentionally does not implement `MetaStore`. Rhiza
+//! 0.12 SQL has no engine-assigned authority timestamp; the separate KV
+//! snapshot path carries one proposer-sampled time inside each root-CAS
+//! transition and relies on epoch/token predicates for stale-writer safety.
 
 use std::sync::Arc;
 

@@ -131,7 +131,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test Rhiza backend
-        run: cargo test -p velorix-meta --features rhiza-backend --lib --test rhiza_backend
+        run: cargo test -p velorix-meta --features rhiza-backend --lib --test rhiza_backend --test rhiza_kv --test rhiza_meta
 
       - name: Lint Rhiza backend
         run: cargo clippy -p velorix-meta --features rhiza-backend --all-targets -- -D warnings

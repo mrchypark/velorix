@@ -1,10 +1,24 @@
-# Rhiza SDK Optional SQL Transport (0.12.0)
+# Rhiza KV MetaStore Migration (0.12.0)
 
-Status: the optional Rhiza SQL transport is implemented and verified: 6 unit
-tests and 5 integration tests pass with the `rhiza-backend` feature. This is
-SQL transport only; the full Velorix `MetaStore` contract is not available
-through Rhiza yet. This remains an additive adapter direction, not a
-replacement, production-readiness, or end-to-end success claim.
+Status: the embedded Rhiza KV transport, bounded root/page snapshot path, and
+all 33 `RhizaKvMetaStore` methods are implemented. Native library tests pass;
+the full runtime wiring and
+production migration remain unverified. This is not a production-readiness or
+end-to-end success claim.
+
+The library user enables `rhiza-backend`, opens a `rhizadb::Config` with its
+local working `DataDir`, and constructs `RhizaKvMetaStore::new(kv)`.
+Local restart tests retain this directory; no-PVC deployments instead need
+verified recovery from shared object storage. The runtime CLI/Meta service
+is not wired to this backend yet.
+
+Local verification for this KV increment: 14 library tests, 5 SQL transport
+tests, 5 KV/snapshot tests, and 3 MetaStore integration tests passed. The latter
+cover catalog/reservation/commit recovery, concurrent clients on one native
+node, and stale-token rejection after takeover with no failed-publication root
+change. These are not a three-node QuePaxa proof. Workspace and Rhiza-feature
+clippy pass with `-D warnings`; the runtime regression suites pass 54 unit and
+232 materialized-view tests.
 
 ## Verified published artifact
 
@@ -49,6 +63,36 @@ Final local verification also passed 54 `velorix-runtime` unit tests, 232
 `materialized_view_runtime` integration tests, workspace clippy with
 `-D warnings`, the Rhiza-feature clippy check, and workflow `actionlint`.
 
+## KV root-CAS safety boundary
+
+Rhiza's KV root CAS is proposer-independent: any proposer can submit the
+conditional mutation, and the replicated state machine decides whether the
+expected root matches. This does not require forcing a single authority
+leader. A fixed, caller-supplied timestamp can provide TTL liveness, but it is
+not an authority clock and cannot replace the atomic epoch-safety primitive;
+expiry should therefore be treated as a liveness hint until an engine-sampled
+consensus timestamp is available.
+
+The snapshot codec bounds each page at 1 MiB and the complete snapshot at 16
+MiB. Page writes precede root publication, so failed or superseded attempts
+can leave orphan pages. Retention/garbage collection of those pages is an
+explicit tradeoff and is not yet a no-PVC recovery proof.
+
+## Evidence and remaining gates
+
+The three-node embedded probe was attempted with an ephemeral S3-compatible
+object store and concurrent startup, but nodes remained `not_ready` with
+`QuePaxa quorum unavailable`; no distributed CAS or cross-node linearizable
+read claim is made. No migration digest, no-PVC object-store recovery test,
+or production rollout has been completed. The implementation is constrained
+to the local Rust/Go/C build and GitHub Actions; no CloudBuild path or private
+cluster identifier is part of this evidence.
+
+The review also found that a recurring check-only run is insufficient for
+acceptance. Acceptance requires native regression tests covering malformed
+receipts, request-id replay/conflict, root-token round trips, page/full-state
+digest validation, and concurrent proposer CAS behavior.
+
 ## Build evidence and limits
 
 The crate's `build.rs` requires a host-target macOS or Linux GNU build, a C
@@ -79,32 +123,28 @@ cold start, then validates certified checkpoint seals before restore/replay.
 This source inspection establishes configuration and startup ordering only; no
 remote object-store cold-start, loss, or recovery test was run here.
 
-## Authority timestamp blocker
+## KV time and fencing semantics
 
-The SDK/native source exposes no engine-assigned transaction timestamp API.
-The native SQL validator rejects nondeterministic `current_timestamp`,
-`current_date`, `current_time`, and `random` expressions. `consistency:
-linearizable` is a read barrier, not an authority wall-clock value. Therefore
-Rhiza cannot currently replace the 14 Velorix call sites using
-`txn_with_raft_serialized_timestamp`, which bind a single Raft-authoritative
-Unix timestamp into fencing and expiry SQL. Host-clock injection, a Raft log
-index, or a metrics timestamp is not equivalent and must not be substituted.
+The KV metadata path does not require an engine-assigned timestamp or a
+single-process leader. Each proposer samples Unix time once for its attempted
+transition; that proposed value, the evaluated domain result, and the complete
+snapshot are published together by the root CAS. A competing proposer must
+reload the winning root and re-evaluate. Reusing a request ID is permitted only
+with the identical payload; an uncertain attempt is resolved with
+`request_status` before another attempt is made.
 
-The minimal upstream addition should be one native operation that:
+Owner/authority epoch and token predicates are the safety boundary: a stale
+writer cannot publish after a newer root has fenced it. The proposer timestamp
+is only a TTL liveness input. Clock skew or rollback can make expiry early or
+late, so this path must not claim bounded wall-clock failover. This is a
+different limitation from the atomic root-CAS safety guarantee and is not an
+upstream API blocker.
 
-1. samples an authority Unix timestamp once before replication, under the
-   leader/authority's command-serialization path;
-2. persists that sampled value in the replicated command, injects it into
-   bound SQL parameters (including conditional-update predicates), and returns
-   it with the committed receipt;
-3. applies the persisted value deterministically during follower/restart
-   replay, never re-sampling wall-clock time; and
-4. preserves the same `request_id`/fingerprint idempotency and
-   `request_status` retry semantics.
-
-Until that API exists, any Rhiza adapter must be explicitly marked
-`authoritative_backend_time=false` and cannot claim the current Velorix
-wall-clock failover/fencing contract.
+The analogous Hiqlite primitive samples wall-clock time at command admission
+and persists that value in the replicated command. It is likewise not a
+monotonic or skew-safe clock; its safety comes from serialized command ordering
+and persisted epoch/token predicates, while TTL liveness remains clock
+dependent.
 
 ## Recovery and migration scope
 

@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use object_store::ObjectStore;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "hiqlite-backend")]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,6 +35,13 @@ pub mod proto {
 
 #[cfg(feature = "rhiza-backend")]
 pub mod rhiza;
+#[cfg(feature = "rhiza-backend")]
+pub mod rhiza_kv;
+#[cfg(feature = "rhiza-backend")]
+pub mod rhiza_kv_snapshot;
+#[cfg(feature = "rhiza-backend")]
+pub mod rhiza_meta;
+mod rhiza_snapshot;
 mod source_cut;
 mod view_bootstrap;
 
@@ -124,7 +132,7 @@ pub enum PublishIngestReservationOutcome {
     InvalidAuthority,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthoritativeIngestPublication {
     pub reservation: IngestRangeReservation,
     pub authority_key: PartitionAuthorityKey,
@@ -191,7 +199,7 @@ pub struct StandingRuntimeFencingCapability {
     pub production_bounded_failover_safe: bool,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct IngestRangeReservation {
     pub stream_id: String,
     pub partition_id: u32,
@@ -327,7 +335,7 @@ pub struct PublishRelationIngestReservationRequest {
     pub object_digest: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelationAuthoritativeIngestPublication {
     pub reservation: IngestRangeReservation,
     pub authority_key: RelationPartitionAuthorityKey,
@@ -504,6 +512,12 @@ pub enum MetaStoreError {
     NonMonotonicCheckpointEpoch { previous: u64, candidate: u64 },
     #[error("hiqlite metadata store error: {0}")]
     Hiqlite(String),
+    #[error("rhiza metadata store error: {0}")]
+    Rhiza(String),
+    #[error("rhiza metadata mutation {request_id} has indeterminate commit state: {detail}")]
+    RhizaIndeterminate { request_id: String, detail: String },
+    #[error("rhiza metadata CAS contention after {attempts} attempts")]
+    RhizaContention { attempts: usize },
 }
 
 #[async_trait]
@@ -1064,42 +1078,79 @@ where
 #[derive(Clone, Default)]
 pub struct InMemoryMetaStore {
     inner: Arc<RwLock<InMemoryMetaState>>,
+    evaluation_now_unix_ms: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct InMemoryMetaState {
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_catalogs: HashMap<(String, String), VelorixRelationCatalogV1>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     ingest_reservations: HashMap<(String, u32), Vec<IngestRangeReservation>>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     legacy_batch_keys: HashMap<String, IngestRangeReservation>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     authoritative_ingest_reservation_keys: HashMap<IngestRangeReservation, PartitionAuthorityKey>,
     committed_ingest_batch_keys: BTreeSet<String>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     authoritative_ingest_publications: HashMap<String, InMemoryIngestPublication>,
     ingest_catalog_epoch: u64,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     view_bootstraps: HashMap<(String, String, String), ViewBootstrapControlV1>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     view_dependency_graph_revisions: HashMap<String, u64>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     standing_runtime_owners: HashMap<(String, String, String), StandingRuntimeOwnerClaim>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     standing_runtime_checkpoints:
         HashMap<(String, String, String), StandingRuntimeCheckpointPointer>,
     partition_authority_now_unix_ms: u64,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     partition_authorities: HashMap<PartitionAuthorityKey, PartitionAuthorityToken>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     partition_checkpoint_pointers: HashMap<PartitionAuthorityKey, PartitionCheckpointPointer>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_partition_authorities:
         HashMap<RelationPartitionAuthorityKey, RelationPartitionAuthorityToken>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_ingest_reservations: HashMap<(String, u32), Vec<IngestRangeReservation>>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_authority_reservation_keys:
         HashMap<IngestRangeReservation, RelationPartitionAuthorityKey>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_batch_keys: HashMap<String, IngestRangeReservation>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_authoritative_ingest_publications:
         HashMap<String, RelationAuthoritativeIngestPublication>,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     relation_reservation_publications: HashMap<IngestRangeReservation, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct InMemoryIngestPublication {
     publication: AuthoritativeIngestPublication,
 }
 
 impl InMemoryMetaStore {
+    #[allow(dead_code)]
+    pub(crate) fn from_state_for_evaluation(state: InMemoryMetaState, now_unix_ms: u64) -> Self {
+        let mut state = state;
+        state.partition_authority_now_unix_ms = now_unix_ms;
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+            evaluation_now_unix_ms: Some(now_unix_ms),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn snapshot_state(&self) -> InMemoryMetaState {
+        self.inner.read().await.clone()
+    }
+
+    fn evaluation_time_ms(&self) -> Result<u64, MetaStoreError> {
+        self.evaluation_now_unix_ms.map_or_else(unix_time_ms, Ok)
+    }
+
     /// Controls the in-memory backend clock for deterministic authority tests.
     /// Production callers never provide time through the authority API.
     pub async fn set_partition_authority_clock_for_test(&self, now_unix_ms: u64) {
@@ -1588,7 +1639,7 @@ impl MetaStore for InMemoryMetaStore {
         validate_current_standing_runtime_owner(
             guard.standing_runtime_owners.get(&key),
             &request.owner,
-            unix_time_ms()?,
+            self.evaluation_time_ms()?,
         )?;
         let Some(mut control) = guard.view_bootstraps.get(&key).cloned() else {
             return Ok(FixViewBootstrapActivationCutOutcome::Conflict);
@@ -1652,7 +1703,7 @@ impl MetaStore for InMemoryMetaStore {
         validate_current_standing_runtime_owner(
             guard.standing_runtime_owners.get(&key),
             &request.owner,
-            unix_time_ms()?,
+            self.evaluation_time_ms()?,
         )?;
         let Some(mut control) = guard.view_bootstraps.get(&key).cloned() else {
             return Ok(PromoteViewBootstrapOutcome::Conflict);
@@ -1693,7 +1744,7 @@ impl MetaStore for InMemoryMetaStore {
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
         request.validate()?;
-        let now = unix_time_ms()?;
+        let now = self.evaluation_time_ms()?;
         let expires_at_unix_ms = now
             .checked_add(request.ttl_ms)
             .ok_or(MetaStoreError::TimestampOverflow)?;
@@ -1760,7 +1811,7 @@ impl MetaStore for InMemoryMetaStore {
         view_id: &str,
     ) -> Result<Option<StandingRuntimeOwnerClaim>, MetaStoreError> {
         validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
-        let now = unix_time_ms()?;
+        let now = self.evaluation_time_ms()?;
         let guard = self.inner.read().await;
         Ok(guard
             .standing_runtime_owners
@@ -1781,7 +1832,7 @@ impl MetaStore for InMemoryMetaStore {
         validate_current_standing_runtime_owner(
             guard.standing_runtime_owners.get(&key),
             &request.owner,
-            unix_time_ms()?,
+            self.evaluation_time_ms()?,
         )?;
         let current = guard.standing_runtime_checkpoints.get(&key);
 
@@ -4647,9 +4698,12 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::UnexpectedOutcome(_) => Status::invalid_argument(error.to_string()),
         MetaStoreError::UnsupportedCapability(_) => Status::failed_precondition(error.to_string()),
-        MetaStoreError::Remote(_) | MetaStoreError::Oss(_) | MetaStoreError::Hiqlite(_) => {
-            Status::unavailable(error.to_string())
-        }
+        MetaStoreError::RhizaIndeterminate { .. } => Status::unknown(error.to_string()),
+        MetaStoreError::Remote(_)
+        | MetaStoreError::Oss(_)
+        | MetaStoreError::Hiqlite(_)
+        | MetaStoreError::Rhiza(_)
+        | MetaStoreError::RhizaContention { .. } => Status::unavailable(error.to_string()),
     }
 }
 
@@ -4682,6 +4736,9 @@ fn partition_authority_status(error: MetaStoreError) -> Status {
         | MetaStoreError::Remote(_)
         | MetaStoreError::Oss(_)
         | MetaStoreError::Hiqlite(_)
+        | MetaStoreError::Rhiza(_)
+        | MetaStoreError::RhizaIndeterminate { .. }
+        | MetaStoreError::RhizaContention { .. }
         | MetaStoreError::UnexpectedOutcome(_) => Status::internal(error.to_string()),
     }
 }
@@ -9831,5 +9888,39 @@ mod relation_partition_authority_tests {
         assert!(source.contains("velorix_relation_ingest_reservations"));
         assert!(source.contains("async fn acquire_relation_partition_authority"));
         assert!(source.contains("async fn list_relation_authoritative_ingest_publications"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_fixed_evaluation_time_reproduces_owner_expiry() {
+        let store = InMemoryMetaStore::from_state_for_evaluation(InMemoryMetaState::default(), 100);
+        let claim = match store
+            .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+                tenant_id: "tenant".into(),
+                program_id: "program".into(),
+                view_id: "view".into(),
+                owner_id: "owner".into(),
+                ttl_ms: 10,
+            })
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+            other => panic!("unexpected outcome: {other:?}"),
+        };
+        assert_eq!(claim.expires_at_unix_ms, 110);
+        let before_expiry =
+            InMemoryMetaStore::from_state_for_evaluation(store.snapshot_state().await, 109);
+        assert!(before_expiry
+            .read_standing_runtime_owner("tenant", "program", "view")
+            .await
+            .unwrap()
+            .is_some());
+        let after_expiry =
+            InMemoryMetaStore::from_state_for_evaluation(store.snapshot_state().await, 110);
+        assert!(after_expiry
+            .read_standing_runtime_owner("tenant", "program", "view")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

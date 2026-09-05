@@ -7777,9 +7777,12 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
         | MetaStoreError::StandingRuntimeOwnerMismatch
         | MetaStoreError::PartitionAuthorityInvalidToken => ApiError::conflict(error),
         MetaStoreError::UnsupportedCapability(_) => ApiError::service_unavailable(error),
-        MetaStoreError::Remote(_) | MetaStoreError::Oss(_) | MetaStoreError::Hiqlite(_) => {
-            ApiError::internal(error)
-        }
+        MetaStoreError::Remote(_)
+        | MetaStoreError::Oss(_)
+        | MetaStoreError::Hiqlite(_)
+        | MetaStoreError::Rhiza(_)
+        | MetaStoreError::RhizaIndeterminate { .. }
+        | MetaStoreError::RhizaContention { .. } => ApiError::internal(error),
     }
 }
 
