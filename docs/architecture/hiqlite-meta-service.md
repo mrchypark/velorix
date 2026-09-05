@@ -95,6 +95,44 @@ cargo run -p velorix-meta --features hiqlite-backend
 
 `VELORIX_HIQLITE_WITH_PROXY=1` enables hiqlite remote proxy mode when the
 deployment requires it.
+
+## Rhiza KV service mode
+
+The metadata binary also supports the embedded Rhiza KV backend behind the
+`rhiza-backend` feature. Membership is fixed explicitly with either
+`VELORIX_RHIZA_MEMBERS_JSON` or a secret-mounted
+`VELORIX_RHIZA_MEMBERS_FILE` (never both). The value is a JSON array containing
+`node_id`, `url`, `peer_url` (`quic://...`), and `token` fields. The local
+`VELORIX_RHIZA_NODE_ID` must be one of the members. `VELORIX_RHIZA_PEER_ADDR`
+is the native bind address (`host:port`); the `quic://` scheme belongs only in
+the member `peer_url`. For the native S3-compatible provider,
+`VELORIX_RHIZA_OBJECT_STORE_ENDPOINT` is also a host and port (for example
+`rustfs:9000`), with `VELORIX_RHIZA_OBJECT_STORE_INSECURE=1` selecting HTTP.
+
+Development Rhiza mode is explicitly single-node and defaults to asynchronous
+object-store durability. Production mode requires exactly three voters,
+explicit S3/GCS/Azure object storage, and
+`VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack`; no local filesystem object
+store is accepted as production durability. The service performs a
+linearizable metadata read before opening its gRPC listener, so an unavailable
+Rhiza quorum fails startup. Rhiza's production fencing capability remains
+fail-closed until the separately recorded three-node recovery evidence exists.
+
+Example development configuration:
+
+```bash
+VELORIX_META_MODE=development \
+VELORIX_META_BIND=127.0.0.1:9090 \
+VELORIX_META_BACKEND=rhiza-kv \
+VELORIX_RHIZA_DATA_DIR=/tmp/velorix-rhiza \
+VELORIX_RHIZA_NODE_ID=dev-1 \
+VELORIX_RHIZA_CLUSTER_ID=velorix-dev \
+VELORIX_RHIZA_BIND_ADDR=127.0.0.1:8100 \
+VELORIX_RHIZA_PEER_ADDR=127.0.0.1:8200 \
+VELORIX_RHIZA_MEMBERS_JSON='[{"node_id":"dev-1","url":"http://127.0.0.1:8100","peer_url":"quic://127.0.0.1:8200","token":""}]' \
+cargo run -p velorix-meta --features rhiza-backend
+```
+
 Production startup is fail-closed: it requires an explicit mode, bind address,
 durable backend, bearer token, transport-security attestation, and exactly
 three unique Hiqlite voter endpoints when `VELORIX_META_BACKEND=hiqlite`.

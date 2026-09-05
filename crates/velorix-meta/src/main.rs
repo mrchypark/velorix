@@ -7,6 +7,9 @@ use std::{
 };
 
 use object_store::{aws::AmazonS3Builder, path::Path, prefix::PrefixStore, ObjectStore};
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "rhiza-backend")]
+use serde_json::json;
 use tonic::{transport::Server, Code, Request};
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
@@ -29,6 +32,8 @@ use velorix_storage::object_key::ObjectKey;
 
 #[cfg(feature = "hiqlite-backend")]
 use velorix_meta::HiqliteMetaStore;
+#[cfg(feature = "rhiza-backend")]
+use velorix_meta::{rhiza_kv::RhizaKvStore, rhiza_meta::RhizaKvMetaStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -46,6 +51,13 @@ async fn main() -> anyhow::Result<()> {
 async fn serve() -> anyhow::Result<()> {
     let config = parse_meta_serve_config_from_env()?;
     let store = meta_store_from_config(&config).await?;
+    // Startup is only successful after a backend operation has completed. For
+    // Rhiza this is a linearizable KV read, so a local process that cannot
+    // reach a quorum never advertises a ready gRPC listener.
+    store
+        .read_meta_store_capabilities()
+        .await
+        .map_err(|error| anyhow::anyhow!("metadata backend readiness probe failed: {error}"))?;
     let service = match config.bearer_token.clone() {
         Some(token) => MetaGrpcService::with_bearer_token(store, token)?,
         None => MetaGrpcService::new(store),
@@ -69,7 +81,43 @@ enum MetaServeMode {
 enum MetaBackendKind {
     Memory,
     Hiqlite,
+    RhizaKv,
     Oss,
+}
+
+/// The service's Rhiza configuration is deliberately explicit. In particular,
+/// membership and peer addresses are not inferred from local process state.
+/// This prevents a restarted no-PVC node from silently joining a different
+/// cluster or advertising an unreachable address.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RhizaMemberConfig {
+    node_id: String,
+    url: String,
+    peer_url: String,
+    #[serde(default)]
+    token: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RhizaServeConfig {
+    data_dir: String,
+    node_id: String,
+    cluster_id: String,
+    bind_addr: String,
+    peer_addr: String,
+    admin_token: Option<String>,
+    members: Vec<RhizaMemberConfig>,
+    object_store_provider: Option<String>,
+    object_store_endpoint: Option<String>,
+    object_store_bucket: Option<String>,
+    object_store_region: Option<String>,
+    object_store_prefix: Option<String>,
+    object_store_access_key: Option<String>,
+    object_store_secret_key: Option<String>,
+    object_store_session_token: Option<String>,
+    object_store_insecure: bool,
+    object_store_durability: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +130,7 @@ struct MetaServeConfig {
     transport_security_attestation: Option<String>,
     hiqlite_nodes: Vec<String>,
     hiqlite_api_secret: Option<String>,
+    rhiza: Option<RhizaServeConfig>,
 }
 
 fn parse_meta_serve_config_from_env() -> anyhow::Result<MetaServeConfig> {
@@ -139,6 +188,11 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
     } else {
         None
     };
+    let rhiza = if backend == MetaBackendKind::RhizaKv {
+        Some(parse_rhiza_config(vars, &mode)?)
+    } else {
+        None
+    };
 
     match mode {
         MetaServeMode::Production => validate_production_meta_serve_config(
@@ -147,6 +201,7 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
             &transport_security,
             &transport_security_attestation,
             &hiqlite_nodes,
+            rhiza.as_ref(),
         )?,
         MetaServeMode::Development => {
             if !bind.ip().is_loopback() && !allow_development_non_loopback {
@@ -178,6 +233,7 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
         transport_security_attestation,
         hiqlite_nodes,
         hiqlite_api_secret,
+        rhiza,
     })
 }
 
@@ -185,9 +241,10 @@ fn parse_meta_backend(value: &str) -> anyhow::Result<MetaBackendKind> {
     match value {
         "memory" | "in-memory" => Ok(MetaBackendKind::Memory),
         "hiqlite" => Ok(MetaBackendKind::Hiqlite),
+        "rhiza-kv" | "rhiza_kv" => Ok(MetaBackendKind::RhizaKv),
         "oss" | "object-store" => Ok(MetaBackendKind::Oss),
         other => anyhow::bail!(
-            "unsupported VELORIX_META_BACKEND `{other}`; expected `memory`, `hiqlite`, or `oss`"
+            "unsupported VELORIX_META_BACKEND `{other}`; expected `memory`, `hiqlite`, `rhiza-kv`, or `oss`"
         ),
     }
 }
@@ -212,6 +269,7 @@ fn validate_production_meta_serve_config(
     transport_security: &Option<String>,
     transport_security_attestation: &Option<String>,
     hiqlite_nodes: &[String],
+    rhiza: Option<&RhizaServeConfig>,
 ) -> anyhow::Result<()> {
     if *backend == MetaBackendKind::Memory {
         anyhow::bail!(
@@ -236,6 +294,24 @@ fn validate_production_meta_serve_config(
             "production VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes"
         );
     }
+    if *backend == MetaBackendKind::RhizaKv {
+        let config = rhiza.expect("Rhiza config is parsed for the Rhiza backend");
+        if config.members.len() != 3 {
+            anyhow::bail!(
+                "production VELORIX_RHIZA_MEMBERS_JSON or VELORIX_RHIZA_MEMBERS_FILE must contain exactly three unique voter nodes"
+            );
+        }
+        if config.object_store_provider.is_none() {
+            anyhow::bail!(
+                "production Rhiza KV requires explicit durable object storage; filesystem/local storage is not permitted"
+            );
+        }
+        if config.object_store_durability != "before-ack" {
+            anyhow::bail!(
+                "production Rhiza KV requires VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -254,6 +330,137 @@ fn parse_hiqlite_nodes(value: &str) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes");
     }
     Ok(nodes)
+}
+
+/// Parse fixed Rhiza membership from JSON or a secret-mounted file. Tokens are
+/// retained only in the in-memory native config and are never included in
+/// diagnostics. A single development node may omit its token; every voter in
+/// a multi-node cluster must provide one.
+fn parse_rhiza_config(
+    vars: &HashMap<String, String>,
+    mode: &MetaServeMode,
+) -> anyhow::Result<RhizaServeConfig> {
+    let data_dir = required_nonempty_config(vars, "VELORIX_RHIZA_DATA_DIR")?;
+    let node_id = required_nonempty_config(vars, "VELORIX_RHIZA_NODE_ID")?;
+    let cluster_id = required_nonempty_config(vars, "VELORIX_RHIZA_CLUSTER_ID")?;
+    let bind_addr = required_nonempty_config(vars, "VELORIX_RHIZA_BIND_ADDR")?;
+    let peer_addr = required_nonempty_config(vars, "VELORIX_RHIZA_PEER_ADDR")?;
+    let admin_token = optional_raw_config(vars, "VELORIX_RHIZA_ADMIN_TOKEN");
+    let members_json = optional_config(vars, "VELORIX_RHIZA_MEMBERS_JSON");
+    let members_file = optional_config(vars, "VELORIX_RHIZA_MEMBERS_FILE");
+    if members_json.is_some() && members_file.is_some() {
+        anyhow::bail!(
+            "VELORIX_RHIZA_MEMBERS_JSON and VELORIX_RHIZA_MEMBERS_FILE are mutually exclusive"
+        );
+    }
+    let members_text = match (members_json, members_file) {
+        (Some(value), None) => value,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|error| anyhow::anyhow!("cannot read VELORIX_RHIZA_MEMBERS_FILE: {error}"))?,
+        (None, None) => {
+            anyhow::bail!("VELORIX_RHIZA_MEMBERS_JSON or VELORIX_RHIZA_MEMBERS_FILE is required")
+        }
+        (Some(_), Some(_)) => unreachable!("mutually exclusive member sources were checked"),
+    };
+    let members = parse_rhiza_members_json(&members_text)?;
+    if !members.iter().any(|member| member.node_id == node_id) {
+        anyhow::bail!("Rhiza membership must include VELORIX_RHIZA_NODE_ID `{node_id}`");
+    }
+    if *mode == MetaServeMode::Development && members.len() != 1 {
+        anyhow::bail!("development Rhiza KV is single-node only; use exactly one membership entry");
+    }
+    if members.len() > 1 && members.iter().any(|member| member.token.is_empty()) {
+        anyhow::bail!("every multi-node Rhiza membership entry must include a voter token");
+    }
+
+    let provider = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_PROVIDER");
+    if let Some(provider) = &provider {
+        if !matches!(provider.as_str(), "s3" | "gcs" | "azure") {
+            anyhow::bail!(
+                "unsupported VELORIX_RHIZA_OBJECT_STORE_PROVIDER `{provider}`; expected `s3`, `gcs`, or `azure`"
+            );
+        }
+    }
+    let object_store_endpoint = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_ENDPOINT")
+        .or_else(|| optional_config(vars, "AWS_ENDPOINT_URL"));
+    let object_store_bucket = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_BUCKET")
+        .or_else(|| optional_config(vars, "VELORIX_S3_BUCKET"));
+    if provider.is_some() && object_store_bucket.is_none() {
+        anyhow::bail!(
+            "VELORIX_RHIZA_OBJECT_STORE_BUCKET is required when Rhiza object storage is configured"
+        );
+    }
+    let object_store_durability = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_DURABILITY")
+        .unwrap_or_else(|| {
+            if *mode == MetaServeMode::Production {
+                "before-ack".to_string()
+            } else {
+                "async".to_string()
+            }
+        });
+    if !matches!(object_store_durability.as_str(), "async" | "before-ack") {
+        anyhow::bail!("VELORIX_RHIZA_OBJECT_STORE_DURABILITY must be `async` or `before-ack`");
+    }
+    let object_store_insecure =
+        match optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_INSECURE").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => anyhow::bail!("VELORIX_RHIZA_OBJECT_STORE_INSECURE must be exactly 0 or 1"),
+        };
+
+    Ok(RhizaServeConfig {
+        data_dir,
+        node_id,
+        cluster_id,
+        bind_addr,
+        peer_addr,
+        admin_token,
+        members,
+        object_store_provider: provider,
+        object_store_endpoint,
+        object_store_bucket,
+        object_store_region: optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_REGION")
+            .or_else(|| optional_config(vars, "AWS_REGION")),
+        object_store_prefix: optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_PREFIX"),
+        object_store_access_key: optional_raw_config(vars, "VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY")
+            .or_else(|| optional_raw_config(vars, "AWS_ACCESS_KEY_ID")),
+        object_store_secret_key: optional_raw_config(vars, "VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY")
+            .or_else(|| optional_raw_config(vars, "AWS_SECRET_ACCESS_KEY")),
+        object_store_session_token: optional_raw_config(
+            vars,
+            "VELORIX_RHIZA_OBJECT_STORE_SESSION_TOKEN",
+        )
+        .or_else(|| optional_raw_config(vars, "AWS_SESSION_TOKEN")),
+        object_store_insecure,
+        object_store_durability,
+    })
+}
+
+fn parse_rhiza_members_json(value: &str) -> anyhow::Result<Vec<RhizaMemberConfig>> {
+    let members = serde_json::from_str::<Vec<RhizaMemberConfig>>(value)
+        .map_err(|error| anyhow::anyhow!("invalid Rhiza membership JSON: {error}"))?;
+    let mut node_ids = BTreeSet::new();
+    for member in &members {
+        if member.node_id.trim().is_empty()
+            || member.url.trim().is_empty()
+            || member.peer_url.trim().is_empty()
+        {
+            anyhow::bail!("every Rhiza membership entry requires node_id, url, and peer_url");
+        }
+        if !member.url.starts_with("http://") && !member.url.starts_with("https://") {
+            anyhow::bail!("Rhiza member url must use http:// or https://");
+        }
+        if !member.peer_url.starts_with("quic://") {
+            anyhow::bail!("Rhiza member peer_url must use quic://");
+        }
+        if !node_ids.insert(member.node_id.clone()) {
+            anyhow::bail!("Rhiza membership must contain unique node IDs");
+        }
+    }
+    if members.is_empty() {
+        anyhow::bail!("Rhiza membership must contain at least one node");
+    }
+    Ok(members)
 }
 
 fn required_nonempty_config(
@@ -284,6 +491,7 @@ struct MetaSmokeConfig {
     expect_production_multi_writer_safe: bool,
     require_unauthenticated_rejected: bool,
     run_standing_runtime_fencing_adversarial: bool,
+    verify_only: bool,
     catalog_probe_id: String,
     connect_retry_timeout: Duration,
 }
@@ -299,6 +507,7 @@ fn parse_meta_smoke_args(
     let mut expect_production_multi_writer_safe = false;
     let mut require_unauthenticated_rejected = true;
     let mut run_standing_runtime_fencing_adversarial = false;
+    let mut verify_only = false;
     let mut catalog_probe_id = default_catalog_probe_id();
     let mut connect_retry_timeout = env::var("VELORIX_META_SMOKE_CONNECT_RETRY_TIMEOUT_SECONDS")
         .ok()
@@ -331,6 +540,7 @@ fn parse_meta_smoke_args(
             "--run-standing-runtime-fencing-adversarial" => {
                 run_standing_runtime_fencing_adversarial = true
             }
+            "--verify-only" => verify_only = true,
             "--allow-unauthenticated" => require_unauthenticated_rejected = false,
             "--help" | "-h" => {
                 print_meta_smoke_usage();
@@ -359,6 +569,7 @@ fn parse_meta_smoke_args(
         expect_production_multi_writer_safe,
         require_unauthenticated_rejected,
         run_standing_runtime_fencing_adversarial,
+        verify_only,
         catalog_probe_id,
         connect_retry_timeout,
     })
@@ -397,7 +608,7 @@ fn parse_duration_seconds(value: &str) -> anyhow::Result<Duration> {
 
 fn print_meta_smoke_usage() {
     eprintln!(
-        "Usage: velorix-meta smoke --endpoint http://velorix-meta:9090 --expect-backend in-memory [--bearer-token TOKEN]"
+        "Usage: velorix-meta smoke --endpoint http://velorix-meta:9090 --expect-backend in-memory [--bearer-token TOKEN] [--catalog-probe-id ID] [--verify-only]"
     );
 }
 
@@ -453,6 +664,22 @@ async fn run_meta_smoke_once(config: &MetaSmokeConfig) -> anyhow::Result<()> {
         );
     }
     let catalog = smoke_relation_catalog(&config.catalog_probe_id)?;
+    if config.verify_only {
+        let read_catalog = store
+            .read_relation_catalog(
+                &catalog.relation_schema.relation_id,
+                &catalog.relation_schema.relation_version,
+            )
+            .await?;
+        if read_catalog != catalog {
+            anyhow::bail!("metadata catalog verification returned a different catalog");
+        }
+        println!(
+            "velorix-meta smoke verified: endpoint={} backend={} auth_enforced={} catalog_probe_id={} mutations=0",
+            config.endpoint, capability.backend_name, capability.control_plane_auth_enforced, config.catalog_probe_id
+        );
+        return Ok(());
+    }
     let store_outcome = store.store_relation_catalog(catalog.clone()).await?;
     let read_catalog = store
         .read_relation_catalog(
@@ -808,6 +1035,15 @@ async fn meta_store_from_config(config: &MetaServeConfig) -> anyhow::Result<Arc<
             )
             .await
         }
+        MetaBackendKind::RhizaKv => {
+            rhiza_meta_store_from_config(
+                config
+                    .rhiza
+                    .as_ref()
+                    .expect("Rhiza config is parsed for the Rhiza backend"),
+            )
+            .await
+        }
         MetaBackendKind::Oss => Ok(Arc::new(OssMetaStore::new(oss_object_store_from_env()?))),
     }
 }
@@ -872,6 +1108,70 @@ async fn hiqlite_meta_store_from_config(
         HiqliteMetaStore::connect_remote(nodes.to_vec(), api_secret.to_string(), with_proxy)
             .await?,
     ))
+}
+
+#[cfg(feature = "rhiza-backend")]
+async fn rhiza_meta_store_from_config(
+    config: &RhizaServeConfig,
+) -> anyhow::Result<Arc<dyn MetaStore>> {
+    let members = config
+        .members
+        .iter()
+        .map(|member| {
+            json!({
+                "node_id": member.node_id,
+                "url": member.url,
+                "peer_url": member.peer_url,
+                "token": member.token,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut native = rhizadb::Config::new(&config.data_dir)
+        .node_id(config.node_id.clone())
+        .cluster_id(config.cluster_id.clone())
+        .bind_addr(config.bind_addr.clone())
+        .peer_addr(config.peer_addr.clone())
+        .set_option("Members", json!(members))
+        .set_option("ObjStoreDurability", json!(config.object_store_durability))
+        .set_option("ObjStoreInsecure", json!(config.object_store_insecure));
+    if let Some(value) = &config.admin_token {
+        native = native.set_option("AdminToken", json!(value));
+    }
+    if let Some(value) = &config.object_store_provider {
+        native = native.set_option("ObjStoreProvider", json!(value));
+    }
+    if let Some(value) = &config.object_store_endpoint {
+        native = native.set_option("ObjStoreEndpoint", json!(value));
+    }
+    if let Some(value) = &config.object_store_bucket {
+        native = native.set_option("ObjStoreBucket", json!(value));
+    }
+    if let Some(value) = &config.object_store_region {
+        native = native.set_option("ObjStoreRegion", json!(value));
+    }
+    if let Some(value) = &config.object_store_prefix {
+        native = native.set_option("ObjStorePrefix", json!(value));
+    }
+    if let Some(value) = &config.object_store_access_key {
+        native = native.set_option("ObjStoreAccessKey", json!(value));
+    }
+    if let Some(value) = &config.object_store_secret_key {
+        native = native.set_option("ObjStoreSecretKey", json!(value));
+    }
+    if let Some(value) = &config.object_store_session_token {
+        native = native.set_option("ObjStoreSessionToken", json!(value));
+    }
+    let kv = RhizaKvStore::open_config(native).await?;
+    Ok(Arc::new(RhizaKvMetaStore::new(kv)))
+}
+
+#[cfg(not(feature = "rhiza-backend"))]
+async fn rhiza_meta_store_from_config(
+    _config: &RhizaServeConfig,
+) -> anyhow::Result<Arc<dyn MetaStore>> {
+    anyhow::bail!(
+        "VELORIX_META_BACKEND=rhiza-kv requires building velorix-meta with `--features rhiza-backend`"
+    )
 }
 
 #[cfg(not(feature = "hiqlite-backend"))]
@@ -950,6 +1250,7 @@ mod tests {
                 expect_production_multi_writer_safe: false,
                 require_unauthenticated_rejected: true,
                 run_standing_runtime_fencing_adversarial: false,
+                verify_only: false,
                 catalog_probe_id: "test-probe".to_string(),
                 connect_retry_timeout: Duration::from_secs(30),
             }
@@ -970,6 +1271,26 @@ mod tests {
         .unwrap();
 
         assert!(config.run_standing_runtime_fencing_adversarial);
+    }
+
+    #[test]
+    fn parse_meta_smoke_args_accepts_verify_only_flag() {
+        let config = parse_meta_smoke_args([
+            "--endpoint".to_string(),
+            "http://velorix-meta:9090".to_string(),
+            "--expect-backend".to_string(),
+            "rhiza-kv".to_string(),
+            "--expect-auth-enforced".to_string(),
+            "false".to_string(),
+            "--allow-unauthenticated".to_string(),
+            "--catalog-probe-id".to_string(),
+            "recovery-probe".to_string(),
+            "--verify-only".to_string(),
+        ])
+        .unwrap();
+
+        assert!(config.verify_only);
+        assert!(!config.expect_auth_enforced);
     }
 
     #[test]
@@ -1122,6 +1443,110 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("must be exactly 0 or 1"));
+    }
+
+    #[test]
+    fn development_rhiza_is_explicit_single_node_and_defaults_async() {
+        let config = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "rhiza-kv"),
+            ("VELORIX_RHIZA_DATA_DIR", "/tmp/velorix-rhiza-dev"),
+            ("VELORIX_RHIZA_NODE_ID", "dev-1"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-dev"),
+            ("VELORIX_RHIZA_BIND_ADDR", "127.0.0.1:9091"),
+            ("VELORIX_RHIZA_PEER_ADDR", "127.0.0.1:9191"),
+            (
+                "VELORIX_RHIZA_MEMBERS_JSON",
+                r#"[{"node_id":"dev-1","url":"http://127.0.0.1:9091","peer_url":"quic://127.0.0.1:9191","token":""}]"#,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(config.backend, MetaBackendKind::RhizaKv);
+        let rhiza = config.rhiza.expect("Rhiza configuration should be present");
+        assert_eq!(rhiza.members.len(), 1);
+        assert_eq!(rhiza.object_store_durability, "async");
+        assert!(rhiza.object_store_provider.is_none());
+    }
+
+    #[test]
+    fn development_rhiza_rejects_multi_node_membership() {
+        let error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "rhiza-kv"),
+            ("VELORIX_RHIZA_DATA_DIR", "/tmp/velorix-rhiza-dev"),
+            ("VELORIX_RHIZA_NODE_ID", "dev-1"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-dev"),
+            ("VELORIX_RHIZA_BIND_ADDR", "127.0.0.1:9091"),
+            ("VELORIX_RHIZA_PEER_ADDR", "127.0.0.1:9191"),
+            (
+                "VELORIX_RHIZA_MEMBERS_JSON",
+                r#"[{"node_id":"dev-1","url":"http://127.0.0.1:9091","peer_url":"quic://127.0.0.1:9191","token":""},{"node_id":"dev-2","url":"http://127.0.0.1:9092","peer_url":"quic://127.0.0.1:9192","token":"token"}]"#,
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(error.to_string().contains("single-node"));
+    }
+
+    #[test]
+    fn production_rhiza_requires_three_voters_before_ack_and_object_storage() {
+        let base = [
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "rhiza-kv"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            (
+                "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
+                "mesh-policy/velorix-meta",
+            ),
+            ("VELORIX_RHIZA_DATA_DIR", "/var/lib/velorix-meta"),
+            ("VELORIX_RHIZA_NODE_ID", "node-a"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta"),
+            ("VELORIX_RHIZA_BIND_ADDR", "0.0.0.0:9091"),
+            ("VELORIX_RHIZA_PEER_ADDR", "0.0.0.0:9191"),
+            (
+                "VELORIX_RHIZA_MEMBERS_JSON",
+                r#"[{"node_id":"node-a","url":"http://meta-a:9091","peer_url":"quic://meta-a:9191","token":"token-a"},{"node_id":"node-b","url":"http://meta-b:9091","peer_url":"quic://meta-b:9191","token":"token-b"},{"node_id":"node-c","url":"http://meta-c:9091","peer_url":"quic://meta-c:9191","token":"token-c"}]"#,
+            ),
+        ];
+        let error = parse_meta_serve_config_from_pairs(base).unwrap_err();
+        assert!(error.to_string().contains("durable object storage"));
+
+        let error = parse_meta_serve_config_from_pairs([
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            base[4],
+            base[5],
+            base[6],
+            base[7],
+            base[8],
+            base[9],
+            base[10],
+            base[11],
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "velorix-meta"),
+            ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "async"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("before-ack"));
+    }
+
+    #[test]
+    fn rhiza_members_reject_duplicate_or_malformed_entries() {
+        let duplicate =
+            parse_rhiza_members_json(r#"[{"node_id":"node-a","url":"http://a","peer_url":"quic://a","token":"token"},{"node_id":"node-a","url":"http://b","peer_url":"quic://b","token":"token"}]"#)
+                .unwrap_err();
+        assert!(duplicate.to_string().contains("unique node IDs"));
+
+        let malformed = parse_rhiza_members_json(
+            r#"[{"node_id":"node-a","url":"http://a","peer_url":"tcp://a","token":"token"}]"#,
+        )
+        .unwrap_err();
+        assert!(malformed.to_string().contains("peer_url must use quic://"));
     }
 
     #[test]

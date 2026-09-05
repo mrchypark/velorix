@@ -7,7 +7,7 @@ use std::{
 };
 
 use object_store::memory::InMemory as InMemoryObjectStore;
-#[cfg(feature = "hiqlite-backend")]
+#[cfg(any(feature = "hiqlite-backend", feature = "rhiza-backend"))]
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{metadata::MetadataValue, transport::Server, Request};
@@ -44,6 +44,8 @@ use velorix_meta::{
     ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
     StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
+#[cfg(feature = "rhiza-backend")]
+use velorix_meta::{rhiza_kv::RhizaKvStore, rhiza_meta::RhizaKvMetaStore};
 
 mod common;
 
@@ -63,6 +65,66 @@ async fn grpc_service_exposes_meta_store_capabilities() {
     assert_eq!(capability.backend_name, "in-memory");
     assert!(!capability.production_multi_writer_safe);
     assert!(capability.linearizable_owner_lease);
+}
+
+#[cfg(feature = "rhiza-backend")]
+#[tokio::test]
+async fn grpc_rhiza_backend_requires_bearer_and_executes_linearizable_store_path() {
+    let directory = TempDir::new().unwrap();
+    let kv = RhizaKvStore::open(directory.path().display().to_string(), "grpc-rhiza-node")
+        .await
+        .unwrap();
+    let endpoint = {
+        let service =
+            MetaGrpcService::with_bearer_token(RhizaKvMetaStore::new(kv), "grpc-rhiza-secret")
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(VelorixMetaServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    };
+
+    let unauthenticated = GrpcMetaStore::connect(endpoint.clone()).await.unwrap();
+    let error = unauthenticated
+        .read_meta_store_capabilities()
+        .await
+        .unwrap_err();
+    let error_debug = format!("{error:?}");
+    assert!(
+        matches!(
+        error,
+        velorix_meta::MetaStoreError::Remote(message)
+            if message.to_ascii_lowercase().contains("authentication")
+        ),
+        "unexpected unauthenticated response: {error_debug}"
+    );
+
+    let authenticated = GrpcMetaStore::connect_with_bearer_token(endpoint, "grpc-rhiza-secret")
+        .await
+        .unwrap();
+    let capabilities = authenticated.read_meta_store_capabilities().await.unwrap();
+    assert_eq!(
+        capabilities.standing_runtime_fencing.backend_name,
+        "rhiza-kv"
+    );
+    assert!(
+        !capabilities
+            .standing_runtime_fencing
+            .production_multi_writer_safe
+    );
+    assert_eq!(
+        authenticated
+            .store_relation_catalog(common::orders_relation_catalog("v1"))
+            .await
+            .unwrap(),
+        velorix_meta::StoreRelationCatalogOutcome::Created
+    );
 }
 
 #[tokio::test]
