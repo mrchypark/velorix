@@ -326,8 +326,8 @@ spec:
           args:
             - >-
               mc alias set fixture http://${minio_service}.${namespace}.svc.cluster.local:9000
-              "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY";
-              mc mb --ignore-existing "fixture/$MINIO_BUCKET"
+              "\$MINIO_ACCESS_KEY" "\$MINIO_SECRET_KEY";
+              mc mb --ignore-existing "fixture/\$MINIO_BUCKET"
           env:
             - name: MINIO_ACCESS_KEY
               valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: access-key}}

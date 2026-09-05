@@ -88,3 +88,21 @@ failover, and no production multi-writer safety. The API's existing
 `logical-fencing`/required production runtime gates must not be bypassed merely
 because metadata service connectivity and recovery pass. Native mTLS client
 wiring is separate from those runtime admission guarantees.
+
+## Executed Kubernetes evidence (2026-09-05)
+
+The isolated fixture passed against the explicitly selected target context
+using runtime source `c4d957b` and GHCR Meta image
+`sha256:7c4f01896611a20f8c9130da9ace9a9c5f6ff3dc67b72e03c620c1fdacaf2b41`.
+All three replacement Meta Pods were Running/Ready, used `emptyDir`, and the
+namespace contained zero PVCs. Their UIDs differed from the original three
+Pods. Each replacement node returned the exact pre-restart catalog over native
+mTLS with bearer authentication and `mutations=0`. An independent coordinator
+then repeated the read-only probe inside each Pod against its loopback endpoint.
+
+The local evidence directory is
+`target/rhiza-kv-live-fixture-approved-evidence/`. Cluster identifiers and
+credentials are deliberately excluded from this document. The earlier default-
+context run is not evidence for the selected target; operators must resolve and
+check the explicit context before execution, rather than reuse current-context.
+The successful fixture remains a test environment, not a production cutover.
