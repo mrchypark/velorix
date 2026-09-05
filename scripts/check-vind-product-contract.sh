@@ -4324,8 +4324,8 @@ checks["metadata server production startup fails closed"] = (
     and "production VELORIX_META_BACKEND must be durable; memory is development-only" in meta
     and "VELORIX_META_BEARER_TOKEN is required in production mode" in meta
     and "VELORIX_META_TRANSPORT_SECURITY is required in production mode" in meta
-    and "use `service-mesh-mtls` attestation" in meta
-    and "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION is required in production mode" in meta
+    and "production metadata transport must use native-mtls" in meta
+    and "service-mesh-mtls is operator-attested and not verified by this binary" in meta
     and "VELORIX_HIQLITE_API_SECRET" in meta
     and "production VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes" in meta
     and "serve_config_requires_explicit_mode_and_backend" in meta
@@ -4336,7 +4336,7 @@ checks["metadata server production startup fails closed"] = (
     and "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK must be exactly 0 or 1" in meta
     and "MetaBackendKind::Memory || bearer_token.is_none()" in meta
     and "production_config_rejects_missing_durable_backend_and_memory_backend" in meta
-    and "production_config_requires_auth_and_transport_security_attestation" in meta
+    and "production_config_requires_auth_and_native_transport_security" in meta
     and "production_hiqlite_requires_exactly_three_unique_voter_nodes" in meta
     and "The metadata server is fail-open by default" in architecture_critique
     and "Resolved by current code evidence: production startup now requires explicit"
