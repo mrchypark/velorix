@@ -21,7 +21,7 @@ use velorix_meta::{
         ReadMetaStoreCapabilitiesRequest,
     },
     validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    GrpcMetaStore, InMemoryMetaStore, MetaGrpcService, MetaStore, OssMetaStore,
+    GrpcMetaStore, InMemoryMetaStore, MetaGrpcService, MetaStore, MetaStoreError, OssMetaStore,
     PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
 };
@@ -511,7 +511,7 @@ where
         }
     };
 
-    let checkpoint_1 = smoke_checkpoint_pointer(&tenant_id, &program_id, &view_id, 1, 'a')?;
+    let checkpoint_1 = smoke_checkpoint_pointer(&tenant_id, &program_id, &view_id, 1, 'a', None)?;
     let publish_1 = store
         .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
             expected_previous: None,
@@ -533,7 +533,14 @@ where
 
     tokio::time::sleep(Duration::from_millis(OWNER_A_EXPIRY_WAIT_MS)).await;
 
-    let checkpoint_2 = smoke_checkpoint_pointer(&tenant_id, &program_id, &view_id, 2, 'b')?;
+    let checkpoint_2 = smoke_checkpoint_pointer(
+        &tenant_id,
+        &program_id,
+        &view_id,
+        2,
+        'b',
+        Some(&checkpoint_1),
+    )?;
     let expired_owner_publish = store
         .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
             expected_previous: Some(checkpoint_1.clone()),
@@ -542,13 +549,12 @@ where
         })
         .await;
     match expired_owner_publish {
-        Ok(PublishStandingRuntimeCheckpointOutcome::Published)
-        | Ok(PublishStandingRuntimeCheckpointOutcome::Duplicate) => {
+        Err(error) if expired_owner_publish_error_is_expected(&error) => {}
+        other => {
             anyhow::bail!(
-                "expired owner-a checkpoint publish unexpectedly succeeded: publish={expired_owner_publish:?}"
+                "expired owner-a checkpoint publish expected lease fencing rejection: publish={other:?}"
             );
         }
-        Ok(PublishStandingRuntimeCheckpointOutcome::Conflict) | Err(_) => {}
     }
 
     let owner_b = match store
@@ -583,11 +589,26 @@ where
         anyhow::bail!("owner-b checkpoint publish returned {publish_2:?}");
     }
 
-    let checkpoint_3 = smoke_checkpoint_pointer(&tenant_id, &program_id, &view_id, 3, 'c')?;
+    let checkpoint_3 = smoke_checkpoint_pointer(
+        &tenant_id,
+        &program_id,
+        &view_id,
+        3,
+        'c',
+        Some(&checkpoint_2),
+    )?;
+    let stale_checkpoint_3 = smoke_checkpoint_pointer(
+        &tenant_id,
+        &program_id,
+        &view_id,
+        3,
+        'c',
+        Some(&checkpoint_1),
+    )?;
     let stale_expected_previous_publish = store
         .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
             expected_previous: Some(checkpoint_1),
-            candidate: checkpoint_3.clone(),
+            candidate: stale_checkpoint_3,
             owner: smoke_owner_token(&owner_b),
         })
         .await?;
@@ -634,6 +655,7 @@ fn smoke_checkpoint_pointer(
     view_id: &str,
     logical_epoch: u64,
     hash_char: char,
+    previous: Option<&StandingRuntimeCheckpointPointer>,
 ) -> anyhow::Result<StandingRuntimeCheckpointPointer> {
     let content_hash = format!("sha256:{}", hash_char.to_string().repeat(64));
     let checkpoint_key = ObjectKey::standing_runtime_checkpoint(
@@ -657,9 +679,23 @@ fn smoke_checkpoint_pointer(
         plan_hash: String::new(),
         coverage_hash: String::new(),
         input_coverage: None,
-        previous_checkpoint_key: String::new(),
-        previous_manifest_hash: String::new(),
+        previous_checkpoint_key: previous
+            .map(|pointer| pointer.checkpoint_key.clone())
+            .unwrap_or_default(),
+        previous_manifest_hash: previous
+            .map(|pointer| pointer.manifest_hash.clone())
+            .unwrap_or_default(),
     })
+}
+
+fn expired_owner_publish_error_is_expected(error: &MetaStoreError) -> bool {
+    const EXPECTED_MESSAGE: &str =
+        "standing runtime owner token does not match the current unexpired owner";
+    error.to_string().contains(EXPECTED_MESSAGE)
+        && matches!(
+            error,
+            MetaStoreError::StandingRuntimeOwnerMismatch | MetaStoreError::Remote(_)
+        )
 }
 
 fn smoke_owner_token(claim: &StandingRuntimeOwnerClaim) -> StandingRuntimeOwnerToken {
@@ -851,6 +887,40 @@ async fn hiqlite_meta_store_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smoke_checkpoint_successors_bind_predecessor_commitments() {
+        let first = smoke_checkpoint_pointer("tenant", "program", "view", 1, 'a', None)
+            .expect("initial smoke checkpoint should be valid");
+        assert!(first.previous_checkpoint_key.is_empty());
+        assert!(first.previous_manifest_hash.is_empty());
+
+        let second = smoke_checkpoint_pointer("tenant", "program", "view", 2, 'b', Some(&first))
+            .expect("successor smoke checkpoint should be valid");
+        assert_eq!(second.previous_checkpoint_key, first.checkpoint_key);
+        assert_eq!(second.previous_manifest_hash, first.manifest_hash);
+
+        let third = smoke_checkpoint_pointer("tenant", "program", "view", 3, 'c', Some(&second))
+            .expect("second successor smoke checkpoint should be valid");
+        assert_eq!(third.previous_checkpoint_key, second.checkpoint_key);
+        assert_eq!(third.previous_manifest_hash, second.manifest_hash);
+    }
+
+    #[test]
+    fn expired_owner_publish_requires_exact_lease_fencing_error() {
+        assert!(expired_owner_publish_error_is_expected(
+            &MetaStoreError::StandingRuntimeOwnerMismatch
+        ));
+        assert!(expired_owner_publish_error_is_expected(&MetaStoreError::Remote(
+            "remote metadata service error: standing runtime owner token does not match the current unexpired owner"
+                .to_string(),
+        )));
+        assert!(!expired_owner_publish_error_is_expected(
+            &MetaStoreError::Serialization(
+                "standing runtime checkpoint predecessor commitment mismatch".to_string(),
+            )
+        ));
+    }
 
     #[test]
     fn parse_meta_smoke_args_accepts_expected_flags() {
