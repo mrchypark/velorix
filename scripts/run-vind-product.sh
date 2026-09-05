@@ -1885,7 +1885,7 @@ fi
 if { [ "$meta_mode" = "development" ] || [ "$meta_mode" = "dev" ]; } \
   && [ "$meta_development_allow_non_loopback" = "1" ]; then
   if [ "$preserve_state" != "0" ] \
-    || [ "$reuse_existing" != "0" ] \
+    || { [ "$cluster_driver" = "docker-vcluster" ] && [ "$reuse_existing" != "0" ]; } \
     || [ -n "${VELORIX_S3_PREFIX+x}" ] \
     || [ -n "${VELORIX_META_S3_PREFIX+x}" ] \
     || [ "$object_store_local_development_authority" != "1" ] \
@@ -2242,8 +2242,15 @@ validate_existing_kubernetes_context() {
       ;;
     esac
   fi
-  context_is_remote=1
-  validate_remote_ephemeral_gate
+  case "$server" in
+    https://127.0.0.1:* | https://localhost:* | https://0.0.0.0:*)
+      context_is_remote=0
+      ;;
+    *)
+      context_is_remote=1
+      validate_remote_ephemeral_gate
+      ;;
+  esac
 }
 
 vcluster_container() {
