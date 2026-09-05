@@ -10,10 +10,49 @@ use velorix_meta::{
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     CommitIngestRangeOutcome, IngestRangeReservation, MetaStore, PartitionAuthorityKey,
     PartitionCheckpointPointer, PublishPartitionCheckpointPointerRequest,
-    ReserveIngestRangeOutcome, StoreRelationCatalogOutcome,
+    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
+    StoreRelationCatalogOutcome,
 };
 
 mod common;
+
+fn standing_runtime_checkpoint_pointer(
+    epoch: u64,
+    hash_seed: &str,
+) -> StandingRuntimeCheckpointPointer {
+    let hash = format!("{hash_seed:0<64}");
+    StandingRuntimeCheckpointPointer {
+        tenant_id: "tenant".to_string(),
+        program_id: "program".to_string(),
+        view_id: "view".to_string(),
+        checkpoint_key: format!(
+            "v1/standing-runtime-checkpoints/tenant/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.json"
+        ),
+        logical_epoch: epoch,
+        content_hash: format!("sha256:{hash}"),
+        manifest_hash: format!("sha256:{hash}"),
+        output_manifest_refs: Vec::new(),
+        bootstrap_generation: 0,
+        plan_hash: String::new(),
+        coverage_hash: String::new(),
+        input_coverage: None,
+        previous_checkpoint_key: String::new(),
+        previous_manifest_hash: String::new(),
+    }
+}
+
+fn standing_runtime_owner_token(
+    claim: velorix_meta::StandingRuntimeOwnerClaim,
+) -> StandingRuntimeOwnerToken {
+    StandingRuntimeOwnerToken {
+        tenant_id: claim.tenant_id,
+        program_id: claim.program_id,
+        view_id: claim.view_id,
+        owner_id: claim.owner_id,
+        owner_epoch: claim.owner_epoch,
+    }
+}
 
 fn reservation() -> IngestRangeReservation {
     IngestRangeReservation {
@@ -133,6 +172,96 @@ async fn concurrent_clients_single_native_node_fence_the_other() {
             .filter(|outcome| matches!(outcome, AcquireStandingRuntimeOwnerOutcome::Conflict(_)))
             .count(),
         1
+    );
+}
+
+#[tokio::test]
+async fn native_takeover_fences_stale_owner_and_reopens_with_new_epoch() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().display().to_string();
+    let store = RhizaKvMetaStore::open(path.clone(), "meta-takeover")
+        .await
+        .unwrap();
+    let owner_a = match store
+        .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner-a".into(),
+            ttl_ms: 1,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => standing_runtime_owner_token(claim),
+        other => panic!("unexpected initial owner outcome: {other:?}"),
+    };
+
+    sleep(Duration::from_millis(20)).await;
+    let owner_b = match store
+        .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner-b".into(),
+            ttl_ms: 30_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => standing_runtime_owner_token(claim),
+        other => panic!("expired owner did not permit takeover: {other:?}"),
+    };
+    assert_eq!(owner_b.owner_epoch, owner_a.owner_epoch + 1);
+
+    let candidate = standing_runtime_checkpoint_pointer(1, "a");
+    let stale = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: candidate.clone(),
+            owner: owner_a,
+        })
+        .await;
+    assert!(
+        matches!(
+            &stale,
+            Err(velorix_meta::MetaStoreError::StandingRuntimeOwnerMismatch)
+        ),
+        "stale owner result: {stale:?}"
+    );
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint("tenant", "program", "view")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: candidate.clone(),
+                owner: owner_b.clone(),
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    drop(store);
+
+    let reopened = RhizaKvMetaStore::open(path, "meta-takeover").await.unwrap();
+    let recovered_owner = reopened
+        .read_standing_runtime_owner("tenant", "program", "view")
+        .await
+        .unwrap()
+        .expect("new owner survives reopen");
+    assert_eq!(recovered_owner.owner_epoch, owner_b.owner_epoch);
+    assert_eq!(
+        reopened
+            .read_standing_runtime_checkpoint("tenant", "program", "view")
+            .await
+            .unwrap(),
+        Some(candidate)
     );
 }
 

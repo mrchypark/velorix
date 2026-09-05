@@ -15,6 +15,8 @@ use velorix_core::standing_program::{
     RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
     RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
 };
+#[cfg(feature = "rhiza-backend")]
+use velorix_meta::GrpcClientTlsConfig;
 #[cfg(feature = "hiqlite-backend")]
 use velorix_meta::HiqliteMetaStore;
 use velorix_meta::{
@@ -118,12 +120,172 @@ async fn grpc_rhiza_backend_requires_bearer_and_executes_linearizable_store_path
             .standing_runtime_fencing
             .production_multi_writer_safe
     );
+    assert!(
+        !capabilities
+            .standing_runtime_fencing
+            .multi_writer_fencing_safe
+    );
+    assert!(
+        !capabilities
+            .standing_runtime_fencing
+            .bounded_wall_clock_failover
+    );
+    assert!(
+        !capabilities
+            .standing_runtime_fencing
+            .production_bounded_failover_safe
+    );
     assert_eq!(
         authenticated
             .store_relation_catalog(common::orders_relation_catalog("v1"))
             .await
             .unwrap(),
         velorix_meta::StoreRelationCatalogOutcome::Created
+    );
+}
+
+#[cfg(feature = "rhiza-backend")]
+#[tokio::test]
+async fn grpc_rhiza_backend_native_mtls_requires_trusted_client_identity() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    use rcgen::{
+        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    ca_params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Box::leak(Box::new(Issuer::new(ca_params, ca_key)));
+
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = server_params.signed_by(&server_key, issuer).unwrap();
+
+    let mut client_params = CertificateParams::new(vec!["client".to_string()]).unwrap();
+    client_params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+    let client_key = KeyPair::generate().unwrap();
+    let client_cert = client_params.signed_by(&client_key, issuer).unwrap();
+
+    let other_client =
+        rcgen::generate_simple_self_signed(vec!["wrong-client".to_string()]).unwrap();
+    let directory = TempDir::new().unwrap();
+    let kv = RhizaKvStore::open(directory.path().display().to_string(), "grpc-mtls-rhiza")
+        .await
+        .unwrap();
+    let service =
+        MetaGrpcService::with_bearer_token(RhizaKvMetaStore::new(kv), "grpc-mtls-secret").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_identity = tonic::transport::Identity::from_pem(
+        format!("{}\n{}", server_cert.pem(), ca_cert.pem()),
+        server_key.serialize_pem(),
+    );
+    let ca_pem = ca_cert.pem();
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(
+                tonic::transport::ServerTlsConfig::new()
+                    .identity(server_identity)
+                    .client_ca_root(tonic::transport::Certificate::from_pem(ca_pem)),
+            )
+            .unwrap()
+            .add_service(VelorixMetaServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let endpoint = format!("https://localhost:{}/", addr.port());
+    let ca_pem = ca_cert.pem().into_bytes();
+
+    let no_client = match GrpcMetaStore::connect_with_tls(
+        endpoint.clone(),
+        GrpcClientTlsConfig {
+            domain_name: "localhost".into(),
+            ca_cert_pem: ca_pem.clone(),
+            client_cert_pem: None,
+            client_key_pem: None,
+        },
+    )
+    .await
+    {
+        Ok(store) => store.read_meta_store_capabilities().await,
+        Err(error) => Err(error),
+    };
+    assert!(
+        no_client.is_err(),
+        "mTLS must reject a client without identity"
+    );
+
+    let wrong_client = match GrpcMetaStore::connect_with_tls(
+        endpoint.clone(),
+        GrpcClientTlsConfig {
+            domain_name: "localhost".into(),
+            ca_cert_pem: ca_pem.clone(),
+            client_cert_pem: Some(other_client.cert.pem().into_bytes()),
+            client_key_pem: Some(other_client.signing_key.serialize_pem().into_bytes()),
+        },
+    )
+    .await
+    {
+        Ok(store) => store.read_meta_store_capabilities().await,
+        Err(error) => Err(error),
+    };
+    assert!(
+        wrong_client.is_err(),
+        "mTLS must reject an untrusted client identity"
+    );
+
+    let client = GrpcMetaStore::connect_with_bearer_token_and_tls(
+        endpoint.clone(),
+        "grpc-mtls-secret",
+        GrpcClientTlsConfig {
+            domain_name: "localhost".into(),
+            ca_cert_pem: ca_pem,
+            client_cert_pem: Some(format!("{}\n{}", client_cert.pem(), ca_cert.pem()).into_bytes()),
+            client_key_pem: Some(client_key.serialize_pem().into_bytes()),
+        },
+    )
+    .await
+    .unwrap();
+    let capabilities = client.read_meta_store_capabilities().await.unwrap();
+    assert_eq!(
+        capabilities.standing_runtime_fencing.backend_name,
+        "rhiza-kv"
+    );
+    assert!(
+        capabilities
+            .standing_runtime_fencing
+            .control_plane_auth_enforced
+    );
+
+    // The trusted mTLS identity authenticates the transport only; the
+    // application bearer token remains independently mandatory.
+    let no_bearer = GrpcMetaStore::connect_with_tls(
+        endpoint,
+        GrpcClientTlsConfig {
+            domain_name: "localhost".into(),
+            ca_cert_pem: ca_cert.pem().into_bytes(),
+            client_cert_pem: Some(format!("{}\n{}", client_cert.pem(), ca_cert.pem()).into_bytes()),
+            client_key_pem: Some(client_key.serialize_pem().into_bytes()),
+        },
+    )
+    .await
+    .unwrap();
+    let no_bearer_error = no_bearer.read_meta_store_capabilities().await.unwrap_err();
+    let no_bearer_message = no_bearer_error.to_string();
+    assert!(
+        no_bearer_message.contains("authentication credentials")
+            || no_bearer_message.contains("bearer token"),
+        "trusted mTLS without bearer must be rejected: {no_bearer_message}"
     );
 }
 

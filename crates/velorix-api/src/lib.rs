@@ -50,15 +50,16 @@ use velorix_control::{
         AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
         BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest,
         CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
-        FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
-        IngestRangeReservation, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
-        PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
-        PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-        RelationIngestCapability, RelationIngestPublicationRefV1, RelationPartitionAuthorityKey,
-        ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer,
-        StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
-        StoreRelationCatalogOutcome, ViewBootstrapControlV1, ViewBootstrapLifecycleV1,
-        INGEST_SOURCE_IDENTITY_GENERATION_V1, RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+        FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
+        GrpcClientTlsConfig, GrpcMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1,
+        MetaStore, MetaStoreError, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+        PublishIngestReservationOutcome, PublishStandingRuntimeCheckpointOutcome,
+        PublishStandingRuntimeCheckpointRequest, RelationIngestCapability,
+        RelationIngestPublicationRefV1, RelationPartitionAuthorityKey, ReserveIngestRangeOutcome,
+        StandingRuntimeCheckpointPointer, StandingRuntimeFencingCapability,
+        StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+        ViewBootstrapControlV1, ViewBootstrapLifecycleV1, INGEST_SOURCE_IDENTITY_GENERATION_V1,
+        RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
         STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
         STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
@@ -1644,13 +1645,25 @@ pub async fn run_from_env() -> anyhow::Result<()> {
             "velorix-api requires object-store conditional update support for active view CAS",
         )?;
     let meta_store = match config.meta_grpc_endpoint.as_ref() {
-        Some(endpoint) => Some(match config.meta_bearer_token.as_ref() {
-            Some(token) => {
-                Arc::new(GrpcMetaStore::connect_with_bearer_token(endpoint, token).await?)
-                    as Arc<dyn MetaStore>
-            }
-            None => Arc::new(GrpcMetaStore::connect(endpoint).await?) as Arc<dyn MetaStore>,
-        }),
+        Some(endpoint) => Some(
+            match (config.meta_bearer_token.as_ref(), config.meta_tls.as_ref()) {
+                (Some(token), Some(tls)) => Arc::new(
+                    GrpcMetaStore::connect_with_bearer_token_and_tls(endpoint, token, tls.clone())
+                        .await?,
+                ) as Arc<dyn MetaStore>,
+                (None, Some(tls)) => {
+                    Arc::new(GrpcMetaStore::connect_with_tls(endpoint, tls.clone()).await?)
+                        as Arc<dyn MetaStore>
+                }
+                (Some(token), None) => {
+                    Arc::new(GrpcMetaStore::connect_with_bearer_token(endpoint, token).await?)
+                        as Arc<dyn MetaStore>
+                }
+                (None, None) => {
+                    Arc::new(GrpcMetaStore::connect(endpoint).await?) as Arc<dyn MetaStore>
+                }
+            },
+        ),
         None => None,
     };
     if config.authoritative_relation_ingest {
@@ -7891,6 +7904,7 @@ struct ApiConfig {
     operator_id: String,
     backend_name: String,
     meta_grpc_endpoint: Option<String>,
+    meta_tls: Option<GrpcClientTlsConfig>,
     meta_bearer_token: Option<String>,
     api_bearer_token: Option<String>,
     admin_bearer_token: Option<String>,
@@ -7948,6 +7962,7 @@ impl ApiConfig {
         let meta_grpc_endpoint = std::env::var("VELORIX_META_GRPC_ENDPOINT")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let meta_tls = meta_tls_config_from_env(meta_grpc_endpoint.as_deref())?;
         let meta_bearer_token = optional_meta_bearer_token_from_env()?;
         let api_bearer_token = optional_api_bearer_token_from_env()?;
         let admin_bearer_token = optional_admin_bearer_token_from_env()?;
@@ -8026,6 +8041,7 @@ impl ApiConfig {
             operator_id,
             backend_name,
             meta_grpc_endpoint,
+            meta_tls,
             meta_bearer_token,
             api_bearer_token,
             admin_bearer_token,
@@ -8082,6 +8098,121 @@ fn optional_nonempty_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Read the metadata client identity as one complete native-mTLS bundle.
+/// Partial bundles are rejected so an API process cannot silently downgrade a
+/// configured secure metadata endpoint to plaintext or one-way TLS.
+fn meta_tls_config_from_env(endpoint: Option<&str>) -> anyhow::Result<Option<GrpcClientTlsConfig>> {
+    meta_tls_config_from_values(
+        endpoint,
+        optional_nonempty_env("VELORIX_META_TLS_CA_FILE"),
+        optional_nonempty_env("VELORIX_META_TLS_CLIENT_CERT_FILE"),
+        optional_nonempty_env("VELORIX_META_TLS_CLIENT_KEY_FILE"),
+        optional_nonempty_env("VELORIX_META_TLS_DOMAIN_NAME"),
+    )
+}
+
+fn meta_tls_config_from_values(
+    endpoint: Option<&str>,
+    ca_path: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    domain_name: Option<String>,
+) -> anyhow::Result<Option<GrpcClientTlsConfig>> {
+    let any_configured =
+        ca_path.is_some() || cert_path.is_some() || key_path.is_some() || domain_name.is_some();
+    if !any_configured {
+        if endpoint.is_some_and(|value| value.starts_with("https://")) {
+            anyhow::bail!(
+                "VELORIX_META_GRPC_ENDPOINT=https requires complete native-mTLS client configuration"
+            );
+        }
+        return Ok(None);
+    }
+    let endpoint = endpoint.ok_or_else(|| {
+        anyhow!("metadata TLS client configuration requires VELORIX_META_GRPC_ENDPOINT")
+    })?;
+    if !endpoint.starts_with("https://") {
+        anyhow::bail!(
+            "metadata TLS client configuration requires an https:// VELORIX_META_GRPC_ENDPOINT"
+        );
+    }
+    let ca_path = ca_path.ok_or_else(|| anyhow!("VELORIX_META_TLS_CA_FILE is required"))?;
+    let cert_path =
+        cert_path.ok_or_else(|| anyhow!("VELORIX_META_TLS_CLIENT_CERT_FILE is required"))?;
+    let key_path =
+        key_path.ok_or_else(|| anyhow!("VELORIX_META_TLS_CLIENT_KEY_FILE is required"))?;
+    let domain_name =
+        domain_name.ok_or_else(|| anyhow!("VELORIX_META_TLS_DOMAIN_NAME is required"))?;
+    let ca_cert_pem = std::fs::read(&ca_path)
+        .with_context(|| format!("failed to read VELORIX_META_TLS_CA_FILE `{ca_path}`"))?;
+    let client_cert_pem = std::fs::read(&cert_path).with_context(|| {
+        format!("failed to read VELORIX_META_TLS_CLIENT_CERT_FILE `{cert_path}`")
+    })?;
+    let client_key_pem = std::fs::read(&key_path)
+        .with_context(|| format!("failed to read VELORIX_META_TLS_CLIENT_KEY_FILE `{key_path}`"))?;
+    if ca_cert_pem.is_empty() || client_cert_pem.is_empty() || client_key_pem.is_empty() {
+        anyhow::bail!("metadata TLS CA, client certificate, and client key must be nonempty");
+    }
+    Ok(Some(GrpcClientTlsConfig {
+        domain_name,
+        ca_cert_pem,
+        client_cert_pem: Some(client_cert_pem),
+        client_key_pem: Some(client_key_pem),
+    }))
+}
+
+#[cfg(test)]
+mod meta_tls_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_tls_requires_complete_https_bundle() {
+        assert!(
+            meta_tls_config_from_values(Some("http://meta:9090"), None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        let error = meta_tls_config_from_values(Some("https://meta:9090"), None, None, None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("complete native-mTLS"));
+
+        let error = meta_tls_config_from_values(
+            Some("https://meta:9090"),
+            Some("ca.pem".into()),
+            None,
+            None,
+            Some("meta".into()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("CLIENT_CERT_FILE"));
+    }
+
+    #[test]
+    fn metadata_tls_reads_ca_and_client_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let ca = directory.path().join("ca.pem");
+        let cert = directory.path().join("client.pem");
+        let key = directory.path().join("client.key");
+        std::fs::write(&ca, b"ca").unwrap();
+        std::fs::write(&cert, b"cert").unwrap();
+        std::fs::write(&key, b"key").unwrap();
+
+        let tls = meta_tls_config_from_values(
+            Some("https://meta:9090"),
+            Some(ca.display().to_string()),
+            Some(cert.display().to_string()),
+            Some(key.display().to_string()),
+            Some("meta".into()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tls.domain_name, "meta");
+        assert_eq!(tls.ca_cert_pem, b"ca");
+        assert_eq!(tls.client_cert_pem.as_deref(), Some(&b"cert"[..]));
+        assert_eq!(tls.client_key_pem.as_deref(), Some(&b"key"[..]));
+    }
 }
 
 fn api_tls_config_from_values(

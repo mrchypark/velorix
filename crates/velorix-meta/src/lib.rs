@@ -15,7 +15,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tonic::{metadata::MetadataValue, transport::Channel, Request, Response, Status};
+use tonic::{
+    metadata::MetadataValue,
+    transport::{Channel, ClientTlsConfig, Endpoint, Identity},
+    Request, Response, Status,
+};
 use velorix_core::relation::{RelationSchemaError, VelorixRelationCatalogV1};
 use velorix_core::standing_program::RuntimeCheckpointInputCoverageV1;
 use velorix_storage::{
@@ -3044,14 +3048,22 @@ fn apply_control_plane_auth_to_capability(
     control_plane_auth_enforced: bool,
 ) {
     capability.control_plane_auth_enforced = control_plane_auth_enforced;
-    capability.multi_writer_fencing_safe = capability.linearizable_owner_lease
-        && capability.durable_monotonic_owner_epoch
-        && capability.owner_validated_checkpoint_publish
-        && capability.publish_checks_owner_and_latest_atomically
-        && capability.publish_rejects_expired_owner
-        && capability.latest_read_linearizable
-        && capability.publish_rejects_scope_mismatch
-        && capability.control_plane_auth_enforced;
+    // Rhiza deliberately reports its logical CAS/lease contract as
+    // unsupported for multi-writer runtime admission: its process-clock TTL
+    // has no bounded-skew guarantee. Authentication must not turn that
+    // explicit backend refusal into a generic formula-derived `true`.
+    if capability.backend_name == "rhiza-kv" {
+        capability.multi_writer_fencing_safe &= control_plane_auth_enforced;
+    } else {
+        capability.multi_writer_fencing_safe = capability.linearizable_owner_lease
+            && capability.durable_monotonic_owner_epoch
+            && capability.owner_validated_checkpoint_publish
+            && capability.publish_checks_owner_and_latest_atomically
+            && capability.publish_rejects_expired_owner
+            && capability.latest_read_linearizable
+            && capability.publish_rejects_scope_mismatch
+            && capability.control_plane_auth_enforced;
+    }
     capability.production_bounded_failover_safe = capability.multi_writer_fencing_safe
         && capability.authoritative_backend_time
         && capability.bounded_wall_clock_failover;
@@ -4756,6 +4768,17 @@ fn partition_authority_remote_error(error: tonic::Status) -> MetaStoreError {
 pub struct GrpcMetaStore {
     client: proto::velorix_meta_client::VelorixMetaClient<Channel>,
     bearer_token: Option<MetadataValue<tonic::metadata::Ascii>>,
+}
+
+/// Explicit TLS material for a metadata client. The CA is always required;
+/// client identity is optional for one-way TLS and required by native-mTLS
+/// servers. No insecure or certificate-verification bypass is exposed.
+#[derive(Clone, Debug)]
+pub struct GrpcClientTlsConfig {
+    pub domain_name: String,
+    pub ca_cert_pem: Vec<u8>,
+    pub client_cert_pem: Option<Vec<u8>>,
+    pub client_key_pem: Option<Vec<u8>>,
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -8443,10 +8466,63 @@ fn hiqlite_error_is_missing_stmt_output(error: &hiqlite::Error) -> bool {
 
 impl GrpcMetaStore {
     pub async fn connect(endpoint: impl AsRef<str>) -> Result<Self, MetaStoreError> {
-        let client =
-            proto::velorix_meta_client::VelorixMetaClient::connect(endpoint.as_ref().to_string())
-                .await
+        Self::connect_inner(endpoint.as_ref(), None).await
+    }
+
+    pub async fn connect_with_tls(
+        endpoint: impl AsRef<str>,
+        tls: GrpcClientTlsConfig,
+    ) -> Result<Self, MetaStoreError> {
+        Self::connect_inner(endpoint.as_ref(), Some(tls)).await
+    }
+
+    async fn connect_inner(
+        endpoint: &str,
+        tls: Option<GrpcClientTlsConfig>,
+    ) -> Result<Self, MetaStoreError> {
+        // Bound both the initial dial and every RPC made through this channel.
+        // In particular, a client used for readiness must not hang forever when
+        // the Rhiza quorum disappears.
+        let mut channel = Endpoint::from_shared(endpoint.to_string())
+            .map(|endpoint| {
+                endpoint
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .timeout(std::time::Duration::from_secs(30))
+            })
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
+        if let Some(tls) = tls {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            if tls.domain_name.trim().is_empty() || tls.ca_cert_pem.is_empty() {
+                return Err(MetaStoreError::Serialization(
+                    "metadata TLS requires a domain name and CA certificate".into(),
+                ));
+            }
+            let client_identity = match (tls.client_cert_pem, tls.client_key_pem) {
+                (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
+                    Some(Identity::from_pem(cert, key))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(MetaStoreError::Serialization(
+                        "metadata TLS client certificate and key must be supplied together".into(),
+                    ));
+                }
+            };
+            let mut config = ClientTlsConfig::new()
+                .domain_name(tls.domain_name)
+                .ca_certificate(tonic::transport::Certificate::from_pem(tls.ca_cert_pem));
+            if let Some(identity) = client_identity {
+                config = config.identity(identity);
+            }
+            channel = channel
+                .tls_config(config)
                 .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
+        }
+        let channel = channel
+            .connect()
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
+        let client = proto::velorix_meta_client::VelorixMetaClient::new(channel);
 
         Ok(Self {
             client,
@@ -8459,6 +8535,16 @@ impl GrpcMetaStore {
         bearer_token: impl Into<String>,
     ) -> Result<Self, MetaStoreError> {
         let mut store = Self::connect(endpoint).await?;
+        store.set_bearer_token(bearer_token)?;
+        Ok(store)
+    }
+
+    pub async fn connect_with_bearer_token_and_tls(
+        endpoint: impl AsRef<str>,
+        bearer_token: impl Into<String>,
+        tls: GrpcClientTlsConfig,
+    ) -> Result<Self, MetaStoreError> {
+        let mut store = Self::connect_with_tls(endpoint, tls).await?;
         store.set_bearer_token(bearer_token)?;
         Ok(store)
     }

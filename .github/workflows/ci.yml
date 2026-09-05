@@ -131,10 +131,23 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test Rhiza backend
-        run: cargo test -p velorix-meta --features rhiza-backend --lib --test rhiza_backend --test rhiza_kv --test rhiza_meta
+        run: cargo test -p velorix-meta --features 'hiqlite-backend rhiza-backend' --tests
+
+      - name: Verify three-node KV cold recovery without local state
+        run: sh scripts/check-rhiza-recovery.sh
+
+      - name: Retain Rhiza recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: rhiza-recovery-evidence
+          path: |
+            target/rhiza-recovery-evidence/**/*.json
+            target/rhiza-recovery-evidence/**/*.log
+          if-no-files-found: ignore
 
       - name: Lint Rhiza backend
-        run: cargo clippy -p velorix-meta --features rhiza-backend --all-targets -- -D warnings
+        run: cargo clippy -p velorix-meta --features 'hiqlite-backend rhiza-backend' --all-targets -- -D warnings
 
   deny:
     name: cargo deny

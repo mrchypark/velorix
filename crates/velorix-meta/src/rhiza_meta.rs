@@ -59,8 +59,21 @@ impl RhizaKvMetaStore {
         ))
     }
 
+    pub async fn open_config(config: rhizadb::Config) -> Result<Self, MetaStoreError> {
+        Ok(Self::new(
+            RhizaKvStore::open_config(config)
+                .await
+                .map_err(rhiza_error)?,
+        ))
+    }
+
     pub fn from_snapshot(snapshot: RhizaKvSnapshot) -> Self {
         Self { snapshot }
+    }
+
+    /// Close the native node after all metadata callers have stopped.
+    pub async fn close(self) -> Result<(), MetaStoreError> {
+        self.snapshot.close().await.map_err(snapshot_error)
     }
 
     async fn load(&self) -> Result<(Option<RootToken>, crate::InMemoryMetaState), MetaStoreError> {

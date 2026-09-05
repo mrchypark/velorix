@@ -118,6 +118,22 @@ linearizable metadata read before opening its gRPC listener, so an unavailable
 Rhiza quorum fails startup. Rhiza's production fencing capability remains
 fail-closed until the separately recorded three-node recovery evidence exists.
 
+Production transport may use native mutual TLS with
+`VELORIX_META_TRANSPORT_SECURITY=native-mtls` and the server files
+`VELORIX_META_TLS_CERT_FILE`, `VELORIX_META_TLS_KEY_FILE`, and
+`VELORIX_META_TLS_CLIENT_CA_FILE`. Every client must present an identity signed
+by the configured CA. `service-mesh-mtls` remains an operator-attested
+external boundary and does not enable native TLS in this binary.
+
+The read-only smoke probes accept the same trust material through
+`VELORIX_META_TLS_CA_FILE`, `VELORIX_META_TLS_CLIENT_CERT_FILE`,
+`VELORIX_META_TLS_CLIENT_KEY_FILE`, and optional
+`VELORIX_META_TLS_DOMAIN_NAME`. Use `smoke --capabilities-only` for an
+authenticated, non-mutating linearizable readiness check. Use
+`smoke --probe-unauthenticated` with a trusted client identity to verify that
+omitting the bearer token is rejected; this probe never falls back to a
+plaintext or insecure TLS channel.
+
 Example development configuration:
 
 ```bash
@@ -134,10 +150,10 @@ cargo run -p velorix-meta --features rhiza-backend
 ```
 
 Production startup is fail-closed: it requires an explicit mode, bind address,
-durable backend, bearer token, transport-security attestation, and exactly
-three unique Hiqlite voter endpoints when `VELORIX_META_BACKEND=hiqlite`.
-The current binary does not configure native TLS; production transport security
-must be attested as an external service-mesh mTLS boundary.
+durable backend, bearer token, and native mTLS certificate files. Unverified
+service-mesh attestation is not accepted by this binary. It also requires exactly three
+unique voter endpoints when `VELORIX_META_BACKEND=hiqlite` (and exactly three
+Rhiza voters plus before-ack object storage for `rhiza-kv`).
 This backend can already be used for catalog/admission durability work, but it
 must not be used to satisfy `VELORIX_STANDING_RUNTIME_FENCING=required` until
 backend-time lease semantics are implemented and verified.
@@ -291,6 +307,12 @@ Point `velorix-api` at the meta service with:
 ```bash
 VELORIX_META_GRPC_ENDPOINT=http://velorix-meta:9090 cargo run -p velorix-api
 ```
+
+For a native-mTLS metadata endpoint, set the complete client bundle on the API
+as well: `VELORIX_META_TLS_CA_FILE`,
+`VELORIX_META_TLS_CLIENT_CERT_FILE`, `VELORIX_META_TLS_CLIENT_KEY_FILE`, and
+`VELORIX_META_TLS_DOMAIN_NAME`, with an `https://` endpoint. Partial bundles
+and HTTPS without verification material fail closed.
 
 or containerized with:
 

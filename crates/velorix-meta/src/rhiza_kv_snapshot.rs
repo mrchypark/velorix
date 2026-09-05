@@ -176,6 +176,11 @@ impl RhizaKvSnapshot {
             CompareExchange::Conflict
         })
     }
+
+    /// Close the native node owned by this snapshot facade.
+    pub async fn close(self) -> Result<(), SnapshotError> {
+        self.kv.close().await.map_err(SnapshotError::Kv)
+    }
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))

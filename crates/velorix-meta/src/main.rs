@@ -10,7 +10,7 @@ use object_store::{aws::AmazonS3Builder, path::Path, prefix::PrefixStore, Object
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "rhiza-backend")]
 use serde_json::json;
-use tonic::{transport::Server, Code, Request};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
@@ -18,13 +18,11 @@ use velorix_core::relation::{
     VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
     CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
+use velorix_meta::GrpcClientTlsConfig;
 use velorix_meta::{
-    proto::{
-        velorix_meta_client::VelorixMetaClient, velorix_meta_server::VelorixMetaServer,
-        ReadMetaStoreCapabilitiesRequest,
-    },
-    validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    GrpcMetaStore, InMemoryMetaStore, MetaGrpcService, MetaStore, MetaStoreError, OssMetaStore,
+    proto::velorix_meta_server::VelorixMetaServer, validate_bearer_token,
+    AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest, GrpcMetaStore,
+    InMemoryMetaStore, MetaGrpcService, MetaStore, MetaStoreError, OssMetaStore,
     PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
 };
@@ -54,19 +52,47 @@ async fn serve() -> anyhow::Result<()> {
     // Startup is only successful after a backend operation has completed. For
     // Rhiza this is a linearizable KV read, so a local process that cannot
     // reach a quorum never advertises a ready gRPC listener.
-    store
-        .read_meta_store_capabilities()
-        .await
-        .map_err(|error| anyhow::anyhow!("metadata backend readiness probe failed: {error}"))?;
+    wait_for_meta_store_readiness(&config, &store).await?;
     let service = match config.bearer_token.clone() {
         Some(token) => MetaGrpcService::with_bearer_token(store, token)?,
         None => MetaGrpcService::new(store),
     };
 
-    Server::builder()
-        .add_service(VelorixMetaServer::new(service))
-        .serve(config.bind)
-        .await?;
+    if config.transport_security.as_deref() == Some("native-mtls") {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = std::fs::read(
+            config
+                .tls_cert_file
+                .as_ref()
+                .expect("native-mtls cert path validated before serve"),
+        )?;
+        let key = std::fs::read(
+            config
+                .tls_key_file
+                .as_ref()
+                .expect("native-mtls key path validated before serve"),
+        )?;
+        let client_ca = std::fs::read(
+            config
+                .tls_client_ca_file
+                .as_ref()
+                .expect("native-mtls client CA path validated before serve"),
+        )?;
+        Server::builder()
+            .tls_config(
+                ServerTlsConfig::new()
+                    .identity(Identity::from_pem(cert, key))
+                    .client_ca_root(Certificate::from_pem(client_ca)),
+            )?
+            .add_service(VelorixMetaServer::new(service))
+            .serve(config.bind)
+            .await?;
+    } else {
+        Server::builder()
+            .add_service(VelorixMetaServer::new(service))
+            .serve(config.bind)
+            .await?;
+    }
 
     Ok(())
 }
@@ -83,6 +109,13 @@ enum MetaBackendKind {
     Hiqlite,
     RhizaKv,
     Oss,
+}
+
+#[derive(Clone, Copy)]
+struct MetaTlsFiles<'a> {
+    cert: Option<&'a String>,
+    key: Option<&'a String>,
+    client_ca: Option<&'a String>,
 }
 
 /// The service's Rhiza configuration is deliberately explicit. In particular,
@@ -131,6 +164,10 @@ struct MetaServeConfig {
     hiqlite_nodes: Vec<String>,
     hiqlite_api_secret: Option<String>,
     rhiza: Option<RhizaServeConfig>,
+    tls_cert_file: Option<String>,
+    tls_key_file: Option<String>,
+    tls_client_ca_file: Option<String>,
+    readiness_timeout: Duration,
 }
 
 fn parse_meta_serve_config_from_env() -> anyhow::Result<MetaServeConfig> {
@@ -175,6 +212,31 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
     let transport_security = optional_config(vars, "VELORIX_META_TRANSPORT_SECURITY");
     let transport_security_attestation =
         optional_config(vars, "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION");
+    let tls_cert_file = if transport_security.as_deref() == Some("native-mtls") {
+        Some(required_nonempty_config(
+            vars,
+            "VELORIX_META_TLS_CERT_FILE",
+        )?)
+    } else {
+        None
+    };
+    let tls_key_file = if transport_security.as_deref() == Some("native-mtls") {
+        Some(required_nonempty_config(vars, "VELORIX_META_TLS_KEY_FILE")?)
+    } else {
+        None
+    };
+    let tls_client_ca_file = if transport_security.as_deref() == Some("native-mtls") {
+        Some(required_nonempty_config(
+            vars,
+            "VELORIX_META_TLS_CLIENT_CA_FILE",
+        )?)
+    } else {
+        None
+    };
+    let readiness_timeout = optional_config(vars, "VELORIX_META_READINESS_TIMEOUT_SECONDS")
+        .map(|value| parse_duration_seconds(&value))
+        .transpose()?
+        .unwrap_or_else(|| Duration::from_secs(60));
     let hiqlite_nodes = if backend == MetaBackendKind::Hiqlite {
         parse_hiqlite_nodes(&required_nonempty_config(vars, "VELORIX_HIQLITE_NODES")?)?
     } else {
@@ -199,9 +261,13 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
             &backend,
             &bearer_token,
             &transport_security,
-            &transport_security_attestation,
             &hiqlite_nodes,
             rhiza.as_ref(),
+            MetaTlsFiles {
+                cert: tls_cert_file.as_ref(),
+                key: tls_key_file.as_ref(),
+                client_ca: tls_client_ca_file.as_ref(),
+            },
         )?,
         MetaServeMode::Development => {
             if !bind.ip().is_loopback() && !allow_development_non_loopback {
@@ -234,6 +300,10 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
         hiqlite_nodes,
         hiqlite_api_secret,
         rhiza,
+        tls_cert_file,
+        tls_key_file,
+        tls_client_ca_file,
+        readiness_timeout,
     })
 }
 
@@ -267,9 +337,9 @@ fn validate_production_meta_serve_config(
     backend: &MetaBackendKind,
     bearer_token: &Option<String>,
     transport_security: &Option<String>,
-    transport_security_attestation: &Option<String>,
     hiqlite_nodes: &[String],
     rhiza: Option<&RhizaServeConfig>,
+    tls: MetaTlsFiles<'_>,
 ) -> anyhow::Result<()> {
     if *backend == MetaBackendKind::Memory {
         anyhow::bail!(
@@ -280,14 +350,21 @@ fn validate_production_meta_serve_config(
         anyhow::bail!("VELORIX_META_BEARER_TOKEN is required in production mode");
     }
     match transport_security.as_deref() {
-        Some("service-mesh-mtls") => {}
+        Some("native-mtls") => {}
+        Some("service-mesh-mtls") => anyhow::bail!(
+            "production metadata transport must use native-mtls; service-mesh-mtls is operator-attested and not verified by this binary"
+        ),
         Some(other) => anyhow::bail!(
-            "unsupported VELORIX_META_TRANSPORT_SECURITY `{other}`; velorix-meta has no native TLS listener, use `service-mesh-mtls` attestation"
+            "unsupported VELORIX_META_TRANSPORT_SECURITY `{other}`; expected `native-mtls`"
         ),
         None => anyhow::bail!("VELORIX_META_TRANSPORT_SECURITY is required in production mode"),
     }
-    if transport_security_attestation.is_none() {
-        anyhow::bail!("VELORIX_META_TRANSPORT_SECURITY_ATTESTATION is required in production mode");
+    if transport_security.as_deref() == Some("native-mtls")
+        && (tls.cert.is_none() || tls.key.is_none() || tls.client_ca.is_none())
+    {
+        anyhow::bail!(
+            "native-mtls requires VELORIX_META_TLS_CERT_FILE, VELORIX_META_TLS_KEY_FILE, and VELORIX_META_TLS_CLIENT_CA_FILE"
+        );
     }
     if *backend == MetaBackendKind::Hiqlite && hiqlite_nodes.len() != 3 {
         anyhow::bail!(
@@ -486,12 +563,18 @@ fn optional_raw_config(vars: &HashMap<String, String>, name: &str) -> Option<Str
 struct MetaSmokeConfig {
     endpoint: String,
     bearer_token: String,
+    unauthenticated_probe: bool,
     expect_backend: String,
     expect_auth_enforced: bool,
     expect_production_multi_writer_safe: bool,
     require_unauthenticated_rejected: bool,
     run_standing_runtime_fencing_adversarial: bool,
     verify_only: bool,
+    capabilities_only: bool,
+    tls_ca_file: Option<String>,
+    tls_client_cert_file: Option<String>,
+    tls_client_key_file: Option<String>,
+    tls_domain_name: Option<String>,
     catalog_probe_id: String,
     connect_retry_timeout: Duration,
 }
@@ -502,12 +585,18 @@ fn parse_meta_smoke_args(
     let mut endpoint = env::var("VELORIX_META_GRPC_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
     let mut bearer_token = env::var("VELORIX_META_BEARER_TOKEN").unwrap_or_default();
+    let mut unauthenticated_probe = false;
     let mut expect_backend = String::new();
     let mut expect_auth_enforced = true;
     let mut expect_production_multi_writer_safe = false;
     let mut require_unauthenticated_rejected = true;
     let mut run_standing_runtime_fencing_adversarial = false;
     let mut verify_only = false;
+    let mut capabilities_only = false;
+    let mut tls_ca_file = optional_nonempty_env("VELORIX_META_TLS_CA_FILE");
+    let mut tls_client_cert_file = optional_nonempty_env("VELORIX_META_TLS_CLIENT_CERT_FILE");
+    let mut tls_client_key_file = optional_nonempty_env("VELORIX_META_TLS_CLIENT_KEY_FILE");
+    let mut tls_domain_name = optional_nonempty_env("VELORIX_META_TLS_DOMAIN_NAME");
     let mut catalog_probe_id = default_catalog_probe_id();
     let mut connect_retry_timeout = env::var("VELORIX_META_SMOKE_CONNECT_RETRY_TIMEOUT_SECONDS")
         .ok()
@@ -520,6 +609,7 @@ fn parse_meta_smoke_args(
         match arg.as_str() {
             "--endpoint" => endpoint = next_arg(&mut args, "--endpoint")?,
             "--bearer-token" => bearer_token = next_arg(&mut args, "--bearer-token")?,
+            "--probe-unauthenticated" => unauthenticated_probe = true,
             "--expect-backend" => expect_backend = next_arg(&mut args, "--expect-backend")?,
             "--expect-auth-enforced" => {
                 expect_auth_enforced = parse_bool(&next_arg(&mut args, "--expect-auth-enforced")?)?
@@ -541,6 +631,17 @@ fn parse_meta_smoke_args(
                 run_standing_runtime_fencing_adversarial = true
             }
             "--verify-only" => verify_only = true,
+            "--capabilities-only" => capabilities_only = true,
+            "--tls-ca-file" => tls_ca_file = Some(next_arg(&mut args, "--tls-ca-file")?),
+            "--tls-client-cert-file" => {
+                tls_client_cert_file = Some(next_arg(&mut args, "--tls-client-cert-file")?)
+            }
+            "--tls-client-key-file" => {
+                tls_client_key_file = Some(next_arg(&mut args, "--tls-client-key-file")?)
+            }
+            "--tls-domain-name" => {
+                tls_domain_name = Some(next_arg(&mut args, "--tls-domain-name")?)
+            }
             "--allow-unauthenticated" => require_unauthenticated_rejected = false,
             "--help" | "-h" => {
                 print_meta_smoke_usage();
@@ -553,9 +654,27 @@ fn parse_meta_smoke_args(
     if expect_backend.trim().is_empty() {
         anyhow::bail!("velorix-meta smoke requires --expect-backend");
     }
-    if expect_auth_enforced {
+    if expect_auth_enforced && !unauthenticated_probe {
         validate_bearer_token(&bearer_token)
             .map_err(|error| anyhow::anyhow!("invalid smoke bearer token: {error}"))?;
+    }
+    if unauthenticated_probe {
+        if !expect_auth_enforced {
+            anyhow::bail!("--probe-unauthenticated requires --expect-auth-enforced true");
+        }
+        if tls_ca_file.is_none()
+            || tls_client_cert_file.is_none()
+            || tls_client_key_file.is_none()
+            || tls_domain_name.is_none()
+        {
+            anyhow::bail!(
+                "--probe-unauthenticated requires TLS CA, domain, client certificate, and client key"
+            );
+        }
+        // The authenticated TLS identity is the transport identity. The probe
+        // deliberately omits only the bearer token and must not open a second
+        // insecure/plaintext channel.
+        require_unauthenticated_rejected = false;
     }
     if catalog_probe_id.trim().is_empty() || catalog_probe_id.chars().any(char::is_whitespace) {
         anyhow::bail!("--catalog-probe-id must be nonempty and contain no whitespace");
@@ -564,12 +683,18 @@ fn parse_meta_smoke_args(
     Ok(MetaSmokeConfig {
         endpoint,
         bearer_token,
+        unauthenticated_probe,
         expect_backend,
         expect_auth_enforced,
         expect_production_multi_writer_safe,
         require_unauthenticated_rejected,
         run_standing_runtime_fencing_adversarial,
         verify_only,
+        capabilities_only,
+        tls_ca_file,
+        tls_client_cert_file,
+        tls_client_key_file,
+        tls_domain_name,
         catalog_probe_id,
         connect_retry_timeout,
     })
@@ -608,7 +733,7 @@ fn parse_duration_seconds(value: &str) -> anyhow::Result<Duration> {
 
 fn print_meta_smoke_usage() {
     eprintln!(
-        "Usage: velorix-meta smoke --endpoint http://velorix-meta:9090 --expect-backend in-memory [--bearer-token TOKEN] [--catalog-probe-id ID] [--verify-only]"
+        "Usage: velorix-meta smoke --endpoint http://velorix-meta:9090 --expect-backend in-memory [--bearer-token TOKEN] [--catalog-probe-id ID] [--capabilities-only|--verify-only] [--probe-unauthenticated --tls-ca-file PATH --tls-domain-name NAME --tls-client-cert-file PATH --tls-client-key-file PATH]"
     );
 }
 
@@ -627,16 +752,45 @@ async fn run_meta_smoke(config: MetaSmokeConfig) -> anyhow::Result<()> {
 }
 
 async fn run_meta_smoke_once(config: &MetaSmokeConfig) -> anyhow::Result<()> {
+    let tls = smoke_tls_config(config)?;
     if config.require_unauthenticated_rejected {
-        assert_unauthenticated_capability_read_rejected(&config.endpoint).await?;
+        assert_unauthenticated_capability_read_rejected(&config.endpoint, tls.clone()).await?;
     }
 
-    let store = if config.expect_auth_enforced {
+    let store = if let Some(tls) = tls {
+        if config.expect_auth_enforced && !config.unauthenticated_probe {
+            GrpcMetaStore::connect_with_bearer_token_and_tls(
+                &config.endpoint,
+                config.bearer_token.clone(),
+                tls,
+            )
+            .await?
+        } else {
+            GrpcMetaStore::connect_with_tls(&config.endpoint, tls).await?
+        }
+    } else if config.expect_auth_enforced && !config.unauthenticated_probe {
         GrpcMetaStore::connect_with_bearer_token(&config.endpoint, config.bearer_token.clone())
             .await?
     } else {
         GrpcMetaStore::connect(&config.endpoint).await?
     };
+    if config.unauthenticated_probe {
+        match store.read_meta_store_capabilities().await {
+            Err(error) if unauthenticated_error_is_expected(&error) => {
+                println!(
+                    "velorix-meta smoke unauthenticated probe verified: endpoint={} client_identity=trusted bearer_token=omitted mutations=0",
+                    config.endpoint
+                );
+                return Ok(());
+            }
+            Err(error) => anyhow::bail!(
+                "unauthenticated metadata capability read failed with unexpected error: {error}"
+            ),
+            Ok(_) => {
+                anyhow::bail!("unauthenticated metadata capability read unexpectedly succeeded")
+            }
+        }
+    }
     let capability = store
         .read_meta_store_capabilities()
         .await?
@@ -662,6 +816,13 @@ async fn run_meta_smoke_once(config: &MetaSmokeConfig) -> anyhow::Result<()> {
             config.expect_production_multi_writer_safe,
             capability.production_multi_writer_safe
         );
+    }
+    if config.capabilities_only {
+        println!(
+            "velorix-meta smoke capabilities verified: endpoint={} backend={} auth_enforced={} mutations=0",
+            config.endpoint, capability.backend_name, capability.control_plane_auth_enforced
+        );
+        return Ok(());
     }
     let catalog = smoke_relation_catalog(&config.catalog_probe_id)?;
     if config.verify_only {
@@ -1007,19 +1168,60 @@ fn smoke_relation_catalog(probe_id: &str) -> anyhow::Result<VelorixRelationCatal
     })
 }
 
-async fn assert_unauthenticated_capability_read_rejected(endpoint: &str) -> anyhow::Result<()> {
-    let mut client = VelorixMetaClient::connect(endpoint.to_string()).await?;
-    match client
-        .read_meta_store_capabilities(Request::new(ReadMetaStoreCapabilitiesRequest {}))
-        .await
-    {
-        Err(status) if status.code() == Code::Unauthenticated => Ok(()),
-        Err(status) => anyhow::bail!(
-            "unauthenticated metadata capability read failed with {}, expected unauthenticated",
-            status.code()
+async fn assert_unauthenticated_capability_read_rejected(
+    endpoint: &str,
+    tls: Option<GrpcClientTlsConfig>,
+) -> anyhow::Result<()> {
+    let client = if let Some(tls) = tls {
+        GrpcMetaStore::connect_with_tls(endpoint, tls).await?
+    } else {
+        GrpcMetaStore::connect(endpoint).await?
+    };
+    match client.read_meta_store_capabilities().await {
+        Err(error) if unauthenticated_error_is_expected(&error) => Ok(()),
+        Err(error) => anyhow::bail!(
+            "unauthenticated metadata capability read failed with unexpected error: {error}"
         ),
         Ok(_) => anyhow::bail!("unauthenticated metadata capability read unexpectedly succeeded"),
     }
+}
+
+fn unauthenticated_error_is_expected(error: &MetaStoreError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("unauthenticated")
+        || message.contains("authentication credentials")
+        || message.contains("authorization bearer token")
+}
+
+fn smoke_tls_config(config: &MetaSmokeConfig) -> anyhow::Result<Option<GrpcClientTlsConfig>> {
+    let Some(ca_file) = &config.tls_ca_file else {
+        if config.tls_client_cert_file.is_some()
+            || config.tls_client_key_file.is_some()
+            || config.tls_domain_name.is_some()
+        {
+            anyhow::bail!("TLS smoke requires a CA file, domain name, and paired client identity");
+        }
+        return Ok(None);
+    };
+    let client_cert = config
+        .tls_client_cert_file
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()?;
+    let client_key = config
+        .tls_client_key_file
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()?;
+    Ok(Some(GrpcClientTlsConfig {
+        domain_name: config
+            .tls_domain_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("TLS smoke requires VELORIX_META_TLS_DOMAIN_NAME"))?,
+        ca_cert_pem: std::fs::read(ca_file)?,
+        client_cert_pem: client_cert,
+        client_key_pem: client_key,
+    }))
 }
 
 async fn meta_store_from_config(config: &MetaServeConfig) -> anyhow::Result<Arc<dyn MetaStore>> {
@@ -1046,6 +1248,46 @@ async fn meta_store_from_config(config: &MetaServeConfig) -> anyhow::Result<Arc<
         }
         MetaBackendKind::Oss => Ok(Arc::new(OssMetaStore::new(oss_object_store_from_env()?))),
     }
+}
+
+async fn wait_for_meta_store_readiness(
+    config: &MetaServeConfig,
+    store: &Arc<dyn MetaStore>,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + config.readiness_timeout;
+    loop {
+        match store.read_meta_store_capabilities().await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if config.backend == MetaBackendKind::RhizaKv
+                    && rhiza_readiness_error_is_retryable(&error)
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                anyhow::bail!("metadata backend readiness probe failed: {error}");
+            }
+        }
+    }
+}
+
+fn rhiza_readiness_error_is_retryable(error: &MetaStoreError) -> bool {
+    let detail = error.to_string().to_ascii_lowercase();
+    matches!(
+        error,
+        MetaStoreError::Rhiza(_) | MetaStoreError::RhizaContention { .. }
+    ) && [
+        "quorum",
+        "not ready",
+        "unavailable",
+        "timeout",
+        "deadline",
+        "connection",
+        "leader",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
 }
 
 fn oss_object_store_from_env() -> anyhow::Result<Arc<dyn ObjectStore>> {
@@ -1245,12 +1487,18 @@ mod tests {
             MetaSmokeConfig {
                 endpoint: "http://velorix-meta:9090".to_string(),
                 bearer_token: "secret".to_string(),
+                unauthenticated_probe: false,
                 expect_backend: "in-memory".to_string(),
                 expect_auth_enforced: true,
                 expect_production_multi_writer_safe: false,
                 require_unauthenticated_rejected: true,
                 run_standing_runtime_fencing_adversarial: false,
                 verify_only: false,
+                capabilities_only: false,
+                tls_ca_file: None,
+                tls_client_cert_file: None,
+                tls_client_key_file: None,
+                tls_domain_name: None,
                 catalog_probe_id: "test-probe".to_string(),
                 connect_retry_timeout: Duration::from_secs(30),
             }
@@ -1291,6 +1539,60 @@ mod tests {
 
         assert!(config.verify_only);
         assert!(!config.expect_auth_enforced);
+    }
+
+    #[test]
+    fn production_native_mtls_requires_explicit_certificate_files() {
+        let error = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "production"),
+            ("VELORIX_META_BACKEND", "oss"),
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("VELORIX_META_BEARER_TOKEN", "secret"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-mtls"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("VELORIX_META_TLS_CERT_FILE"));
+    }
+
+    #[test]
+    fn parse_meta_smoke_args_accepts_capabilities_only_flag() {
+        let config = parse_meta_smoke_args([
+            "--endpoint".to_string(),
+            "https://velorix-meta:9090".to_string(),
+            "--bearer-token".to_string(),
+            "secret".to_string(),
+            "--expect-backend".to_string(),
+            "rhiza-kv".to_string(),
+            "--capabilities-only".to_string(),
+        ])
+        .unwrap();
+        assert!(config.capabilities_only);
+    }
+
+    #[test]
+    fn parse_meta_smoke_args_requires_tls_identity_for_unauthenticated_probe() {
+        let error = parse_meta_smoke_args([
+            "--endpoint".to_string(),
+            "https://velorix-meta:9090".to_string(),
+            "--expect-backend".to_string(),
+            "rhiza-kv".to_string(),
+            "--probe-unauthenticated".to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("requires TLS CA"));
+    }
+
+    #[test]
+    fn rhiza_readiness_retries_only_transient_native_errors() {
+        assert!(rhiza_readiness_error_is_retryable(&MetaStoreError::Rhiza(
+            "Rhiza KV operation failed (quorum_unavailable): no leader".into(),
+        )));
+        assert!(!rhiza_readiness_error_is_retryable(
+            &MetaStoreError::Serialization("invalid snapshot digest".into())
+        ));
+        assert!(!rhiza_readiness_error_is_retryable(&MetaStoreError::Rhiza(
+            "Rhiza KV operation failed (invalid_request): malformed key".into(),
+        )));
     }
 
     #[test]
@@ -1496,11 +1798,14 @@ mod tests {
             ("VELORIX_META_BACKEND", "rhiza-kv"),
             ("VELORIX_META_BIND", "0.0.0.0:9090"),
             ("VELORIX_META_BEARER_TOKEN", "secret"),
-            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-mtls"),
             (
                 "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
                 "mesh-policy/velorix-meta",
             ),
+            ("VELORIX_META_TLS_CERT_FILE", "/tmp/meta.crt"),
+            ("VELORIX_META_TLS_KEY_FILE", "/tmp/meta.key"),
+            ("VELORIX_META_TLS_CLIENT_CA_FILE", "/tmp/meta-ca.crt"),
             ("VELORIX_RHIZA_DATA_DIR", "/var/lib/velorix-meta"),
             ("VELORIX_RHIZA_NODE_ID", "node-a"),
             ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta"),
@@ -1527,6 +1832,9 @@ mod tests {
             base[9],
             base[10],
             base[11],
+            base[12],
+            base[13],
+            base[14],
             ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
             ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "velorix-meta"),
             ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "async"),
@@ -1555,11 +1863,14 @@ mod tests {
             ("VELORIX_META_MODE", "production"),
             ("VELORIX_META_BIND", "0.0.0.0:9090"),
             ("VELORIX_META_BEARER_TOKEN", "secret"),
-            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-mtls"),
             (
                 "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
                 "mesh-policy/velorix-meta",
             ),
+            ("VELORIX_META_TLS_CERT_FILE", "/tmp/meta.crt"),
+            ("VELORIX_META_TLS_KEY_FILE", "/tmp/meta.key"),
+            ("VELORIX_META_TLS_CLIENT_CA_FILE", "/tmp/meta-ca.crt"),
         ])
         .unwrap_err();
         assert!(missing_backend_error
@@ -1582,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn production_config_requires_auth_and_transport_security_attestation() {
+    fn production_config_requires_auth_and_native_transport_security() {
         let missing_auth_error = parse_meta_serve_config_from_pairs([
             ("VELORIX_META_MODE", "production"),
             ("VELORIX_META_BACKEND", "oss"),
@@ -1623,7 +1934,7 @@ mod tests {
         .unwrap_err();
         assert!(unsupported_transport_error
             .to_string()
-            .contains("service-mesh-mtls"));
+            .contains("native-mtls"));
 
         let missing_attestation_error = parse_meta_serve_config_from_pairs([
             ("VELORIX_META_MODE", "production"),
@@ -1635,7 +1946,7 @@ mod tests {
         .unwrap_err();
         assert!(missing_attestation_error
             .to_string()
-            .contains("VELORIX_META_TRANSPORT_SECURITY_ATTESTATION"));
+            .contains("native-mtls"));
     }
 
     #[test]
@@ -1645,11 +1956,14 @@ mod tests {
             ("VELORIX_META_BACKEND", "hiqlite"),
             ("VELORIX_META_BIND", "0.0.0.0:9090"),
             ("VELORIX_META_BEARER_TOKEN", "secret"),
-            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-mtls"),
             (
                 "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
                 "mesh-policy/velorix-meta",
             ),
+            ("VELORIX_META_TLS_CERT_FILE", "/tmp/meta.crt"),
+            ("VELORIX_META_TLS_KEY_FILE", "/tmp/meta.key"),
+            ("VELORIX_META_TLS_CLIENT_CA_FILE", "/tmp/meta-ca.crt"),
             (
                 "VELORIX_HIQLITE_NODES",
                 "node-a:8200,node-b:8200,node-c:8200",
@@ -1665,11 +1979,14 @@ mod tests {
             ("VELORIX_META_BACKEND", "hiqlite"),
             ("VELORIX_META_BIND", "0.0.0.0:9090"),
             ("VELORIX_META_BEARER_TOKEN", "secret"),
-            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-mtls"),
             (
                 "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
                 "mesh-policy/velorix-meta",
             ),
+            ("VELORIX_META_TLS_CERT_FILE", "/tmp/meta.crt"),
+            ("VELORIX_META_TLS_KEY_FILE", "/tmp/meta.key"),
+            ("VELORIX_META_TLS_CLIENT_CA_FILE", "/tmp/meta-ca.crt"),
             ("VELORIX_HIQLITE_API_SECRET", "api-secret"),
             (
                 "VELORIX_HIQLITE_NODES",
@@ -1684,11 +2001,14 @@ mod tests {
             ("VELORIX_META_BACKEND", "hiqlite"),
             ("VELORIX_META_BIND", "0.0.0.0:9090"),
             ("VELORIX_META_BEARER_TOKEN", "secret"),
-            ("VELORIX_META_TRANSPORT_SECURITY", "service-mesh-mtls"),
+            ("VELORIX_META_TRANSPORT_SECURITY", "native-mtls"),
             (
                 "VELORIX_META_TRANSPORT_SECURITY_ATTESTATION",
                 "mesh-policy/velorix-meta",
             ),
+            ("VELORIX_META_TLS_CERT_FILE", "/tmp/meta.crt"),
+            ("VELORIX_META_TLS_KEY_FILE", "/tmp/meta.key"),
+            ("VELORIX_META_TLS_CLIENT_CA_FILE", "/tmp/meta-ca.crt"),
             ("VELORIX_HIQLITE_API_SECRET", "api-secret"),
             (
                 "VELORIX_HIQLITE_NODES",

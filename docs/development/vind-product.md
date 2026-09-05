@@ -126,6 +126,13 @@ apply helper, `scripts/apply-vind-product-ingress.sh`, creates Kubernetes
 `Ingress` resources only. It does not create DNS records, public certificates,
 TLS Secrets, or PVCs.
 
+For the embedded Rhiza KV metadata service's isolated three-node/no-PVC
+service-connection and pod-replacement recovery check, use
+[`development/rhiza-kv-k8s.md`](rhiza-kv-k8s.md) and
+`scripts/run-rhiza-kv-k8s-gate.sh`. The harness is preflight-only unless
+`VELORIX_RHIZA_EXECUTE=1` is explicitly set and records production trust as
+false.
+
 Refresh deployed image digest evidence with:
 
 ```bash

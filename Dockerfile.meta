@@ -5,9 +5,22 @@ RUN rustup toolchain install 1.98.1 --profile minimal --no-self-update \
     && rustup default 1.98.1 \
     && rustc --version | grep -Eq '^rustc 1\.98\.1 '
 
+# rhizadb's native FFI is built by its Cargo build script. Keep the
+# compiler in the image build stage; it is not part of the runtime image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && apt-get install -y --no-install-recommends ca-certificates curl protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
+
+ARG GO_VERSION=1.27.0
+ARG GO_TARBALL_SHA256=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685
+RUN curl --fail --silent --show-error --location \
+      "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+      --output /tmp/go.tar.gz \
+    && echo "${GO_TARBALL_SHA256}  /tmp/go.tar.gz" | sha256sum --check --strict \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm -f /tmp/go.tar.gz \
+    && /usr/local/go/bin/go version | grep -Eq '^go version go1\.27\.0 linux/amd64$'
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
@@ -16,7 +29,7 @@ COPY --from=velorix-hiqlite-source . /hiqlite
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    RUSTFLAGS="-C strip=symbols" cargo build --release -p velorix-meta --features hiqlite-backend --locked \
+    RUSTFLAGS="-C strip=symbols" GOTOOLCHAIN=local cargo build --release -p velorix-meta --features "hiqlite-backend rhiza-backend" --locked \
     && cp /workspace/target/release/velorix-meta /workspace/velorix-meta
 
 FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime
@@ -29,4 +42,5 @@ COPY --from=builder /workspace/velorix-meta /usr/local/bin/velorix-meta
 
 USER 65532:65532
 EXPOSE 9090
+EXPOSE 8200/udp
 ENTRYPOINT ["/usr/local/bin/velorix-meta"]
