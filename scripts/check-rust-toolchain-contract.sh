@@ -31,7 +31,7 @@ if ! printf '%s\n' "$toolchain_refs" | awk -v build="$build_toolchain" -v minimu
     exit 1
 fi
 
-test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$build_toolchain" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 10
+test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$build_toolchain" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 11
 test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$msrv" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 1
 grep -Fqx "        uses: dtolnay/rust-toolchain@$msrv" .github/workflows/ci.yml
 
