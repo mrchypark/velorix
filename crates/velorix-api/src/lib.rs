@@ -132,8 +132,8 @@ use velorix_core::{
         validate_supported_cross_join_sql, validate_supported_filter_project_sql,
         validate_supported_interval_join_sql, validate_supported_join_view_sql,
         validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
-        validate_supported_semi_anti_join_sql, validate_supported_temporal_join_sql,
-        validate_supported_three_input_inner_join_count_sql,
+        validate_supported_scalar_aggregate_filter_sql, validate_supported_semi_anti_join_sql,
+        validate_supported_temporal_join_sql, validate_supported_three_input_inner_join_count_sql,
         validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1,
         SupportedAggregateInputRelationSide, SupportedAggregateOutput,
         SupportedAnalyticRowNumberPlan, SupportedCrossJoinPlanV1, SupportedFilterProjectPlan,
@@ -681,6 +681,18 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
             if let Ok(plan) = validate_supported_join_view_sql(sql, catalogs) {
                 validate_join_plan_catalog_order(&plan, catalogs)?;
                 return join_sum_count_output_schema(view_id, catalogs, &plan)
+                    .map(|schema| Some(vec![schema]));
+            }
+            if let Ok(plan) = validate_supported_scalar_aggregate_filter_sql(sql, catalogs) {
+                let outer_catalog = catalogs
+                    .iter()
+                    .find(|catalog| {
+                        catalog.relation_schema.relation_id == plan.outer_input_relation_id
+                    })
+                    .ok_or_else(|| {
+                        ApiError::bad_request("scalar aggregate filter outer catalog is missing")
+                    })?;
+                return filter_project_output_schema(view_id, outer_catalog, &plan.projection)
                     .map(|schema| Some(vec![schema]));
             }
             if catalogs.len() == 2 {

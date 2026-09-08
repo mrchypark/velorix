@@ -1096,10 +1096,21 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
     let payload: Value = serde_json::from_str(&state_payload.payload)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     match payload.get("runtime_kind").and_then(Value::as_str) {
-        Some("filter_project" | "analytic_row_number" | "latest_by_key") => return Ok(None),
-        Some("interval_join" | "interval_join_v2" | "cross_join_v2" | "recursive_fixpoint_v2") => {
-            return Ok(Some(Vec::new()))
-        }
+        Some(
+            "filter_project"
+            | "analytic_row_number"
+            | "latest_by_key"
+            | "scalar_aggregate_filter"
+            | "analytic_window_frame"
+            | "two_input_semi_anti_join_project_v1",
+        ) => return Ok(None),
+        Some(
+            "interval_join"
+            | "interval_join_v2"
+            | "cross_join_v2"
+            | "recursive_fixpoint_v2"
+            | "temporal_join_v1",
+        ) => return Ok(Some(Vec::new())),
         Some("two_input_join_sum_count" | "two_input_join_common_dag_reference_v1") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
                 return Ok(None);
@@ -1143,7 +1154,20 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
                 .map_err(|source| ApiError::bad_request(source.to_string()))?;
             return Ok(Some(plan.aggregate_outputs));
         }
-        Some(_) | None => {}
+        Some("single_key_sum_count") => {
+            let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
+                return Ok(None);
+            };
+            let plan: SupportedViewPlan = serde_json::from_value(plan.clone())
+                .map_err(|source| ApiError::bad_request(source.to_string()))?;
+            return Ok(Some(supported_view_plan_aggregate_outputs(&plan)));
+        }
+        Some(kind) => {
+            return Err(ApiError::bad_request(format!(
+                "unsupported standing runtime checkpoint kind `{kind}`"
+            )))
+        }
+        None => {}
     }
     let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
         return Ok(None);

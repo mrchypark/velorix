@@ -22101,8 +22101,61 @@ fn scalar_aggregate_filter_materializes_and_restores() {
     // avg now 40; no score exceeds 40.
     assert!(users.is_empty(), "no score exceeds avg 40: {users:?}");
 
-    // Restart: checkpoint then restore, verify state and continued updates.
+    // Restart: a live outer row must retain the comparison field in the
+    // checkpoint, even when that field is not part of the projected output.
     let checkpoint = runtime.checkpoint().unwrap();
+    let mut tampered_checkpoint = checkpoint.clone();
+    let state_payload = tampered_checkpoint.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let comparison_column = payload["plan"]["outer_comparison_column_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let outer_row = payload["outer_rows"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    outer_row["values"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&comparison_column);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered_checkpoint.state_root.content_hash =
+        stable_bytes_hash(state_payload.payload.as_bytes());
+    let restore_error = match restore_standing_runtime(tampered_checkpoint) {
+        Ok(_) => panic!("checkpoint missing comparison field unexpectedly restored"),
+        Err(error) => error,
+    };
+    assert!(
+        restore_error.contains("scalar_aggregate_filter_checkpoint_outer_comparison_column"),
+        "{restore_error}"
+    );
+
+    let mut nullable_checkpoint = checkpoint.clone();
+    let state_payload = nullable_checkpoint.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let comparison_column = payload["plan"]["outer_comparison_column_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let outer_row = payload["outer_rows"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .next()
+        .unwrap();
+    outer_row["values"]
+        .as_object_mut()
+        .unwrap()
+        .insert(comparison_column, Value::Null);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    nullable_checkpoint.state_root.content_hash =
+        stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(nullable_checkpoint).is_ok());
+
+    // Restore the intact checkpoint and verify state and continued updates.
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
     restored
         .apply_changes(
@@ -22147,6 +22200,78 @@ fn scalar_aggregate_filter_materializes_and_restores() {
         .collect::<Vec<_>>();
     users.sort();
     assert_eq!(users, vec!["dave".to_string()]);
+}
+
+#[test]
+fn scalar_aggregate_filter_nullable_count_column_skips_null_and_restores() {
+    let scores = scores_catalog();
+    let purchases = purchases_catalog_with_nullable_amount();
+    let catalogs = vec![scores.clone(), purchases.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output = scores_projection_output_schema();
+    let count_sql =
+        "select s.user_id, s.score from scores s where s.score > (select count(a.amount) from purchases a)";
+    let star_sql =
+        "select s.user_id, s.score from scores s where s.score > (select count(*) from purchases a)";
+    let count_identity = standing_identity_with_view(count_sql, "positive_scores");
+    let star_identity = standing_identity_with_view(star_sql, "positive_scores");
+    let mut count_runtime = create_standing_runtime_with_sql_and_catalogs(
+        &count_identity,
+        &catalogs,
+        count_sql,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let mut star_runtime = create_standing_runtime_with_sql_and_catalogs(
+        &star_identity,
+        &catalogs,
+        star_sql,
+        &input_schemas,
+        std::slice::from_ref(&output),
+    )
+    .unwrap();
+    let outer_input = relation_input(
+        &scores,
+        "nullable-count-scores",
+        0,
+        2,
+        scores_rows_batch(&[("low", 2, 1), ("high", 3, 1)]),
+    );
+    let scalar_input = relation_input(
+        &purchases,
+        "nullable-count-purchases",
+        0,
+        3,
+        purchases_nullable_amount_batch(),
+    );
+    count_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nullable-count-column").unwrap(),
+            vec![outer_input.clone(), scalar_input.clone()],
+        )
+        .unwrap();
+    star_runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nullable-count-star").unwrap(),
+            vec![outer_input, scalar_input],
+        )
+        .unwrap();
+
+    // COUNT(amount) sees only 10 and 5, so score 3 passes; COUNT(*) sees all
+    // three rows, so no score passes the strict comparison.
+    assert_projected_scores_page(count_runtime.as_ref(), 1, &[("high", 3)]);
+    assert_projected_scores_page(star_runtime.as_ref(), 1, &[]);
+
+    let count_restored = restore_standing_runtime(count_runtime.checkpoint().unwrap()).unwrap();
+    let star_restored = restore_standing_runtime(star_runtime.checkpoint().unwrap()).unwrap();
+    assert_projected_scores_page(count_restored.as_ref(), 1, &[("high", 3)]);
+    assert_projected_scores_page(star_restored.as_ref(), 1, &[]);
 }
 
 #[test]
