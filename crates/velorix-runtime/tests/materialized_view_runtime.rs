@@ -717,6 +717,202 @@ fn runtime_same_epoch_input_permutations_have_identical_state_output_and_restore
 }
 
 #[test]
+fn runtime_same_epoch_filtered_group_deltas_have_order_independent_state() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns.truncate(2);
+    output_schema.columns[1].nullable = true;
+    let sql =
+        "select user_id, sum(amount) filter (where amount > 100) as sum from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let inputs =
+        [(0, 10, 1), (1, 200, 1)].map(|(partition_id, amount, weight)| RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            stream_id: "filtered-permutation-stream".to_string(),
+            partition_id,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 1,
+            event_time_watermark: None,
+            batches: vec![purchases_rows_batch(&[("alice", amount, weight)])],
+        });
+
+    let mut baseline = None;
+    for order in [[0, 1], [1, 0]] {
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            std::slice::from_ref(&catalog),
+            sql,
+            std::slice::from_ref(&input_schema),
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new("filtered-permuted-epoch").unwrap(),
+                order.iter().map(|index| inputs[*index].clone()).collect(),
+            )
+            .unwrap();
+        assert_sum_page(runtime.as_ref(), 1, "alice", Some(200));
+        let checkpoint = runtime.checkpoint().unwrap();
+        match &baseline {
+            Some(expected) => assert_eq!(&checkpoint, expected),
+            None => baseline = Some(checkpoint),
+        }
+    }
+}
+
+#[test]
+fn runtime_same_epoch_net_zero_group_delta_is_order_independent() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns.truncate(2);
+    output_schema.columns[1].nullable = true;
+    let sql =
+        "select user_id, sum(amount) filter (where amount > 100) as sum from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let inputs = [(0, 1), (1, -1)].map(|(partition_id, weight)| RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "net-zero-permutation-stream".to_string(),
+        partition_id,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 1,
+        event_time_watermark: None,
+        batches: vec![purchases_rows_batch(&[("alice", 10, weight)])],
+    });
+    let mut baseline = None;
+    for order in [[0, 1], [1, 0]] {
+        let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+            &identity,
+            std::slice::from_ref(&catalog),
+            sql,
+            std::slice::from_ref(&input_schema),
+            std::slice::from_ref(&output_schema),
+        )
+        .unwrap();
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new("net-zero-permuted-epoch").unwrap(),
+                order.iter().map(|index| inputs[*index].clone()).collect(),
+            )
+            .unwrap();
+        assert_empty_page(runtime.as_ref(), 1);
+        let checkpoint = runtime.checkpoint().unwrap();
+        match &baseline {
+            Some(expected) => assert_eq!(&checkpoint, expected),
+            None => baseline = Some(checkpoint),
+        }
+    }
+}
+
+#[test]
+fn runtime_restore_rejects_legacy_single_key_checkpoint_without_group_counts() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select user_id, sum(amount) filter (where amount > 100) as sum, count(*) filter (where amount < 0) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("legacy-counts").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "legacy-counts-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[("alice", 17, 1)])],
+            }],
+        )
+        .unwrap();
+    let mut checkpoint = runtime.checkpoint().unwrap();
+    let state_payload = checkpoint.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("group_input_counts");
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+
+    let err = match restore_standing_runtime(checkpoint) {
+        Ok(_) => panic!("legacy checkpoint unexpectedly restored"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("legacy_single_key_group_counts_missing"),
+        "{err}"
+    );
+}
+
+#[test]
+fn runtime_restore_rejects_single_key_group_count_key_mismatch() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select user_id, sum(amount) filter (where amount > 100) as sum, count(*) filter (where amount < 0) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("mismatched-count-key").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "mismatched-count-key-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[("alice", 17, 1)])],
+            }],
+        )
+        .unwrap();
+    let mut checkpoint = runtime.checkpoint().unwrap();
+    let state_payload = checkpoint.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["group_input_counts"]["records"][0]["key"] = json!("bob");
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+
+    assert!(restore_standing_runtime(checkpoint).is_err());
+}
+
+#[test]
 fn runtime_bounds_restored_idempotency_history_and_preserves_recent_duplicates() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -4778,6 +4974,63 @@ fn runtime_materializes_nullable_column_count_aggregate() {
 }
 
 #[test]
+fn runtime_materializes_all_null_count_column_group_across_restore_and_retract() {
+    let catalog = purchases_catalog_with_nullable_amount();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_count_output_schema();
+    let sql = "select user_id, count(amount) as count from purchases group by user_id";
+    let identity = standing_identity_with_view(sql, "purchases_by_user_count");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nullable-count-all-null").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "nullable-count-all-null-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![purchases_all_null_amount_batch()],
+            }],
+        )
+        .unwrap();
+    assert_count_page(runtime.as_ref(), 1, &[("alice", 0)]);
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_count_page(restored.as_ref(), 1, &[("alice", 0)]);
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("nullable-count-all-null-retract").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "nullable-count-all-null-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![purchases_all_null_amount_retraction_batch()],
+            }],
+        )
+        .unwrap();
+    assert_count_page(restored.as_ref(), 2, &[]);
+}
+
+#[test]
 fn runtime_materializes_mixed_nullable_column_count_aggregate() {
     let catalog = purchases_catalog_with_nullable_amount();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
@@ -4818,6 +5071,65 @@ fn runtime_materializes_mixed_nullable_column_count_aggregate() {
         1,
         &[("alice", 10, 1), ("bob", 5, 1)],
     );
+}
+
+#[test]
+fn runtime_materializes_all_null_single_input_filter_and_count_star_across_restore_retract() {
+    let catalog = purchases_catalog_with_nullable_amount();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql =
+        "select user_id, sum(amount) filter (where amount > 0) as sum, count(*) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nullable-all-null").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "nullable-all-null-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![purchases_all_null_amount_batch()],
+            }],
+        )
+        .unwrap();
+    assert_sum_count_page_nullable(runtime.as_ref(), 1, &[("alice", None, 1)]);
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_sum_count_page_nullable(restored.as_ref(), 1, &[("alice", None, 1)]);
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("nullable-all-null-retract").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "nullable-all-null-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 1,
+                end_offset_exclusive: 2,
+                event_time_watermark: None,
+                batches: vec![purchases_all_null_amount_retraction_batch()],
+            }],
+        )
+        .unwrap();
+    assert_empty_page(restored.as_ref(), 2);
 }
 
 #[test]
@@ -5334,7 +5646,8 @@ fn runtime_materializes_single_relation_aggregate_with_between_predicates() {
 fn runtime_materializes_single_relation_aggregate_with_matching_filters() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = purchases_output_schema();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
     let sql = "select user_id, sum(amount) filter (where amount > 5) as sum, count(*) filter (where amount > 5) as count from purchases group by user_id";
     let identity = standing_identity(sql);
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
@@ -5365,19 +5678,146 @@ fn runtime_materializes_single_relation_aggregate_with_matching_filters() {
         )
         .unwrap();
 
-    assert_sum_count_page(
+    assert_sum_count_page_nullable(
         runtime.as_ref(),
-        "purchases_by_user",
         1,
-        &[("alice", 17, 2)],
+        &[("alice", Some(17), 2), ("bob", None, 0)],
     );
+}
+
+#[test]
+fn runtime_preserves_group_with_no_qualifying_aggregate_inputs() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select user_id, sum(amount) filter (where amount > 100) as sum, count(*) filter (where amount < 0) as count from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("epoch-no-qualifying-inputs").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[("alice", 10, 1)])],
+            }],
+        )
+        .unwrap();
+
+    assert_null_sum_count_page(runtime.as_ref(), 1, "alice");
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_null_sum_count_page(restored.as_ref(), 1, "alice");
+}
+
+#[test]
+fn runtime_sum_only_filter_preserves_zero_and_reinserted_groups() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns.truncate(2);
+    output_schema.columns[1].nullable = true;
+    let sql = "select user_id, sum(amount) filter (where amount > 100) as sum from purchases group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+
+    let apply =
+        |runtime: &mut Box<dyn StandingProgramRuntime + Send>, epoch, offset, amount, weight| {
+            runtime
+                .apply_changes(
+                    epoch,
+                    EpochIdempotencyKey::new(format!("sum-only-{epoch}")).unwrap(),
+                    vec![RelationInputBatch {
+                        encoding: RelationInputEncodingV1::SourceRelationV1,
+                        relation_id: catalog.relation_schema.relation_id.clone(),
+                        relation_version: catalog.relation_schema.relation_version.clone(),
+                        stream_id: "test-stream".to_string(),
+                        partition_id: 0,
+                        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                        start_offset_inclusive: offset,
+                        end_offset_exclusive: offset + 1,
+                        event_time_watermark: None,
+                        batches: vec![purchases_rows_batch(&[("alice", amount, weight)])],
+                    }],
+                )
+                .unwrap();
+        };
+
+    apply(&mut runtime, 1, 0, 10, 1);
+    assert_null_sum_page(runtime.as_ref(), 1, "alice");
+    apply(&mut runtime, 2, 1, 10, -1);
+    assert_empty_page(runtime.as_ref(), 2);
+    apply(&mut runtime, 3, 2, 200, 1);
+    assert_sum_page(runtime.as_ref(), 3, "alice", Some(200));
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_sum_page(restored.as_ref(), 3, "alice", Some(200));
+}
+
+#[test]
+fn runtime_where_filter_does_not_create_phantom_group() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql = "select user_id, sum(amount) as sum, count(*) as count from purchases where amount > 100 group by user_id";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("where-filter-no-group").unwrap(),
+            vec![RelationInputBatch {
+                encoding: RelationInputEncodingV1::SourceRelationV1,
+                relation_id: catalog.relation_schema.relation_id.clone(),
+                relation_version: catalog.relation_schema.relation_version.clone(),
+                stream_id: "test-stream".to_string(),
+                partition_id: 0,
+                schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                start_offset_inclusive: 0,
+                end_offset_exclusive: 1,
+                event_time_watermark: None,
+                batches: vec![purchases_rows_batch(&[("alice", 10, 1)])],
+            }],
+        )
+        .unwrap();
+    assert_empty_page(runtime.as_ref(), 1);
 }
 
 #[test]
 fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = purchases_output_schema();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
     let sql = "select user_id, sum(amount) filter (where amount > 5) as sum, count(*) as count from purchases group by user_id";
     let identity = standing_identity(sql);
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
@@ -5408,11 +5848,10 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
         )
         .unwrap();
 
-    assert_sum_count_page(
+    assert_sum_count_page_nullable(
         runtime.as_ref(),
-        "purchases_by_user",
         1,
-        &[("alice", 17, 2), ("bob", 0, 1)],
+        &[("alice", Some(17), 2), ("bob", None, 1)],
     );
 
     runtime
@@ -5434,19 +5873,17 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
         )
         .unwrap();
 
-    assert_sum_count_page(
+    assert_sum_count_page_nullable(
         runtime.as_ref(),
-        "purchases_by_user",
         2,
-        &[("alice", 7, 1), ("bob", 0, 1)],
+        &[("alice", Some(7), 1), ("bob", None, 1)],
     );
 
     let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
-    assert_sum_count_page(
+    assert_sum_count_page_nullable(
         restored.as_ref(),
-        "purchases_by_user",
         2,
-        &[("alice", 7, 1), ("bob", 0, 1)],
+        &[("alice", Some(7), 1), ("bob", None, 1)],
     );
 }
 
@@ -5454,7 +5891,8 @@ fn runtime_materializes_single_relation_aggregate_with_mixed_filters() {
 fn runtime_materializes_single_relation_filtered_count_distinct_with_mixed_filters() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = purchases_output_schema();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
     let sql = "select user_id, sum(amount) filter (where amount > 5) as sum, count(distinct amount) filter (where amount > 0) as count from purchases group by user_id";
     let identity = standing_identity(sql);
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
@@ -5490,19 +5928,17 @@ fn runtime_materializes_single_relation_filtered_count_distinct_with_mixed_filte
         )
         .unwrap();
 
-    assert_sum_count_page(
+    assert_sum_count_page_nullable(
         runtime.as_ref(),
-        "purchases_by_user",
         1,
-        &[("alice", 27, 2), ("bob", 0, 1)],
+        &[("alice", Some(27), 2), ("bob", None, 1)],
     );
 
     let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
-    assert_sum_count_page(
+    assert_sum_count_page_nullable(
         restored.as_ref(),
-        "purchases_by_user",
         1,
-        &[("alice", 27, 2), ("bob", 0, 1)],
+        &[("alice", Some(27), 2), ("bob", None, 1)],
     );
 }
 
@@ -5566,7 +6002,8 @@ fn runtime_materializes_single_relation_mixed_min_max_avg_filters() {
 fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = purchases_output_schema();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
     let sql = "select user_id, sum(amount) filter (where amount > 5) as sum, count(*) as count from purchases group by user_id having sum > 0 order by sum desc limit 1";
     let identity = standing_identity(sql);
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
@@ -5633,7 +6070,8 @@ fn runtime_materializes_single_relation_mixed_filter_having_top_k() {
 fn runtime_materializes_single_relation_aggregate_with_different_filters() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = purchases_output_schema();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
     let sql = "select user_id, sum(amount) filter (where amount > 5) as sum, count(*) filter (where amount <= 5) as count from purchases group by user_id";
     let identity = standing_identity(sql);
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
@@ -6531,6 +6969,137 @@ fn runtime_materializes_single_key_order_by_limit_offset_top_k() {
         )
         .unwrap();
     assert_top_purchase_user(runtime.as_ref(), 2, "alice", 17, 2);
+}
+
+#[test]
+fn runtime_materializes_nullable_aggregate_top_k_with_datafusion_default_null_order() {
+    let catalog = purchases_catalog_with_nullable_amount();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum, user_id asc limit 2 offset 1";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nullable-top-k-1").unwrap(),
+            vec![relation_input(
+                &catalog,
+                "nullable-top-k-stream",
+                0,
+                4,
+                purchases_nullable_top_k_rows_batch(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(
+        top_k_sum_rows(runtime.as_ref(), 1),
+        vec![
+            ("carol".to_string(), Some(5)),
+            ("dave".to_string(), Some(0))
+        ]
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime(checkpoint).unwrap();
+    assert_eq!(
+        top_k_sum_rows(restored.as_ref(), 1),
+        vec![
+            ("carol".to_string(), Some(5)),
+            ("dave".to_string(), Some(0))
+        ]
+    );
+    restored
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("nullable-top-k-2").unwrap(),
+            vec![relation_input(
+                &catalog,
+                "nullable-top-k-stream",
+                4,
+                5,
+                purchases_nullable_top_k_retract_bob_batch(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(
+        top_k_sum_rows(restored.as_ref(), 2),
+        vec![("alice".to_string(), None), ("carol".to_string(), Some(5))]
+    );
+}
+
+#[test]
+fn runtime_materializes_nullable_aggregate_top_k_desc_nulls_first() {
+    let catalog = purchases_catalog_with_nullable_amount();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let mut output_schema = purchases_output_schema();
+    output_schema.columns[1].nullable = true;
+    let sql = "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum desc limit 2";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("nullable-top-k-desc-1").unwrap(),
+            vec![relation_input(
+                &catalog,
+                "nullable-top-k-desc-stream",
+                0,
+                4,
+                purchases_nullable_top_k_rows_batch(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(
+        top_k_sum_rows(runtime.as_ref(), 1),
+        vec![("alice".to_string(), None), ("carol".to_string(), Some(5))]
+    );
+}
+
+#[test]
+fn runtime_materializes_integer_aggregate_top_k_without_f64_precision_loss() {
+    let catalog = purchases_catalog_without_value_role();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_output_schema();
+    let sql = "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum desc limit 1";
+    let identity = standing_identity(sql);
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        std::slice::from_ref(&input_schema),
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("integer-top-k-precision").unwrap(),
+            vec![relation_input(
+                &catalog,
+                "integer-top-k-stream",
+                0,
+                2,
+                purchases_large_int_top_k_batch(),
+            )],
+        )
+        .unwrap();
+    assert_top_purchase_user(runtime.as_ref(), 1, "bob", i64::MAX, 1);
 }
 
 #[test]
@@ -16509,6 +17078,188 @@ fn assert_sum_count_page(
     }
 }
 
+fn assert_sum_count_page_nullable(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected: &[(&str, Option<i64>, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), expected.len());
+    for (index, (key, sum, count)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
+        match sum {
+            Some(value) => assert_eq!(sums.value(index), *value),
+            None => assert!(sums.is_null(index)),
+        }
+        assert_eq!(counts.value(index), *count);
+    }
+}
+
+fn assert_null_sum_count_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_user: &str,
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(keys.value(0), expected_user);
+    assert!(sums.is_null(0));
+    assert_eq!(counts.value(0), 0);
+}
+
+fn assert_null_sum_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_user: &str,
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(keys.value(0), expected_user);
+    assert!(sums.is_null(0));
+}
+
+fn assert_sum_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+    expected_user: &str,
+    expected_sum: Option<i64>,
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(keys.value(0), expected_user);
+    match expected_sum {
+        Some(value) => assert_eq!(sums.value(0), value),
+        None => assert!(sums.is_null(0)),
+    }
+}
+
+fn assert_empty_page(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 0);
+}
+
 fn assert_latest_status_page(
     runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
     epoch: u64,
@@ -17690,6 +18441,45 @@ fn assert_top_purchase_user(
     assert_eq!(events.value(0), expected_events);
 }
 
+fn top_k_sum_rows(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    epoch: u64,
+) -> Vec<(String, Option<i64>)> {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "purchases_by_user".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let sums = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|index| {
+            (
+                keys.value(index).to_string(),
+                (!sums.is_null(index)).then(|| sums.value(index)),
+            )
+        })
+        .collect()
+}
+
 fn assert_scores_min_max_avg_page(
     runtime: &(dyn StandingProgramRuntime + Send),
     epoch: u64,
@@ -18713,6 +19503,86 @@ fn purchases_nullable_amount_batch() -> RecordBatch {
             Arc::new(StringArray::from(vec!["alice", "bob", "alice"])) as _,
             Arc::new(Int64Array::from(vec![Some(10), Some(5), None])) as _,
             Arc::new(Int64Array::from(vec![1, 1, 1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn purchases_nullable_top_k_rows_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["alice", "bob", "carol", "dave"])) as _,
+            Arc::new(Int64Array::from(vec![None, Some(0), Some(5), Some(0)])) as _,
+            Arc::new(Int64Array::from(vec![1, 1, 1, 1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn purchases_nullable_top_k_retract_bob_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["bob"])) as _,
+            Arc::new(Int64Array::from(vec![Some(0)])) as _,
+            Arc::new(Int64Array::from(vec![-1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn purchases_large_int_top_k_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["alice", "bob"])) as _,
+            Arc::new(Int64Array::from(vec![i64::MAX - 1, i64::MAX])) as _,
+            Arc::new(Int64Array::from(vec![1, 1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn purchases_all_null_amount_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])) as _,
+            Arc::new(Int64Array::from(vec![None])) as _,
+            Arc::new(Int64Array::from(vec![1])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn purchases_all_null_amount_retraction_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, true),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["alice"])) as _,
+            Arc::new(Int64Array::from(vec![None])) as _,
+            Arc::new(Int64Array::from(vec![-1])) as _,
         ],
     )
     .unwrap()

@@ -1923,11 +1923,15 @@ fn single_key_aggregate_sql_accepts_matching_aggregate_filter_predicates() {
     else {
         panic!("expected single-key runtime execution");
     };
-    let leaves = supported
-        .predicate_expr
-        .as_ref()
-        .expect("aggregate FILTER should lower to input predicate")
-        .leaf_predicates();
+    // An aggregate FILTER is evaluated after the group has been retained;
+    // lowering it into the source predicate would incorrectly drop groups
+    // whose aggregate has no qualifying contributions.
+    assert!(supported.predicate_expr.is_none());
+    let filter = supported
+        .aggregate_filter_exprs
+        .get("sum")
+        .expect("aggregate FILTER should remain per-output");
+    let leaves = filter.leaf_predicates();
     assert_eq!(leaves.len(), 1);
     assert_eq!(leaves[0].column_id, "score");
     assert_eq!(leaves[0].op, PredicateOp::Gt);
@@ -6486,6 +6490,50 @@ fn single_key_aggregate_sql_lowers_order_by_limit_top_k() {
 }
 
 #[test]
+fn single_key_aggregate_sql_defaults_order_by_top_k_to_ascending() {
+    let catalog = purchases_catalog_without_value_role();
+    let output_schema = purchases_output_schema();
+
+    let plan = lower_supported_view_sql_to_logical_plan(
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum limit 1",
+        &catalog,
+        &output_schema,
+    )
+    .unwrap();
+
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan: supported } = &plan.execution
+    else {
+        panic!("expected single-key aggregate execution");
+    };
+    assert_eq!(
+        supported.top_k.as_ref().map(|top_k| top_k.descending),
+        Some(false)
+    );
+    assert!(plan.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::TopK {
+            order_by,
+            descending: false,
+            limit: 1,
+            ..
+        } if order_by.column_id == "sum"
+    )));
+}
+
+#[test]
+fn single_key_aggregate_sql_rejects_explicit_null_ordering_top_k() {
+    let catalog = purchases_catalog_without_value_role();
+    let error = validate_supported_view_sql(
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum asc nulls first limit 1",
+        &catalog,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("ORDER BY NULLS/WITH FILL is not supported for materialized top-k views"));
+}
+
+#[test]
 fn single_key_aggregate_sql_lowers_order_by_metric_then_key_top_k() {
     let catalog = scores_catalog();
     let output_schema = scores_output_schema();
@@ -6911,6 +6959,67 @@ fn single_key_aggregate_sql_accepts_decimal_avg_as_float64_output() {
             && aggregate.input_column_id.as_deref() == Some("amount")
             && aggregate.output_column_id == "average"
     }));
+}
+
+#[test]
+fn single_key_aggregate_sql_rejects_nullable_decimal_value_aggregates() {
+    let mut nullable_decimal_catalog = purchases_catalog_without_value_role();
+    let amount = nullable_decimal_catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "amount")
+        .unwrap();
+    amount.logical_type = VelorixLogicalTypeV1::Decimal {
+        precision: 12,
+        scale: 2,
+    };
+    amount.physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+        precision: 12,
+        scale: 2,
+    };
+    amount.nullable = true;
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nullable_decimal_catalog.relation_schema)
+            .expect("nullable decimal catalog should fingerprint");
+    nullable_decimal_catalog.schema_fingerprint = schema_fingerprint.clone();
+    nullable_decimal_catalog
+        .incremental_relation
+        .schema_fingerprint = schema_fingerprint;
+
+    for sql in [
+        "select user_id, sum(amount) as total from purchases group by user_id",
+        "select user_id, avg(amount) as average from purchases group by user_id",
+        "select user_id, min(amount) as smallest from purchases group by user_id",
+        "select user_id, max(amount) as largest from purchases group by user_id",
+    ] {
+        let error = validate_supported_view_sql(sql, &nullable_decimal_catalog).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "nullable Decimal value aggregates require an explicitly supported decimal runtime"
+            ),
+            "unexpected error for {sql}: {error}"
+        );
+    }
+
+    let nonnullable_decimal_catalog = {
+        let mut catalog = nullable_decimal_catalog;
+        catalog.relation_schema.columns[1].nullable = false;
+        let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("non-nullable decimal catalog should fingerprint");
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+        catalog
+    };
+    for sql in [
+        "select user_id, sum(amount) as total from purchases group by user_id",
+        "select user_id, avg(amount) as average from purchases group by user_id",
+        "select user_id, min(amount) as smallest from purchases group by user_id",
+        "select user_id, max(amount) as largest from purchases group by user_id",
+    ] {
+        validate_supported_view_sql(sql, &nonnullable_decimal_catalog)
+            .unwrap_or_else(|error| panic!("non-nullable decimal SQL rejected: {sql}: {error}"));
+    }
 }
 
 #[test]

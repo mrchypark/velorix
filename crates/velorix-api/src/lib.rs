@@ -49,17 +49,18 @@ use velorix_control::{
         validate_bearer_token, AcquireStandingRuntimeOwnerOutcome,
         AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
         BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest,
-        CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
-        FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
-        GrpcClientTlsConfig, GrpcMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1,
-        MetaStore, MetaStoreError, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
-        PublishIngestReservationOutcome, PublishStandingRuntimeCheckpointOutcome,
-        PublishStandingRuntimeCheckpointRequest, RelationIngestCapability,
-        RelationIngestPublicationRefV1, RelationPartitionAuthorityKey, ReserveIngestRangeOutcome,
-        StandingRuntimeCheckpointPointer, StandingRuntimeFencingCapability,
-        StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
-        ViewBootstrapControlV1, ViewBootstrapLifecycleV1, INGEST_SOURCE_IDENTITY_GENERATION_V1,
-        RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+        CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
+        CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+        FixViewBootstrapActivationCutRequest, GrpcClientTlsConfig, GrpcMetaStore,
+        IngestRangeReservation, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
+        PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+        PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+        RelationIngestCapability, RelationIngestPublicationRefV1,
+        RelationIngestSourceIdentityCutV1, RelationPartitionAuthorityKey,
+        ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer,
+        StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
+        StoreRelationCatalogOutcome, ViewBootstrapControlV1, ViewBootstrapLifecycleV1,
+        INGEST_SOURCE_IDENTITY_GENERATION_V1, RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
         STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
         STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
@@ -189,6 +190,7 @@ pub struct ApiState {
     relation_ingest_config: Option<RelationIngestApiConfig>,
     relation_ingest_publishers: Arc<Mutex<HashMap<String, RelationIngestPublisher>>>,
     standing_runtime_owner_ttl_ms: u64,
+    legacy_rebuild_view_id: Option<String>,
     standing_runtime_fencing_required: bool,
     standing_runtime_fencing_mode: StandingRuntimeFencingMode,
     api_bearer_token: Option<Arc<str>>,
@@ -833,6 +835,7 @@ impl ApiState {
             relation_ingest_config: None,
             relation_ingest_publishers: Arc::new(Mutex::new(HashMap::new())),
             standing_runtime_owner_ttl_ms: 30_000,
+            legacy_rebuild_view_id: None,
             standing_runtime_fencing_required: false,
             standing_runtime_fencing_mode: StandingRuntimeFencingMode::SingleWriter,
             api_bearer_token: None,
@@ -914,7 +917,7 @@ impl ApiState {
         self.relation_ingest_mode == RelationIngestMode::Authoritative
     }
 
-    async fn relation_ingest_publisher(
+    pub(crate) async fn relation_ingest_publisher(
         &self,
         catalog: &VelorixRelationCatalogV1,
         request: &IngestRowsRequest,
@@ -982,6 +985,15 @@ impl ApiState {
     pub fn with_standing_runtime_owner_ttl_ms(mut self, ttl_ms: u64) -> Self {
         self.standing_runtime_owner_ttl_ms = ttl_ms;
         self
+    }
+
+    pub fn with_legacy_rebuild_view_id(mut self, view_id: Option<String>) -> Self {
+        self.legacy_rebuild_view_id = view_id;
+        self
+    }
+
+    fn legacy_rebuild_targeted(&self, view_id: &str) -> bool {
+        self.legacy_rebuild_view_id.as_deref() == Some(view_id)
     }
 
     pub fn with_standing_runtime_fencing_required(mut self, required: bool) -> Self {
@@ -1348,6 +1360,14 @@ impl ApiState {
     pub async fn restore_standing_program_runtimes_from_active_views(
         &self,
     ) -> Result<usize, ApiError> {
+        self.restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(false)
+            .await
+    }
+
+    pub(crate) async fn restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(
+        &self,
+        allow_legacy_rebuild: bool,
+    ) -> Result<usize, ApiError> {
         self.validate_standing_runtime_fencing_or_evict().await?;
         let active_views = self
             .view_registry()?
@@ -1363,11 +1383,24 @@ impl ApiState {
             if active_standing_runtime_identity(&active).is_none() {
                 continue;
             }
-            if let Some(replay_plan) =
-                ensure_standing_runtime_for_active_view(self, &active).await?
-            {
-                replay_committed_ingest_into_standing_runtime(self, &active, &replay_plan).await?;
-                restored += 1;
+            match ensure_standing_runtime_for_active_view(self, &active).await {
+                Ok(Some(replay_plan)) => {
+                    replay_committed_ingest_into_standing_runtime(self, &active, &replay_plan)
+                        .await?;
+                    restored += 1;
+                }
+                Ok(None) => {}
+                Err(error)
+                    if allow_legacy_rebuild
+                        && self.legacy_rebuild_targeted(&active.spec.view_id)
+                        && velorix_runtime::is_legacy_single_key_group_counts_missing(
+                            &error.to_string(),
+                        ) =>
+                {
+                    migrate_legacy_single_key_runtime(self, &active).await?;
+                    restored += 1;
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -1691,6 +1724,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         )
         .with_standing_runtime_fencing_mode(config.standing_runtime_fencing)
         .with_standing_runtime_owner_ttl_ms(config.standing_runtime_owner_ttl_ms)
+        .with_legacy_rebuild_view_id(config.legacy_rebuild_view_id)
         .with_output_compaction_interval_epochs(config.output_compaction_interval_epochs)
         .with_experimental_advanced_view_features(config.experimental_advanced_view_features);
     if let Some(token) = config.api_bearer_token {
@@ -1723,7 +1757,7 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         )?;
     }
     state
-        .restore_standing_program_runtimes_from_active_views()
+        .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
@@ -5913,7 +5947,7 @@ fn aggregate_output_schema(
         columns.push(ColumnSchema {
             name: aggregate.output_column_id.clone(),
             data_type: single_key_aggregate_output_type(catalog, aggregate)?,
-            nullable: false,
+            nullable: aggregate_output_is_nullable(&aggregate.function),
         });
     }
     let primary_key = group_keys
@@ -6746,6 +6780,13 @@ fn single_key_aggregate_output_type(
             generic_single_key_sum_count_sum_type_for_column(catalog, column_id)
         }
     }
+}
+
+fn aggregate_output_is_nullable(function: &LogicalPlanAggregateFunctionV1) -> bool {
+    !matches!(
+        function,
+        LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct
+    )
 }
 
 fn sql_type_from_catalog_column(column: &RelationColumnV1) -> Result<SqlDataType, ApiError> {
@@ -7783,13 +7824,17 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
         | MetaStoreError::PartitionAuthorityTokenScopeMismatch
         | MetaStoreError::DuplicateSourceCutRelation { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
+        | MetaStoreError::UnsupportedRelationGeneration { .. }
         | MetaStoreError::UnexpectedOutcome(_) => ApiError::bad_request(error),
         MetaStoreError::RelationCatalogConflict { .. }
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::AuthorityEpochOverflow
         | MetaStoreError::StandingRuntimeOwnerMismatch
         | MetaStoreError::PartitionAuthorityInvalidToken => ApiError::conflict(error),
-        MetaStoreError::UnsupportedCapability(_) => ApiError::service_unavailable(error),
+        MetaStoreError::UnsupportedCapability(_)
+        | MetaStoreError::IncompleteRelationSourceCut { .. } => {
+            ApiError::service_unavailable(error)
+        }
         MetaStoreError::Remote(_)
         | MetaStoreError::Oss(_)
         | MetaStoreError::Hiqlite(_)
@@ -7915,6 +7960,7 @@ struct ApiConfig {
     output_compaction_interval_epochs: u64,
     standing_runtime_fencing: StandingRuntimeFencingMode,
     standing_runtime_owner_ttl_ms: u64,
+    legacy_rebuild_view_id: Option<String>,
     experimental_advanced_view_features: bool,
     authoritative_relation_ingest: bool,
     relation_ingest_owner_id: Option<String>,
@@ -8014,6 +8060,7 @@ impl ApiConfig {
         )?;
         let standing_runtime_owner_ttl_ms =
             parse_positive_u64_env("VELORIX_STANDING_RUNTIME_OWNER_TTL_MS", 30_000)?;
+        let legacy_rebuild_view_id = optional_nonempty_env("VELORIX_LEGACY_REBUILD_VIEW_ID");
         let experimental_advanced_view_features =
             parse_bool_env("VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES", false)?;
         let authoritative_relation_ingest =
@@ -8052,6 +8099,7 @@ impl ApiConfig {
             output_compaction_interval_epochs,
             standing_runtime_fencing,
             standing_runtime_owner_ttl_ms,
+            legacy_rebuild_view_id,
             experimental_advanced_view_features,
             authoritative_relation_ingest,
             relation_ingest_owner_id,

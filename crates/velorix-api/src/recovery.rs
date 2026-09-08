@@ -6,6 +6,401 @@ pub(super) struct StandingRuntimeBackfillReplayOutcome {
     pub(super) remaining_batches: usize,
 }
 
+/// Rebuilds the one explicitly supported legacy single-key checkpoint shape
+/// from an immutable authoritative relation-wide source cut. This path is
+/// startup-only and is never used by ordinary recovery/backfill.
+pub(super) async fn migrate_legacy_single_key_runtime(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+) -> Result<(), ApiError> {
+    let identity = active_standing_runtime_identity(active).ok_or_else(|| {
+        ApiError::bad_request("legacy runtime rebuild requires a standing runtime identity")
+    })?;
+    let runtime_binding = active.runtime.as_ref().ok_or_else(|| {
+        ApiError::bad_request("legacy runtime rebuild requires a runtime binding")
+    })?;
+    if runtime_binding.runtime_kind != MATERIALIZED_VIEW_RUNTIME_NAME
+        || !matches!(
+            runtime_binding
+                .logical_plan
+                .as_ref()
+                .map(|plan| &plan.execution),
+            Some(VelorixLogicalViewExecutionV1::SingleKeySumCount { .. })
+        )
+    {
+        return Err(ApiError::bad_request(
+            "legacy runtime rebuild supports only the native single-key sum/count runtime",
+        ));
+    }
+    if runtime_binding
+        .input_bindings
+        .iter()
+        .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
+    {
+        return Err(ApiError::bad_request(
+            "legacy runtime rebuild supports direct source relations only",
+        ));
+    }
+    let Some(meta_store) = state.meta_store.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "legacy runtime rebuild requires metadata service",
+        ));
+    };
+    let Some(relation_ingest) = state.relation_ingest_config.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "legacy runtime rebuild requires authoritative relation ingest",
+        ));
+    };
+    let old_record = read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("legacy runtime rebuild checkpoint is missing"))?;
+    old_record
+        .checkpoint
+        .validate_identity(identity)
+        .map_err(ApiError::bad_request)?;
+    let source_identities = active
+        .spec
+        .input_relations
+        .iter()
+        .map(|relation| IngestSourceRelationIdentityV1 {
+            relation_id: relation.relation_id.clone(),
+            relation_version: relation.relation_version.clone(),
+            relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+            schema_fingerprint: relation.schema_fingerprint.clone(),
+        })
+        .collect::<Vec<_>>();
+    let source_cuts = meta_store
+        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+            namespace: relation_ingest.namespace.clone(),
+            relations: source_identities.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    let catalogs = catalogs_for_input_bindings(state, runtime_binding).await?;
+    let (input_batches, replay_checkpoints, coverage) = legacy_rebuild_batches_and_coverage(
+        active,
+        &old_record,
+        &source_cuts,
+        relation_ingest.namespace.as_str(),
+        state,
+    )
+    .await?;
+    let runtime = build_standing_runtime_for_runtime_binding(
+        state,
+        &active.spec,
+        runtime_binding,
+        &catalogs,
+        &active.spec.input_relations,
+        &active.spec.output_relations,
+    )?
+    .ok_or_else(|| ApiError::conflict("legacy runtime rebuild raced with runtime installation"))?;
+    let shared_runtime = Arc::new(Mutex::new(runtime));
+    let lower_bound_epoch = old_record
+        .checkpoint
+        .logical_epoch
+        .checked_add(1)
+        .ok_or_else(|| ApiError::bad_request("legacy runtime rebuild epoch overflow"))?;
+    let idempotency_key = EpochIdempotencyKey::new(format!(
+        "{}:legacy-rebuild:{}",
+        active.spec.view_id,
+        stable_bytes_hash(old_record.checkpoint_key.as_bytes())
+    ))
+    .map_err(ApiError::bad_request)?;
+    let _owner = state
+        .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("legacy runtime rebuild requires owner fencing")
+        })?;
+    let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
+        Arc::clone(&shared_runtime),
+        lower_bound_epoch,
+        idempotency_key,
+        input_batches,
+        StandingRuntimeBudgetLimits::from_state(state),
+    )
+    .await?;
+    if apply_result.checkpoint.logical_epoch <= old_record.checkpoint.logical_epoch {
+        return Err(ApiError::bad_request(
+            "legacy runtime rebuild did not advance the checkpoint epoch",
+        ));
+    }
+    validate_legacy_rebuild_frontiers(&apply_result.checkpoint, &coverage)?;
+    let owner = state
+        .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("legacy runtime rebuild owner lease expired")
+        })?;
+    persist_standing_runtime_checkpoint(
+        state,
+        &active.spec.view_id,
+        &apply_result.checkpoint,
+        &apply_result.output_deltas,
+        StandingRuntimeCheckpointPersistContext::new(
+            Some(old_record),
+            replay_checkpoints,
+            Some(owner),
+        )
+        .with_input_coverage(coverage)
+        .replacing_replay_coverage()
+        .with_expected_relation_source_cuts(source_cuts),
+        None,
+    )
+    .await?;
+    let runtime = Arc::try_unwrap(shared_runtime)
+        .map_err(|_| ApiError::internal("legacy runtime rebuild runtime still referenced"))?
+        .into_inner()
+        .map_err(|_| ApiError::internal("legacy runtime rebuild runtime lock poisoned"))?;
+    insert_standing_runtime(state, &active.spec.view_id, runtime)
+}
+
+pub(super) fn validate_legacy_rebuild_frontiers(
+    checkpoint: &RuntimeCheckpoint,
+    coverage: &RuntimeCheckpointInputCoverageV1,
+) -> Result<(), ApiError> {
+    let expected = coverage
+        .relations
+        .iter()
+        .flat_map(|relation| {
+            relation.partitions.iter().map(|partition| {
+                (
+                    relation.relation_id.as_str(),
+                    relation.relation_version.as_str(),
+                    partition.stream_id.as_str(),
+                    partition.partition_id,
+                    partition.processed_offset_exclusive,
+                )
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let actual = checkpoint
+        .input_frontiers
+        .iter()
+        .map(|frontier| {
+            (
+                frontier.relation_id.as_str(),
+                frontier.relation_version.as_str(),
+                frontier.stream_id.as_str(),
+                frontier.partition_id,
+                frontier.committed_offset_exclusive,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if expected != actual {
+        return Err(ApiError::service_unavailable(
+            "legacy runtime rebuild checkpoint frontiers do not match the captured source cut",
+        ));
+    }
+    Ok(())
+}
+
+async fn legacy_rebuild_batches_and_coverage(
+    active: &ActiveMaterializedView,
+    old_record: &StandingRuntimeCheckpointRecord,
+    source_cuts: &[RelationIngestSourceIdentityCutV1],
+    expected_namespace: &str,
+    state: &ApiState,
+) -> Result<
+    (
+        Vec<RelationInputBatch>,
+        Vec<ReplayCheckpoint>,
+        RuntimeCheckpointInputCoverageV1,
+    ),
+    ApiError,
+> {
+    let old_coverage = old_record
+        .checkpoint
+        .input_coverage
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::bad_request("legacy runtime rebuild requires existing input coverage")
+        })?;
+    let mut expected_relations = active
+        .spec
+        .input_relations
+        .iter()
+        .map(|relation| {
+            (
+                relation.relation_id.clone(),
+                relation.relation_version.clone(),
+                relation.schema_fingerprint.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if source_cuts.len() != expected_relations.len() {
+        return Err(ApiError::service_unavailable(
+            "legacy runtime source cut does not cover every input relation",
+        ));
+    }
+    let mut input_batches = Vec::new();
+    let mut replay_checkpoints = Vec::new();
+    let mut relations = Vec::new();
+    for source in source_cuts {
+        let relation_key = (
+            source.relation.relation_id.clone(),
+            source.relation.relation_version.clone(),
+            source.relation.schema_fingerprint.clone(),
+        );
+        if !expected_relations.remove(&relation_key)
+            || source.relation.relation_generation != INGEST_SOURCE_IDENTITY_GENERATION_V1
+            || source.cut.schema_version != RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1
+            || source.cut.relation_id != source.relation.relation_id
+            || source.cut.namespace != expected_namespace
+        {
+            return Err(ApiError::service_unavailable(
+                "legacy runtime source cut identity is invalid",
+            ));
+        }
+        let mut partitions = Vec::new();
+        for partition in &source.cut.partitions {
+            if partition.base_offset_inclusive != 0 {
+                return Err(ApiError::service_unavailable(format!(
+                    "legacy runtime source history is not replayable from offset zero for {}/{} p={}",
+                    source.relation.relation_id, partition.stream_id, partition.partition_id
+                )));
+            }
+            let mut frontier = partition.base_offset_inclusive;
+            for publication in &partition.publications {
+                if publication.start_offset_inclusive != frontier
+                    || publication.end_offset_exclusive <= publication.start_offset_inclusive
+                {
+                    return Err(ApiError::service_unavailable(
+                        "legacy runtime source cut contains a gap or overlap",
+                    ));
+                }
+                let batch = validate_relation_publication_ref(
+                    state,
+                    &source.relation.relation_id,
+                    &source.relation.relation_version,
+                    &source.relation.schema_fingerprint,
+                    &partition.stream_id,
+                    partition.partition_id,
+                    publication,
+                )
+                .await?;
+                let envelope = IngestEnvelope::decode(batch.payload().clone())
+                    .map_err(ApiError::bad_request)?;
+                let header = envelope.header();
+                if header.relation_id != source.relation.relation_id
+                    || header.relation_version != source.relation.relation_version
+                    || header.schema_fingerprint != source.relation.schema_fingerprint
+                {
+                    return Err(ApiError::bad_request(
+                        "legacy runtime source publication identity mismatch",
+                    ));
+                }
+                let descriptor = batch.descriptor();
+                if descriptor.start_offset_inclusive != publication.start_offset_inclusive
+                    || descriptor.end_offset_exclusive != publication.end_offset_exclusive
+                {
+                    return Err(ApiError::bad_request(
+                        "legacy runtime source publication range mismatch",
+                    ));
+                }
+                frontier = publication.end_offset_exclusive;
+                input_batches.push(RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: source.relation.relation_id.clone(),
+                    relation_version: source.relation.relation_version.clone(),
+                    stream_id: partition.stream_id.clone(),
+                    partition_id: partition.partition_id,
+                    schema_fingerprint: source.relation.schema_fingerprint.clone(),
+                    start_offset_inclusive: publication.start_offset_inclusive,
+                    end_offset_exclusive: publication.end_offset_exclusive,
+                    event_time_watermark: header.event_time_watermark.clone(),
+                    batches: envelope.record_batches().map_err(ApiError::bad_request)?,
+                });
+            }
+            if frontier != partition.committed_offset_exclusive {
+                return Err(ApiError::service_unavailable(
+                    "legacy runtime source cut frontier is inconsistent",
+                ));
+            }
+            replay_checkpoints.push(ReplayCheckpoint::for_relation(
+                source.relation.relation_id.clone(),
+                source.relation.relation_version.clone(),
+                partition.stream_id.clone(),
+                partition.partition_id,
+                partition.committed_offset_exclusive,
+            ));
+            partitions.push(RuntimeCheckpointPartitionCoverageV1 {
+                stream_id: partition.stream_id.clone(),
+                stream_generation: 1,
+                partition_id: partition.partition_id,
+                partition_generation: 1,
+                covered_from_offset_inclusive: partition.base_offset_inclusive,
+                processed_offset_exclusive: partition.committed_offset_exclusive,
+            });
+        }
+        relations.push(RuntimeCheckpointRelationCoverageV1 {
+            relation_id: source.relation.relation_id.clone(),
+            relation_version: source.relation.relation_version.clone(),
+            relation_generation: source.relation.relation_generation,
+            schema_fingerprint: source.relation.schema_fingerprint.clone(),
+            partitions,
+        });
+    }
+    if !expected_relations.is_empty() {
+        return Err(ApiError::service_unavailable(
+            "legacy runtime source cut omitted an input relation",
+        ));
+    }
+    for frontier in &old_record.checkpoint.input_frontiers {
+        let Some(partition) = source_cuts
+            .iter()
+            .flat_map(|source| {
+                source
+                    .cut
+                    .partitions
+                    .iter()
+                    .map(move |partition| (&source.relation, partition))
+            })
+            .find(|(relation, partition)| {
+                relation.relation_id == frontier.relation_id
+                    && relation.relation_version == frontier.relation_version
+                    && partition.stream_id == frontier.stream_id
+                    && partition.partition_id == frontier.partition_id
+            })
+        else {
+            return Err(ApiError::service_unavailable(
+                "legacy runtime source cut does not cover an old checkpoint frontier",
+            ));
+        };
+        if partition.1.committed_offset_exclusive < frontier.committed_offset_exclusive {
+            return Err(ApiError::service_unavailable(
+                "legacy runtime source cut is behind an old checkpoint frontier",
+            ));
+        }
+    }
+    relations.sort_by(|left, right| left.relation_id.cmp(&right.relation_id));
+    input_batches.sort_by_key(|batch| {
+        (
+            batch.relation_id.clone(),
+            batch.stream_id.clone(),
+            batch.partition_id,
+            batch.start_offset_inclusive,
+        )
+    });
+    replay_checkpoints.sort_by_key(|checkpoint| {
+        (
+            checkpoint.relation_id.clone(),
+            checkpoint.stream_id.clone(),
+            checkpoint.partition_id,
+        )
+    });
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: old_coverage.schema_version,
+        view_generation: old_coverage.view_generation,
+        plan_hash: old_coverage.plan_hash.clone(),
+        input_catalog_epoch: old_coverage.input_catalog_epoch,
+        relations,
+    }
+    .canonicalized()
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok((input_batches, replay_checkpoints, coverage))
+}
+
 pub(super) async fn replay_committed_ingest_into_standing_runtime(
     state: &ApiState,
     active: &ActiveMaterializedView,
@@ -595,14 +990,6 @@ pub(super) async fn validate_relation_publication_ref(
     partition_id: u32,
     publication: &RelationIngestPublicationRefV1,
 ) -> Result<IngestBatch, ApiError> {
-    if publication.relation_version != relation_version
-        || publication.schema_fingerprint != schema_fingerprint
-    {
-        return Err(ApiError::bad_request(format!(
-            "authoritative relation publication `{}` has mismatched relation identity",
-            publication.request_id
-        )));
-    }
     let (_, staging_parts) = ObjectKey::parse_ingest_staging(&publication.object_key)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let expected_batch_key = ObjectKey::ingest_batch(

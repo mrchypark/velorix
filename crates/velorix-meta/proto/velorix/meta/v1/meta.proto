@@ -14,6 +14,7 @@ service VelorixMeta {
   rpc ListAuthoritativeIngestPublications(ListAuthoritativeIngestPublicationsRequest) returns (ListAuthoritativeIngestPublicationsResponse);
   rpc CaptureIngestSourceCut(CaptureIngestSourceCutRequest) returns (CaptureIngestSourceCutResponse);
   rpc CaptureRelationIngestSourceCut(CaptureRelationIngestSourceCutRequest) returns (CaptureRelationIngestSourceCutResponse);
+  rpc CaptureRelationIngestSourceCuts(CaptureRelationIngestSourceCutsRequest) returns (CaptureRelationIngestSourceCutsResponse);
   rpc BeginViewBootstrap(BeginViewBootstrapRequest) returns (BeginViewBootstrapResponse);
   rpc ReadViewBootstrap(ReadViewBootstrapRequest) returns (ReadViewBootstrapResponse);
   rpc FixViewBootstrapActivationCut(FixViewBootstrapActivationCutRequest) returns (FixViewBootstrapActivationCutResponse);
@@ -21,6 +22,7 @@ service VelorixMeta {
   rpc AcquireStandingRuntimeOwner(AcquireStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
   rpc ReadStandingRuntimeOwner(ReadStandingRuntimeOwnerRequest) returns (ReadStandingRuntimeOwnerResponse);
   rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
+  rpc PublishStandingRuntimeCheckpointGuarded(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
   rpc ReadStandingRuntimeCheckpoint(ReadStandingRuntimeCheckpointRequest) returns (ReadStandingRuntimeCheckpointResponse);
   rpc ReadViewDependencyGraphRevision(ReadViewDependencyGraphRevisionRequest) returns (ReadViewDependencyGraphRevisionResponse);
   rpc ReadPartitionAuthorityCapability(ReadPartitionAuthorityCapabilityRequest) returns (ReadPartitionAuthorityCapabilityResponse);
@@ -293,6 +295,14 @@ message CaptureRelationIngestSourceCutResponse {
   bytes source_cut_json = 1;
 }
 
+message CaptureRelationIngestSourceCutsRequest {
+  bytes request_json = 1;
+}
+
+message CaptureRelationIngestSourceCutsResponse {
+  bytes source_cuts_json = 1;
+}
+
 message AuthoritativeIngestPublication {
   ReserveIngestRangeRequest reservation = 1;
   PartitionAuthorityKey authority_key = 2;
@@ -415,6 +425,9 @@ message PublishStandingRuntimeCheckpointRequest {
   StandingRuntimeCheckpointPointer expected_previous = 1;
   StandingRuntimeCheckpointPointer candidate = 2;
   StandingRuntimeOwnerToken owner = 3;
+  // JSON keeps this additive and preserves the legacy request shape when
+  // omitted.  The metadata service validates the complete identity/ref cut.
+  bytes expected_relation_source_cuts_json = 4;
 }
 
 message PublishStandingRuntimeCheckpointResponse {

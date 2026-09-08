@@ -1681,7 +1681,7 @@ pub fn infer_single_key_sum_count_output_schema(
         columns.push(ColumnSchema {
             name: output_name,
             data_type,
-            nullable: false,
+            nullable: upper != "COUNT",
         });
     }
     if columns.len() == 1 {
@@ -2297,18 +2297,18 @@ pub fn validate_supported_view_sql(
         relation_alias,
         &projection.output_key_column_id,
     )?;
-    let predicate_expr = combine_row_predicate_exprs(
-        validate_selection_with_cte_source(
-            select,
-            cte_source.as_ref(),
-            from_source.source_selection.as_ref(),
-            catalog,
-            key_column,
-            projection.value_column,
-            relation_alias,
-        )?,
-        projection.aggregate_filter_expr.clone(),
-    );
+    // Aggregate FILTER is evaluated per aggregate after grouping. It is not a
+    // source WHERE clause: keeping it out of predicate_expr keeps groups with
+    // zero qualifying aggregate inputs observable as SQL NULL/0 rows.
+    let predicate_expr = validate_selection_with_cte_source(
+        select,
+        cte_source.as_ref(),
+        from_source.source_selection.as_ref(),
+        catalog,
+        key_column,
+        projection.value_column,
+        relation_alias,
+    )?;
     let predicates = predicate_expr
         .as_ref()
         .map(RowPredicateExpr::leaf_predicates)
@@ -2346,6 +2346,15 @@ pub fn validate_supported_view_sql(
     if group_keys.is_empty() && top_k.is_some() {
         return unsupported("global aggregate does not support Top-K clauses");
     }
+    let aggregate_filter_exprs = if let Some(shared_filter) = projection.aggregate_filter_expr {
+        projection
+            .aggregate_outputs
+            .iter()
+            .map(|output| (output.output_column_id.clone(), shared_filter.clone()))
+            .collect()
+    } else {
+        projection.aggregate_filter_exprs
+    };
     Ok(SupportedViewPlan {
         input_relation_id: catalog.relation_schema.relation_id.clone(),
         group_key_column_id: key_column.column_id.clone(),
@@ -2364,7 +2373,7 @@ pub fn validate_supported_view_sql(
         aggregate_outputs: projection.aggregate_outputs,
         predicate: predicates.first().cloned(),
         predicate_expr,
-        aggregate_filter_exprs: projection.aggregate_filter_exprs,
+        aggregate_filter_exprs,
         having,
         having_expr,
         top_k,
@@ -11698,6 +11707,23 @@ fn validate_projection<'a>(
             if aggregate.output.function == LogicalPlanAggregateFunctionV1::Avg {
                 validate_numeric_avg_column(column)?;
             }
+            if column.nullable
+                && matches!(
+                    column.physical_arrow_type,
+                    ArrowPhysicalTypeV1::Decimal128 { .. }
+                )
+                && matches!(
+                    aggregate.output.function,
+                    LogicalPlanAggregateFunctionV1::Sum
+                        | LogicalPlanAggregateFunctionV1::Avg
+                        | LogicalPlanAggregateFunctionV1::Min
+                        | LogicalPlanAggregateFunctionV1::Max
+                )
+            {
+                return unsupported(
+                    "nullable Decimal value aggregates require an explicitly supported decimal runtime",
+                );
+            }
             if value_column.is_none() {
                 value_column = Some(column);
             }
@@ -11960,7 +11986,7 @@ fn validate_aggregate_top_k(
         order_output_column_id: output_column_id,
         order_input_column_id: None,
         tie_breaker_output_column_id,
-        descending: order.options.asc != Some(true),
+        descending: order.options.asc == Some(false),
         limit: top_k_bounds.limit,
         offset: top_k_bounds.offset,
     }))

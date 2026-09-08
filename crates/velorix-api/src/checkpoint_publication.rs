@@ -8,9 +8,29 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     context: StandingRuntimeCheckpointPersistContext,
     mut timer: Option<&mut IngestTimer>,
 ) -> Result<StandingRuntimeCheckpointWriteSummary, ApiError> {
-    let checkpoint =
-        standing_runtime_checkpoint_with_authoritative_input_coverage(state, view_id, checkpoint)
-            .await?;
+    let StandingRuntimeCheckpointPersistContext {
+        previous_record,
+        replay_checkpoints_to_merge,
+        owner,
+        published_relation,
+        direct_view_inputs,
+        input_coverage,
+        replace_replay_coverage,
+        expected_relation_source_cuts,
+    } = context;
+    let checkpoint = match input_coverage {
+        Some(input_coverage) => {
+            let mut checkpoint = checkpoint.clone();
+            checkpoint.input_coverage = Some(input_coverage);
+            checkpoint
+        }
+        None => {
+            standing_runtime_checkpoint_with_authoritative_input_coverage(
+                state, view_id, checkpoint,
+            )
+            .await?
+        }
+    };
     let checkpoint = &checkpoint;
     if !checkpoint.identity.view_ids.iter().any(|id| id == view_id) {
         return Err(ApiError::bad_request(format!(
@@ -25,13 +45,6 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         &checkpoint.state_root.content_hash,
     )
     .map_err(ApiError::bad_request)?;
-    let StandingRuntimeCheckpointPersistContext {
-        previous_record,
-        replay_checkpoints_to_merge,
-        owner,
-        published_relation,
-        direct_view_inputs,
-    } = context;
     let previous_record = match previous_record {
         Some(record) => Some(record),
         None => {
@@ -116,10 +129,14 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     } else {
         expected_previous.clone()
     };
-    let replay_checkpoints = merged_standing_runtime_replay_checkpoints(
-        previous_record.as_ref(),
-        replay_checkpoints_to_merge,
-    );
+    let replay_checkpoints = if replace_replay_coverage {
+        replay_checkpoints_to_merge
+    } else {
+        merged_standing_runtime_replay_checkpoints(
+            previous_record.as_ref(),
+            replay_checkpoints_to_merge,
+        )
+    };
     let record = StandingRuntimeCheckpointRecord {
         schema_version: 1,
         record_kind: "standing_runtime_checkpoint_v1".to_string(),
@@ -168,8 +185,14 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     if state.meta_store.is_some() {
         validate_checkpoint_pointer_object_exists_for_meta_rehydration(state, &candidate).await?;
     }
-    publish_standing_runtime_checkpoint_pointer(state, expected_previous, candidate.clone(), owner)
-        .await?;
+    publish_standing_runtime_checkpoint_pointer(
+        state,
+        expected_previous,
+        candidate.clone(),
+        owner,
+        expected_relation_source_cuts,
+    )
+    .await?;
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_pointer");
     }
@@ -1331,6 +1354,7 @@ pub(super) async fn publish_standing_runtime_checkpoint_pointer(
     expected_previous: Option<StandingRuntimeCheckpointPointer>,
     candidate: StandingRuntimeCheckpointPointer,
     owner: Option<StandingRuntimeOwnerToken>,
+    expected_relation_source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
 ) -> Result<(), ApiError> {
     let Some(meta_store) = &state.meta_store else {
         return Ok(());
@@ -1344,18 +1368,29 @@ pub(super) async fn publish_standing_runtime_checkpoint_pointer(
             expected_previous,
             candidate: candidate.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: expected_relation_source_cuts.clone(),
         })
         .await
         .map_err(meta_error_to_api)?
     {
         PublishStandingRuntimeCheckpointOutcome::Published
         | PublishStandingRuntimeCheckpointOutcome::Duplicate => Ok(()),
+        PublishStandingRuntimeCheckpointOutcome::SourceCutChanged => Err(ApiError::conflict(
+            "authoritative relation source cut changed before checkpoint publication; previous checkpoint pointer was left unchanged",
+        )),
         PublishStandingRuntimeCheckpointOutcome::Conflict => {
+            if expected_relation_source_cuts.is_some() {
+                return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
+            }
             let Some(previous) = retry_expected_previous else {
                 return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
             };
             rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
-                state, &previous, candidate, owner,
+                state,
+                &previous,
+                candidate,
+                owner,
+                expected_relation_source_cuts,
             )
             .await
         }
@@ -1367,6 +1402,7 @@ pub(super) async fn rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
     previous: &StandingRuntimeCheckpointPointer,
     candidate: StandingRuntimeCheckpointPointer,
     owner: StandingRuntimeOwnerToken,
+    expected_relation_source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
 ) -> Result<(), ApiError> {
     let Some(meta_store) = &state.meta_store else {
         return Ok(());
@@ -1394,12 +1430,18 @@ pub(super) async fn rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
                     expected_previous: None,
                     candidate: previous.clone(),
                     owner: owner.clone(),
+                    expected_relation_source_cuts: None,
                 })
                 .await
                 .map_err(meta_error_to_api)?
             {
                 PublishStandingRuntimeCheckpointOutcome::Published
                 | PublishStandingRuntimeCheckpointOutcome::Duplicate => {}
+                PublishStandingRuntimeCheckpointOutcome::SourceCutChanged => {
+                    return Err(ApiError::conflict(
+                        "authoritative relation source cut changed while rehydrating the previous checkpoint pointer",
+                    ));
+                }
                 PublishStandingRuntimeCheckpointOutcome::Conflict => {
                     return Err(standing_runtime_checkpoint_publish_conflict(&candidate));
                 }
@@ -1412,12 +1454,16 @@ pub(super) async fn rehydrate_empty_meta_checkpoint_pointer_and_retry_publish(
             expected_previous: Some(previous.clone()),
             candidate: candidate.clone(),
             owner,
+            expected_relation_source_cuts,
         })
         .await
         .map_err(meta_error_to_api)?
     {
         PublishStandingRuntimeCheckpointOutcome::Published
         | PublishStandingRuntimeCheckpointOutcome::Duplicate => Ok(()),
+        PublishStandingRuntimeCheckpointOutcome::SourceCutChanged => Err(ApiError::conflict(
+            "authoritative relation source cut changed before checkpoint publication; previous checkpoint pointer was left unchanged",
+        )),
         PublishStandingRuntimeCheckpointOutcome::Conflict => {
             Err(standing_runtime_checkpoint_publish_conflict(&candidate))
         }

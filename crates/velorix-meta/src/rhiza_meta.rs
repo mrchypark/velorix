@@ -17,7 +17,8 @@ use crate::{
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     AuthoritativeIngestPublication, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
-    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
+    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest,
+    CaptureRelationIngestSourceCutsRequest, CommitIngestRangeOutcome,
     FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, InMemoryMetaStore,
     IngestRangeReservation, IngestSourceCutV1, MetaStore, MetaStoreCapabilities, MetaStoreError,
     PartitionAuthorityCapability, PartitionAuthorityKey, PartitionAuthorityToken,
@@ -26,11 +27,12 @@ use crate::{
     PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
     PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
     PublishStandingRuntimeCheckpointRequest, RelationAuthoritativeIngestPublication,
-    RelationIngestCapability, RelationIngestSourceCutV1, RelationPartitionAuthorityKey,
-    RelationPartitionAuthorityToken, ReserveAuthoritativeIngestRangeRequest,
-    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerClaim, StoreRelationCatalogOutcome,
-    VelorixRelationCatalogV1, ViewBootstrapControlV1,
+    RelationIngestCapability, RelationIngestSourceCutV1, RelationIngestSourceIdentityCutV1,
+    RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerClaim, StoreRelationCatalogOutcome, VelorixRelationCatalogV1,
+    ViewBootstrapControlV1,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 8;
@@ -323,6 +325,17 @@ impl MetaStore for RhizaKvMetaStore {
         self.read_eval(move |store| {
             let request = request.clone();
             async move { store.capture_relation_ingest_source_cut(request).await }
+        })
+        .await
+    }
+
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        self.read_eval(move |store| {
+            let request = request.clone();
+            async move { store.capture_relation_ingest_source_cuts(request).await }
         })
         .await
     }

@@ -12,19 +12,20 @@ use velorix_meta::{
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
-    CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
-    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, InMemoryMetaStore,
-    IngestRangeReservation, IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore,
-    MetaStoreCapabilities, OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken,
-    PartitionCheckpointPointer, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
-    PublishIngestReservationOutcome, PublishIngestReservationRequest,
-    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
-    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
-    PublishStandingRuntimeCheckpointRequest, RelationPartitionAuthorityKey,
-    RelationPartitionAuthorityToken, ReserveAuthoritativeIngestRangeRequest,
-    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
-    ViewBootstrapLifecycleV1, STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
+    CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
+    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, InMemoryMetaStore, IngestRangeReservation,
+    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreCapabilities,
+    OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
+    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
+    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
+    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
+    STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
 };
 
@@ -409,6 +410,132 @@ async fn relation_source_cut_uses_committed_publications_only_and_stops_at_holes
 }
 
 #[tokio::test]
+async fn relation_source_cuts_capture_all_authoritative_partitions_or_fail_on_pending_ranges() {
+    let store = InMemoryMetaStore::default();
+    let mut authorities = Vec::new();
+    for partition_id in [0, 1] {
+        let key = relation_authority_key_partition("orders", partition_id);
+        let authority = match store
+            .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+                key,
+                owner_id: format!("writer-{partition_id}"),
+                current_token: None,
+                ttl_ms: 100,
+            })
+            .await
+            .unwrap()
+        {
+            AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+            other => panic!("unexpected authority outcome: {other:?}"),
+        };
+        authorities.push(authority);
+    }
+    for (partition_id, authority) in authorities.iter().enumerate() {
+        let reservation = relation_reservation_partition(
+            partition_id as u32,
+            0,
+            10,
+            &format!("partition-{partition_id}"),
+        );
+        assert_eq!(
+            store
+                .reserve_relation_authoritative_ingest_range(
+                    ReserveRelationAuthoritativeIngestRangeRequest {
+                        reservation: reservation.clone(),
+                        authority: authority.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            ReserveIngestRangeOutcome::Reserved
+        );
+        assert_eq!(
+            store
+                .publish_relation_ingest_reservation(PublishRelationIngestReservationRequest {
+                    reservation,
+                    authority: authority.clone(),
+                    request_id: format!("publication-{partition_id}"),
+                    request_digest: format!("sha256:request-{partition_id}"),
+                    object_key: format!("objects/partition-{partition_id}"),
+                    object_digest: format!("sha256:object-{partition_id}"),
+                })
+                .await
+                .unwrap(),
+            PublishIngestReservationOutcome::Committed
+        );
+    }
+
+    let request = CaptureRelationIngestSourceCutsRequest {
+        namespace: "default".into(),
+        relations: vec![
+            IngestSourceRelationIdentityV1 {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+                relation_generation: 1,
+                schema_fingerprint: "sha256:schema".into(),
+            },
+            IngestSourceRelationIdentityV1 {
+                relation_id: "payments".into(),
+                relation_version: "v2".into(),
+                relation_generation: 1,
+                schema_fingerprint: "sha256:payments-schema".into(),
+            },
+        ],
+    };
+    let cuts = store
+        .capture_relation_ingest_source_cuts(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(cuts.len(), 2);
+    assert_eq!(cuts[0].relation.relation_version, "v1");
+    assert_eq!(cuts[0].relation.schema_fingerprint, "sha256:schema");
+    assert_eq!(cuts[0].cut.partitions.len(), 2);
+    assert_eq!(
+        cuts[0]
+            .cut
+            .partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert!(cuts[0]
+        .cut
+        .partitions
+        .iter()
+        .all(|partition| partition.publications.len() == 1));
+    assert_eq!(cuts[1].relation.relation_id, "payments");
+    assert_eq!(cuts[1].relation.relation_version, "v2");
+    assert_eq!(
+        cuts[1].relation.schema_fingerprint,
+        "sha256:payments-schema"
+    );
+    assert!(cuts[1].cut.partitions.is_empty());
+
+    let pending = relation_reservation_partition(1, 10, 20, "partition-1-pending");
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: pending,
+                    authority: authorities[1].clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    let error = store
+        .capture_relation_ingest_source_cuts(request)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        velorix_meta::MetaStoreError::IncompleteRelationSourceCut { .. }
+    ));
+}
+
+#[tokio::test]
 async fn partition_authority_is_explicitly_unsupported_by_unwired_backends() {
     let temp = TempDir::new().unwrap();
     let store = OssMetaStore::new(Arc::new(
@@ -754,6 +881,7 @@ async fn view_bootstrap_activation_cut_and_promotion_fail_closed_across_tail_rac
                 expected_previous: None,
                 candidate: first_pointer.clone(),
                 owner: owner.clone(),
+                expected_relation_source_cuts: None,
             })
             .await
             .unwrap(),
@@ -817,6 +945,7 @@ async fn view_bootstrap_activation_cut_and_promotion_fail_closed_across_tail_rac
             expected_previous: Some(first_pointer),
             candidate: covering_pointer.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -964,6 +1093,7 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
             expected_previous: None,
             candidate: first.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -972,6 +1102,7 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
             expected_previous: None,
             candidate: retry,
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -980,6 +1111,7 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
             expected_previous: None,
             candidate: conflicting_second,
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -988,6 +1120,7 @@ async fn standing_runtime_checkpoint_publish_is_linearizable_and_idempotent() {
             expected_previous: Some(first),
             candidate: second.clone(),
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1301,6 +1434,7 @@ async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previou
             expected_previous: None,
             candidate: first.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1309,6 +1443,7 @@ async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previou
             expected_previous: Some(first.clone()),
             candidate: second.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1318,6 +1453,7 @@ async fn standing_runtime_checkpoint_publish_conflicts_on_stale_expected_previou
             expected_previous: Some(first),
             candidate: third,
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1343,6 +1479,7 @@ async fn standing_runtime_checkpoint_publish_rejects_rollback_fork_and_aba() {
             expected_previous: None,
             candidate: first.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1353,6 +1490,7 @@ async fn standing_runtime_checkpoint_publish_rejects_rollback_fork_and_aba() {
             expected_previous: Some(first.clone()),
             candidate: unbound_fork,
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1364,6 +1502,7 @@ async fn standing_runtime_checkpoint_publish_rejects_rollback_fork_and_aba() {
             expected_previous: Some(first.clone()),
             candidate: second.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1373,6 +1512,7 @@ async fn standing_runtime_checkpoint_publish_rejects_rollback_fork_and_aba() {
             expected_previous: Some(second.clone()),
             candidate: first.clone(),
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1384,6 +1524,7 @@ async fn standing_runtime_checkpoint_publish_rejects_rollback_fork_and_aba() {
             expected_previous: Some(second.clone()),
             candidate: divergent,
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1420,6 +1561,7 @@ async fn standing_runtime_checkpoint_pointer_preserves_output_manifest_refs() {
             expected_previous: None,
             candidate: pointer.clone(),
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1441,6 +1583,7 @@ async fn standing_runtime_checkpoint_pointer_rejects_non_monotonic_successor() {
             expected_previous: Some(checkpoint_pointer(2, "b")),
             candidate: checkpoint_pointer(1, "a"),
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap_err();
@@ -1464,6 +1607,7 @@ async fn standing_runtime_checkpoint_same_state_requires_and_accepts_a_distinct_
                 expected_previous: None,
                 candidate: previous.clone(),
                 owner: owner.clone(),
+                expected_relation_source_cuts: None,
             })
             .await
             .unwrap(),
@@ -1475,6 +1619,7 @@ async fn standing_runtime_checkpoint_same_state_requires_and_accepts_a_distinct_
                 expected_previous: Some(previous),
                 candidate: candidate.clone(),
                 owner,
+                expected_relation_source_cuts: None,
             })
             .await
             .unwrap(),
@@ -1524,6 +1669,7 @@ async fn standing_runtime_checkpoint_pointer_preserves_validated_input_coverage(
             expected_previous: None,
             candidate: pointer.clone(),
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1559,6 +1705,7 @@ async fn standing_runtime_checkpoint_pointer_rejects_mismatched_coverage_hash() 
             expected_previous: None,
             candidate: pointer,
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1579,6 +1726,7 @@ async fn standing_runtime_checkpoint_pointer_rejects_invalid_output_manifest_ref
             expected_previous: None,
             candidate: wrong_prefix,
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1595,6 +1743,7 @@ async fn standing_runtime_checkpoint_pointer_rejects_invalid_output_manifest_ref
             expected_previous: None,
             candidate: wrong_epoch,
             owner: owner.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1611,6 +1760,7 @@ async fn standing_runtime_checkpoint_pointer_rejects_invalid_output_manifest_ref
             expected_previous: None,
             candidate: wrong_delta_epoch,
             owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .is_err());
@@ -1637,6 +1787,7 @@ async fn standing_runtime_owner_lease_conflicts_renews_and_fences_publish() {
                 owner_id: "owner-b".to_string(),
                 ..owner_a.clone()
             },
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap_err();
@@ -1645,6 +1796,7 @@ async fn standing_runtime_owner_lease_conflicts_renews_and_fences_publish() {
             expected_previous: None,
             candidate: pointer.clone(),
             owner: owner_a.clone(),
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap();
@@ -1690,6 +1842,7 @@ async fn standing_runtime_checkpoint_publish_rejects_owner_scope_mismatch() {
             expected_previous: None,
             candidate: pointer,
             owner: mismatched_owner,
+            expected_relation_source_cuts: None,
         })
         .await
         .unwrap_err();
@@ -1886,6 +2039,16 @@ fn relation_authority_key(relation_id: &str) -> RelationPartitionAuthorityKey {
     }
 }
 
+fn relation_authority_key_partition(
+    relation_id: &str,
+    partition_id: u32,
+) -> RelationPartitionAuthorityKey {
+    RelationPartitionAuthorityKey {
+        partition_id,
+        ..relation_authority_key(relation_id)
+    }
+}
+
 fn relation_reservation(start: u64, end: u64, batch: &str) -> IngestRangeReservation {
     IngestRangeReservation {
         stream_id: "orders".to_string(),
@@ -1898,6 +2061,22 @@ fn relation_reservation(start: u64, end: u64, batch: &str) -> IngestRangeReserva
         relation_version: "v1".to_string(),
         schema_fingerprint: "sha256:schema".to_string(),
         writer_epoch: 1,
+    }
+}
+
+fn relation_reservation_partition(
+    partition_id: u32,
+    start: u64,
+    end: u64,
+    batch: &str,
+) -> IngestRangeReservation {
+    IngestRangeReservation {
+        partition_id,
+        start_offset_inclusive: start,
+        end_offset_exclusive: end,
+        batch_key: format!("batches/{batch}"),
+        payload_digest: format!("sha256:{batch}"),
+        ..relation_reservation(0, 1, batch)
     }
 }
 

@@ -905,6 +905,7 @@ where
             expected_previous: None,
             candidate: checkpoint_1.clone(),
             owner: smoke_owner_token(&owner_a),
+            expected_relation_source_cuts: None,
         })
         .await?;
     if publish_1 != PublishStandingRuntimeCheckpointOutcome::Published {
@@ -934,6 +935,7 @@ where
             expected_previous: Some(checkpoint_1.clone()),
             candidate: checkpoint_2.clone(),
             owner: smoke_owner_token(&owner_a),
+            expected_relation_source_cuts: None,
         })
         .await;
     match expired_owner_publish {
@@ -971,6 +973,7 @@ where
             expected_previous: Some(checkpoint_1.clone()),
             candidate: checkpoint_2.clone(),
             owner: smoke_owner_token(&owner_b),
+            expected_relation_source_cuts: None,
         })
         .await?;
     if publish_2 != PublishStandingRuntimeCheckpointOutcome::Published {
@@ -998,6 +1001,7 @@ where
             expected_previous: Some(checkpoint_1),
             candidate: stale_checkpoint_3,
             owner: smoke_owner_token(&owner_b),
+            expected_relation_source_cuts: None,
         })
         .await?;
     if stale_expected_previous_publish != PublishStandingRuntimeCheckpointOutcome::Conflict {
@@ -1011,6 +1015,7 @@ where
             expected_previous: Some(checkpoint_2.clone()),
             candidate: checkpoint_3,
             owner: smoke_owner_token(&owner_a),
+            expected_relation_source_cuts: None,
         })
         .await;
     if stale_owner_publish.is_ok() {
