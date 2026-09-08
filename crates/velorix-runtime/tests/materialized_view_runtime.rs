@@ -23738,6 +23738,99 @@ fn edges_rows_batch(rows: &[(&str, &str, &str, i64)]) -> RecordBatch {
     .unwrap()
 }
 
+fn numeric_edges_catalog() -> VelorixRelationCatalogV1 {
+    let mut catalog = edges_catalog();
+    catalog.relation_schema.relation_id = "numeric_edges".to_string();
+    catalog.relation_schema.relation_name = "numeric_edges".to_string();
+    catalog.relation_schema.relation_version = "2026-08-28.v1".to_string();
+    catalog.relation_schema.columns = vec![
+        RelationColumnV1 {
+            column_id: "edge_id".to_string(),
+            name: "edge_id".to_string(),
+            logical_type: VelorixLogicalTypeV1::Utf8,
+            physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+            nullable: false,
+            ordinal: 0,
+            semantic_role: RelationSemanticRoleV1::PrimaryKey,
+        },
+        RelationColumnV1 {
+            column_id: "node".to_string(),
+            name: "node".to_string(),
+            logical_type: VelorixLogicalTypeV1::Int64,
+            physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+            nullable: false,
+            ordinal: 1,
+            semantic_role: RelationSemanticRoleV1::Value,
+        },
+        RelationColumnV1 {
+            column_id: "next_node".to_string(),
+            name: "next_node".to_string(),
+            logical_type: VelorixLogicalTypeV1::Int64,
+            physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+            nullable: false,
+            ordinal: 2,
+            semantic_role: RelationSemanticRoleV1::Value,
+        },
+        RelationColumnV1 {
+            column_id: "score".to_string(),
+            name: "score".to_string(),
+            logical_type: VelorixLogicalTypeV1::Int64,
+            physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+            nullable: false,
+            ordinal: 3,
+            semantic_role: RelationSemanticRoleV1::Value,
+        },
+        RelationColumnV1 {
+            column_id: "delta".to_string(),
+            name: "delta".to_string(),
+            logical_type: VelorixLogicalTypeV1::Int64,
+            physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+            nullable: false,
+            ordinal: 4,
+            semantic_role: RelationSemanticRoleV1::Weight,
+        },
+    ];
+    catalog.relation_schema.primary_key_column_ids = vec!["edge_id".to_string()];
+    catalog.relation_schema.weight_column_id = "delta".to_string();
+    catalog.datafusion_registration.name = "numeric_edges".to_string();
+    catalog.incremental_relation.relation_id = "numeric_edges".to_string();
+    let schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    catalog
+}
+
+fn numeric_edges_rows_batch(rows: &[(&str, i64, i64, i64, i64)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("edge_id", DataType::Utf8, false),
+            Field::new("node", DataType::Int64, false),
+            Field::new("next_node", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("delta", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap()
+}
+
 fn recursive_reachability_output_schema() -> RelationSchema {
     RelationSchema {
         relation_id: "reachability".to_string(),
@@ -23757,6 +23850,28 @@ fn recursive_reachability_output_schema() -> RelationSchema {
             },
         ],
         primary_key: vec!["src".to_string(), "dst".to_string()],
+    }
+}
+
+fn numeric_reachability_output_schema(view_id: &str) -> RelationSchema {
+    RelationSchema {
+        relation_id: view_id.to_string(),
+        relation_name: view_id.to_string(),
+        relation_version: "2026-08-28.v1".to_string(),
+        schema_fingerprint: "numeric-reach-v1".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "node".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "next_node".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["node".to_string(), "next_node".to_string()],
     }
 }
 
@@ -23797,6 +23912,49 @@ fn assert_reachability_page(
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
+}
+
+fn assert_numeric_reachability_page(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    view_id: &str,
+    epoch: u64,
+    expected: &[(i64, i64)],
+) {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "program-purchases".into(),
+                view_id: view_id.to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let nodes = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let next_nodes = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut actual = (0..batch.num_rows())
+        .map(|index| (nodes.value(index), next_nodes.value(index)))
+        .collect::<Vec<_>>();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "unexpected recursive output for {view_id}"
+    );
 }
 
 #[test]
@@ -23954,6 +24112,148 @@ fn recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_cl
             error.to_string().contains(fragment),
             "expected fail-closed for {fragment}, got: {error}"
         );
+    }
+}
+
+#[test]
+fn recursive_cte_literal_left_comparisons_match_column_left_after_restore_and_retract() {
+    let catalog = numeric_edges_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    type ExpectedRows = [(i64, i64)];
+    type PredicateCase<'a> = (&'a str, &'a str, &'a ExpectedRows, &'a ExpectedRows);
+    let cases: &[PredicateCase<'_>] = &[
+        (
+            "numeric_reach_gt",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where e.score > 3) select node, next_node from reach",
+            &[(1, 2), (1, 3)],
+            &[(1, 2), (1, 3)],
+        ),
+        (
+            "numeric_reach_literal_lt",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where 3 < e.score) select node, next_node from reach",
+            &[(1, 2), (1, 3)],
+            &[(1, 2), (1, 3)],
+        ),
+        (
+            "numeric_reach_lt",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where e.score < 3) select node, next_node from reach",
+            &[(1, 2)],
+            &[(1, 2)],
+        ),
+        (
+            "numeric_reach_literal_gt",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where 3 > e.score) select node, next_node from reach",
+            &[(1, 2)],
+            &[(1, 2)],
+        ),
+        (
+            "numeric_reach_gte",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where e.score >= 3) select node, next_node from reach",
+            &[(1, 2), (1, 3), (1, 4), (1, 5)],
+            &[(1, 2), (1, 3)],
+        ),
+        (
+            "numeric_reach_literal_lte",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where 3 <= e.score) select node, next_node from reach",
+            &[(1, 2), (1, 3), (1, 4), (1, 5)],
+            &[(1, 2), (1, 3)],
+        ),
+        (
+            "numeric_reach_lte",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where e.score <= 3) select node, next_node from reach",
+            &[(1, 2)],
+            &[(1, 2)],
+        ),
+        (
+            "numeric_reach_literal_gte",
+            "with recursive reach as (select e.node, e.next_node from numeric_edges e where e.node = 1 union distinct select r.node, e.next_node from reach r join numeric_edges e on r.next_node = e.node where 3 >= e.score) select node, next_node from reach",
+            &[(1, 2)],
+            &[(1, 2)],
+        ),
+    ];
+
+    // The strict and non-strict forms are intentionally different controls;
+    // the test oracle must not be derived from the buggy literal-left plan.
+    assert_ne!(cases[0].2, cases[4].2);
+
+    let mut runtimes = cases
+        .iter()
+        .map(|(view_id, sql, expected, retracted_expected)| {
+            let output_schema = numeric_reachability_output_schema(view_id);
+            let identity = standing_identity_with_view(sql, view_id);
+            let runtime = create_standing_runtime_with_sql_and_catalogs(
+                &identity,
+                std::slice::from_ref(&catalog),
+                sql,
+                std::slice::from_ref(&input_schema),
+                std::slice::from_ref(&output_schema),
+            )
+            .unwrap();
+            (*view_id, runtime, *expected, *retracted_expected)
+        })
+        .collect::<Vec<_>>();
+
+    let initial_rows = [
+        ("e1", 1, 2, 0, 1),
+        ("e2", 2, 3, 4, 1),
+        ("e3", 3, 4, 3, 1),
+        ("e4", 4, 5, 6, 1),
+    ];
+    for (view_id, runtime, expected, _) in &mut runtimes {
+        runtime
+            .apply_changes(
+                1,
+                EpochIdempotencyKey::new(format!("{view_id}-epoch-1")).unwrap(),
+                vec![relation_input(
+                    &catalog,
+                    "numeric-reach-edges",
+                    0,
+                    initial_rows.len() as u64,
+                    numeric_edges_rows_batch(&initial_rows),
+                )],
+            )
+            .unwrap();
+        assert_numeric_reachability_page(runtime.as_ref(), view_id, 1, expected);
+    }
+
+    let mut restored_runtimes = Vec::new();
+    for (view_id, runtime, expected, retracted_expected) in runtimes {
+        let checkpoint = runtime.checkpoint().unwrap();
+        let restored = restore_standing_runtime(checkpoint).unwrap();
+        assert_numeric_reachability_page(restored.as_ref(), view_id, 1, expected);
+        restored_runtimes.push((view_id, restored, expected, retracted_expected));
+    }
+
+    for (view_id, runtime, expected, retracted_expected) in &mut restored_runtimes {
+        runtime
+            .apply_changes(
+                2,
+                EpochIdempotencyKey::new(format!("{view_id}-epoch-2")).unwrap(),
+                vec![relation_input(
+                    &catalog,
+                    "numeric-reach-edges",
+                    4,
+                    5,
+                    numeric_edges_rows_batch(&[("e3", 3, 4, 3, -1)]),
+                )],
+            )
+            .unwrap();
+        assert_numeric_reachability_page(runtime.as_ref(), view_id, 2, retracted_expected);
+
+        runtime
+            .apply_changes(
+                3,
+                EpochIdempotencyKey::new(format!("{view_id}-epoch-3")).unwrap(),
+                vec![relation_input(
+                    &catalog,
+                    "numeric-reach-edges",
+                    5,
+                    6,
+                    numeric_edges_rows_batch(&[("e3", 3, 4, 3, 1)]),
+                )],
+            )
+            .unwrap();
+        assert_numeric_reachability_page(runtime.as_ref(), view_id, 3, expected);
     }
 }
 

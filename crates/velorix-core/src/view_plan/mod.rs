@@ -18534,14 +18534,15 @@ fn validate_recursive_base_predicates(
             BinaryOperator::GtEq => PredicateOp::GtEq,
             _ => return unsupported("recursive CTE WHERE clauses must use comparison predicates"),
         };
-        let (column_expr, literal_expr) = if let Some(column) =
+        let (column_expr, literal_expr, literal_on_left) = if let Some(column) =
             expression_filter_project_column(left.as_ref(), catalog, Some(alias), None)
         {
-            (Some(column), right)
+            (Some(column), right, false)
         } else {
             (
                 expression_filter_project_column(right.as_ref(), catalog, Some(alias), None),
                 left,
+                true,
             )
         };
         let Some(column) = column_expr else {
@@ -18581,11 +18582,27 @@ fn validate_recursive_base_predicates(
         };
         predicates.push(RecursiveBasePredicateV1 {
             base_column_id: column.column_id.clone(),
-            op: comparison_op,
+            op: if literal_on_left {
+                invert_recursive_predicate_operator(comparison_op)
+            } else {
+                comparison_op
+            },
             literal,
         });
     }
     Ok(predicates)
+}
+
+fn invert_recursive_predicate_operator(op: PredicateOp) -> PredicateOp {
+    match op {
+        PredicateOp::Lt => PredicateOp::Gt,
+        PredicateOp::LtEq => PredicateOp::GtEq,
+        PredicateOp::Gt => PredicateOp::Lt,
+        PredicateOp::GtEq => PredicateOp::LtEq,
+        PredicateOp::Eq => PredicateOp::Eq,
+        PredicateOp::NotEq => PredicateOp::NotEq,
+        other => other,
+    }
 }
 
 /// Phase 8.5: lowers an admitted recursive CTE to a logical view plan.

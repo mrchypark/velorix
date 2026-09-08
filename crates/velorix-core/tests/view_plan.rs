@@ -24,10 +24,11 @@ use velorix_core::{
         validate_logical_view_plan, validate_supported_analytic_row_number_sql,
         validate_supported_filter_project_sql, validate_supported_interval_join_sql,
         validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_temporal_join_sql, validate_supported_tumbling_window_sql,
-        validate_supported_view_sql, AggregateOutputPredicateExpr, BuiltinScalarFunctionV1,
-        JoinPredicateExpr, LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1,
-        LogicalPlanColumnRef, LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
+        validate_supported_recursive_cte_sql, validate_supported_temporal_join_sql,
+        validate_supported_tumbling_window_sql, validate_supported_view_sql,
+        AggregateOutputPredicateExpr, BuiltinScalarFunctionV1, JoinPredicateExpr,
+        LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
+        LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
         LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
         RuntimeScalarTypeV1, ScalarLiteralV1, SupportedAggregateInputRelationSide,
         SupportedAggregateOutputIdentity, SupportedAnalyticWindowFunction,
@@ -10685,6 +10686,33 @@ fn unsupported_join_sql_families_fail_closed_without_logical_plan_fallback() {
             .contains("three-input JOIN requires a composite primary key on every input"),
         "expected unsupported three-table join to fail closed in bounded admission for SQL `{sql}`, got `{error}`"
     );
+}
+
+#[test]
+fn recursive_base_predicates_normalize_literal_left_comparisons() {
+    let catalog = generic_adapter_catalog(scores_catalog());
+    for (operator, literal_left_operator) in [
+        ("<", ">"),
+        ("<=", ">="),
+        ("=", "="),
+        ("<>", "<>"),
+        (">", "<"),
+        (">=", "<="),
+    ] {
+        let canonical = format!(
+            "with recursive reach as (select user_id, score from scores e where e.score {operator} 5 union distinct select r.user_id, e.score from reach r join scores e on r.user_id = e.user_id where e.score {operator} 5) select user_id, score from reach"
+        );
+        let literal_left = format!(
+            "with recursive reach as (select user_id, score from scores e where 5 {literal_left_operator} e.score union distinct select r.user_id, e.score from reach r join scores e on r.user_id = e.user_id where 5 {literal_left_operator} e.score) select user_id, score from reach"
+        );
+        let canonical_plan = validate_supported_recursive_cte_sql(&canonical, &catalog).unwrap();
+        let literal_left_plan =
+            validate_supported_recursive_cte_sql(&literal_left, &catalog).unwrap();
+        assert_eq!(
+            canonical_plan, literal_left_plan,
+            "literal-left normalization mismatch for `{operator}`"
+        );
+    }
 }
 
 #[test]
