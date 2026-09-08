@@ -41,6 +41,7 @@ use velorix_core::{
     view_plan::{
         logical_view_plan_hash, lower_supported_analytic_row_number_sql_to_logical_plan,
         lower_supported_filter_project_sql_to_logical_plan,
+        lower_supported_interval_join_sql_to_logical_plan,
         lower_supported_join_view_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
         lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
         lower_supported_tumbling_window_sql_to_logical_plan_with_policy, LateRowPolicy,
@@ -22701,12 +22702,21 @@ fn assert_interval_join_page(
     epoch: u64,
     expected: &[(&str, i64, i64, &str)],
 ) {
+    assert_interval_join_page_for_view(runtime, "interval_matches", epoch, expected);
+}
+
+fn assert_interval_join_page_for_view(
+    runtime: &(dyn StandingProgramRuntime + Send),
+    view_id: &str,
+    epoch: u64,
+    expected: &[(&str, i64, i64, &str)],
+) {
     let page = runtime
         .materialized_view_page(
             ScopedViewId {
                 tenant_id: "tenant-a".into(),
                 program_id: "program-purchases".into(),
-                view_id: "interval_matches".into(),
+                view_id: view_id.to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -22750,6 +22760,103 @@ fn assert_interval_join_page(
     actual.sort();
     expected.sort();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn interval_join_equivalent_operand_rewrite_preserves_admission_and_output() {
+    let rides = interval_join_rides_catalog();
+    let vehicles = interval_join_vehicles_catalog();
+    let catalogs = vec![rides.clone(), vehicles.clone()];
+    let input_schemas = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect::<Vec<_>>();
+    let output_schema = interval_join_output_schema();
+    let canonical_sql = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time";
+    let rewritten_sql = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on v.capacity_end > r.booking_start and r.booking_end_time > v.capacity_start_time";
+    let canonical_plan =
+        lower_supported_interval_join_sql_to_logical_plan(canonical_sql, &catalogs, &output_schema)
+            .unwrap();
+    let rewritten_plan =
+        lower_supported_interval_join_sql_to_logical_plan(rewritten_sql, &catalogs, &output_schema)
+            .unwrap();
+    assert_eq!(canonical_plan.execution, rewritten_plan.execution);
+
+    let mut canonical = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(canonical_sql, "interval_matches"),
+        &catalogs,
+        canonical_sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut rewritten = create_standing_runtime_with_sql_and_catalogs(
+        &standing_identity_with_view(rewritten_sql, "interval_matches_rewritten"),
+        &catalogs,
+        rewritten_sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let inputs = vec![
+        relation_input(
+            &rides,
+            "interval-rewrite-rides",
+            0,
+            2,
+            interval_rides_rows_batch(&[("r1", 10, 20, 1), ("r2", 30, 40, 1)]),
+        ),
+        relation_input(
+            &vehicles,
+            "interval-rewrite-vehicles",
+            0,
+            3,
+            interval_vehicles_rows_batch(&[
+                ("v1", 15, 25, 1),
+                ("v2", 20, 30, 1),
+                ("v3", 50, 60, 1),
+            ]),
+        ),
+    ];
+    canonical
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("interval-rewrite-canonical").unwrap(),
+            inputs.clone(),
+        )
+        .unwrap();
+    rewritten
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("interval-rewrite-rewritten").unwrap(),
+            inputs,
+        )
+        .unwrap();
+    // The overlap predicate is strict: r1 ending at 20 does not overlap v2
+    // starting at 20.
+    let expected = [("r1", 10, 20, "v1")];
+    assert_interval_join_page_for_view(canonical.as_ref(), "interval_matches", 1, &expected);
+    assert_interval_join_page_for_view(
+        rewritten.as_ref(),
+        "interval_matches_rewritten",
+        1,
+        &expected,
+    );
+
+    let reversed_direction = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start > v.capacity_end and v.capacity_start_time > r.booking_end_time";
+    assert!(lower_supported_interval_join_sql_to_logical_plan(
+        reversed_direction,
+        &catalogs,
+        &output_schema,
+    )
+    .is_err());
+    let overlap_in_where = "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on true where r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time";
+    assert!(lower_supported_interval_join_sql_to_logical_plan(
+        overlap_in_where,
+        &catalogs,
+        &output_schema,
+    )
+    .is_err());
 }
 
 #[test]

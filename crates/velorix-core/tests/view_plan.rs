@@ -22,12 +22,12 @@ use velorix_core::{
         lower_supported_tumbling_window_sql_to_logical_plan,
         lower_supported_view_sql_to_logical_plan, supported_join_view_plan_key_pairs,
         validate_logical_view_plan, validate_supported_analytic_row_number_sql,
-        validate_supported_filter_project_sql, validate_supported_join_view_sql,
-        validate_supported_latest_by_key_sql, validate_supported_temporal_join_sql,
-        validate_supported_tumbling_window_sql, validate_supported_view_sql,
-        AggregateOutputPredicateExpr, BuiltinScalarFunctionV1, JoinPredicateExpr,
-        LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
-        LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
+        validate_supported_filter_project_sql, validate_supported_interval_join_sql,
+        validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
+        validate_supported_temporal_join_sql, validate_supported_tumbling_window_sql,
+        validate_supported_view_sql, AggregateOutputPredicateExpr, BuiltinScalarFunctionV1,
+        JoinPredicateExpr, LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1,
+        LogicalPlanColumnRef, LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
         LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
         RuntimeScalarTypeV1, ScalarLiteralV1, SupportedAggregateInputRelationSide,
         SupportedAggregateOutputIdentity, SupportedAnalyticWindowFunction,
@@ -10687,6 +10687,94 @@ fn unsupported_join_sql_families_fail_closed_without_logical_plan_fallback() {
     );
 }
 
+#[test]
+fn interval_join_accepts_equivalent_operand_and_conjunct_permutations() {
+    let catalogs = vec![
+        interval_catalog("left_intervals"),
+        interval_catalog("right_intervals"),
+    ];
+    let canonical = "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_end and l.window_end > r.window_start";
+    let rewritten = "select l.id, l.window_start from left_intervals l join right_intervals r on r.window_start < l.window_end and r.window_end > l.window_start";
+
+    let canonical_plan = validate_supported_interval_join_sql(canonical, &catalogs).unwrap();
+    let rewritten_plan = validate_supported_interval_join_sql(rewritten, &catalogs).unwrap();
+    assert_eq!(canonical_plan, rewritten_plan);
+
+    let mut suffixed_catalogs = catalogs.clone();
+    for catalog in &mut suffixed_catalogs {
+        catalog.relation_schema.columns[1].column_id = "window_start_time".to_string();
+        catalog.relation_schema.columns[1].name = "window_start_time".to_string();
+        catalog.relation_schema.columns[2].column_id = "window_end_time".to_string();
+        catalog.relation_schema.columns[2].name = "window_end_time".to_string();
+        refresh_catalog_fingerprint(catalog);
+    }
+    let suffixed = "select l.id, l.window_start_time from left_intervals l join right_intervals r on l.window_start_time < r.window_end_time and l.window_end_time > r.window_start_time";
+    let suffixed_plan = validate_supported_interval_join_sql(suffixed, &suffixed_catalogs).unwrap();
+    assert_eq!(suffixed_plan.left_start_column_id, "window_start_time");
+    assert_eq!(suffixed_plan.left_end_column_id, "window_end_time");
+}
+
+#[test]
+fn interval_join_rejects_reversed_non_overlap_predicates() {
+    let catalogs = vec![
+        interval_catalog("left_intervals"),
+        interval_catalog("right_intervals"),
+    ];
+    for sql in [
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_end < r.window_start and r.window_end < l.window_start",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start > r.window_end and r.window_start > l.window_end",
+    ] {
+        let error = validate_supported_interval_join_sql(sql, &catalogs).unwrap_err();
+        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+    }
+}
+
+#[test]
+fn interval_join_rejects_where_order_by_and_extra_conditions() {
+    let catalogs = vec![
+        interval_catalog("left_intervals"),
+        interval_catalog("right_intervals"),
+    ];
+    for sql in [
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_end and l.window_end > r.window_start where l.window_start >= 0",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_end and l.window_end > r.window_start order by l.id",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_end and l.window_end > r.window_start and l.id = r.id",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_end and l.window_end > r.window_start and l.window_start < r.window_end",
+        "select l.id, l.window_start from left_intervals l join right_intervals l on l.window_start < l.window_end and l.window_end > l.window_start",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_start and l.window_end > r.window_end",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start <= r.window_end and l.window_end > r.window_start",
+        "select l.id, l.window_start from left_intervals l join right_intervals r on l.window_start < r.window_end or l.window_end > r.window_start",
+    ] {
+        let error = validate_supported_interval_join_sql(sql, &catalogs).unwrap_err();
+        assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+    }
+}
+
+#[test]
+fn interval_join_checks_weights_against_their_own_relation() {
+    let mut left = interval_catalog("left_intervals");
+    left.relation_schema.columns[1].column_id = "left_start".to_string();
+    left.relation_schema.columns[1].name = "left_start".to_string();
+    left.relation_schema.columns[2].column_id = "left_end".to_string();
+    left.relation_schema.columns[2].name = "left_end".to_string();
+    refresh_catalog_fingerprint(&mut left);
+
+    let mut right = interval_catalog("right_intervals");
+    right.relation_schema.columns[1].column_id = "right_start".to_string();
+    right.relation_schema.columns[1].name = "right_start".to_string();
+    right.relation_schema.columns[2].column_id = "right_end".to_string();
+    right.relation_schema.columns[2].name = "right_end".to_string();
+    right.relation_schema.columns[3].column_id = "left_start".to_string();
+    right.relation_schema.columns[3].name = "left_start".to_string();
+    right.relation_schema.weight_column_id = "left_start".to_string();
+    refresh_catalog_fingerprint(&mut right);
+
+    let sql = "select l.id, l.left_start from left_intervals l join right_intervals r on l.left_start < r.right_end and l.left_end > r.right_start";
+    let plan = validate_supported_interval_join_sql(sql, &[left, right]).unwrap();
+    assert_eq!(plan.left_start_column_id, "left_start");
+    assert_eq!(plan.right_end_column_id, "right_end");
+}
+
 fn scores_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
         relation_id: "scores".to_string(),
@@ -10745,6 +10833,43 @@ fn scores_catalog() -> VelorixRelationCatalogV1 {
             adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
+}
+
+fn interval_catalog(relation_id: &str) -> VelorixRelationCatalogV1 {
+    let mut catalog = scores_catalog();
+    catalog.relation_schema.relation_id = relation_id.to_string();
+    catalog.relation_schema.relation_name = relation_id.to_string();
+    catalog.relation_schema.primary_key_column_ids = vec!["id".to_string()];
+    catalog.relation_schema.columns[0].column_id = "id".to_string();
+    catalog.relation_schema.columns[0].name = "id".to_string();
+    catalog.relation_schema.columns[1].column_id = "window_start".to_string();
+    catalog.relation_schema.columns[1].name = "window_start".to_string();
+    catalog.relation_schema.columns.insert(
+        2,
+        RelationColumnV1 {
+            column_id: "window_end".to_string(),
+            name: "window_end".to_string(),
+            logical_type: VelorixLogicalTypeV1::Int64,
+            physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+            nullable: false,
+            ordinal: 2,
+            semantic_role: RelationSemanticRoleV1::Value,
+        },
+    );
+    for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+        column.ordinal = ordinal as u32;
+    }
+    catalog.datafusion_registration.name = relation_id.to_string();
+    catalog.incremental_relation.relation_id = relation_id.to_string();
+    catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string();
+    refresh_catalog_fingerprint(&mut catalog);
+    catalog
+}
+
+fn refresh_catalog_fingerprint(catalog: &mut VelorixRelationCatalogV1) {
+    let fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.schema_fingerprint = fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = fingerprint;
 }
 
 fn scores_with_category_catalog() -> VelorixRelationCatalogV1 {
