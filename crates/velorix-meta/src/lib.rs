@@ -50,9 +50,10 @@ mod source_cut;
 mod view_bootstrap;
 
 pub use source_cut::{
-    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest, IngestSourceCutV1,
-    IngestSourcePartitionCutV1, IngestSourceRelationCutV1, IngestSourceRelationIdentityV1,
-    RelationIngestPartitionCutV1, RelationIngestPublicationRefV1, RelationIngestSourceCutV1,
+    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest,
+    CaptureRelationIngestSourceCutsRequest, IngestSourceCutV1, IngestSourcePartitionCutV1,
+    IngestSourceRelationCutV1, IngestSourceRelationIdentityV1, RelationIngestPartitionCutV1,
+    RelationIngestPublicationRefV1, RelationIngestSourceCutV1, RelationIngestSourceIdentityCutV1,
     INGEST_SOURCE_CUT_SCHEMA_VERSION_V1, INGEST_SOURCE_IDENTITY_GENERATION_V1,
     RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
 };
@@ -433,11 +434,16 @@ pub enum AcquireStandingRuntimeOwnerOutcome {
     Conflict(StandingRuntimeOwnerClaim),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PublishStandingRuntimeCheckpointRequest {
     pub expected_previous: Option<StandingRuntimeCheckpointPointer>,
     pub candidate: StandingRuntimeCheckpointPointer,
     pub owner: StandingRuntimeOwnerToken,
+    /// The complete authoritative relation-ingest source cut observed while
+    /// building `candidate`.  This is an optional guard so old callers keep
+    /// the exact pre-existing wire shape when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_relation_source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +451,10 @@ pub enum PublishStandingRuntimeCheckpointOutcome {
     Published,
     Duplicate,
     Conflict,
+    /// The requested source cut no longer describes the authoritative
+    /// relation-ingest state.  This is intentionally distinct from pointer
+    /// predecessor CAS conflict so callers can recapture and retry safely.
+    SourceCutChanged,
 }
 
 #[derive(Debug, Error)]
@@ -476,6 +486,8 @@ pub enum MetaStoreError {
     InvalidDuration { field: &'static str },
     #[error("metadata integer field `{field}` is out of range: {value}")]
     IntegerOutOfRange { field: &'static str, value: u64 },
+    #[error("relation source identity generation `{generation}` is unsupported")]
+    UnsupportedRelationGeneration { generation: u64 },
     #[error("metadata timestamp overflow")]
     TimestampOverflow,
     #[error("partition authority epoch cannot advance beyond i64::MAX")]
@@ -503,6 +515,15 @@ pub enum MetaStoreError {
     OverlappingSourceCutRange {
         stream_id: String,
         partition_id: u32,
+    },
+    #[error(
+        "relation source cut incomplete for {relation_id}/{stream_id}/p={partition_id}: {reason}"
+    )]
+    IncompleteRelationSourceCut {
+        relation_id: String,
+        stream_id: String,
+        partition_id: u32,
+        reason: &'static str,
     },
     #[error("metadata capability `{0}` is not supported by this backend")]
     UnsupportedCapability(&'static str),
@@ -635,6 +656,16 @@ pub trait MetaStore: Send + Sync + 'static {
         request.validate()?;
         Err(MetaStoreError::UnsupportedCapability(
             "relation_committed_ingest_source_cut",
+        ))
+    }
+
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_ingest_source_cuts",
         ))
     }
 
@@ -924,6 +955,13 @@ where
         &self,
     ) -> Result<RelationIngestCapability, MetaStoreError> {
         (**self).read_relation_ingest_capability().await
+    }
+
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        (**self).capture_relation_ingest_source_cuts(request).await
     }
 
     async fn capture_relation_ingest_source_cut(
@@ -1843,6 +1881,48 @@ impl MetaStore for InMemoryMetaStore {
         if current == Some(&request.candidate) {
             return Ok(PublishStandingRuntimeCheckpointOutcome::Duplicate);
         }
+
+        // Keep the source-cut check inside the same write-lock critical
+        // section as owner validation and predecessor CAS.  Rebuild the full
+        // authoritative relation-wide cuts (including publication identity
+        // and object refs), not merely partition frontiers.
+        if let Some(expected_cuts) = request.expected_relation_source_cuts.as_deref() {
+            let expected_cuts =
+                source_cut::canonicalize_relation_ingest_source_cuts(expected_cuts)?;
+            let capture_request = CaptureRelationIngestSourceCutsRequest {
+                namespace: expected_cuts[0].cut.namespace.clone(),
+                relations: expected_cuts
+                    .iter()
+                    .map(|entry| entry.relation.clone())
+                    .collect(),
+            };
+            let reservations = guard
+                .relation_ingest_reservations
+                .values()
+                .flatten()
+                .filter_map(|reservation| {
+                    guard
+                        .relation_authority_reservation_keys
+                        .get(reservation)
+                        .cloned()
+                        .map(|authority| (authority, reservation.clone()))
+                })
+                .collect::<Vec<_>>();
+            let publications = guard
+                .relation_authoritative_ingest_publications
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let actual_cuts = source_cut::build_relation_ingest_source_cuts(
+                &capture_request,
+                reservations,
+                publications,
+            )?;
+            if source_cut::canonicalize_relation_ingest_source_cuts(&actual_cuts)? != expected_cuts
+            {
+                return Ok(PublishStandingRuntimeCheckpointOutcome::SourceCutChanged);
+            }
+        }
         if current != request.expected_previous.as_ref() {
             return Ok(PublishStandingRuntimeCheckpointOutcome::Conflict);
         }
@@ -2047,6 +2127,32 @@ impl MetaStore for InMemoryMetaStore {
                 .values()
                 .cloned(),
         )
+    }
+
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        request.validate()?;
+        let guard = self.inner.read().await;
+        let reservations = guard
+            .relation_ingest_reservations
+            .values()
+            .flatten()
+            .filter_map(|reservation| {
+                guard
+                    .relation_authority_reservation_keys
+                    .get(reservation)
+                    .cloned()
+                    .map(|authority| (authority, reservation.clone()))
+            })
+            .collect::<Vec<_>>();
+        let publications = guard
+            .relation_authoritative_ingest_publications
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        source_cut::build_relation_ingest_source_cuts(&request, reservations, publications)
     }
 
     async fn reserve_relation_authoritative_ingest_range(
@@ -3220,6 +3326,66 @@ impl<S> MetaGrpcService<S> {
             )),
         }
     }
+
+    async fn publish_standing_runtime_checkpoint_rpc(
+        &self,
+        request: Request<proto::PublishStandingRuntimeCheckpointRequest>,
+        guarded: bool,
+    ) -> Result<Response<proto::PublishStandingRuntimeCheckpointResponse>, Status>
+    where
+        S: MetaStore,
+    {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        let expected_relation_source_cuts = if request.expected_relation_source_cuts_json.is_empty()
+        {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&request.expected_relation_source_cuts_json)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            )
+        };
+        if guarded && expected_relation_source_cuts.is_none() {
+            return Err(Status::invalid_argument(
+                "guarded checkpoint publication requires expected relation source cuts",
+            ));
+        }
+        if !guarded && expected_relation_source_cuts.is_some() {
+            return Err(Status::failed_precondition(
+                "guarded checkpoint publication requires the guarded RPC",
+            ));
+        }
+        let candidate = request
+            .candidate
+            .ok_or_else(|| Status::invalid_argument("candidate checkpoint pointer is required"))?;
+        let owner = request
+            .owner
+            .ok_or_else(|| Status::invalid_argument("standing runtime owner token is required"))?;
+        let expected_previous = request
+            .expected_previous
+            .map(standing_runtime_checkpoint_pointer_from_proto)
+            .transpose()
+            .map_err(meta_status)?;
+        let candidate =
+            standing_runtime_checkpoint_pointer_from_proto(candidate).map_err(meta_status)?;
+        let outcome = self
+            .store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous,
+                candidate,
+                owner: standing_runtime_owner_token_from_proto(owner),
+                expected_relation_source_cuts,
+            })
+            .await
+            .map_err(meta_status)?;
+
+        Ok(Response::new(
+            proto::PublishStandingRuntimeCheckpointResponse {
+                outcome: publish_standing_runtime_checkpoint_outcome(&outcome).to_string(),
+            },
+        ))
+    }
 }
 
 #[tonic::async_trait]
@@ -3517,6 +3683,26 @@ where
         ))
     }
 
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: Request<proto::CaptureRelationIngestSourceCutsRequest>,
+    ) -> Result<Response<proto::CaptureRelationIngestSourceCutsResponse>, Status> {
+        self.authorize(&request)?;
+        let request = serde_json::from_slice(&request.into_inner().request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let source_cuts = self
+            .store
+            .capture_relation_ingest_source_cuts(request)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(
+            proto::CaptureRelationIngestSourceCutsResponse {
+                source_cuts_json: serde_json::to_vec(&source_cuts)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            },
+        ))
+    }
+
     async fn begin_view_bootstrap(
         &self,
         request: Request<proto::BeginViewBootstrapRequest>,
@@ -3743,36 +3929,16 @@ where
         &self,
         request: Request<proto::PublishStandingRuntimeCheckpointRequest>,
     ) -> Result<Response<proto::PublishStandingRuntimeCheckpointResponse>, Status> {
-        self.authorize(&request)?;
-        let request = request.into_inner();
-        let candidate = request
-            .candidate
-            .ok_or_else(|| Status::invalid_argument("candidate checkpoint pointer is required"))?;
-        let owner = request
-            .owner
-            .ok_or_else(|| Status::invalid_argument("standing runtime owner token is required"))?;
-        let expected_previous = request
-            .expected_previous
-            .map(standing_runtime_checkpoint_pointer_from_proto)
-            .transpose()
-            .map_err(meta_status)?;
-        let candidate =
-            standing_runtime_checkpoint_pointer_from_proto(candidate).map_err(meta_status)?;
-        let outcome = self
-            .store
-            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
-                expected_previous,
-                candidate,
-                owner: standing_runtime_owner_token_from_proto(owner),
-            })
+        self.publish_standing_runtime_checkpoint_rpc(request, false)
             .await
-            .map_err(meta_status)?;
+    }
 
-        Ok(Response::new(
-            proto::PublishStandingRuntimeCheckpointResponse {
-                outcome: publish_standing_runtime_checkpoint_outcome(&outcome).to_string(),
-            },
-        ))
+    async fn publish_standing_runtime_checkpoint_guarded(
+        &self,
+        request: Request<proto::PublishStandingRuntimeCheckpointRequest>,
+    ) -> Result<Response<proto::PublishStandingRuntimeCheckpointResponse>, Status> {
+        self.publish_standing_runtime_checkpoint_rpc(request, true)
+            .await
     }
 
     async fn read_standing_runtime_checkpoint(
@@ -4581,6 +4747,7 @@ fn publish_standing_runtime_checkpoint_outcome(
         PublishStandingRuntimeCheckpointOutcome::Published => "published",
         PublishStandingRuntimeCheckpointOutcome::Duplicate => "duplicate",
         PublishStandingRuntimeCheckpointOutcome::Conflict => "conflict",
+        PublishStandingRuntimeCheckpointOutcome::SourceCutChanged => "source_cut_changed",
     }
 }
 
@@ -4697,6 +4864,7 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::InvalidBearerToken { .. }
         | MetaStoreError::InvalidDuration { .. }
         | MetaStoreError::IntegerOutOfRange { .. }
+        | MetaStoreError::UnsupportedRelationGeneration { .. }
         | MetaStoreError::TimestampOverflow
         | MetaStoreError::AuthorityEpochOverflow
         | MetaStoreError::Serialization(_)
@@ -4708,6 +4876,7 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::PartitionAuthorityInvalidToken
         | MetaStoreError::DuplicateSourceCutRelation { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
+        | MetaStoreError::IncompleteRelationSourceCut { .. }
         | MetaStoreError::UnexpectedOutcome(_) => Status::invalid_argument(error.to_string()),
         MetaStoreError::UnsupportedCapability(_) => Status::failed_precondition(error.to_string()),
         MetaStoreError::RhizaIndeterminate { .. } => Status::unknown(error.to_string()),
@@ -4724,6 +4893,7 @@ fn partition_authority_status(error: MetaStoreError) -> Status {
         MetaStoreError::EmptyField { .. }
         | MetaStoreError::InvalidDuration { .. }
         | MetaStoreError::IntegerOutOfRange { .. }
+        | MetaStoreError::UnsupportedRelationGeneration { .. }
         | MetaStoreError::Serialization(_)
         | MetaStoreError::PartitionCheckpointScopeMismatch
         | MetaStoreError::PartitionAuthorityTokenScopeMismatch => {
@@ -4744,6 +4914,7 @@ fn partition_authority_status(error: MetaStoreError) -> Status {
         | MetaStoreError::StandingRuntimeOwnerMismatch
         | MetaStoreError::DuplicateSourceCutRelation { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
+        | MetaStoreError::IncompleteRelationSourceCut { .. }
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::Remote(_)
         | MetaStoreError::Oss(_)
@@ -5841,6 +6012,60 @@ impl MetaStore for HiqliteMetaStore {
             .list_relation_authoritative_ingest_publications(&request.authority)
             .await?;
         source_cut::build_relation_ingest_source_cut(&request, publications)
+    }
+
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        request.validate()?;
+        let rows = self
+            .with_schema_repair(|| async {
+                self.client
+                    .query_consistent_map::<RelationSourceCutRow, _>(
+                        "SELECT
+                            reservations.stream_id,
+                            reservations.partition_id,
+                            reservations.start_offset_inclusive,
+                            reservations.end_offset_exclusive,
+                            reservations.batch_key,
+                            reservations.payload_digest,
+                            reservations.relation_id,
+                            reservations.relation_version,
+                            reservations.schema_fingerprint,
+                            reservations.writer_epoch,
+                            reservations.authority_namespace,
+                            reservations.authority_relation_id,
+                            reservations.committed,
+                            reservations.authoritative_request_id,
+                            reservations.object_key,
+                            reservations.object_digest,
+                            requests.request_digest,
+                            requests.outcome AS request_outcome
+                         FROM velorix_relation_ingest_reservations reservations
+                         LEFT JOIN velorix_relation_ingest_publication_requests requests
+                           ON requests.request_id = reservations.authoritative_request_id
+                         WHERE reservations.authority_namespace = $1
+                         ORDER BY reservations.relation_id, reservations.relation_version,
+                                  reservations.schema_fingerprint, reservations.stream_id,
+                                  reservations.partition_id, reservations.start_offset_inclusive,
+                                  reservations.end_offset_inclusive",
+                        vec![hiqlite::Param::from(request.namespace.clone())],
+                    )
+                    .await
+                    .map_err(hiqlite_error)
+            })
+            .await?;
+        let mut reservations = Vec::with_capacity(rows.len());
+        let mut publications = Vec::new();
+        for row in rows {
+            let (authority, reservation, publication) = row.into_source_cut_entry()?;
+            reservations.push((authority, reservation));
+            if let Some(publication) = publication {
+                publications.push(publication);
+            }
+        }
+        source_cut::build_relation_ingest_source_cuts(&request, reservations, publications)
     }
 
     async fn reserve_relation_authoritative_ingest_range(
@@ -7236,6 +7461,15 @@ impl MetaStore for HiqliteMetaStore {
         request: PublishStandingRuntimeCheckpointRequest,
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
         request.validate()?;
+        if request.expected_relation_source_cuts.is_some() {
+            // A static SQL pre-read followed by this CAS would allow a
+            // relation ingest commit to land between the two operations.  Do
+            // not claim a guarded publication guarantee until the source-cut
+            // predicate can be evaluated in the same Raft transaction.
+            return Err(MetaStoreError::UnsupportedCapability(
+                "guarded_standing_runtime_checkpoint_source_cut_publish",
+            ));
+        }
         let candidate_epoch = i64_from_u64("logical_epoch", request.candidate.logical_epoch)?;
         let candidate_output_manifest_refs_json =
             standing_runtime_output_manifest_refs_json(&request.candidate.output_manifest_refs)?;
@@ -7883,6 +8117,109 @@ struct RelationAuthoritativeIngestPublicationRow {
     request_digest: String,
     object_key: String,
     object_digest: String,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+struct RelationSourceCutRow {
+    stream_id: String,
+    partition_id: i64,
+    start_offset_inclusive: i64,
+    end_offset_exclusive: i64,
+    batch_key: String,
+    payload_digest: String,
+    relation_id: String,
+    relation_version: String,
+    schema_fingerprint: String,
+    writer_epoch: i64,
+    authority_namespace: String,
+    authority_relation_id: String,
+    committed: i64,
+    authoritative_request_id: String,
+    object_key: String,
+    object_digest: String,
+    request_digest: Option<String>,
+    request_outcome: Option<String>,
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl From<&mut hiqlite::Row<'_>> for RelationSourceCutRow {
+    fn from(row: &mut hiqlite::Row<'_>) -> Self {
+        Self {
+            stream_id: row.get("stream_id"),
+            partition_id: row.get("partition_id"),
+            start_offset_inclusive: row.get("start_offset_inclusive"),
+            end_offset_exclusive: row.get("end_offset_exclusive"),
+            batch_key: row.get("batch_key"),
+            payload_digest: row.get("payload_digest"),
+            relation_id: row.get("relation_id"),
+            relation_version: row.get("relation_version"),
+            schema_fingerprint: row.get("schema_fingerprint"),
+            writer_epoch: row.get("writer_epoch"),
+            authority_namespace: row.get("authority_namespace"),
+            authority_relation_id: row.get("authority_relation_id"),
+            committed: row.get("committed"),
+            authoritative_request_id: row.get("authoritative_request_id"),
+            object_key: row.get("object_key"),
+            object_digest: row.get("object_digest"),
+            request_digest: row.get("request_digest"),
+            request_outcome: row.get("request_outcome"),
+        }
+    }
+}
+
+#[cfg(feature = "hiqlite-backend")]
+impl RelationSourceCutRow {
+    fn into_source_cut_entry(
+        self,
+    ) -> Result<
+        (
+            RelationPartitionAuthorityKey,
+            IngestRangeReservation,
+            Option<RelationAuthoritativeIngestPublication>,
+        ),
+        MetaStoreError,
+    > {
+        let reservation = RelationIngestReservationRow {
+            stream_id: self.stream_id.clone(),
+            partition_id: self.partition_id,
+            start_offset_inclusive: self.start_offset_inclusive,
+            end_offset_exclusive: self.end_offset_exclusive,
+            batch_key: self.batch_key,
+            payload_digest: self.payload_digest,
+            relation_id: self.relation_id,
+            relation_version: self.relation_version,
+            schema_fingerprint: self.schema_fingerprint,
+            writer_epoch: self.writer_epoch,
+            authority_namespace: self.authority_namespace.clone(),
+            authority_relation_id: self.authority_relation_id.clone(),
+        }
+        .into_reservation()?;
+        let authority = RelationPartitionAuthorityKey {
+            namespace: self.authority_namespace,
+            relation_id: self.authority_relation_id,
+            stream_id: reservation.stream_id.clone(),
+            partition_id: reservation.partition_id,
+        };
+        let publication = if self.committed == 1
+            && self.request_outcome.as_deref() == Some("committed")
+        {
+            Some(RelationAuthoritativeIngestPublication {
+                reservation: reservation.clone(),
+                authority_key: authority.clone(),
+                request_id: self.authoritative_request_id,
+                request_digest: self.request_digest.ok_or_else(|| {
+                    MetaStoreError::Serialization(
+                        "committed relation ingest publication is missing request digest".into(),
+                    )
+                })?,
+                object_key: self.object_key,
+                object_digest: self.object_digest,
+            })
+        } else {
+            None
+        };
+        Ok((authority, reservation, publication))
+    }
 }
 
 #[cfg(feature = "hiqlite-backend")]
@@ -8966,6 +9303,24 @@ impl MetaStore for GrpcMetaStore {
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))
     }
 
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .capture_relation_ingest_source_cuts(
+                self.request(proto::CaptureRelationIngestSourceCutsRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.source_cuts_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
     async fn begin_view_bootstrap(
         &self,
         request: BeginViewBootstrapRequest,
@@ -9144,32 +9499,52 @@ impl MetaStore for GrpcMetaStore {
         &self,
         request: PublishStandingRuntimeCheckpointRequest,
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
-        let response = self
-            .client()
-            .publish_standing_runtime_checkpoint(
-                self.request(proto::PublishStandingRuntimeCheckpointRequest {
-                    expected_previous: request
-                        .expected_previous
-                        .map(standing_runtime_checkpoint_pointer_to_proto),
-                    candidate: Some(standing_runtime_checkpoint_pointer_to_proto(
-                        request.candidate,
-                    )),
-                    owner: Some(standing_runtime_owner_token_to_proto(request.owner)),
-                }),
-            )
-            .await
-            .map_err(|error| match error.code() {
-                tonic::Code::FailedPrecondition => MetaStoreError::UnsupportedCapability(
-                    "linearizable_standing_runtime_checkpoint_publish",
-                ),
-                _ => MetaStoreError::Remote(error.to_string()),
-            })?
-            .into_inner();
+        let guarded = request.expected_relation_source_cuts.is_some();
+        let expected_relation_source_cuts_json = request
+            .expected_relation_source_cuts
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?
+            .unwrap_or_default();
+        let request = self.request(proto::PublishStandingRuntimeCheckpointRequest {
+            expected_previous: request
+                .expected_previous
+                .map(standing_runtime_checkpoint_pointer_to_proto),
+            candidate: Some(standing_runtime_checkpoint_pointer_to_proto(
+                request.candidate,
+            )),
+            owner: Some(standing_runtime_owner_token_to_proto(request.owner)),
+            expected_relation_source_cuts_json,
+        });
+        let response = if guarded {
+            self.client()
+                .publish_standing_runtime_checkpoint_guarded(request)
+                .await
+        } else {
+            self.client()
+                .publish_standing_runtime_checkpoint(request)
+                .await
+        }
+        .map_err(|error| match error.code() {
+            tonic::Code::Unimplemented if guarded => MetaStoreError::UnsupportedCapability(
+                "guarded_standing_runtime_checkpoint_source_cut_publish",
+            ),
+            tonic::Code::FailedPrecondition if guarded => MetaStoreError::UnsupportedCapability(
+                "guarded_standing_runtime_checkpoint_source_cut_publish",
+            ),
+            tonic::Code::FailedPrecondition => MetaStoreError::UnsupportedCapability(
+                "linearizable_standing_runtime_checkpoint_publish",
+            ),
+            _ => MetaStoreError::Remote(error.to_string()),
+        })?
+        .into_inner();
 
         match response.outcome.as_str() {
             "published" => Ok(PublishStandingRuntimeCheckpointOutcome::Published),
             "duplicate" => Ok(PublishStandingRuntimeCheckpointOutcome::Duplicate),
             "conflict" => Ok(PublishStandingRuntimeCheckpointOutcome::Conflict),
+            "source_cut_changed" => Ok(PublishStandingRuntimeCheckpointOutcome::SourceCutChanged),
             other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
         }
     }
@@ -9559,6 +9934,7 @@ mod hiqlite_capability_tests {
                 owner_id: "owner-a".to_string(),
                 owner_epoch: 1,
             },
+            expected_relation_source_cuts: None,
         };
 
         assert!(matches!(

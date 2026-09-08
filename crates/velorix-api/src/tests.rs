@@ -7,17 +7,27 @@ use object_store::{
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     Result as ObjectStoreResult,
 };
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::sync::Notify;
 use tower::ServiceExt as _;
 use velorix_control::meta_admin::{
-    CaptureIngestSourceCutRequest, InMemoryMetaStore, IngestSourceRelationIdentityV1,
-    ViewBootstrapLifecycleV1,
+    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest, InMemoryMetaStore,
+    IngestSourceRelationIdentityV1, ViewBootstrapLifecycleV1,
 };
 use velorix_core::{
     delta::{DeltaKey, DeltaRecord, DeltaValue},
     relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
     standing_program::{
-        DurableStateRoot, RelationFrontier, RuntimeCheckpointStatePayload, ViewFrontier,
+        DurableStateRoot, RelationFrontier, RuntimeCheckpointInputCoverageV1,
+        RuntimeCheckpointPartitionCoverageV1, RuntimeCheckpointRelationCoverageV1,
+        RuntimeCheckpointStatePayload, ViewFrontier,
     },
 };
 use velorix_meta as meta;
@@ -11674,13 +11684,26 @@ async fn append_admitted_ingest_without_runtime_apply(
 #[derive(Clone)]
 struct DurableCapabilityMetaStore {
     inner: Arc<InMemoryMetaStore>,
+    guard_race: Option<Arc<GuardRaceHook>>,
+}
+
+struct GuardRaceHook {
+    reached: Notify,
+    release: Notify,
+    fire_once: AtomicBool,
 }
 
 impl DurableCapabilityMetaStore {
     fn new(inner: InMemoryMetaStore) -> Self {
         Self {
             inner: Arc::new(inner),
+            guard_race: None,
         }
+    }
+
+    fn with_guard_race(mut self, guard_race: Arc<GuardRaceHook>) -> Self {
+        self.guard_race = Some(guard_race);
+        self
     }
 }
 
@@ -11740,6 +11763,14 @@ impl MetaStore for DurableCapabilityMetaStore {
         &self,
         request: PublishStandingRuntimeCheckpointRequest,
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
+        if request.expected_relation_source_cuts.is_some() {
+            if let Some(guard_race) = &self.guard_race {
+                if guard_race.fire_once.swap(false, Ordering::SeqCst) {
+                    guard_race.reached.notify_one();
+                    guard_race.release.notified().await;
+                }
+            }
+        }
         self.inner
             .publish_standing_runtime_checkpoint(request)
             .await
@@ -11822,6 +11853,15 @@ impl MetaStore for DurableCapabilityMetaStore {
         request: CaptureRelationIngestSourceCutRequest,
     ) -> Result<meta::RelationIngestSourceCutV1, MetaStoreError> {
         self.inner.capture_relation_ingest_source_cut(request).await
+    }
+
+    async fn capture_relation_ingest_source_cuts(
+        &self,
+        request: CaptureRelationIngestSourceCutsRequest,
+    ) -> Result<Vec<meta::RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+        self.inner
+            .capture_relation_ingest_source_cuts(request)
+            .await
     }
 
     async fn begin_view_bootstrap(
@@ -12020,6 +12060,301 @@ async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta
     .await;
     assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
     assert_eq!(restarted_query.1["rows"], query.1["rows"]);
+}
+
+#[tokio::test]
+async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_old_objects() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let guard_race = Arc::new(GuardRaceHook {
+        reached: Notify::new(),
+        release: Notify::new(),
+        fire_once: AtomicBool::new(true),
+    });
+    let meta: Arc<dyn MetaStore> = Arc::new(
+        DurableCapabilityMetaStore::new(InMemoryMetaStore::default())
+            .with_guard_race(Arc::clone(&guard_race)),
+    );
+    let state = test_authoritative_api_state_with_store(
+        Arc::clone(&store),
+        "legacy-rebuild-owner",
+        meta.clone(),
+    )
+    .await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let view = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "legacy_rebuild_scores",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) filter (where score > 0) as sum, count(*) filter (where score > 0) as count from scores group by user_id",
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(view.0, StatusCode::CREATED, "{view:?}");
+    let ingest = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_id": "scores",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "legacy-rebuild-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+        }),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+
+    let active = state
+        .view_registry()
+        .unwrap()
+        .list_active()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.spec.view_id == "legacy_rebuild_scores")
+        .expect("legacy view should be active");
+    let identity = active_standing_runtime_identity(&active).unwrap();
+    let old_record =
+        read_latest_standing_runtime_checkpoint(&state, identity, "legacy_rebuild_scores")
+            .await
+            .unwrap()
+            .expect("ingest should publish a checkpoint");
+    let old_checkpoint_object = old_record.checkpoint_key.clone();
+    let old_state_object = old_record.checkpoint.state_root.object_key.clone();
+    let old_pointer = standing_runtime_checkpoint_pointer_from_record(&old_record);
+    let mut legacy_record = old_record.clone();
+    let mut payload: Value = serde_json::from_str(
+        &legacy_record
+            .checkpoint
+            .state_payload
+            .as_ref()
+            .expect("checkpoint read should hydrate state")
+            .payload,
+    )
+    .unwrap();
+    payload
+        .as_object_mut()
+        .expect("generic runtime payload should be an object")
+        .remove("group_input_counts");
+    payload["engine"]["logical_epoch"] = json!(2);
+    let payload = serde_json::to_string(&payload).unwrap();
+    let content_hash = stable_bytes_hash(payload.as_bytes());
+    legacy_record.checkpoint.logical_epoch += 1;
+    legacy_record.checkpoint.output_manifest_refs.clear();
+    legacy_record.previous_checkpoint = Some(old_pointer.clone());
+    legacy_record.manifest_hash.clear();
+    for frontier in &mut legacy_record.checkpoint.output_frontiers {
+        frontier.committed_epoch = legacy_record.checkpoint.logical_epoch;
+    }
+    let state_payload = legacy_record.checkpoint.state_payload.as_mut().unwrap();
+    state_payload.payload = payload;
+    legacy_record.checkpoint.state_root.content_hash = content_hash.clone();
+    legacy_record.checkpoint.state_root.object_key = "legacy-inline-state".to_string();
+    legacy_record.checkpoint_key = ObjectKey::standing_runtime_checkpoint(
+        &legacy_record.checkpoint.identity.tenant_id,
+        &legacy_record.checkpoint.identity.program_id,
+        &legacy_record.view_id,
+        legacy_record.checkpoint.logical_epoch,
+        &content_hash,
+    )
+    .unwrap()
+    .as_str()
+    .to_string();
+    let legacy_checkpoint_object = legacy_record.checkpoint_key.clone();
+    let synthetic_restore = velorix_runtime::materialized_view_runtime::restore_standing_runtime(
+        legacy_record.checkpoint.clone(),
+    )
+    .err()
+    .expect("synthetic checkpoint should require the legacy rebuild path");
+    assert!(synthetic_restore.contains("legacy_single_key_group_counts_missing"));
+    store
+        .put(
+            &Path::from(legacy_checkpoint_object.as_str()),
+            serde_json::to_vec(&legacy_record).unwrap().into(),
+        )
+        .await
+        .unwrap();
+    let owner = state
+        .acquire_standing_runtime_owner(identity, "legacy_rebuild_scores")
+        .await
+        .unwrap()
+        .expect("authoritative metadata should fence rebuild");
+    meta.publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+        expected_previous: Some(old_pointer),
+        candidate: standing_runtime_checkpoint_pointer_from_record(&legacy_record),
+        owner,
+        expected_relation_source_cuts: None,
+    })
+    .await
+    .unwrap();
+    remove_standing_runtime(&state, identity, "legacy_rebuild_scores").unwrap();
+
+    let rebuilt_state = state
+        .clone()
+        .with_legacy_rebuild_view_id(Some("legacy_rebuild_scores".to_string()));
+    let pointer_before_gate = meta
+        .read_standing_runtime_checkpoint(
+            &identity.tenant_id,
+            &identity.program_id,
+            "legacy_rebuild_scores",
+        )
+        .await
+        .unwrap();
+    let gated = rebuilt_state
+        .restore_standing_program_runtimes_from_active_views()
+        .await
+        .expect_err("ordinary restore must not invoke legacy migration");
+    assert!(gated
+        .to_string()
+        .contains("legacy_single_key_group_counts_missing"));
+    assert_eq!(
+        meta.read_standing_runtime_checkpoint(
+            &identity.tenant_id,
+            &identity.program_id,
+            "legacy_rebuild_scores",
+        )
+        .await
+        .unwrap(),
+        pointer_before_gate,
+    );
+    let wrong_target = rebuilt_state
+        .clone()
+        .with_legacy_rebuild_view_id(Some("different-view".to_string()));
+    let wrong_target_error = wrong_target
+        .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
+        .await
+        .expect_err("a non-target view must not invoke legacy migration");
+    assert!(wrong_target_error
+        .to_string()
+        .contains("legacy_single_key_group_counts_missing"));
+    let migration_state = rebuilt_state.clone();
+    let migration = tokio::spawn(async move {
+        migration_state
+            .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
+            .await
+    });
+    guard_race.reached.notified().await;
+
+    // Commit a real new source batch after the captured cut but before the
+    // guarded checkpoint publication. The migration must fail closed, leaving
+    // the legacy pointer in place; the next startup retry captures the new cut
+    // and replays both source batches.
+    let source_state = state.clone();
+    let source_request = IngestRowsRequest {
+        relation_id: "scores".to_string(),
+        relation_version: "2026-05-24.v1".to_string(),
+        stream_id: "legacy-rebuild-stream".to_string(),
+        partition_id: 0,
+        start_offset_inclusive: 1,
+        rows: vec![json!({"user_id": "bob", "score": 7, "delta": 1})],
+        event_time_watermark: None,
+    };
+    let source_catalog = read_relation_catalog(
+        &source_state,
+        &source_request.relation_id,
+        &source_request.relation_version,
+    )
+    .await
+    .unwrap();
+    let prepared =
+        prepare_ingest_batch_with_catalog(&source_state, source_request, source_catalog, None)
+            .unwrap();
+    let publisher = source_state
+        .relation_ingest_publisher(&prepared.catalog, &prepared.request)
+        .await
+        .unwrap();
+    publisher.start().await.unwrap();
+    publisher
+        .publish(
+            prepared.request.start_offset_inclusive,
+            prepared.end_offset_exclusive,
+            prepared.envelope,
+        )
+        .await
+        .unwrap();
+
+    guard_race.release.notify_one();
+    let guarded_error = migration
+        .await
+        .unwrap()
+        .expect_err("post-cut source commit must reject the guarded publication");
+    assert!(guarded_error
+        .to_string()
+        .contains("authoritative relation source cut changed"));
+    assert_eq!(
+        meta.read_standing_runtime_checkpoint(
+            &identity.tenant_id,
+            &identity.program_id,
+            "legacy_rebuild_scores",
+        )
+        .await
+        .unwrap(),
+        pointer_before_gate,
+    );
+
+    let restored = rebuilt_state
+        .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
+        .await
+        .unwrap();
+    assert_eq!(restored, 1);
+    let query = call_json(
+        &app(rebuilt_state.clone()),
+        Method::POST,
+        "/v1/views/legacy_rebuild_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            {"user_id": "alice", "sum": 10, "count": 1},
+            {"user_id": "bob", "sum": 7, "count": 1}
+        ]),
+    );
+    assert!(store
+        .get(&Path::from(old_checkpoint_object.as_str()))
+        .await
+        .is_ok());
+    assert!(store
+        .get(&Path::from(legacy_checkpoint_object.as_str()))
+        .await
+        .is_ok());
+    assert!(store
+        .get(&Path::from(old_state_object.as_str()))
+        .await
+        .is_ok());
+
+    remove_standing_runtime(&rebuilt_state, identity, "legacy_rebuild_scores").unwrap();
+    let retried = rebuilt_state
+        .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
+        .await
+        .unwrap();
+    assert_eq!(retried, 1);
+    let retried_query = call_json(
+        &app(rebuilt_state),
+        Method::POST,
+        "/v1/views/legacy_rebuild_scores/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(retried_query.0, StatusCode::OK, "{retried_query:?}");
+    assert_eq!(retried_query.1["rows"], query.1["rows"]);
 }
 
 #[tokio::test]
@@ -17061,6 +17396,46 @@ fn standing_runtime_budget_rejects_oversized_state_payload() {
 
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(error.to_string().contains("checkpoint state payload size"));
+}
+
+#[test]
+fn legacy_rebuild_frontiers_must_match_the_captured_source_cut() {
+    let checkpoint = test_runtime_checkpoint(Vec::new());
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: 1,
+        view_generation: 1,
+        plan_hash: "sha256:plan".to_string(),
+        input_catalog_epoch: 1,
+        relations: vec![RuntimeCheckpointRelationCoverageV1 {
+            relation_id: "purchases".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+            relation_generation: 1,
+            schema_fingerprint: "sha256:purchases".to_string(),
+            partitions: vec![RuntimeCheckpointPartitionCoverageV1 {
+                stream_id: "test-stream".to_string(),
+                stream_generation: 1,
+                partition_id: 0,
+                partition_generation: 1,
+                covered_from_offset_inclusive: 0,
+                processed_offset_exclusive: 11,
+            }],
+        }],
+    };
+    validate_legacy_rebuild_frontiers(&checkpoint, &coverage).unwrap();
+
+    let mut mismatched = checkpoint.clone();
+    mismatched.input_frontiers[0].committed_offset_exclusive = 10;
+    let error = validate_legacy_rebuild_frontiers(&mismatched, &coverage).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("do not match the captured source cut"));
+
+    let mut missing = coverage;
+    missing.relations[0].partitions.clear();
+    let error = validate_legacy_rebuild_frontiers(&checkpoint, &missing).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("do not match the captured source cut"));
 }
 
 #[tokio::test]

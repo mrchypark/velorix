@@ -256,6 +256,7 @@ async fn rhiza_three_node_kv_meta_quorum_loss_and_empty_directory_recovery() {
                 expected_previous: None,
                 candidate: pointer.clone(),
                 owner: owner.clone(),
+                expected_relation_source_cuts: None,
             })
             .await
             .expect("checkpoint CAS"),
@@ -314,6 +315,7 @@ async fn rhiza_three_node_kv_meta_quorum_loss_and_empty_directory_recovery() {
                 expected_previous: Some(pointer.clone()),
                 candidate: candidate8.clone(),
                 owner: second.clone(),
+                expected_relation_source_cuts: None,
             }),
         nodes[1]
             .store
@@ -323,6 +325,7 @@ async fn rhiza_three_node_kv_meta_quorum_loss_and_empty_directory_recovery() {
                 expected_previous: Some(pointer.clone()),
                 candidate: candidate9.clone(),
                 owner: second.clone(),
+                expected_relation_source_cuts: None,
             })
     );
     let outcomes = [

@@ -38,8 +38,51 @@ version `1`, runtime kind `single_key_sum_count`) contains:
 
 The restore path must not default a missing `group_input_counts` field to an
 empty state. A checkpoint from before this state existed requires a deliberate
-replay or rebuild of the affected view; there is no claimed seamless legacy
-restore or migration procedure here.
+replay or rebuild of the affected view; it is not a seamless legacy restore.
+
+An explicit, startup-only rebuild path now exists for the one supported legacy
+shape. It is enabled only when `VELORIX_LEGACY_REBUILD_VIEW_ID` exactly names
+the affected view; ordinary restore calls and ingest-triggered runtime
+initialization leave it disabled. The path is fail-closed unless all of these
+conditions hold:
+
+- the checkpoint has already passed identity, current-plan, and schema
+  validation and failed specifically with the known missing-group-counts
+  classifier;
+- the binding is the native materialized `SingleKeySumCount` runtime over
+  direct source relations (published-view inputs and other runtime families
+  are rejected);
+- metadata returns one atomic relation-wide source cut for every input
+  relation in the configured namespace, with generation/schema identity
+  intact, contiguous publications, no retention gap, and coverage from offset
+  zero through every old frontier;
+- every staged publication is revalidated against its immutable envelope and
+  digest before a fresh empty runtime replays it; the captured cut is reused
+  unchanged for the replacement coverage;
+- the existing runtime-owner lease is acquired/renewed and the new checkpoint
+  is published with the old pointer as its strict CAS predecessor.
+
+The old checkpoint and all staged objects are retained. A source-cut,
+replay, lease, frontier, or pointer-CAS failure leaves the old authoritative
+pointer unchanged and does not silently fall back to ordinary replay. The
+guarded publication now carries the complete captured cuts into the metadata
+CAS transaction. A source-cut change returns a distinct fail-closed error; a
+generic predecessor conflict on a guarded migration does not invoke pointer
+rehydration or write an intermediate predecessor record. If the predecessor is
+missing or changed, migration remains manual/fail-closed. The local API proof
+covers the exact captured-cut/frontier guard and an authoritative in-memory
+startup fixture that reaches the typed legacy error, rejects a source commit
+after the cut, then retries against the fresh cut while preserving old objects
+and avoiding double application. External-object-store fault injection and a
+competing-writer CAS failure remain required before this path can be treated as
+production migration evidence.
+
+The migration does not use a `LocalIngestLog` listing as a substitute for the
+authoritative relation-wide cut. Backends that cannot evaluate the guarded
+source-cut predicate atomically (including the current Hiqlite adapter) reject
+the guarded publication as unsupported; they must not silently downgrade to an
+unguarded pointer write.
+Historical shared-FILTER plan mismatches remain manual/fail-closed.
 
 The API-generated schema for generic aggregate views now marks `SUM`, `AVG`,
 `MIN`, and `MAX` outputs nullable while keeping `COUNT` and `COUNT DISTINCT`
@@ -95,9 +138,23 @@ Core unit tests (74) passed in the preceding group-liveness validation run.
 The API test does not weaken the expected
 rows or add a fallback execution path.
 
+The guarded migration continuation also passed `cargo test --workspace --quiet`
+and workspace all-target clippy with `-D warnings` on 2026-09-08. This includes
+202 API tests, 244 materialized-view runtime tests, and 348 planner tests.
+The migration race fixture publishes a real source batch after capture and
+before checkpoint publication; it verifies rejection with the old pointer
+unchanged, successful replay against the next captured cut, and idempotent retry.
+
+Additional guard regressions exercise the remote gRPC source-change outcome,
+an old-server `UNIMPLEMENTED` response with exactly one guarded RPC and no
+ordinary-publication fallback, and stale-cut rejection after a local Rhiza
+store reopen. The Rhiza test is local persistence evidence, not a three-node
+network-failure or external-object-store recovery test.
+
 Focused restore tests reject missing legacy group counts and mismatched group
 keys. Older shared-FILTER plans also differ from the normalized current plan
-and require replay/rebuild; no automatic migration is implemented.
+and require an explicit replay/rebuild; they are not covered by the targeted
+single-key migration path.
 The signed-delta regression also verifies a net-zero group with both filters
 false in positive-first and negative-first input order.
 
@@ -113,8 +170,11 @@ rejection and preserves admission for the corresponding non-nullable forms.
 
 The evidence above is local, in-memory API/runtime evidence. It does not prove
 an external object-store failure, Kubernetes replacement-pod recovery, or
-production cutover. Legacy restore rejection is tested, but a replay/rebuild
-procedure against an existing deployment is not. Nullable source aggregate
+production cutover. The replay/rebuild proof is in-memory and does not claim
+an existing deployment migration. The tested migration shape is a current
+plan-valid filtered single-key aggregate with the legacy group-count field
+removed; historical folded/shared-FILTER plans and schema-incompatible
+checkpoints remain outside it. Nullable source aggregate
 coverage beyond the tested Int64 shape, including Decimal128, remains outside
 this proof. No unverified legacy restore command or production durability claim
 is provided here.

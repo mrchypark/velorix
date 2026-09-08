@@ -1,8 +1,11 @@
 use std::{
+    convert::Infallible,
+    future::{ready, Ready},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -10,6 +13,7 @@ use object_store::memory::InMemory as InMemoryObjectStore;
 #[cfg(any(feature = "hiqlite-backend", feature = "rhiza-backend"))]
 use tempfile::TempDir;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::codegen::{http, Service};
 use tonic::{metadata::MetadataValue, transport::Server, Request};
 use velorix_core::standing_program::{
     RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
@@ -34,22 +38,67 @@ use velorix_meta::{
     validate_bearer_token, AcquireRelationPartitionAuthorityOutcome,
     AcquireRelationPartitionAuthorityRequest, AcquireStandingRuntimeOwnerOutcome,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
-    CaptureRelationIngestSourceCutRequest, CommitIngestRangeOutcome,
-    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest, GrpcMetaStore,
-    InMemoryMetaStore, IngestRangeReservation, IngestSourceRelationIdentityV1, MetaGrpcService,
-    MetaStore, OssMetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
-    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
-    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
-    PublishStandingRuntimeCheckpointOutcome, RelationPartitionAuthorityKey,
-    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
-    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
-    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
+    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, GrpcMetaStore, InMemoryMetaStore, IngestRangeReservation,
+    IngestSourceRelationIdentityV1, MetaGrpcService, MetaStore, OssMetaStore,
+    PartitionAuthorityKey, PartitionCheckpointPointer, PromoteViewBootstrapOutcome,
+    PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    RelationPartitionAuthorityKey, ReserveAuthoritativeIngestRangeRequest,
+    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
+    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 #[cfg(feature = "rhiza-backend")]
 use velorix_meta::{rhiza_kv::RhizaKvStore, rhiza_meta::RhizaKvMetaStore};
 
 mod common;
+
+/// Simulates an old metadata server: it advertises the service but has no
+/// guarded-publication method, so the client must fail closed on UNIMPLEMENTED
+/// instead of retrying through the ordinary publication RPC.
+#[derive(Clone)]
+struct LegacyMetaService {
+    guarded_calls: Arc<AtomicUsize>,
+    ordinary_calls: Arc<AtomicUsize>,
+}
+
+impl Service<http::Request<tonic::body::Body>> for LegacyMetaService {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
+        if request
+            .uri()
+            .path()
+            .ends_with("/PublishStandingRuntimeCheckpointGuarded")
+        {
+            self.guarded_calls.fetch_add(1, Ordering::SeqCst);
+        } else if request
+            .uri()
+            .path()
+            .ends_with("/PublishStandingRuntimeCheckpoint")
+        {
+            self.ordinary_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        ready(Ok(http::Response::builder()
+            .status(http::StatusCode::OK)
+            .header("content-type", "application/grpc")
+            .header("grpc-status", "12")
+            .body(tonic::body::Body::empty())
+            .expect("legacy gRPC status response")))
+    }
+}
+
+impl tonic::server::NamedService for LegacyMetaService {
+    const NAME: &'static str = "velorix.meta.v1.VelorixMeta";
+}
 
 #[tokio::test]
 async fn grpc_service_exposes_meta_store_capabilities() {
@@ -142,6 +191,23 @@ async fn grpc_rhiza_backend_requires_bearer_and_executes_linearizable_store_path
             .unwrap(),
         velorix_meta::StoreRelationCatalogOutcome::Created
     );
+    let cuts = authenticated
+        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+            namespace: "default".into(),
+            relations: vec![IngestSourceRelationIdentityV1 {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+                relation_generation: 1,
+                schema_fingerprint: common::orders_relation_catalog("v1")
+                    .schema_fingerprint
+                    .to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(cuts.len(), 1);
+    assert_eq!(cuts[0].relation.relation_id, "orders");
+    assert!(cuts[0].cut.partitions.is_empty());
 }
 
 #[cfg(feature = "rhiza-backend")]
@@ -709,6 +775,7 @@ async fn grpc_meta_store_reserves_commits_and_captures_ingest_source_cut() {
                 expected_previous: None,
                 candidate: pointer.clone(),
                 owner: owner.clone(),
+                expected_relation_source_cuts: None,
             },
         )
         .await
@@ -799,6 +866,7 @@ async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
                 expected_previous: None,
                 candidate: pointer.clone(),
                 owner: owner.clone(),
+                expected_relation_source_cuts: None,
             },
         )
         .await
@@ -812,6 +880,7 @@ async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
                 expected_previous: Some(pointer),
                 candidate: successor.clone(),
                 owner,
+                expected_relation_source_cuts: None,
             },
         )
         .await
@@ -830,6 +899,212 @@ async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
 }
 
 #[tokio::test]
+async fn grpc_guarded_checkpoint_preserves_source_changed_outcome_and_pointer() {
+    let backend = InMemoryMetaStore::default();
+    let endpoint = spawn_meta_service_for(backend.clone()).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let authority_key = RelationPartitionAuthorityKey {
+        namespace: "default".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders".into(),
+        partition_id: 0,
+    };
+    let authority = match store
+        .acquire_relation_partition_authority(
+            velorix_meta::AcquireRelationPartitionAuthorityRequest {
+                key: authority_key,
+                owner_id: "writer".into(),
+                current_token: None,
+                ttl_ms: 30_000,
+            },
+        )
+        .await
+        .unwrap()
+    {
+        velorix_meta::AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected authority outcome: {other:?}"),
+    };
+    let identity = IngestSourceRelationIdentityV1 {
+        relation_id: "orders".into(),
+        relation_version: "v1".into(),
+        relation_generation: 1,
+        schema_fingerprint: "sha256:schema".into(),
+    };
+    let publish = |store: &GrpcMetaStore,
+                   authority: &velorix_meta::RelationPartitionAuthorityToken,
+                   start: u64,
+                   end: u64,
+                   id: &str| {
+        let store = store.clone();
+        let authority = authority.clone();
+        let id = id.to_string();
+        async move {
+            let reservation = IngestRangeReservation {
+                stream_id: "orders".into(),
+                partition_id: 0,
+                start_offset_inclusive: start,
+                end_offset_exclusive: end,
+                batch_key: format!("batch-{id}"),
+                payload_digest: format!("sha256:payload-{id}"),
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+                schema_fingerprint: "sha256:schema".into(),
+                writer_epoch: 1,
+            };
+            assert_eq!(
+                store
+                    .reserve_relation_authoritative_ingest_range(
+                        ReserveRelationAuthoritativeIngestRangeRequest {
+                            reservation: reservation.clone(),
+                            authority: authority.clone(),
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                ReserveIngestRangeOutcome::Reserved
+            );
+            assert_eq!(
+                store
+                    .publish_relation_ingest_reservation(PublishRelationIngestReservationRequest {
+                        reservation,
+                        authority: authority.clone(),
+                        request_id: id.clone(),
+                        request_digest: format!("sha256:{id}"),
+                        object_key: format!("objects/{id}"),
+                        object_digest: format!("sha256:object-{id}"),
+                    })
+                    .await
+                    .unwrap(),
+                PublishIngestReservationOutcome::Committed
+            );
+        }
+    };
+    publish(&store, &authority, 0, 10, "one").await;
+    let cuts = store
+        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+            namespace: "default".into(),
+            relations: vec![identity],
+        })
+        .await
+        .unwrap();
+    let owner = match store
+        .acquire_standing_runtime_owner(owner_request("owner-a"))
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => StandingRuntimeOwnerToken {
+            tenant_id: claim.tenant_id,
+            program_id: claim.program_id,
+            view_id: claim.view_id,
+            owner_id: claim.owner_id,
+            owner_epoch: claim.owner_epoch,
+        },
+        other => panic!("unexpected owner outcome: {other:?}"),
+    };
+    let first = checkpoint_pointer(1, "a");
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(
+                velorix_meta::PublishStandingRuntimeCheckpointRequest {
+                    expected_previous: None,
+                    candidate: first.clone(),
+                    owner: owner.clone(),
+                    expected_relation_source_cuts: Some(cuts.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    publish(&store, &authority, 10, 20, "two").await;
+    let mut second = checkpoint_pointer(2, "b");
+    second.previous_checkpoint_key = first.checkpoint_key.clone();
+    second.previous_manifest_hash = first.manifest_hash.clone();
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(
+                velorix_meta::PublishStandingRuntimeCheckpointRequest {
+                    expected_previous: Some(first.clone()),
+                    candidate: second,
+                    owner,
+                    expected_relation_source_cuts: Some(cuts),
+                },
+            )
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::SourceCutChanged
+    );
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint("default", "program", "view")
+            .await
+            .unwrap(),
+        Some(first)
+    );
+}
+
+#[tokio::test]
+async fn grpc_guarded_checkpoint_fails_closed_against_legacy_server() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let guarded_calls = Arc::new(AtomicUsize::new(0));
+    let ordinary_calls = Arc::new(AtomicUsize::new(0));
+    let service = LegacyMetaService {
+        guarded_calls: Arc::clone(&guarded_calls),
+        ordinary_calls: Arc::clone(&ordinary_calls),
+    };
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(service)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let store = GrpcMetaStore::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+    let expected_relation_source_cuts = vec![velorix_meta::RelationIngestSourceIdentityCutV1 {
+        relation: IngestSourceRelationIdentityV1 {
+            relation_id: "orders".into(),
+            relation_version: "v1".into(),
+            relation_generation: 1,
+            schema_fingerprint: "sha256:schema".into(),
+        },
+        cut: velorix_meta::RelationIngestSourceCutV1 {
+            schema_version: velorix_meta::RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+            namespace: "default".into(),
+            relation_id: "orders".into(),
+            partitions: Vec::new(),
+        },
+    }];
+    let error = store
+        .publish_standing_runtime_checkpoint(
+            velorix_meta::PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: checkpoint_pointer(1, "a"),
+                owner: StandingRuntimeOwnerToken {
+                    tenant_id: "default".into(),
+                    program_id: "program".into(),
+                    view_id: "view".into(),
+                    owner_id: "owner".into(),
+                    owner_epoch: 1,
+                },
+                expected_relation_source_cuts: Some(expected_relation_source_cuts),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        velorix_meta::MetaStoreError::UnsupportedCapability(
+            "guarded_standing_runtime_checkpoint_source_cut_publish"
+        )
+    ));
+    assert_eq!(guarded_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ordinary_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn grpc_service_rejects_mismatched_standing_runtime_checkpoint_scope() {
     let service = MetaGrpcService::new(InMemoryMetaStore::default());
     let mut pointer = proto_checkpoint_pointer(1, "a");
@@ -842,6 +1117,7 @@ async fn grpc_service_rejects_mismatched_standing_runtime_checkpoint_scope() {
                 expected_previous: None,
                 candidate: Some(pointer),
                 owner: Some(owner),
+                expected_relation_source_cuts_json: Vec::new(),
             },
         ))
         .await
@@ -1240,6 +1516,89 @@ async fn grpc_relation_authority_round_trips_scope_fencing_and_publication() {
     ));
 }
 
+#[tokio::test]
+async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
+    let backend = InMemoryMetaStore::default();
+    let endpoint = spawn_meta_service_for(backend).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let key = RelationPartitionAuthorityKey {
+        namespace: "tenant-a".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+    };
+    let authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".into(),
+            current_token: None,
+            ttl_ms: 100,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        outcome => panic!("expected relation acquire, got {outcome:?}"),
+    };
+    let reservation = IngestRangeReservation {
+        stream_id: key.stream_id.clone(),
+        partition_id: key.partition_id,
+        start_offset_inclusive: 0,
+        end_offset_exclusive: 10,
+        batch_key: "batches/orders-0-10".into(),
+        payload_digest: "sha256:orders".into(),
+        relation_id: key.relation_id.clone(),
+        relation_version: "v1".into(),
+        schema_fingerprint: "sha256:schema".into(),
+        writer_epoch: 1,
+    };
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: reservation.clone(),
+                    authority: authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(PublishRelationIngestReservationRequest {
+                reservation,
+                authority,
+                request_id: "orders-publication".into(),
+                request_digest: "sha256:request".into(),
+                object_key: "objects/orders".into(),
+                object_digest: "sha256:object".into(),
+            })
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    let cuts = store
+        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+            namespace: "tenant-a".into(),
+            relations: vec![IngestSourceRelationIdentityV1 {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+                relation_generation: 1,
+                schema_fingerprint: "sha256:schema".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(cuts.len(), 1);
+    assert_eq!(cuts[0].relation.relation_version, "v1");
+    assert_eq!(cuts[0].cut.partitions.len(), 1);
+    assert_eq!(
+        cuts[0].cut.partitions[0].publications[0].object_key,
+        "objects/orders"
+    );
+}
+
 #[cfg(feature = "hiqlite-backend")]
 #[tokio::test]
 #[allow(clippy::field_reassign_with_default)]
@@ -1619,5 +1978,6 @@ fn proto_publish_checkpoint_request(
         expected_previous: None,
         candidate: Some(proto_checkpoint_pointer(epoch, hash_seed)),
         owner: Some(proto_owner_token("view", owner_id, owner_epoch)),
+        expected_relation_source_cuts_json: Vec::new(),
     }
 }

@@ -7,12 +7,15 @@ use velorix_meta::rhiza_kv_snapshot::RhizaKvSnapshot;
 use velorix_meta::rhiza_meta::RhizaKvMetaStore;
 use velorix_meta::{
     AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
+    AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    CommitIngestRangeOutcome, IngestRangeReservation, MetaStore, PartitionAuthorityKey,
-    PartitionCheckpointPointer, PublishPartitionCheckpointPointerRequest,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken,
-    StoreRelationCatalogOutcome,
+    CaptureRelationIngestSourceCutsRequest, CommitIngestRangeOutcome, IngestRangeReservation,
+    IngestSourceRelationIdentityV1, MetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
+    PublishIngestReservationOutcome, PublishPartitionCheckpointPointerRequest,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, RelationPartitionAuthorityKey,
+    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
+    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 
 mod common;
@@ -220,6 +223,7 @@ async fn native_takeover_fences_stale_owner_and_reopens_with_new_epoch() {
             expected_previous: None,
             candidate: candidate.clone(),
             owner: owner_a,
+            expected_relation_source_cuts: None,
         })
         .await;
     assert!(
@@ -242,6 +246,7 @@ async fn native_takeover_fences_stale_owner_and_reopens_with_new_epoch() {
                 expected_previous: None,
                 candidate: candidate.clone(),
                 owner: owner_b.clone(),
+                expected_relation_source_cuts: None,
             })
             .await
             .unwrap(),
@@ -262,6 +267,170 @@ async fn native_takeover_fences_stale_owner_and_reopens_with_new_epoch() {
             .await
             .unwrap(),
         Some(candidate)
+    );
+}
+
+#[tokio::test]
+async fn guarded_source_cut_publish_rejects_after_rhiza_reopen_without_pointer_change() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().display().to_string();
+    let store = RhizaKvMetaStore::open(path.clone(), "meta-source-cut")
+        .await
+        .unwrap();
+    let relation_key = RelationPartitionAuthorityKey {
+        namespace: "default".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+    };
+    let relation_authority = match store
+        .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+            key: relation_key,
+            owner_id: "writer".into(),
+            current_token: None,
+            ttl_ms: 30_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected relation authority outcome: {other:?}"),
+    };
+    let first_range = reservation();
+    assert_eq!(
+        store
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: first_range.clone(),
+                    authority: relation_authority.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        store
+            .publish_relation_ingest_reservation(PublishRelationIngestReservationRequest {
+                reservation: first_range,
+                authority: relation_authority.clone(),
+                request_id: "relation-request-1".into(),
+                request_digest: "sha256:request-1".into(),
+                object_key: "objects/relation-1".into(),
+                object_digest: "sha256:object-1".into(),
+            })
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    let cuts = store
+        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+            namespace: "default".into(),
+            relations: vec![IngestSourceRelationIdentityV1 {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+                relation_generation: 1,
+                schema_fingerprint: "sha256:schema".into(),
+            }],
+        })
+        .await
+        .unwrap();
+    let owner = match store
+        .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner".into(),
+            ttl_ms: 30_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => standing_runtime_owner_token(claim),
+        other => panic!("unexpected owner outcome: {other:?}"),
+    };
+    let first_pointer = standing_runtime_checkpoint_pointer(1, "a");
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: first_pointer.clone(),
+                owner: owner.clone(),
+                expected_relation_source_cuts: Some(cuts.clone()),
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    drop(store);
+
+    let reopened = RhizaKvMetaStore::open(path, "meta-source-cut")
+        .await
+        .unwrap();
+    let mut second_range = reservation();
+    second_range.start_offset_inclusive = 10;
+    second_range.end_offset_exclusive = 20;
+    second_range.batch_key = "orders-batch-1".into();
+    second_range.payload_digest = "sha256:payload-1".into();
+    assert_eq!(
+        reopened
+            .reserve_relation_authoritative_ingest_range(
+                ReserveRelationAuthoritativeIngestRangeRequest {
+                    reservation: second_range.clone(),
+                    authority: relation_authority,
+                },
+            )
+            .await
+            .unwrap(),
+        ReserveIngestRangeOutcome::Reserved
+    );
+    assert_eq!(
+        reopened
+            .publish_relation_ingest_reservation(PublishRelationIngestReservationRequest {
+                reservation: second_range,
+                authority: match reopened
+                    .read_relation_partition_authority(&RelationPartitionAuthorityKey {
+                        namespace: "default".into(),
+                        relation_id: "orders".into(),
+                        stream_id: "orders-stream".into(),
+                        partition_id: 0,
+                    })
+                    .await
+                    .unwrap()
+                {
+                    Some(token) => token,
+                    None => panic!("relation authority did not survive reopen"),
+                },
+                request_id: "relation-request-2".into(),
+                request_digest: "sha256:request-2".into(),
+                object_key: "objects/relation-2".into(),
+                object_digest: "sha256:object-2".into(),
+            })
+            .await
+            .unwrap(),
+        PublishIngestReservationOutcome::Committed
+    );
+    let mut second_pointer = standing_runtime_checkpoint_pointer(2, "b");
+    second_pointer.previous_checkpoint_key = first_pointer.checkpoint_key.clone();
+    second_pointer.previous_manifest_hash = first_pointer.manifest_hash.clone();
+    assert_eq!(
+        reopened
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: Some(first_pointer.clone()),
+                candidate: second_pointer,
+                owner,
+                expected_relation_source_cuts: Some(cuts),
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::SourceCutChanged
+    );
+    assert_eq!(
+        reopened
+            .read_standing_runtime_checkpoint("tenant", "program", "view")
+            .await
+            .unwrap(),
+        Some(first_pointer)
     );
 }
 

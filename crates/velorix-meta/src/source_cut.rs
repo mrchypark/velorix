@@ -15,10 +15,6 @@ pub const RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct RelationIngestPublicationRefV1 {
     pub request_id: String,
-    #[serde(default)]
-    pub relation_version: String,
-    #[serde(default)]
-    pub schema_fingerprint: String,
     pub start_offset_inclusive: u64,
     pub end_offset_exclusive: u64,
     pub batch_key: String,
@@ -46,11 +42,50 @@ pub struct RelationIngestSourceCutV1 {
     pub partitions: Vec<RelationIngestPartitionCutV1>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationIngestSourceIdentityCutV1 {
+    pub relation: IngestSourceRelationIdentityV1,
+    pub cut: RelationIngestSourceCutV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureRelationIngestSourceCutRequest {
     pub authority: RelationPartitionAuthorityKey,
     pub relation_version: String,
     pub schema_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRelationIngestSourceCutsRequest {
+    pub namespace: String,
+    pub relations: Vec<IngestSourceRelationIdentityV1>,
+}
+
+impl CaptureRelationIngestSourceCutsRequest {
+    pub(crate) fn validate(&self) -> Result<(), MetaStoreError> {
+        require_non_empty("namespace", &self.namespace)?;
+        if self.relations.is_empty() {
+            return Err(MetaStoreError::EmptyField { field: "relations" });
+        }
+        let mut seen = BTreeSet::new();
+        for relation in &self.relations {
+            relation.validate()?;
+            if relation.relation_generation != INGEST_SOURCE_IDENTITY_GENERATION_V1 {
+                return Err(MetaStoreError::UnsupportedRelationGeneration {
+                    generation: relation.relation_generation,
+                });
+            }
+            if !seen.insert(relation) {
+                return Err(MetaStoreError::DuplicateSourceCutRelation {
+                    relation_id: relation.relation_id.clone(),
+                    relation_version: relation.relation_version.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl CaptureRelationIngestSourceCutRequest {
@@ -100,8 +135,6 @@ pub(crate) fn build_relation_ingest_source_cut(
         frontier = reservation.end_offset_exclusive;
         refs.push(RelationIngestPublicationRefV1 {
             request_id: publication.request_id.clone(),
-            relation_version: reservation.relation_version.clone(),
-            schema_fingerprint: reservation.schema_fingerprint.clone(),
             start_offset_inclusive: reservation.start_offset_inclusive,
             end_offset_exclusive: reservation.end_offset_exclusive,
             batch_key: reservation.batch_key.clone(),
@@ -124,6 +157,282 @@ pub(crate) fn build_relation_ingest_source_cut(
     })
 }
 
+pub(crate) fn build_relation_ingest_source_cuts(
+    request: &CaptureRelationIngestSourceCutsRequest,
+    reservations: impl IntoIterator<Item = (RelationPartitionAuthorityKey, IngestRangeReservation)>,
+    publications: impl IntoIterator<Item = RelationAuthoritativeIngestPublication>,
+) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+    request.validate()?;
+    let requested = request.relations.iter().cloned().collect::<BTreeSet<_>>();
+    let mut grouped = BTreeMap::<
+        (IngestSourceRelationIdentityV1, String, u32),
+        Vec<(RelationPartitionAuthorityKey, IngestRangeReservation)>,
+    >::new();
+    for (authority, reservation) in reservations {
+        reservation.validate()?;
+        let requested_relation = request.relations.iter().find(|candidate| {
+            candidate.relation_id == reservation.relation_id
+                && candidate.relation_version == reservation.relation_version
+                && candidate.schema_fingerprint == reservation.schema_fingerprint
+        });
+        if requested_relation.is_none() {
+            continue;
+        }
+        if authority.namespace != request.namespace
+            || authority.relation_id != reservation.relation_id
+            || authority.stream_id != reservation.stream_id
+            || authority.partition_id != reservation.partition_id
+        {
+            return Err(MetaStoreError::IncompleteRelationSourceCut {
+                relation_id: reservation.relation_id.clone(),
+                stream_id: reservation.stream_id.clone(),
+                partition_id: reservation.partition_id,
+                reason: "reservation authority scope mismatch",
+            });
+        }
+        let relation = requested_relation.expect("checked above").clone();
+        if requested.contains(&relation) {
+            grouped
+                .entry((
+                    relation,
+                    reservation.stream_id.clone(),
+                    reservation.partition_id,
+                ))
+                .or_default()
+                .push((authority, reservation));
+        }
+    }
+
+    let mut publication_map = BTreeMap::new();
+    for publication in publications {
+        let key = relation_source_entry_key(&publication.authority_key, &publication.reservation);
+        if publication_map.insert(key, publication).is_some() {
+            return Err(MetaStoreError::Serialization(
+                "duplicate relation ingest publication in source-cut snapshot".into(),
+            ));
+        }
+    }
+
+    let mut cuts = Vec::with_capacity(request.relations.len());
+    for relation in &request.relations {
+        let mut partitions = Vec::new();
+        for ((group_relation, stream_id, partition_id), mut ranges) in grouped
+            .iter()
+            .filter(|((candidate, _, _), _)| candidate == relation)
+            .map(|(key, ranges)| (key.clone(), ranges.clone()))
+        {
+            ranges.sort_by_key(|(_, reservation)| {
+                (
+                    reservation.start_offset_inclusive,
+                    reservation.end_offset_exclusive,
+                    reservation.batch_key.clone(),
+                )
+            });
+            let Some((_, first)) = ranges.first() else {
+                continue;
+            };
+            let base_offset_inclusive = first.start_offset_inclusive;
+            let mut committed_offset_exclusive = base_offset_inclusive;
+            let mut refs = Vec::with_capacity(ranges.len());
+            for (authority, reservation) in ranges {
+                if reservation.start_offset_inclusive < committed_offset_exclusive {
+                    return Err(MetaStoreError::OverlappingSourceCutRange {
+                        stream_id: stream_id.clone(),
+                        partition_id,
+                    });
+                }
+                if reservation.start_offset_inclusive != committed_offset_exclusive {
+                    return Err(MetaStoreError::IncompleteRelationSourceCut {
+                        relation_id: group_relation.relation_id.clone(),
+                        stream_id: stream_id.clone(),
+                        partition_id,
+                        reason: "reservation hole",
+                    });
+                }
+                let key = relation_source_entry_key(&authority, &reservation);
+                let Some(publication) = publication_map.remove(&key) else {
+                    return Err(MetaStoreError::IncompleteRelationSourceCut {
+                        relation_id: group_relation.relation_id.clone(),
+                        stream_id: stream_id.clone(),
+                        partition_id,
+                        reason: "missing authoritative publication",
+                    });
+                };
+                committed_offset_exclusive = reservation.end_offset_exclusive;
+                refs.push(RelationIngestPublicationRefV1 {
+                    request_id: publication.request_id,
+                    start_offset_inclusive: reservation.start_offset_inclusive,
+                    end_offset_exclusive: reservation.end_offset_exclusive,
+                    batch_key: reservation.batch_key.clone(),
+                    payload_digest: reservation.payload_digest.clone(),
+                    object_key: publication.object_key,
+                    object_digest: publication.object_digest,
+                });
+            }
+            partitions.push(RelationIngestPartitionCutV1 {
+                stream_id,
+                partition_id,
+                base_offset_inclusive,
+                committed_offset_exclusive,
+                publications: refs,
+            });
+        }
+        cuts.push(RelationIngestSourceIdentityCutV1 {
+            relation: relation.clone(),
+            cut: RelationIngestSourceCutV1 {
+                schema_version: RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
+                namespace: request.namespace.clone(),
+                relation_id: relation.relation_id.clone(),
+                partitions,
+            },
+        });
+    }
+
+    if let Some(publication) = publication_map.values().find(|publication| {
+        publication.authority_key.namespace == request.namespace
+            && request.relations.iter().any(|relation| {
+                relation.relation_id == publication.reservation.relation_id
+                    && relation.relation_version == publication.reservation.relation_version
+                    && relation.schema_fingerprint == publication.reservation.schema_fingerprint
+            })
+    }) {
+        return Err(MetaStoreError::IncompleteRelationSourceCut {
+            relation_id: publication.reservation.relation_id.clone(),
+            stream_id: publication.reservation.stream_id.clone(),
+            partition_id: publication.reservation.partition_id,
+            reason: "publication has no matching reservation",
+        });
+    }
+
+    Ok(cuts)
+}
+
+/// Validates and canonicalizes a guarded relation source-cut snapshot.
+///
+/// The builder above emits this shape, but guarded publication also accepts
+/// snapshots arriving over the wire.  Validate the identity and every
+/// publication reference before comparing it with a freshly rebuilt snapshot;
+/// otherwise a caller could exploit alternate ordering or incomplete frontier
+/// data to bypass the source-cut precondition.
+pub(crate) fn canonicalize_relation_ingest_source_cuts(
+    cuts: &[RelationIngestSourceIdentityCutV1],
+) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
+    if cuts.is_empty() {
+        return Err(MetaStoreError::EmptyField {
+            field: "expected_relation_source_cuts",
+        });
+    }
+    let mut canonical = cuts.to_vec();
+    let namespace = canonical[0].cut.namespace.clone();
+    require_non_empty("source_cut.namespace", &namespace)?;
+    let mut seen_relations = BTreeSet::new();
+    for entry in &mut canonical {
+        entry.relation.validate()?;
+        if entry.relation.relation_generation != INGEST_SOURCE_IDENTITY_GENERATION_V1 {
+            return Err(MetaStoreError::UnsupportedRelationGeneration {
+                generation: entry.relation.relation_generation,
+            });
+        }
+        if !seen_relations.insert(entry.relation.clone()) {
+            return Err(MetaStoreError::DuplicateSourceCutRelation {
+                relation_id: entry.relation.relation_id.clone(),
+                relation_version: entry.relation.relation_version.clone(),
+            });
+        }
+        if entry.cut.schema_version != RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1 {
+            return Err(MetaStoreError::Serialization(
+                "unsupported relation source cut schema version".into(),
+            ));
+        }
+        require_non_empty("source_cut.namespace", &entry.cut.namespace)?;
+        if entry.cut.namespace != namespace || entry.cut.relation_id != entry.relation.relation_id {
+            return Err(MetaStoreError::IncompleteRelationSourceCut {
+                relation_id: entry.relation.relation_id.clone(),
+                stream_id: String::new(),
+                partition_id: 0,
+                reason: "source cut identity mismatch",
+            });
+        }
+        validate_relation_source_cut_partitions(&entry.cut)?;
+    }
+    canonical.sort_by(|left, right| left.relation.cmp(&right.relation));
+    Ok(canonical)
+}
+
+fn validate_relation_source_cut_partitions(
+    cut: &RelationIngestSourceCutV1,
+) -> Result<(), MetaStoreError> {
+    let mut previous_partition = None;
+    for partition in &cut.partitions {
+        require_non_empty("source_cut.stream_id", &partition.stream_id)?;
+        if partition.base_offset_inclusive > partition.committed_offset_exclusive {
+            return Err(MetaStoreError::Serialization(
+                "relation source cut partition offsets are not monotonic".into(),
+            ));
+        }
+        let partition_key = (&partition.stream_id, partition.partition_id);
+        if previous_partition.is_some_and(|previous| previous >= partition_key) {
+            return Err(MetaStoreError::Serialization(
+                "relation source cut partitions are not canonical".into(),
+            ));
+        }
+        previous_partition = Some(partition_key);
+        let mut frontier = partition.base_offset_inclusive;
+        for publication in &partition.publications {
+            require_non_empty("source_cut.request_id", &publication.request_id)?;
+            require_non_empty("source_cut.batch_key", &publication.batch_key)?;
+            require_non_empty("source_cut.payload_digest", &publication.payload_digest)?;
+            require_non_empty("source_cut.object_key", &publication.object_key)?;
+            require_non_empty("source_cut.object_digest", &publication.object_digest)?;
+            if publication.start_offset_inclusive != frontier
+                || publication.start_offset_inclusive >= publication.end_offset_exclusive
+            {
+                return Err(MetaStoreError::Serialization(
+                    "relation source cut publications are not contiguous".into(),
+                ));
+            }
+            frontier = publication.end_offset_exclusive;
+        }
+        if frontier != partition.committed_offset_exclusive {
+            return Err(MetaStoreError::Serialization(
+                "relation source cut frontier does not match publications".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn relation_source_entry_key(
+    authority: &RelationPartitionAuthorityKey,
+    reservation: &IngestRangeReservation,
+) -> (
+    String,
+    String,
+    String,
+    u32,
+    String,
+    String,
+    u64,
+    u64,
+    String,
+    String,
+    u64,
+) {
+    (
+        authority.namespace.clone(),
+        authority.relation_id.clone(),
+        authority.stream_id.clone(),
+        authority.partition_id,
+        reservation.relation_version.clone(),
+        reservation.schema_fingerprint.clone(),
+        reservation.start_offset_inclusive,
+        reservation.end_offset_exclusive,
+        reservation.batch_key.clone(),
+        reservation.payload_digest.clone(),
+        reservation.writer_epoch,
+    )
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngestSourceRelationIdentityV1 {
@@ -136,6 +445,167 @@ pub struct IngestSourceRelationIdentityV1 {
 
 fn default_ingest_source_identity_generation() -> u64 {
     INGEST_SOURCE_IDENTITY_GENERATION_V1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relation_identity() -> IngestSourceRelationIdentityV1 {
+        IngestSourceRelationIdentityV1 {
+            relation_id: "orders".into(),
+            relation_version: "v1".into(),
+            relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+            schema_fingerprint: "sha256:schema".into(),
+        }
+    }
+
+    fn authority(relation_id: &str) -> RelationPartitionAuthorityKey {
+        RelationPartitionAuthorityKey {
+            namespace: "default".into(),
+            relation_id: relation_id.into(),
+            stream_id: "orders-stream".into(),
+            partition_id: 0,
+        }
+    }
+
+    fn reservation() -> IngestRangeReservation {
+        IngestRangeReservation {
+            stream_id: "orders-stream".into(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 10,
+            batch_key: "batch-1".into(),
+            payload_digest: "sha256:payload".into(),
+            relation_id: "orders".into(),
+            relation_version: "v1".into(),
+            schema_fingerprint: "sha256:schema".into(),
+            writer_epoch: 1,
+        }
+    }
+
+    fn publication(
+        authority_key: RelationPartitionAuthorityKey,
+        reservation: IngestRangeReservation,
+        request_id: &str,
+    ) -> RelationAuthoritativeIngestPublication {
+        RelationAuthoritativeIngestPublication {
+            reservation,
+            authority_key,
+            request_id: request_id.into(),
+            request_digest: format!("sha256:{request_id}"),
+            object_key: format!("objects/{request_id}"),
+            object_digest: format!("sha256:object-{request_id}"),
+        }
+    }
+
+    fn request() -> CaptureRelationIngestSourceCutsRequest {
+        CaptureRelationIngestSourceCutsRequest {
+            namespace: "default".into(),
+            relations: vec![relation_identity()],
+        }
+    }
+
+    #[test]
+    fn legacy_relation_source_cut_wire_shape_decodes_without_identity_fields() {
+        let json = r#"{
+            "schema_version": 1,
+            "namespace": "default",
+            "relation_id": "orders",
+            "partitions": [{
+                "stream_id": "orders-stream",
+                "partition_id": 0,
+                "base_offset_inclusive": 0,
+                "committed_offset_exclusive": 10,
+                "publications": [{
+                    "request_id": "request-1",
+                    "start_offset_inclusive": 0,
+                    "end_offset_exclusive": 10,
+                    "batch_key": "batch-1",
+                    "payload_digest": "sha256:payload",
+                    "object_key": "objects/request-1",
+                    "object_digest": "sha256:object"
+                }]
+            }]
+        }"#;
+        let cut: RelationIngestSourceCutV1 = serde_json::from_str(json).unwrap();
+        assert_eq!(cut.partitions[0].publications[0].request_id, "request-1");
+        let encoded = serde_json::to_value(cut).unwrap();
+        let publication = &encoded["partitions"][0]["publications"][0];
+        assert!(publication.get("relation_version").is_none());
+        assert!(publication.get("schema_fingerprint").is_none());
+    }
+
+    #[test]
+    fn relation_source_cut_rejects_authority_scope_mismatch() {
+        let reservation = reservation();
+        let error = build_relation_ingest_source_cuts(
+            &request(),
+            [(authority("other"), reservation.clone())],
+            [publication(authority("other"), reservation, "request-1")],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaStoreError::IncompleteRelationSourceCut {
+                reason: "reservation authority scope mismatch",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn relation_source_cut_rejects_orphan_and_duplicate_publications() {
+        let reservation = reservation();
+        let orphan = build_relation_ingest_source_cuts(
+            &request(),
+            [],
+            [publication(
+                authority("orders"),
+                reservation.clone(),
+                "request-1",
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            orphan,
+            MetaStoreError::IncompleteRelationSourceCut {
+                reason: "publication has no matching reservation",
+                ..
+            }
+        ));
+
+        let mut mismatched_reservation = reservation.clone();
+        mismatched_reservation.payload_digest = "sha256:other-payload".into();
+        let mismatched = build_relation_ingest_source_cuts(
+            &request(),
+            [(authority("orders"), reservation.clone())],
+            [publication(
+                authority("orders"),
+                mismatched_reservation,
+                "request-mismatched",
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mismatched,
+            MetaStoreError::IncompleteRelationSourceCut {
+                reason: "missing authoritative publication",
+                ..
+            }
+        ));
+
+        let duplicate = build_relation_ingest_source_cuts(
+            &request(),
+            [(authority("orders"), reservation.clone())],
+            [
+                publication(authority("orders"), reservation.clone(), "request-1"),
+                publication(authority("orders"), reservation, "request-2"),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(duplicate, MetaStoreError::Serialization(_)));
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

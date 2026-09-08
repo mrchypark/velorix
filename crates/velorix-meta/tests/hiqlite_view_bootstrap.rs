@@ -1222,6 +1222,7 @@ async fn hiqlite_activation_cas_fences_expired_owner_pointer_change_and_concurre
                 expected_previous: None,
                 candidate: pointer_1.clone(),
                 owner: owner_a.clone(),
+                expected_relation_source_cuts: None,
             })
             .await
             .unwrap(),
@@ -1267,6 +1268,7 @@ async fn hiqlite_activation_cas_fences_expired_owner_pointer_change_and_concurre
                 expected_previous: Some(pointer_1.clone()),
                 candidate: pointer_2.clone(),
                 owner: owner_a_renewed.clone(),
+                expected_relation_source_cuts: None,
             })
             .await
             .unwrap(),

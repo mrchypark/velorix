@@ -3,7 +3,7 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct PreparedIngestBatch {
     pub(super) request: IngestRowsRequest,
-    catalog: VelorixRelationCatalogV1,
+    pub(super) catalog: VelorixRelationCatalogV1,
     record_batch: RecordBatch,
     pub(super) end_offset_exclusive: u64,
     event_time_watermark: Option<InputEventTimeWatermark>,
@@ -47,6 +47,9 @@ pub(super) struct StandingRuntimeCheckpointPersistContext {
     pub(super) owner: Option<StandingRuntimeOwnerToken>,
     pub(super) published_relation: Option<PublishedRelationBindingV1>,
     pub(super) direct_view_inputs: Vec<StandingRuntimeDirectViewInputV1>,
+    pub(super) input_coverage: Option<RuntimeCheckpointInputCoverageV1>,
+    pub(super) replace_replay_coverage: bool,
+    pub(super) expected_relation_source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +70,9 @@ impl StandingRuntimeCheckpointPersistContext {
             owner,
             published_relation: None,
             direct_view_inputs: Vec::new(),
+            input_coverage: None,
+            replace_replay_coverage: false,
+            expected_relation_source_cuts: None,
         }
     }
 
@@ -83,6 +89,27 @@ impl StandingRuntimeCheckpointPersistContext {
         direct_view_inputs: Vec<StandingRuntimeDirectViewInputV1>,
     ) -> Self {
         self.direct_view_inputs = direct_view_inputs;
+        self
+    }
+
+    pub(super) fn with_input_coverage(
+        mut self,
+        input_coverage: RuntimeCheckpointInputCoverageV1,
+    ) -> Self {
+        self.input_coverage = Some(input_coverage);
+        self
+    }
+
+    pub(super) fn replacing_replay_coverage(mut self) -> Self {
+        self.replace_replay_coverage = true;
+        self
+    }
+
+    pub(super) fn with_expected_relation_source_cuts(
+        mut self,
+        expected_relation_source_cuts: Vec<RelationIngestSourceIdentityCutV1>,
+    ) -> Self {
+        self.expected_relation_source_cuts = Some(expected_relation_source_cuts);
         self
     }
 }
