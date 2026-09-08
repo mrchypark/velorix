@@ -12,6 +12,7 @@ pub struct SingleKeySumCountRuntime {
     engine: KeyedAggregateKernel,
     published_output: DeltaBatch,
     filtered_aggregate_state: DeltaBatch,
+    group_input_counts: DeltaBatch,
     input_frontiers: Vec<RelationFrontier>,
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     applied_epochs: BTreeMap<String, LogicalEpoch>,
@@ -98,6 +99,7 @@ impl SingleKeySumCountRuntime {
             ),
             published_output,
             filtered_aggregate_state,
+            group_input_counts: DeltaBatch::default(),
             input_frontiers: Vec::new(),
             input_event_time_frontiers: Vec::new(),
             applied_epochs: BTreeMap::new(),
@@ -164,6 +166,11 @@ impl SingleKeySumCountRuntime {
             engine: self.engine.checkpoint_state().to_payload(),
             published_output: self.published_output.clone(),
             filtered_aggregate_state: self.filtered_aggregate_state.clone(),
+            group_input_counts: single_key_plan_uses_runtime_aggregate_state(
+                &self.plan,
+                &self.catalog,
+            )
+            .then(|| self.group_input_counts.clone()),
             applied_epochs: self
                 .applied_epochs
                 .iter()
@@ -248,8 +255,9 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 attempted_epoch: logical_epoch,
             });
         }
-        if single_key_plan_uses_runtime_aggregate_state(&self.plan) {
+        if single_key_plan_uses_runtime_aggregate_state(&self.plan, &self.catalog) {
             let mut combined = DeltaBatch::default();
+            let mut combined_group_inputs = DeltaBatch::default();
             let mut input_frontiers = self.input_frontiers.clone();
             let mut input_event_time_frontiers = self.input_event_time_frontiers.clone();
             for input in input_changes {
@@ -260,17 +268,29 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 )?;
                 let delta = aggregate_group_input_delta_batch(&self.catalog, &self.plan, &input)?;
                 let delta = filter_delta_batch_for_plan(&delta, &self.plan, &self.catalog)?;
-                let delta =
+                // Count rows surviving the view-level WHERE, but before each
+                // aggregate's FILTER clause, so group liveness matches SQL
+                // grouping semantics rather than one aggregate's inputs.
+                let group_delta =
                     rekey_delta_batch_for_aggregate_group(&delta, &self.catalog, &self.plan)?;
+                combined_group_inputs = combined_group_inputs.combine(&group_delta);
+                let delta = group_delta;
                 combined = combined.combine(&delta);
                 advance_input_frontier(&mut input_frontiers, &input)?;
                 advance_input_event_time_frontier(&mut input_event_time_frontiers, &input)?;
             }
+            let next_group_input_counts =
+                apply_group_input_count_delta(&self.group_input_counts, &combined_group_inputs)?;
             let (next_state, _) = apply_filtered_single_key_aggregate_delta(
                 &self.filtered_aggregate_state,
                 &combined,
                 &self.plan,
                 &self.catalog,
+            )?;
+            let next_state = synchronize_filtered_aggregate_groups(
+                &next_state,
+                &next_group_input_counts,
+                &self.plan,
             )?;
             let aggregate_outputs = supported_view_plan_aggregate_outputs(&self.plan);
             let published_state = publish_aggregate_state(&next_state, &self.plan)?;
@@ -305,6 +325,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
                 .commit_prepared_epoch(prepared_epoch)
                 .map_err(|_| invalid_runtime_state())?;
             self.filtered_aggregate_state = next_state;
+            self.group_input_counts = next_group_input_counts;
             self.published_output = visible_output;
             self.input_frontiers = input_frontiers.clone();
             self.input_event_time_frontiers = input_event_time_frontiers.clone();
@@ -528,6 +549,14 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             return Err(invalid_checkpoint());
         }
         validate_plan_matches_catalog(&plan, &payload.catalog)?;
+        let group_input_counts =
+            if single_key_plan_uses_runtime_aggregate_state(&plan, &payload.catalog) {
+                payload
+                    .group_input_counts
+                    .ok_or_else(legacy_single_key_checkpoint_requires_replay)?
+            } else {
+                DeltaBatch::default()
+            };
         let value_mode = aggregate_value_mode_for_plan(&payload.catalog, &plan)?;
         let track_extrema = plan_tracks_extrema(&plan);
         let logical_plan = payload.logical_plan;
@@ -548,16 +577,25 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
         )
         .map_err(|_| invalid_checkpoint())?;
         let published_output = payload.published_output;
-        let filtered_aggregate_state = if single_key_plan_uses_runtime_aggregate_state(&plan)
-            && !supported_view_plan_is_singleton(&plan)
-            && payload.filtered_aggregate_state.records().is_empty()
-        {
-            published_output.clone()
-        } else {
-            payload.filtered_aggregate_state
-        };
+        let filtered_aggregate_state =
+            if single_key_plan_uses_runtime_aggregate_state(&plan, &payload.catalog)
+                && !supported_view_plan_is_singleton(&plan)
+                && payload.filtered_aggregate_state.records().is_empty()
+            {
+                published_output.clone()
+            } else {
+                payload.filtered_aggregate_state
+            };
         validate_published_output(&published_output)?;
         validate_published_output(&filtered_aggregate_state)?;
+        if single_key_plan_uses_runtime_aggregate_state(&plan, &payload.catalog) {
+            validate_group_input_count_state(
+                &group_input_counts,
+                &filtered_aggregate_state,
+                &plan,
+                &payload.catalog,
+            )?;
+        }
         let mut applied_epochs = payload
             .applied_epochs
             .into_iter()
@@ -575,6 +613,7 @@ impl StandingProgramRuntime for SingleKeySumCountRuntime {
             engine,
             published_output,
             filtered_aggregate_state,
+            group_input_counts,
             input_frontiers: checkpoint.input_frontiers,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
             applied_epochs,

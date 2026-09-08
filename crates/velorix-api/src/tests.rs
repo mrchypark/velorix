@@ -3095,6 +3095,11 @@ fn single_key_output_schema_fingerprint_changes_with_aggregate_projection() {
             .collect::<Vec<_>>(),
         vec!["user", "total", "events", "average"]
     );
+    assert!(sum_count_schema.columns[1].nullable);
+    assert!(!sum_count_schema.columns[2].nullable);
+    assert!(avg_schema.columns[1].nullable);
+    assert!(!avg_schema.columns[2].nullable);
+    assert!(avg_schema.columns[3].nullable);
 }
 
 #[test]
@@ -5111,6 +5116,376 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
     .await;
     assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
     assert_eq!(restarted_query.1["rows"], query_response.1["rows"]);
+}
+
+#[tokio::test]
+async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_restart_retraction() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(
+        store.clone(),
+        "api-test-filtered-group-survival-owner-a",
+        false,
+    )
+    .await;
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(
+        relation_response.0,
+        StatusCode::CREATED,
+        "{relation_response:?}"
+    );
+
+    let view_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "filtered_score_groups",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) filter (where score = 0) as filtered_sum, count(*) filter (where score = 0) as filtered_count from scores group by user_id"
+        }),
+    )
+    .await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+    let rows = json!([
+        {"user_id": "zero", "score": 0, "delta": 1},
+        {"user_id": "filtered_out", "score": 1, "delta": 1}
+    ]);
+    let ingest_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "filtered-group-survival-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": rows
+        }),
+    )
+    .await;
+    assert_eq!(
+        ingest_response.0,
+        StatusCode::CREATED,
+        "{ingest_response:?}"
+    );
+
+    let expected_rows = json!([
+        {"user_id": "filtered_out", "filtered_sum": null, "filtered_count": 0},
+        {"user_id": "zero", "filtered_sum": 0, "filtered_count": 1}
+    ]);
+    let query_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/filtered_score_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+    assert_eq!(
+        query_response.1["rows"], expected_rows,
+        "{query_response:?}"
+    );
+
+    let restarted_state = test_api_state_with_store(
+        store.clone(),
+        "api-test-filtered-group-survival-owner-b",
+        true,
+    )
+    .await;
+    assert_eq!(
+        restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let restarted_router = app(restarted_state);
+    let restarted_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/filtered_score_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+    assert_eq!(
+        restarted_query.1["rows"], expected_rows,
+        "{restarted_query:?}"
+    );
+
+    let retraction_response = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "filtered-group-survival-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 2,
+            "rows": [
+                {"user_id": "zero", "score": 0, "delta": -1},
+                {"user_id": "filtered_out", "score": 1, "delta": -1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(
+        retraction_response.0,
+        StatusCode::CREATED,
+        "{retraction_response:?}"
+    );
+
+    let empty_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/filtered_score_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(empty_query.0, StatusCode::OK, "{empty_query:?}");
+    assert_eq!(empty_query.1["rows"], json!([]), "{empty_query:?}");
+
+    let reinsert_response = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "filtered-group-survival-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 4,
+            "rows": rows
+        }),
+    )
+    .await;
+    assert_eq!(
+        reinsert_response.0,
+        StatusCode::CREATED,
+        "{reinsert_response:?}"
+    );
+
+    let reinserted_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/filtered_score_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(reinserted_query.0, StatusCode::OK, "{reinserted_query:?}");
+    assert_eq!(
+        reinserted_query.1["rows"], expected_rows,
+        "{reinserted_query:?}"
+    );
+}
+
+#[tokio::test]
+async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_restart() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(
+        store.clone(),
+        "api-test-nullable-aggregate-survival-owner-a",
+        false,
+    )
+    .await;
+    let router = app(state);
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({
+            "catalog": test_scores_catalog_with_nullable_score(),
+            "default_orders_sum_count": false
+        }),
+    )
+    .await;
+    assert_eq!(
+        relation_response.0,
+        StatusCode::CREATED,
+        "{relation_response:?}"
+    );
+
+    let view_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "nullable_score_aggregate_groups",
+            "input_relation_id": "scores",
+            "input_relation_version": "2026-05-24.v1",
+            "sql": "select user_id, sum(score) as score_sum, avg(score) as score_avg, min(score) as score_min, max(score) as score_max, count(score) as score_count from scores group by user_id"
+        }),
+    )
+    .await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+    let rows = json!([
+        {"user_id": "empty", "score": null, "delta": 1},
+        {"user_id": "mixed", "score": 0, "delta": 1},
+        {"user_id": "mixed", "score": null, "delta": 1},
+        {"user_id": "zero", "score": 0, "delta": 1}
+    ]);
+    let ingest_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "nullable-aggregate-survival-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 0,
+            "rows": rows
+        }),
+    )
+    .await;
+    assert_eq!(
+        ingest_response.0,
+        StatusCode::CREATED,
+        "{ingest_response:?}"
+    );
+
+    let expected_rows = json!([
+        {
+            "user_id": "empty",
+            "score_sum": null,
+            "score_avg": null,
+            "score_min": null,
+            "score_max": null,
+            "score_count": 0
+        },
+        {
+            "user_id": "mixed",
+            "score_sum": 0,
+            "score_avg": 0.0,
+            "score_min": 0,
+            "score_max": 0,
+            "score_count": 1
+        },
+        {
+            "user_id": "zero",
+            "score_sum": 0,
+            "score_avg": 0.0,
+            "score_min": 0,
+            "score_max": 0,
+            "score_count": 1
+        }
+    ]);
+    let query_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/nullable_score_aggregate_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+    assert_eq!(
+        query_response.1["rows"], expected_rows,
+        "{query_response:?}"
+    );
+
+    let restarted_state = test_api_state_with_store(
+        store.clone(),
+        "api-test-nullable-aggregate-survival-owner-b",
+        true,
+    )
+    .await;
+    assert_eq!(
+        restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let restarted_router = app(restarted_state);
+    let restarted_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/nullable_score_aggregate_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+    assert_eq!(
+        restarted_query.1["rows"], expected_rows,
+        "{restarted_query:?}"
+    );
+
+    let retraction_response = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "nullable-aggregate-survival-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 4,
+            "rows": [
+                {"user_id": "empty", "score": null, "delta": -1},
+                {"user_id": "mixed", "score": 0, "delta": -1},
+                {"user_id": "mixed", "score": null, "delta": -1},
+                {"user_id": "zero", "score": 0, "delta": -1}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(
+        retraction_response.0,
+        StatusCode::CREATED,
+        "{retraction_response:?}"
+    );
+    let empty_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/nullable_score_aggregate_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(empty_query.0, StatusCode::OK, "{empty_query:?}");
+    assert_eq!(empty_query.1["rows"], json!([]), "{empty_query:?}");
+
+    let reinsert_response = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "nullable-aggregate-survival-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 8,
+            "rows": rows
+        }),
+    )
+    .await;
+    assert_eq!(
+        reinsert_response.0,
+        StatusCode::CREATED,
+        "{reinsert_response:?}"
+    );
+    let reinserted_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/nullable_score_aggregate_groups/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(reinserted_query.0, StatusCode::OK, "{reinserted_query:?}");
+    assert_eq!(
+        reinserted_query.1["rows"], expected_rows,
+        "{reinserted_query:?}"
+    );
 }
 
 #[tokio::test]
@@ -10930,7 +11305,7 @@ async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
         query.1["rows"],
         json!([
             {"user_id": "alice", "sum": 27, "count": 2},
-            {"user_id": "bob", "sum": 0, "count": 1}
+            {"user_id": "bob", "sum": null, "count": 1}
         ])
     );
 }

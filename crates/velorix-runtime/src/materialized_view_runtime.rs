@@ -636,6 +636,11 @@ struct GenericCheckpointPayload {
     published_output: DeltaBatch,
     #[serde(default)]
     filtered_aggregate_state: DeltaBatch,
+    // Runtime aggregate checkpoints need input multiplicity independently of
+    // filtered aggregate contributions.  Missing values are intentionally
+    // rejected by the runtime restore path rather than defaulted to zero.
+    #[serde(default)]
+    group_input_counts: Option<DeltaBatch>,
     applied_epochs: Vec<GenericAppliedEpoch>,
 }
 
@@ -1600,6 +1605,20 @@ fn single_key_input_delta_batch(
         );
     }
     if let Some(count_column_id) = single_key_count_distinct_input_column(plan) {
+        if single_key_plan_uses_runtime_aggregate_state(plan, catalog) {
+            return arrow_record_batches_to_key_nullable_value_delta_batch(
+                catalog,
+                &input.relation_id,
+                &input.relation_version,
+                &input.schema_fingerprint,
+                std::slice::from_ref(&plan.group_key_column_id),
+                &plan.sum_value_column_id,
+                &input.batches,
+            )
+            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_input_batch",
+            });
+        }
         return arrow_record_batches_to_key_value_delta_batch_skipping_null_values(
             catalog,
             &input.relation_id,
@@ -1614,6 +1633,20 @@ fn single_key_input_delta_batch(
         });
     }
     if let Some(count_column_id) = single_key_count_only_input_column(plan) {
+        if single_key_plan_uses_runtime_aggregate_state(plan, catalog) {
+            return arrow_record_batches_to_key_nullable_value_delta_batch(
+                catalog,
+                &input.relation_id,
+                &input.relation_version,
+                &input.schema_fingerprint,
+                std::slice::from_ref(&plan.group_key_column_id),
+                &plan.sum_value_column_id,
+                &input.batches,
+            )
+            .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "generic_input_batch",
+            });
+        }
         return arrow_record_batches_to_key_nullable_count_delta_batch(
             catalog,
             &input.relation_id,
@@ -1624,7 +1657,9 @@ fn single_key_input_delta_batch(
             &input.batches,
         );
     }
-    if single_key_nullable_value_count_input_column(plan).is_some() {
+    if single_key_nullable_value_count_input_column(plan).is_some()
+        && !single_key_plan_uses_runtime_aggregate_state(plan, catalog)
+    {
         return arrow_record_batches_to_key_value_delta_batch_skipping_null_values(
             catalog,
             &input.relation_id,
@@ -1652,7 +1687,7 @@ fn single_key_input_delta_batch(
             field: "generic_input_batch",
         });
     }
-    if single_key_plan_uses_runtime_aggregate_state(plan)
+    if single_key_plan_uses_runtime_aggregate_state(plan, catalog)
         && catalog_column_by_id(catalog, &plan.sum_value_column_id)?.nullable
     {
         return arrow_record_batches_to_key_nullable_value_delta_batch(
@@ -3043,9 +3078,11 @@ fn validate_supported_schemas(
         });
     }
     for (column, aggregate) in aggregate_columns.iter().zip(aggregate_outputs.iter()) {
+        // SUM/MIN/MAX/AVG over a live group with no qualifying inputs are
+        // SQL NULL; COUNT remains zero. Existing schemas may predate
+        // nullable aggregate metadata, so accept either nullability here.
         if column.name != aggregate.output_column_id
             || column.data_type != aggregate_output_sql_type(catalog, aggregate)?
-            || column.nullable
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "output_schema",
@@ -3946,10 +3983,25 @@ fn single_key_sum_coalesce_fallback(plan: &SupportedViewPlan) -> Option<i64> {
     })
 }
 
-fn single_key_plan_uses_runtime_aggregate_state(plan: &SupportedViewPlan) -> bool {
+fn single_key_plan_uses_runtime_aggregate_state(
+    plan: &SupportedViewPlan,
+    catalog: &VelorixRelationCatalogV1,
+) -> bool {
     plan.aggregate_output_identity.is_some()
         || single_key_multi_input_column_ids(plan).is_some()
         || !plan.aggregate_filter_exprs.is_empty()
+        || supported_view_plan_aggregate_outputs(plan)
+            .iter()
+            .any(|output| {
+                output.input_column_id.as_ref().is_some_and(|column_id| {
+                    catalog
+                        .relation_schema
+                        .columns
+                        .iter()
+                        .find(|column| column.column_id == *column_id)
+                        .is_some_and(|column| column.nullable)
+                })
+            })
         || supported_view_plan_aggregate_outputs(plan)
             .iter()
             .any(|output| {
@@ -4160,6 +4212,32 @@ fn apply_filtered_single_key_aggregate_delta(
             if !include {
                 continue;
             }
+            // SQL value aggregates ignore NULL contributions. COUNT(*) still
+            // counts the source row, while COUNT(column) ignores its NULL
+            // argument. Expressions are evaluated separately and may turn a
+            // NULL input into a concrete value (for example COALESCE).
+            let raw_input_is_null = aggregate.input_expression.is_none()
+                && aggregate.input_column_id.is_some()
+                && aggregate_input_record_value(
+                    aggregate,
+                    plan.sum_value_column_id.as_str(),
+                    record,
+                )
+                .is_null();
+            if raw_input_is_null
+                && (matches!(
+                    aggregate.function,
+                    LogicalPlanAggregateFunctionV1::Sum
+                        | LogicalPlanAggregateFunctionV1::Avg
+                        | LogicalPlanAggregateFunctionV1::Min
+                        | LogicalPlanAggregateFunctionV1::Max
+                        | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
+                        | LogicalPlanAggregateFunctionV1::PercentileCont { .. }
+                ) || (aggregate.function == LogicalPlanAggregateFunctionV1::Count
+                    && aggregate.input_column_id.is_some()))
+            {
+                continue;
+            }
             let update = match aggregate.function {
                 LogicalPlanAggregateFunctionV1::Sum => FilteredAggregateUpdate::AddI64 {
                     aggregate: aggregate.clone(),
@@ -4171,7 +4249,7 @@ fn apply_filtered_single_key_aggregate_delta(
                     )?
                     .checked_mul(record.weight)
                     .ok_or_else(invalid_runtime_state)?,
-                    qualifying_count_delta: None,
+                    qualifying_count_delta: Some(record.weight),
                 },
                 LogicalPlanAggregateFunctionV1::Avg => FilteredAggregateUpdate::Avg {
                     aggregate: aggregate.clone(),
@@ -4229,7 +4307,7 @@ fn apply_filtered_single_key_aggregate_delta(
             .or_insert_with(|| rows.get(&key).cloned());
         let row = rows
             .entry(key.clone())
-            .or_insert_with(|| zeroed_filtered_aggregate_record(record, &aggregate_outputs));
+            .or_insert_with(|| zeroed_filtered_aggregate_record(record, &aggregate_outputs, true));
         let row_value = row
             .value
             .as_json()
@@ -4253,7 +4331,7 @@ fn apply_filtered_single_key_aggregate_delta(
                 FilteredAggregateUpdate::AddI64 {
                     aggregate,
                     delta,
-                    qualifying_count_delta: _,
+                    qualifying_count_delta,
                 } => {
                     let current = row_value
                         .get(&aggregate.output_column_id)
@@ -4264,9 +4342,16 @@ fn apply_filtered_single_key_aggregate_delta(
                         .checked_add(delta)
                         .ok_or_else(invalid_runtime_state)?;
                     row_value.insert(
-                        aggregate.output_column_id,
+                        aggregate.output_column_id.clone(),
                         Value::Number(JsonNumber::from(next)),
                     );
+                    if let Some(count_delta) = qualifying_count_delta {
+                        update_hidden_count(
+                            &mut row_value,
+                            &single_key_sum_qualifying_count_key(&aggregate.output_column_id),
+                            count_delta,
+                        )?;
+                    }
                 }
                 FilteredAggregateUpdate::Avg { aggregate, amount } => {
                     update_filtered_avg_value(
@@ -4300,6 +4385,253 @@ fn apply_filtered_single_key_aggregate_delta(
     let next = DeltaBatch::from_records(rows.into_values());
     validate_published_output(&next)?;
     Ok((next, DeltaBatch::from_records(output)))
+}
+
+/// Applies unfiltered input multiplicity independently of aggregate filters.
+/// A group's existence is a property of source rows, not of any aggregate's
+/// current value (which may legitimately be zero or NULL).
+fn apply_group_input_count_delta(
+    current: &DeltaBatch,
+    input: &DeltaBatch,
+) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    let mut counts = BTreeMap::new();
+    let mut keys = BTreeMap::new();
+    for row in current.net_rows().map_err(|_| invalid_runtime_state())? {
+        if row.weight != 1 {
+            return Err(invalid_runtime_state());
+        }
+        let count = row
+            .value
+            .as_json()
+            .as_object()
+            .and_then(|value| value.get("count"))
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid_runtime_state)?;
+        if count <= 0 {
+            return Err(invalid_runtime_state());
+        }
+        let key = canonical_json(row.key.as_json());
+        if keys.insert(key.clone(), row.key.clone()).is_some() {
+            return Err(invalid_runtime_state());
+        }
+        counts.insert(key, count);
+    }
+    let mut input_deltas: BTreeMap<String, (DeltaKey, i64)> = BTreeMap::new();
+    for record in input.records() {
+        let key = canonical_json(record.key.as_json());
+        let entry = input_deltas
+            .entry(key)
+            .or_insert_with(|| (record.key.clone(), 0));
+        entry.1 = entry
+            .1
+            .checked_add(record.weight)
+            .ok_or_else(invalid_runtime_state)?;
+    }
+    for (key, (record_key, delta)) in input_deltas {
+        let next = counts
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(delta)
+            .ok_or_else(invalid_runtime_state)?;
+        if next < 0 {
+            return Err(invalid_runtime_state());
+        }
+        if next == 0 {
+            counts.remove(&key);
+            keys.remove(&key);
+        } else {
+            counts.insert(key.clone(), next);
+            keys.insert(key, record_key);
+        }
+    }
+    let rows = counts.into_iter().map(|(key, count)| {
+        let mut value = Map::new();
+        value.insert("count".to_string(), Value::Number(JsonNumber::from(count)));
+        let row_key = keys.remove(&key).ok_or_else(invalid_runtime_state)?;
+        Ok(DeltaRecord::new(
+            row_key,
+            DeltaValue::from_json(Value::Object(value)),
+            1,
+        ))
+    });
+    let rows = rows.collect::<Result<Vec<_>, StandingProgramRuntimeError>>()?;
+    let next = DeltaBatch::from_records(rows);
+    validate_published_output(&next)?;
+    Ok(next)
+}
+
+fn validate_group_input_count_state(
+    group_input_counts: &DeltaBatch,
+    filtered_state: &DeltaBatch,
+    plan: &SupportedViewPlan,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<(), StandingProgramRuntimeError> {
+    let mut live_keys = BTreeSet::new();
+    for row in group_input_counts
+        .net_rows()
+        .map_err(|_| invalid_checkpoint())?
+    {
+        if row.weight != 1 {
+            return Err(invalid_checkpoint());
+        }
+        let count = row
+            .value
+            .as_json()
+            .as_object()
+            .and_then(|value| value.get("count"))
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid_checkpoint)?;
+        if count <= 0 {
+            return Err(invalid_checkpoint());
+        }
+        if !live_keys.insert(canonical_json(row.key.as_json())) {
+            return Err(invalid_checkpoint());
+        }
+    }
+    let mut state_keys = BTreeSet::new();
+    for row in filtered_state
+        .net_rows()
+        .map_err(|_| invalid_checkpoint())?
+    {
+        if row.weight != 1 {
+            return Err(invalid_checkpoint());
+        }
+        let key = canonical_json(row.key.as_json());
+        validate_single_key_aggregate_group_key(row.key.as_json(), plan, catalog)
+            .map_err(|_| invalid_checkpoint())?;
+        if !live_keys.contains(&key) {
+            return Err(invalid_checkpoint());
+        }
+        let value = row
+            .value
+            .as_json()
+            .as_object()
+            .ok_or_else(invalid_checkpoint)?;
+        for aggregate in supported_view_plan_aggregate_outputs(plan) {
+            project_aggregate_value(value, &aggregate).map_err(|_| invalid_checkpoint())?;
+        }
+        if !state_keys.insert(key) {
+            return Err(invalid_checkpoint());
+        }
+    }
+    if state_keys != live_keys {
+        return Err(invalid_checkpoint());
+    }
+    Ok(())
+}
+
+fn validate_single_key_aggregate_group_key(
+    key: &Value,
+    plan: &SupportedViewPlan,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<(), StandingProgramRuntimeError> {
+    let group_keys = supported_view_plan_group_keys(plan);
+    if supported_view_plan_is_singleton(plan) {
+        if key == &singleton_aggregate_key("state") {
+            return Ok(());
+        }
+        return Err(invalid_checkpoint());
+    }
+    if group_keys.len() == 1 {
+        let group_key = &group_keys[0];
+        let expected_type = if let Some(column_id) = &group_key.input_column_id {
+            sql_type_from_catalog_column(catalog_column(catalog, column_id)?)?
+        } else {
+            SqlDataType::Int64
+        };
+        return validate_group_key_value_type(key, &expected_type);
+    }
+    let object = key.as_object().ok_or_else(invalid_checkpoint)?;
+    if object.len() != group_keys.len() {
+        return Err(invalid_checkpoint());
+    }
+    for group_key in group_keys {
+        let value = object
+            .get(&group_key.output_column_id)
+            .ok_or_else(invalid_checkpoint)?;
+        let expected_type = if let Some(column_id) = &group_key.input_column_id {
+            sql_type_from_catalog_column(catalog_column(catalog, column_id)?)?
+        } else {
+            SqlDataType::Int64
+        };
+        validate_group_key_value_type(value, &expected_type)?;
+    }
+    Ok(())
+}
+
+fn validate_group_key_value_type(
+    value: &Value,
+    expected_type: &SqlDataType,
+) -> Result<(), StandingProgramRuntimeError> {
+    let valid = match expected_type {
+        SqlDataType::Utf8 | SqlDataType::Char { .. } => value.is_null() || value.is_string(),
+        SqlDataType::Int8
+        | SqlDataType::Int16
+        | SqlDataType::Int32
+        | SqlDataType::Int64
+        | SqlDataType::Date
+        | SqlDataType::Timestamp { .. } => value.is_i64(),
+        SqlDataType::Float32 | SqlDataType::Float64 => value.is_number(),
+        SqlDataType::Bool => value.is_boolean(),
+        SqlDataType::Decimal { .. } => value.is_string(),
+        SqlDataType::Json => true,
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_checkpoint())
+    }
+}
+
+/// Restores zero-contribution rows for live groups and drops rows only after
+/// the source multiplicity reaches zero.
+fn synchronize_filtered_aggregate_groups(
+    state: &DeltaBatch,
+    group_input_counts: &DeltaBatch,
+    plan: &SupportedViewPlan,
+) -> Result<DeltaBatch, StandingProgramRuntimeError> {
+    let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
+    let mut rows = BTreeMap::new();
+    for row in state.net_rows().map_err(|_| invalid_runtime_state())? {
+        if row.weight != 1 {
+            return Err(invalid_runtime_state());
+        }
+        let key = canonical_json(row.key.as_json());
+        if rows.insert(key, row).is_some() {
+            return Err(invalid_runtime_state());
+        }
+    }
+    let mut live_keys = BTreeSet::new();
+    for row in group_input_counts
+        .net_rows()
+        .map_err(|_| invalid_runtime_state())?
+    {
+        if row.weight != 1 {
+            return Err(invalid_runtime_state());
+        }
+        let count = row
+            .value
+            .as_json()
+            .as_object()
+            .and_then(|value| value.get("count"))
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid_runtime_state)?;
+        if count <= 0 {
+            return Err(invalid_runtime_state());
+        }
+        let key = canonical_json(row.key.as_json());
+        if !live_keys.insert(key.clone()) {
+            return Err(invalid_runtime_state());
+        }
+        rows.entry(key)
+            .or_insert_with(|| zeroed_filtered_aggregate_record(&row, &aggregate_outputs, true));
+    }
+    rows.retain(|key, _| live_keys.contains(key));
+    let next = DeltaBatch::from_records(rows.into_values());
+    validate_published_output(&next)?;
+    Ok(next)
 }
 
 enum FilteredAggregateUpdate {
@@ -4429,7 +4761,7 @@ fn apply_filtered_join_aggregate_delta(
             .entry(key.clone())
             .or_insert_with(|| rows.get(&key).cloned());
         let row = rows.entry(key.clone()).or_insert_with(|| {
-            let zero = zeroed_filtered_aggregate_record(record, &aggregate_outputs);
+            let zero = zeroed_filtered_aggregate_record(record, &aggregate_outputs, false);
             DeltaRecord::new(aggregate_key, zero.value, zero.weight)
         });
         let value = row
@@ -4548,12 +4880,20 @@ fn publish_join_aggregate_state(
 fn zeroed_filtered_aggregate_record(
     input: &DeltaRecord,
     aggregate_outputs: &[SupportedAggregateOutput],
+    track_sum_qualifying_count: bool,
 ) -> DeltaRecord {
     let mut value = serde_json::Map::new();
     for aggregate in aggregate_outputs {
         let initial = match aggregate.function {
             LogicalPlanAggregateFunctionV1::CountDistinct => Value::Array(Vec::new()),
             LogicalPlanAggregateFunctionV1::Avg => zeroed_filtered_avg_value(),
+            LogicalPlanAggregateFunctionV1::Sum if track_sum_qualifying_count => {
+                value.insert(
+                    single_key_sum_qualifying_count_key(&aggregate.output_column_id),
+                    Value::Number(JsonNumber::from(0)),
+                );
+                Value::Number(JsonNumber::from(0))
+            }
             LogicalPlanAggregateFunctionV1::Min
             | LogicalPlanAggregateFunctionV1::Max
             | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
@@ -4682,6 +5022,10 @@ fn left_join_group_row_count_key() -> &'static str {
 
 fn sum_qualifying_count_key(output_column_id: &str) -> String {
     format!("__velorix_sum_qualifying_count_v1:{output_column_id}")
+}
+
+fn single_key_sum_qualifying_count_key(output_column_id: &str) -> String {
+    format!("__velorix_single_key_sum_qualifying_count_v1:{output_column_id}")
 }
 
 fn update_hidden_count(
@@ -6689,6 +7033,11 @@ fn compare_output_scalar(
     if let Some(result) = compare_null_predicate(actual, op) {
         return Ok(result);
     }
+    // Ordinary SQL comparisons with NULL evaluate to UNKNOWN and therefore
+    // do not satisfy HAVING; avoid attempting typed numeric conversion.
+    if actual.is_null() {
+        return Ok(false);
+    }
     match data_type {
         SqlDataType::Int8
         | SqlDataType::Int16
@@ -8576,11 +8925,8 @@ fn apply_top_k_to_published_output(
     rows.sort_by(|left, right| {
         let ordering = top_k_record_value(left, aggregate)
             .and_then(|left_value| {
-                top_k_record_value(right, aggregate).map(|right_value| {
-                    left_value
-                        .partial_cmp(&right_value)
-                        .unwrap_or(Ordering::Equal)
-                })
+                top_k_record_value(right, aggregate)
+                    .map(|right_value| compare_top_k_record_values(&left_value, &right_value))
             })
             .unwrap_or(Ordering::Equal);
         let ordering = if top_k.descending {
@@ -8817,14 +9163,51 @@ fn compare_row_number_values(column: &RelationColumnV1, left: &Value, right: &Va
 fn top_k_record_value(
     record: &DeltaRecord,
     aggregate: &SupportedAggregateOutput,
-) -> Result<f64, StandingProgramRuntimeError> {
+) -> Result<Option<TopKRecordValue>, StandingProgramRuntimeError> {
     let value = record
         .value
         .as_json()
         .as_object()
         .ok_or_else(invalid_runtime_state)?;
     let projected = project_aggregate_value(value, aggregate)?;
-    aggregate_sum_as_f64(&projected)
+    if projected.is_null() {
+        return Ok(None);
+    }
+    if let Some(value) = projected.as_i64() {
+        return Ok(Some(TopKRecordValue::Int(value)));
+    }
+    Ok(Some(TopKRecordValue::Float(aggregate_sum_as_f64(
+        &projected,
+    )?)))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TopKRecordValue {
+    Int(i64),
+    Float(f64),
+}
+
+fn compare_top_k_record_values(
+    left: &Option<TopKRecordValue>,
+    right: &Option<TopKRecordValue>,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        // DataFusion's default NullsMax contract is ASC NULLS LAST and DESC
+        // NULLS FIRST; the caller reverses this ordering for DESC.
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(TopKRecordValue::Int(left)), Some(TopKRecordValue::Int(right))) => left.cmp(right),
+        (Some(TopKRecordValue::Float(left)), Some(TopKRecordValue::Float(right))) => {
+            left.partial_cmp(right).unwrap_or(Ordering::Equal)
+        }
+        (Some(TopKRecordValue::Int(left)), Some(TopKRecordValue::Float(right))) => {
+            (*left as f64).partial_cmp(right).unwrap_or(Ordering::Equal)
+        }
+        (Some(TopKRecordValue::Float(left)), Some(TopKRecordValue::Int(right))) => left
+            .partial_cmp(&(*right as f64))
+            .unwrap_or(Ordering::Equal),
+    }
 }
 
 fn validate_published_output(output: &DeltaBatch) -> Result<(), StandingProgramRuntimeError> {
@@ -8861,14 +9244,31 @@ fn project_aggregate_value(
 ) -> Result<Value, StandingProgramRuntimeError> {
     match aggregate.function {
         LogicalPlanAggregateFunctionV1::Sum => {
-            if value.contains_key(left_join_group_row_count_key())
-                && value
-                    .get(&sum_qualifying_count_key(&aggregate.output_column_id))
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default()
-                    == 0
-            {
-                return Ok(Value::Null);
+            let qualifying_count = value
+                .get(&single_key_sum_qualifying_count_key(
+                    &aggregate.output_column_id,
+                ))
+                .and_then(Value::as_i64)
+                .or_else(|| {
+                    value
+                        .contains_key(left_join_group_row_count_key())
+                        .then(|| {
+                            Some(
+                                value
+                                    .get(&sum_qualifying_count_key(&aggregate.output_column_id))
+                                    .and_then(Value::as_i64)
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .flatten()
+                });
+            if let Some(qualifying_count) = qualifying_count {
+                if qualifying_count == 0 {
+                    return Ok(Value::Null);
+                }
+                if qualifying_count < 0 {
+                    return Err(invalid_runtime_state());
+                }
             }
             value
                 .get(aggregate.output_column_id.as_str())
@@ -9057,6 +9457,12 @@ fn aggregate_sum_as_f64(value: &Value) -> Result<f64, StandingProgramRuntimeErro
 fn invalid_checkpoint() -> StandingProgramRuntimeError {
     StandingProgramRuntimeError::InvalidProgramIdentity {
         field: "generic_checkpoint_payload",
+    }
+}
+
+fn legacy_single_key_checkpoint_requires_replay() -> StandingProgramRuntimeError {
+    StandingProgramRuntimeError::InvalidProgramIdentityDynamic {
+        field: "generic_checkpoint_payload:legacy_single_key_group_counts_missing".into(),
     }
 }
 

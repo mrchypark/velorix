@@ -5913,7 +5913,7 @@ fn aggregate_output_schema(
         columns.push(ColumnSchema {
             name: aggregate.output_column_id.clone(),
             data_type: single_key_aggregate_output_type(catalog, aggregate)?,
-            nullable: false,
+            nullable: aggregate_output_is_nullable(&aggregate.function),
         });
     }
     let primary_key = group_keys
@@ -6746,6 +6746,13 @@ fn single_key_aggregate_output_type(
             generic_single_key_sum_count_sum_type_for_column(catalog, column_id)
         }
     }
+}
+
+fn aggregate_output_is_nullable(function: &LogicalPlanAggregateFunctionV1) -> bool {
+    !matches!(
+        function,
+        LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct
+    )
 }
 
 fn sql_type_from_catalog_column(column: &RelationColumnV1) -> Result<SqlDataType, ApiError> {
