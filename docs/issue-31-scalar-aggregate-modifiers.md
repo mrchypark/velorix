@@ -38,5 +38,10 @@ and no stronger API oracle claim is made. The nullable API matrix is now
 verified for all five aggregate NULL-skipping cases plus `COUNT(*)` row
 counting.
 Typed checkpoint dispatch covers the scalar and temporal paths as part of the
-partial issue-36 wiring, but a full restored temporal API end-to-end exercise
-was not run; issue #36 remains open. No cluster rollout is claimed.
+partial issue-36 wiring. Subsequent API evidence now includes
+`rest_temporal_asof_join_materializes_retracts_and_restores` for the narrow
+[issue #27 ASOF contract](https://github.com/mrchypark/velorix/issues/27),
+including restore/requery and right-side retraction. This completed evidence
+supersedes the earlier pending-fixture note, but issue #36 remains pending PR
+merge and is not closed; it does not claim full ASOF support or a cluster
+rollout.

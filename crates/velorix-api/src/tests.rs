@@ -18931,6 +18931,195 @@ async fn public_1_0_admits_event_time_window_sql_by_default() {
 }
 
 #[tokio::test]
+async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store.clone(), "api-test-temporal-asof-a", false).await;
+    let router = app(state);
+    let rides = test_temporal_asof_catalog("rides", "ride_id", "booking_start");
+    let prices = test_temporal_asof_catalog("prices", "vehicle_id", "price");
+    for catalog in [rides, prices] {
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({"catalog": catalog, "default_orders_sum_count": false}),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
+    }
+
+    let input_relation_refs = json!([
+        {"relation_id": "rides", "relation_version": "2026-08-14.v1"},
+        {"relation_id": "prices", "relation_version": "2026-08-14.v1"}
+    ]);
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l ASOF JOIN prices p MATCH_CONDITION(p.event_time <= l.event_time) ON l.ride_id = p.vehicle_id WHERE p.vehicle_id IS NOT NULL";
+    let view_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "temporal_asof_pricing",
+            "input_relation_refs": input_relation_refs,
+            "sql": sql,
+            "source_kind": "standing_view",
+            "response_formats": ["json"]
+        }),
+    )
+    .await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+    let rejected_cases = [
+        (
+            "temporal_generic_inner_rejected",
+            "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time",
+        ),
+        (
+            "temporal_missing_where_rejected",
+            "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l ASOF JOIN prices p MATCH_CONDITION(p.event_time <= l.event_time) ON l.ride_id = p.vehicle_id",
+        ),
+    ];
+    for (view_id, rejected_sql) in rejected_cases {
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id": view_id,
+                "input_relation_refs": input_relation_refs,
+                "sql": rejected_sql,
+                "source_kind": "standing_view",
+                "response_formats": ["json"]
+            }),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST, "{response:?}");
+    }
+
+    let prices_batch = json!({
+        "relation_id": "prices",
+        "relation_version": "2026-08-14.v1",
+        "stream_id": "temporal-asof-prices",
+        "partition_id": 0,
+        "start_offset_inclusive": 0,
+        "rows": [
+            {"vehicle_id": "p1", "price": 1000, "event_time": 100, "delta": 1},
+            {"vehicle_id": "p1", "price": 2000, "event_time": 200, "delta": 1},
+            {"vehicle_id": "p1", "price": 3000, "event_time": 300, "delta": 1},
+            {"vehicle_id": "p2", "price": 999, "event_time": 240, "delta": 1}
+        ]
+    });
+    let ingest_prices = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({"batches": [prices_batch]}),
+    )
+    .await;
+    assert_eq!(ingest_prices.0, StatusCode::CREATED, "{ingest_prices:?}");
+
+    let ingest_rides = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [{
+                "relation_id": "rides",
+                "relation_version": "2026-08-14.v1",
+                "stream_id": "temporal-asof-rides",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"ride_id": "p1", "booking_start": 10, "event_time": 250, "delta": 1},
+                    {"ride_id": "missing", "booking_start": 20, "event_time": 250, "delta": 1}
+                ]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(ingest_rides.0, StatusCode::CREATED, "{ingest_rides:?}");
+
+    let expected_before_retract = json!([{
+        "ride_id": "p1",
+        "booking_start": 10,
+        "event_time": 250,
+        "price": 2000,
+        "price_event_time": 200
+    }]);
+    let query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/temporal_asof_pricing/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(query.1["rows"], expected_before_retract, "{query:?}");
+
+    let restarted_state = test_api_state_with_store(store, "api-test-temporal-asof-b", true).await;
+    assert_eq!(
+        restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let restarted_router = app(restarted_state);
+    let restarted_query = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/temporal_asof_pricing/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(restarted_query.0, StatusCode::OK, "{restarted_query:?}");
+    assert_eq!(
+        restarted_query.1["rows"], expected_before_retract,
+        "{restarted_query:?}"
+    );
+
+    let retract = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [{
+                "relation_id": "prices",
+                "relation_version": "2026-08-14.v1",
+                "stream_id": "temporal-asof-prices",
+                "partition_id": 0,
+                "start_offset_inclusive": 4,
+                "rows": [{"vehicle_id": "p1", "price": 2000, "event_time": 200, "delta": -1}]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(retract.0, StatusCode::CREATED, "{retract:?}");
+    let query_after_retract = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/temporal_asof_pricing/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        query_after_retract.0,
+        StatusCode::OK,
+        "{query_after_retract:?}"
+    );
+    assert_eq!(
+        query_after_retract.1["rows"],
+        json!([{
+            "ride_id": "p1",
+            "booking_start": 10,
+            "event_time": 250,
+            "price": 1000,
+            "price_event_time": 100
+        }]),
+        "{query_after_retract:?}"
+    );
+}
+
+#[tokio::test]
 async fn rest_relation_admission_rejects_internal_published_view_output_source_kind() {
     let state = test_api_state().await;
     let router = app(state);
@@ -19077,6 +19266,34 @@ fn test_interval_side_catalog_for_e2e(
             (end_column, VelorixLogicalTypeV1::Int64, false),
         ],
     ))
+}
+
+fn test_temporal_asof_catalog(
+    relation_id: &str,
+    key_column: &str,
+    value_column: &str,
+) -> VelorixRelationCatalogV1 {
+    let mut catalog = generic_adapter_catalog(test_relation_catalog_for_e2e(
+        relation_id,
+        &[
+            (key_column, VelorixLogicalTypeV1::Utf8, false),
+            (value_column, VelorixLogicalTypeV1::Int64, false),
+            ("event_time", VelorixLogicalTypeV1::Int64, false),
+        ],
+    ));
+    catalog.relation_schema.event_time_column_id = Some("event_time".to_string());
+    catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "event_time")
+        .expect("temporal as-of event-time column")
+        .semantic_role = RelationSemanticRoleV1::EventTime;
+    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+        .expect("temporal as-of catalog should fingerprint");
+    catalog.schema_fingerprint = schema_fingerprint.clone();
+    catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+    catalog
 }
 
 fn test_relation_catalog_for_e2e(

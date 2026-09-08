@@ -12015,10 +12015,67 @@ fn probe_temporal_join_admission() {
     let a = mk_catalog("left_t");
     let b = mk_catalog("right_t");
     let catalogs = vec![a, b];
-    let sql = "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l join right_t r on r.event_time <= l.event_time";
+    let sql = "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l asof join right_t r match_condition (r.event_time <= l.event_time) on l.id = r.id where r.id is not null";
     let result = validate_supported_temporal_join_sql(sql, &catalogs);
     println!("temporal join result: {:?}", result);
     assert!(result.is_ok(), "temporal join should admit: {:?}", result);
+
+    let flipped = "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l asof join right_t r match_condition (l.event_time >= r.event_time) on r.id = l.id where r.id is not null";
+    assert!(validate_supported_temporal_join_sql(flipped, &catalogs).is_ok());
+    for rejected in [
+        "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l join right_t r on r.event_time <= l.event_time where r.id is not null",
+        "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l asof join right_t r match_condition (r.event_time <= l.event_time) on l.id = r.id",
+        "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l asof join right_t r match_condition (r.event_time <= l.event_time) on l.id = r.id where l.id is not null",
+        "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l asof join right_t r match_condition (r.event_time <= l.event_time) on l.id = r.id and l.value = r.value where r.id is not null",
+        "select l.id, l.value, l.event_time, r.value, r.event_time as r_time from left_t l asof join right_t r match_condition (r.event_time <= l.event_time) on l.value = r.value where r.id is not null",
+    ] {
+        assert!(
+            validate_supported_temporal_join_sql(rejected, &catalogs).is_err(),
+            "unsupported temporal syntax unexpectedly admitted: {rejected}"
+        );
+    }
+
+    let refresh_catalog = |catalog: &mut VelorixRelationCatalogV1| {
+        let fingerprint = SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema)
+            .expect("test catalog schema should fingerprint");
+        catalog.schema_fingerprint = fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = fingerprint;
+    };
+    let mut nullable_projection = catalogs.clone();
+    nullable_projection[0].relation_schema.columns[1].nullable = true;
+    refresh_catalog(&mut nullable_projection[0]);
+    assert!(validate_supported_temporal_join_sql(sql, &nullable_projection).is_err());
+
+    for (logical_type, physical_arrow_type) in [
+        (VelorixLogicalTypeV1::Int64, ArrowPhysicalTypeV1::Int64),
+        (VelorixLogicalTypeV1::Bool, ArrowPhysicalTypeV1::Boolean),
+    ] {
+        let mut incompatible_keys = catalogs.clone();
+        for catalog in &mut incompatible_keys {
+            let key = catalog
+                .relation_schema
+                .columns
+                .iter_mut()
+                .find(|column| column.column_id == "id")
+                .unwrap();
+            key.logical_type = logical_type.clone();
+            key.physical_arrow_type = physical_arrow_type.clone();
+        }
+        refresh_catalog(&mut incompatible_keys[0]);
+        refresh_catalog(&mut incompatible_keys[1]);
+        assert!(validate_supported_temporal_join_sql(sql, &incompatible_keys).is_err());
+    }
+
+    let mut nullable_time = catalogs.clone();
+    nullable_time[0]
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "event_time")
+        .unwrap()
+        .nullable = true;
+    refresh_catalog(&mut nullable_time[0]);
+    assert!(validate_supported_temporal_join_sql(sql, &nullable_time).is_err());
 }
 
 #[test]

@@ -74,7 +74,7 @@ evidence for that family.
 | Event-time windows | Default public | `TUMBLE`, `HOP`, and `SESSION` over the validated aggregate shape and declared event-time/watermark contract. `tumbling_event_time_aggregate_sql_accepts_subsecond_interval_units` and `rest_hopping_window_advanced_aggregate_view_survives_api_restart`. |
 | Recursive CTE | Default public path; API E2E/restart verification pending | The default API can reach the validated positive `UNION DISTINCT` fixpoint grammar; arbitrary recursive SQL is rejected. Runtime evidence: `recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`; API admission-to-restart evidence is still required. |
 | Interval join | Default public path; API E2E/restart verification pending | The default API can reach the two-input inner overlap validator/runtime for exact strict endpoint comparisons and bounded projection, with no grouping or `HAVING`. Runtime evidence: `interval_join_materializes_overlap_retraction_and_restart`; API admission-to-restart coverage is still required. |
-| Temporal/as-of join | Default public path; API E2E/restart verification pending | The default API can reach the bounded two-input temporal/equality/projection validator/runtime. Runtime evidence: `temporal_join_materializes_asof_match_and_retracts`; API admission-to-restart coverage is still required. |
+| Temporal/as-of join | Default public path; narrow API E2E evidence captured; PR merge pending | The default API can reach the bounded two-input temporal/equality/projection validator/runtime. Runtime evidence: `temporal_join_materializes_asof_match_and_retracts`; API evidence is the narrow contract test below, with merge and final workspace verification still pending. |
 | Percentile and median | Default public | Grouped `median`, `percentile_disc`, and `percentile_cont` use direct Int64 input columns and validated numeric literal percentiles in `[0, 1]`; global median, string/Decimal128 inputs, and invalid percentile shapes/types fail closed during admission. They are not supported in join output-schema construction. Public factory evidence: `rest_grouped_median_and_percentiles_materialize_and_survive_api_restart`; rejection evidence: `rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs`; runtime evidence: `percentile_aggregates_are_exact_across_retract_and_restart`. |
 | `ROW_NUMBER`, `RANK`, `DENSE_RANK` | Experimental-gated | One relation with validated partition/order/tie-breaker and bounded rank-filter form. Default admission returns an explicit experimental-disabled error; `public_1_0_rejects_experimental_view_surfaces_by_default`. |
 | Scalar aggregate subquery filter | Internal but publicly unreachable | `ScalarAggregateFilter` runtime coverage exists (`scalar_aggregate_filter_materializes_and_restores`), but the public output-schema factory has no corresponding branch. |
@@ -89,6 +89,16 @@ unsupported distinct aggregates, `UNION ALL`, `ROLLUP`/`CUBE`/`GROUPING SETS`,
 DDL/DML, multiple statements, and parser-only syntax. Query-time SQL is a
 separate read-only DataFusion surface over one published output table; it never
 expands materialization support.
+
+The subsequent public API evidence is
+`rest_temporal_asof_join_materializes_retracts_and_restores`. It covers only the
+narrow [issue #27 ASOF contract](https://github.com/mrchypark/velorix/issues/27):
+single UTF8 primary keys, non-NULL supported event-time/output columns, exact
+left/right primary-key equality, and the mandatory `WHERE right_pk IS NOT NULL`
+guard, including requery after restore and right-side retraction. This completed
+evidence supersedes the earlier pending API-fixture note, but does not claim full
+ASOF or general temporal INNER JOIN support. Issue #36 remains pending PR merge,
+and no cluster rollout is claimed.
 
 ## Operational boundaries
 

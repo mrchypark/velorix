@@ -1,9 +1,9 @@
 //! Phase 8.3: Temporal (as-of) join runtime.
 //!
-//! Matches each left row with the most recent right row by event time
-//! before the left row's timestamp: `SELECT ... FROM left l JOIN right r
-//! ON r.event_time <= l.event_time`. This is common for order enrichment
-//! (match each order with the latest price snapshot).
+//! Matches each left row with one deterministic right row at the most recent
+//! event time before the left row's timestamp using the admitted explicit
+//! `ASOF JOIN ... MATCH_CONDITION` contract. This is common for order
+//! enrichment (match each order with the latest price snapshot).
 //!
 //! State: BTreeMap of right-side rows keyed by join_key, then by
 //! event_time, with bag semantics (multiple rows per key+time).
@@ -73,7 +73,7 @@ impl TemporalJoinRuntime {
                 field: "logical_temporal_join_plan",
             }
         })?;
-        validate_temporal_join_contract(&catalogs, &input_schemas, &plan)?;
+        validate_temporal_join_contract(&catalogs, &input_schemas, &output_schema, &plan)?;
         let compiled =
             validate_supported_temporal_join_sql(view_sql.as_str(), &catalogs).map_err(|_| {
                 StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -631,8 +631,21 @@ impl StandingProgramRuntime for TemporalJoinRuntime {
                 payload.left_input_schema.clone(),
                 payload.right_input_schema.clone(),
             ],
+            &payload.output_schema,
             &payload.plan,
         )?;
+        let compiled = validate_supported_temporal_join_sql(
+            payload.view_sql.as_str(),
+            &[payload.left_catalog.clone(), payload.right_catalog.clone()],
+        )
+        .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "temporal_join_plan",
+        })?;
+        if compiled != payload.plan {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_plan",
+            });
+        }
         if payload.logical_epoch != checkpoint.logical_epoch
             || payload.input_frontiers != checkpoint.input_frontiers
             || payload.input_event_time_frontiers != checkpoint.input_event_time_frontiers
@@ -690,35 +703,36 @@ fn recompute_from_staged(
                         .map(|(t, _)| *t);
                     if let Some(rt) = floor_time {
                         if let Some(rows) = time_map.get(&rt) {
-                            for right_row in rows {
-                                if right_row.weight <= 0 {
-                                    continue;
-                                }
-                                let mut output = serde_json::Map::new();
-                                for item in &plan.output_columns {
-                                    let value = match item.side {
-                                        TemporalJoinSideV1::Left => {
-                                            left_row.values.get(&item.column_id)
-                                        }
-                                        TemporalJoinSideV1::Right => {
-                                            right_row.values.get(&item.column_id)
-                                        }
-                                    };
-                                    output.insert(
-                                        item.output_name.clone(),
-                                        value.cloned().unwrap_or(Value::Null),
-                                    );
-                                }
-                                let weight = left_row
-                                    .weight
-                                    .checked_mul(right_row.weight)
-                                    .ok_or_else(invalid_runtime_state)?;
-                                records.push(DeltaRecord::new(
-                                    DeltaKey::from_json(Value::Object(output)),
-                                    DeltaValue::from_json(Value::Object(serde_json::Map::new())),
-                                    weight,
-                                ));
+                            let Some(right_row) =
+                                rows.iter().filter(|row| row.weight > 0).min_by_key(|row| {
+                                    canonical_json(&Value::Object(
+                                        row.values.clone().into_iter().collect(),
+                                    ))
+                                })
+                            else {
+                                continue;
+                            };
+                            let mut output = serde_json::Map::new();
+                            for item in &plan.output_columns {
+                                let value = match item.side {
+                                    TemporalJoinSideV1::Left => {
+                                        left_row.values.get(&item.column_id)
+                                    }
+                                    TemporalJoinSideV1::Right => {
+                                        right_row.values.get(&item.column_id)
+                                    }
+                                };
+                                output.insert(
+                                    item.output_name.clone(),
+                                    value.cloned().unwrap_or(Value::Null),
+                                );
                             }
+                            let weight = left_row.weight;
+                            records.push(DeltaRecord::new(
+                                DeltaKey::from_json(Value::Object(output)),
+                                DeltaValue::from_json(Value::Object(serde_json::Map::new())),
+                                weight,
+                            ));
                         }
                     }
                 }
@@ -901,6 +915,7 @@ fn deserialize_checkpoint_payload(
 fn validate_temporal_join_contract(
     catalogs: &[VelorixRelationCatalogV1],
     input_schemas: &[RelationSchema],
+    output_schema: &RelationSchema,
     plan: &SupportedTemporalJoinPlanV1,
 ) -> Result<(), StandingProgramRuntimeError> {
     if plan.schema_version != 1 || catalogs.len() != 2 || input_schemas.len() != 2 {
@@ -930,12 +945,79 @@ fn validate_temporal_join_contract(
             field: "temporal_join_input_schemas",
         });
     }
+    let left_key = catalog_primary_key_column(left_catalog)?;
+    let right_key = catalog_primary_key_column(right_catalog)?;
+    if plan.left_join_column_id != left_key.column_id
+        || plan.right_join_column_id != right_key.column_id
+        || left_key.nullable
+        || right_key.nullable
+        || left_key.physical_arrow_type != right_key.physical_arrow_type
+        || !matches!(
+            left_key.physical_arrow_type,
+            velorix_core::relation::ArrowPhysicalTypeV1::Utf8
+        )
+    {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "temporal_join_keys",
+        });
+    }
+    let left_time = catalog_column(left_catalog, &plan.left_event_time_column_id)?;
+    let right_time = catalog_column(right_catalog, &plan.right_event_time_column_id)?;
+    if left_time.nullable
+        || right_time.nullable
+        || left_time.physical_arrow_type != right_time.physical_arrow_type
+        || !matches!(
+            left_time.physical_arrow_type,
+            velorix_core::relation::ArrowPhysicalTypeV1::Int64
+                | velorix_core::relation::ArrowPhysicalTypeV1::TimestampNanosecond { .. }
+        )
+    {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "temporal_join_event_time_columns",
+        });
+    }
+    if output_schema.primary_key
+        != plan
+            .output_columns
+            .iter()
+            .map(|column| column.output_name.clone())
+            .collect::<Vec<_>>()
+    {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "temporal_join_output_schema.primary_key",
+        });
+    }
+    if output_schema.columns.len() != plan.output_columns.len() {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "temporal_join_output_schema.columns",
+        });
+    }
     for output in &plan.output_columns {
         let catalog = match output.side {
             TemporalJoinSideV1::Left => left_catalog,
             TemporalJoinSideV1::Right => right_catalog,
         };
-        catalog_column(catalog, &output.column_id)?;
+        let column = catalog_column(catalog, &output.column_id)?;
+        if column.nullable {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_output_columns",
+            });
+        }
+    }
+    for (output, schema_column) in plan.output_columns.iter().zip(&output_schema.columns) {
+        let catalog = match output.side {
+            TemporalJoinSideV1::Left => left_catalog,
+            TemporalJoinSideV1::Right => right_catalog,
+        };
+        let column = catalog_column(catalog, &output.column_id)?;
+        if schema_column.name != output.output_name
+            || schema_column.data_type != sql_type_from_catalog_column(column)?
+            || schema_column.nullable
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "temporal_join_output_schema.columns",
+            });
+        }
     }
     Ok(())
 }
