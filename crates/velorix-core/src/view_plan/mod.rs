@@ -17529,6 +17529,9 @@ pub fn validate_supported_interval_join_sql(
     }
     let query = parse_single_query(sql)?;
     validate_query_level_clauses(&query, false)?;
+    if query.order_by.is_some() {
+        return unsupported("interval join ORDER BY clauses are not supported yet");
+    }
     let SetExpr::Select(select) = query.body.as_ref() else {
         return unsupported("interval join requires a single SELECT");
     };
@@ -17554,6 +17557,9 @@ pub fn validate_supported_interval_join_sql(
         return unsupported("interval join currently supports INNER JOIN only");
     }
     let right_table = registered_table_ref(&right_join.relation, "right")?;
+    if identifier_eq(left_table.alias.as_str(), right_table.alias.as_str()) {
+        return unsupported("interval join inputs must use distinct table aliases");
+    }
     if right_table.name != right_catalog.relation_schema.relation_id {
         return unsupported("interval join right relation must be the second registered relation");
     }
@@ -17566,6 +17572,9 @@ pub fn validate_supported_interval_join_sql(
     };
     let on_expr: &Expr = on_expr;
     let conjuncts = split_and_conjuncts(on_expr);
+    if conjuncts.len() != 2 {
+        return unsupported("interval join requires exactly two strict overlap comparisons");
+    }
     let mut left_start = None;
     let mut left_end = None;
     let mut right_start = None;
@@ -17574,31 +17583,63 @@ pub fn validate_supported_interval_join_sql(
         let Expr::BinaryOp { left, op, right } = conjunct else {
             return unsupported("interval join ON predicates must be strict overlap comparisons");
         };
-        if op != BinaryOperator::Lt {
+        if !matches!(op, BinaryOperator::Lt | BinaryOperator::Gt) {
             return unsupported("interval join requires `start < end` overlap comparisons");
         }
         let left_ref = qualified_column_ref(left.as_ref())?;
         let right_ref = qualified_column_ref(right.as_ref())?;
-        let (left_side, right_side) = orient_join_refs(
-            left_ref,
-            right_ref,
-            left_table.alias.as_str(),
-            right_table.alias.as_str(),
-        )?;
+        // Keep the comparison direction while orienting relation references.
+        // `orient_join_refs` is intentionally lossy for equality joins: it
+        // only answers which relation each operand belongs to.  For overlap
+        // predicates, however, `left.start < right.end` and
+        // `left.start > right.end` have opposite meanings and cannot be
+        // inferred from endpoint names after that swap.
+        let (left_side, right_side, op) =
+            if identifier_eq(left_ref.qualifier.as_str(), left_table.alias.as_str())
+                && identifier_eq(right_ref.qualifier.as_str(), right_table.alias.as_str())
+            {
+                (left_ref, right_ref, op)
+            } else if identifier_eq(left_ref.qualifier.as_str(), right_table.alias.as_str())
+                && identifier_eq(right_ref.qualifier.as_str(), left_table.alias.as_str())
+            {
+                (
+                    right_ref,
+                    left_ref,
+                    match op {
+                        BinaryOperator::Lt => BinaryOperator::Gt,
+                        BinaryOperator::Gt => BinaryOperator::Lt,
+                        _ => unreachable!("operator was checked above"),
+                    },
+                )
+            } else {
+                return unsupported("JOIN ON columns must reference the two joined table aliases");
+            };
         let left_column = qualified_ref_catalog_column(&left_side, left_catalog)?;
         let right_column = qualified_ref_catalog_column(&right_side, right_catalog)?;
-        if left_column.column_id == right_catalog.relation_schema.weight_column_id
-            || right_column.column_id == left_catalog.relation_schema.weight_column_id
+        if left_column.column_id == left_catalog.relation_schema.weight_column_id
+            || right_column.column_id == right_catalog.relation_schema.weight_column_id
         {
             return unsupported("interval join must not reference weight columns");
         }
-        // left.start < right.end and right.start < left.end
-        if left_column.column_id.ends_with("_start") || right_column.column_id.ends_with("_end") {
+        // In relation-oriented form, the only strict overlap comparisons are
+        // `left.start < right.end` and `left.end > right.start`.  The
+        // operator is part of the proof; endpoint naming alone is not.
+        if op == BinaryOperator::Lt
+            && interval_endpoint_column_has_token(&left_column.column_id, "start")
+            && interval_endpoint_column_has_token(&right_column.column_id, "end")
+        {
             left_start = Some(left_column.column_id.clone());
             right_end = Some(right_column.column_id.clone());
-        } else {
+        } else if op == BinaryOperator::Gt
+            && interval_endpoint_column_has_token(&left_column.column_id, "end")
+            && interval_endpoint_column_has_token(&right_column.column_id, "start")
+        {
             right_start = Some(right_column.column_id.clone());
             left_end = Some(left_column.column_id.clone());
+        } else {
+            return unsupported(
+                "interval join ON predicate is not one of the strict overlap comparisons",
+            );
         }
     }
     let (Some(left_start), Some(left_end), Some(right_start), Some(right_end)) =
@@ -17632,6 +17673,9 @@ pub fn validate_supported_interval_join_sql(
     let max_interval_duration_ns = i64::MAX / 4;
     let left_key = catalog_primary_key_column(left_catalog)?;
     let right_key = catalog_primary_key_column(right_catalog)?;
+    if select.selection.is_some() {
+        return unsupported("interval join WHERE predicates are not supported yet");
+    }
     let projection = validate_filter_project_projection(
         select,
         left_catalog,
@@ -17674,6 +17718,15 @@ pub fn validate_supported_interval_join_sql(
             max_matches_per_epoch: 1_000_000,
         },
     })
+}
+
+fn interval_endpoint_column_has_token(column_id: &str, token: &str) -> bool {
+    let column_id = column_id.to_ascii_lowercase();
+    match token {
+        "start" => column_id.ends_with("_start") || column_id.ends_with("_start_time"),
+        "end" => column_id.ends_with("_end") || column_id.ends_with("_end_time"),
+        _ => false,
+    }
 }
 
 pub fn lower_supported_interval_join_sql_to_logical_plan(
