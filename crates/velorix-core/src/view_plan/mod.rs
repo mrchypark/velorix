@@ -18789,11 +18789,10 @@ pub struct TemporalJoinResourceContractV1 {
     pub max_output_rows_per_epoch: u64,
 }
 
-/// Phase 8.3: validates `SELECT ... FROM left JOIN right ON
-/// r.event_time <= l.event_time` for as-of joins. Admission requires
-/// INNER JOIN with `<=` predicate on event time columns, a plain
-/// projection of direct columns, and no WHERE, GROUP BY, DISTINCT,
-/// or aggregates.
+/// Phase 8.3: validates an explicit `ASOF JOIN ... MATCH_CONDITION
+/// (r.event_time <= l.event_time) ON left_pk = right_pk WHERE right_pk IS NOT
+/// NULL` shape. Admission requires a plain projection of direct non-nullable
+/// columns and no GROUP BY, DISTINCT, or aggregates.
 pub fn validate_supported_temporal_join_sql(
     sql: &str,
     catalogs: &[VelorixRelationCatalogV1],
@@ -18839,57 +18838,128 @@ fn validate_supported_temporal_join_sql_inner(
     let [right_join] = left_from.joins.as_slice() else {
         return unsupported("temporal join requires exactly one JOIN");
     };
-    let constraint = match &right_join.join_operator {
-        JoinOperator::Inner(c) | JoinOperator::Join(c) => c,
-        _ => return unsupported("temporal join requires INNER JOIN"),
+    let (match_condition, constraint) = match &right_join.join_operator {
+        JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => (match_condition, constraint),
+        _ => return unsupported("temporal join requires explicit ASOF JOIN"),
     };
     let right_table = registered_table_ref(&right_join.relation, "right")?;
     if right_table.name != right_catalog.relation_schema.relation_id {
         return unsupported("temporal join right relation must be the second registered relation");
     }
+    let left_key = catalog_primary_key_column(left_catalog)?;
+    let right_key = catalog_primary_key_column(right_catalog)?;
+    if left_key.nullable || right_key.nullable {
+        return unsupported("temporal join primary keys must be non-nullable");
+    }
+    if left_key.physical_arrow_type != right_key.physical_arrow_type {
+        return unsupported("temporal ASOF primary keys must use the same physical type");
+    }
+    if !matches!(left_key.physical_arrow_type, ArrowPhysicalTypeV1::Utf8) {
+        return unsupported("temporal ASOF primary keys currently require the UTF-8 physical type");
+    }
     let JoinConstraint::On(on_expr) = constraint else {
-        return unsupported("temporal join requires an ON predicate");
+        return unsupported("temporal ASOF join requires an ON primary-key equality");
     };
-    // Expect exactly one conjunct: r.event_time <= l.event_time
     let conjuncts = split_and_conjuncts(on_expr);
     let [conjunct] = conjuncts.as_slice() else {
-        return unsupported("temporal join ON must be a single predicate");
+        return unsupported("temporal ASOF join ON must be one primary-key equality");
     };
-    let Expr::BinaryOp { left, op, right } = conjunct else {
-        return unsupported("temporal join ON must be a comparison");
+    let Expr::BinaryOp {
+        left: on_left,
+        op: BinaryOperator::Eq,
+        right: on_right,
+    } = conjunct
+    else {
+        return unsupported("temporal ASOF join ON must be a primary-key equality");
     };
-    if !matches!(op, BinaryOperator::LtEq) {
-        return unsupported("temporal join ON must use <= (less than or equal)");
+    let on_left_ref = qualified_column_ref(on_left.as_ref())?;
+    let on_right_ref = qualified_column_ref(on_right.as_ref())?;
+    let key_pair_matches =
+        (identifier_eq(on_left_ref.qualifier.as_str(), left_table.alias.as_str())
+            && column_identifier_eq(left_key, on_left_ref.column.as_str())
+            && identifier_eq(on_right_ref.qualifier.as_str(), right_table.alias.as_str())
+            && column_identifier_eq(right_key, on_right_ref.column.as_str()))
+            || (identifier_eq(on_left_ref.qualifier.as_str(), right_table.alias.as_str())
+                && column_identifier_eq(right_key, on_left_ref.column.as_str())
+                && identifier_eq(on_right_ref.qualifier.as_str(), left_table.alias.as_str())
+                && column_identifier_eq(left_key, on_right_ref.column.as_str()));
+    if !key_pair_matches {
+        return unsupported("temporal ASOF join ON must equate the two primary keys");
     }
-    let left_ref = qualified_column_ref(left.as_ref())?;
-    let right_ref = qualified_column_ref(right.as_ref())?;
-    // Determine which side is left/right table and which is event_time column
-    // Determine which qualifier is which: left side <= right side (r.event_time <= l.event_time)
-    let (r_event_col, l_event_col) =
-        if identifier_eq(left_ref.qualifier.as_str(), right_table.alias.as_str())
-            && identifier_eq(right_ref.qualifier.as_str(), left_table.alias.as_str())
-        {
-            (left_ref.column.as_str(), right_ref.column.as_str())
-        } else if identifier_eq(left_ref.qualifier.as_str(), left_table.alias.as_str())
-            && identifier_eq(right_ref.qualifier.as_str(), right_table.alias.as_str())
-        {
-            (right_ref.column.as_str(), left_ref.column.as_str())
-        } else {
-            return unsupported(
-                "temporal join ON must compare right.event_time with left.event_time",
-            );
-        };
+    let match_conjuncts = split_and_conjuncts(match_condition);
+    let [match_conjunct] = match_conjuncts.as_slice() else {
+        return unsupported("temporal ASOF MATCH_CONDITION must be one comparison");
+    };
+    let Expr::BinaryOp {
+        left: match_left,
+        op,
+        right: match_right,
+    } = match_conjunct
+    else {
+        return unsupported("temporal ASOF MATCH_CONDITION must be a comparison");
+    };
+    let match_left_ref = qualified_column_ref(match_left.as_ref())?;
+    let match_right_ref = qualified_column_ref(match_right.as_ref())?;
+    let (r_event_col, l_event_col) = if matches!(op, BinaryOperator::LtEq)
+        && identifier_eq(
+            match_left_ref.qualifier.as_str(),
+            right_table.alias.as_str(),
+        )
+        && identifier_eq(
+            match_right_ref.qualifier.as_str(),
+            left_table.alias.as_str(),
+        ) {
+        (
+            match_left_ref.column.as_str(),
+            match_right_ref.column.as_str(),
+        )
+    } else if matches!(op, BinaryOperator::GtEq)
+        && identifier_eq(match_left_ref.qualifier.as_str(), left_table.alias.as_str())
+        && identifier_eq(
+            match_right_ref.qualifier.as_str(),
+            right_table.alias.as_str(),
+        )
+    {
+        (
+            match_right_ref.column.as_str(),
+            match_left_ref.column.as_str(),
+        )
+    } else {
+        return unsupported(
+            "temporal ASOF MATCH_CONDITION must compare right.event_time <= left.event_time",
+        );
+    };
     let left_event_time_col = catalog_column_by_id(left_catalog, l_event_col)?;
     let right_event_time_col = catalog_column_by_id(right_catalog, r_event_col)?;
+    if left_event_time_col.nullable || right_event_time_col.nullable {
+        return unsupported("temporal ASOF event-time columns must be non-nullable");
+    }
+    if left_event_time_col.physical_arrow_type != right_event_time_col.physical_arrow_type {
+        return unsupported("temporal ASOF event-time columns must use the same physical type");
+    }
     if !matches!(
         left_event_time_col.physical_arrow_type,
         ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::TimestampNanosecond { .. }
+    ) || !matches!(
+        right_event_time_col.physical_arrow_type,
+        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::TimestampNanosecond { .. }
     ) {
-        return unsupported("temporal join event time columns must be Int64 nanoseconds");
+        return unsupported("temporal ASOF event time columns must be Int64 nanoseconds");
     }
-    // Projection: all direct columns from both sides
-    if select.selection.is_some() {
-        return unsupported("temporal join WHERE is not supported yet");
+    let Some(selection) = &select.selection else {
+        return unsupported("temporal ASOF join requires WHERE right_pk IS NOT NULL");
+    };
+    let Expr::IsNotNull(where_expr) = selection else {
+        return unsupported("temporal ASOF WHERE must be right_pk IS NOT NULL");
+    };
+    let where_ref = qualified_column_ref(where_expr.as_ref())?;
+    if !identifier_eq(where_ref.qualifier.as_str(), right_table.alias.as_str())
+        || !column_identifier_eq(right_key, where_ref.column.as_str())
+    {
+        return unsupported("temporal ASOF WHERE must filter the right primary key");
     }
     let mut output_columns = Vec::new();
     let left_alias = left_table.alias.as_str();
@@ -18911,6 +18981,9 @@ fn validate_supported_temporal_join_sql_inner(
             );
         };
         let column = qualified_ref_catalog_column(&reference, catalog)?;
+        if column.nullable {
+            return unsupported("temporal ASOF projections must use non-nullable columns");
+        }
         let output_name = alias_item.unwrap_or(column.name.as_str()).to_string();
         output_columns.push(TemporalJoinOutputColumnV1 {
             side,
@@ -18925,8 +18998,8 @@ fn validate_supported_temporal_join_sql_inner(
         schema_version: 1,
         left_input_relation_id: left_catalog.relation_schema.relation_id.clone(),
         right_input_relation_id: right_catalog.relation_schema.relation_id.clone(),
-        left_join_column_id: catalog_primary_key_column(left_catalog)?.column_id.clone(),
-        right_join_column_id: catalog_primary_key_column(right_catalog)?.column_id.clone(),
+        left_join_column_id: left_key.column_id.clone(),
+        right_join_column_id: right_key.column_id.clone(),
         left_event_time_column_id: left_event_time_col.column_id.clone(),
         right_event_time_column_id: right_event_time_col.column_id.clone(),
         output_columns,

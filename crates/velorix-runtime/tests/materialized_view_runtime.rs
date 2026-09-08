@@ -16925,6 +16925,33 @@ fn assert_projected_scores_page(
     }
 }
 
+fn temporal_price_values(
+    runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
+    epoch: u64,
+) -> Vec<i64> {
+    let page = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".to_string(),
+                program_id: "program-purchases".to_string(),
+                view_id: "enriched".to_string(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(epoch),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &page.batches[0];
+    let prices = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (0..prices.len()).map(|index| prices.value(index)).collect()
+}
+
 fn assert_projected_user_ids_page(
     runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
     epoch: u64,
@@ -25102,7 +25129,7 @@ fn temporal_join_materializes_asof_match_and_retracts() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25263,6 +25290,43 @@ fn temporal_join_materializes_asof_match_and_retracts() {
     );
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.logical_epoch, 3);
+
+    let mut tampered_plan = checkpoint.clone();
+    let state_payload = tampered_plan.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["plan"]["left_join_column_id"] = json!("not_the_primary_key");
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered_plan.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered_plan)
+        .err()
+        .unwrap()
+        .contains("temporal_join_keys"));
+
+    let mut tampered_output_schema = checkpoint.clone();
+    let state_payload = tampered_output_schema.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["output_schema"]["columns"][0]["name"] = json!("wrong_name");
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered_output_schema.state_root.content_hash =
+        stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered_output_schema)
+        .err()
+        .unwrap()
+        .contains("temporal_join_output_schema.columns"));
+
+    let legacy_sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time where p.vehicle_id is not null";
+    let mut legacy_checkpoint = checkpoint.clone();
+    legacy_checkpoint.identity.sql_hash = stable_bytes_hash(legacy_sql.as_bytes());
+    let state_payload = legacy_checkpoint.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["view_sql"] = json!(legacy_sql);
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    legacy_checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(legacy_checkpoint)
+        .err()
+        .unwrap()
+        .contains("temporal_join_plan"));
+
     let restored = restore_standing_runtime(checkpoint).unwrap();
     let page = restored
         .materialized_view_page(
@@ -25291,6 +25355,221 @@ fn temporal_join_materializes_asof_match_and_retracts() {
     );
 }
 
+#[test]
+fn temporal_join_ties_choose_one_canonical_right_row_and_preserve_left_weight() {
+    let rides = temporal_join_rides_catalog();
+    let prices = temporal_join_prices_catalog();
+    let catalogs = vec![rides.clone(), prices.clone()];
+    let input_schemas: Vec<RelationSchema> = catalogs
+        .iter()
+        .map(|catalog| catalog_input_relation_schema(catalog).unwrap())
+        .collect();
+    let output_schema = temporal_join_output_schema();
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
+    let identity = standing_identity_with_view(sql, "enriched");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        &catalogs,
+        sql,
+        &input_schemas,
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("tie-1").unwrap(),
+            vec![
+                relation_input(
+                    &prices,
+                    "tie-prices",
+                    0,
+                    2,
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("vehicle_id", DataType::Utf8, false),
+                            Field::new("price", DataType::Int64, false),
+                            Field::new("event_time", DataType::Int64, false),
+                            Field::new("delta", DataType::Int64, false),
+                        ])),
+                        vec![
+                            Arc::new(StringArray::from(vec!["p1", "p1"])) as _,
+                            Arc::new(Int64Array::from(vec![2000, 1000])) as _,
+                            Arc::new(Int64Array::from(vec![100, 100])) as _,
+                            Arc::new(Int64Array::from(vec![1, 2])) as _,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                relation_input(
+                    &rides,
+                    "tie-rides",
+                    0,
+                    1,
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("ride_id", DataType::Utf8, false),
+                            Field::new("booking_start", DataType::Int64, false),
+                            Field::new("event_time", DataType::Int64, false),
+                            Field::new("delta", DataType::Int64, false),
+                        ])),
+                        vec![
+                            Arc::new(StringArray::from(vec!["p1"])) as _,
+                            Arc::new(Int64Array::from(vec![10])) as _,
+                            Arc::new(Int64Array::from(vec![150])) as _,
+                            Arc::new(Int64Array::from(vec![1])) as _,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_eq!(temporal_price_values(runtime.as_ref(), 1), vec![1000]);
+
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_eq!(temporal_price_values(restored.as_ref(), 1), vec![1000]);
+    let mut runtime = restored;
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("tie-zero-weight").unwrap(),
+            vec![relation_input(
+                &prices,
+                "tie-prices",
+                2,
+                3,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![2000])) as _,
+                        Arc::new(Int64Array::from(vec![100])) as _,
+                        Arc::new(Int64Array::from(vec![0])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(temporal_price_values(runtime.as_ref(), 2), vec![1000]);
+
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("tie-loser-retract").unwrap(),
+            vec![relation_input(
+                &prices,
+                "tie-prices",
+                3,
+                4,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("vehicle_id", DataType::Utf8, false),
+                        Field::new("price", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![2000])) as _,
+                        Arc::new(Int64Array::from(vec![100])) as _,
+                        Arc::new(Int64Array::from(vec![-1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    assert_eq!(temporal_price_values(runtime.as_ref(), 3), vec![1000]);
+
+    runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("tie-winner-retract").unwrap(),
+            vec![
+                relation_input(
+                    &prices,
+                    "tie-prices",
+                    4,
+                    5,
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("vehicle_id", DataType::Utf8, false),
+                            Field::new("price", DataType::Int64, false),
+                            Field::new("event_time", DataType::Int64, false),
+                            Field::new("delta", DataType::Int64, false),
+                        ])),
+                        vec![
+                            Arc::new(StringArray::from(vec!["p1"])) as _,
+                            Arc::new(Int64Array::from(vec![2000])) as _,
+                            Arc::new(Int64Array::from(vec![100])) as _,
+                            Arc::new(Int64Array::from(vec![1])) as _,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                relation_input(
+                    &prices,
+                    "tie-prices",
+                    5,
+                    6,
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![
+                            Field::new("vehicle_id", DataType::Utf8, false),
+                            Field::new("price", DataType::Int64, false),
+                            Field::new("event_time", DataType::Int64, false),
+                            Field::new("delta", DataType::Int64, false),
+                        ])),
+                        vec![
+                            Arc::new(StringArray::from(vec!["p1"])) as _,
+                            Arc::new(Int64Array::from(vec![1000])) as _,
+                            Arc::new(Int64Array::from(vec![100])) as _,
+                            Arc::new(Int64Array::from(vec![-2])) as _,
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_eq!(temporal_price_values(runtime.as_ref(), 4), vec![2000]);
+
+    runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("tie-left-retract").unwrap(),
+            vec![relation_input(
+                &rides,
+                "tie-rides",
+                1,
+                2,
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("ride_id", DataType::Utf8, false),
+                        Field::new("booking_start", DataType::Int64, false),
+                        Field::new("event_time", DataType::Int64, false),
+                        Field::new("delta", DataType::Int64, false),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["p1"])) as _,
+                        Arc::new(Int64Array::from(vec![10])) as _,
+                        Arc::new(Int64Array::from(vec![150])) as _,
+                        Arc::new(Int64Array::from(vec![-1])) as _,
+                    ],
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+    assert!(temporal_price_values(runtime.as_ref(), 5).is_empty());
+}
+
 /// Fault-injection: verify state is unchanged when input validation fails.
 #[test]
 fn fault_injection_input_validation_preserves_state() {
@@ -25302,7 +25581,7 @@ fn fault_injection_input_validation_preserves_state() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25386,7 +25665,7 @@ fn fault_injection_resource_limit_preserves_state() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25474,7 +25753,7 @@ fn temporal_join_multiple_left_rows_same_key_different_times() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25578,7 +25857,7 @@ fn temporal_join_left_retraction_removes_output() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25711,7 +25990,7 @@ fn temporal_join_no_matching_right_row() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25775,7 +26054,7 @@ fn temporal_join_simultaneous_left_and_right_same_epoch() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25900,7 +26179,7 @@ fn temporal_join_right_eviction_removes_superseded_rows() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -26033,7 +26312,7 @@ fn temporal_join_right_retraction_shifts_output() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -26182,7 +26461,7 @@ fn temporal_join_multiple_join_keys() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -26285,7 +26564,7 @@ fn temporal_join_boundary_equal_event_times() {
         .map(|c| catalog_input_relation_schema(c).unwrap())
         .collect();
     let output_schema = temporal_join_output_schema();
-    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l join prices p on p.event_time <= l.event_time";
+    let sql = "select l.ride_id, l.booking_start, l.event_time, p.price, p.event_time as price_event_time from rides l asof join prices p match_condition (p.event_time <= l.event_time) on l.ride_id = p.vehicle_id where p.vehicle_id is not null";
     let identity = standing_identity_with_view(sql, "enriched");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
