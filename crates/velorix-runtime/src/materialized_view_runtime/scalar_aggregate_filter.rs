@@ -502,6 +502,16 @@ impl StandingProgramRuntime for ScalarAggregateFilterRuntime {
             &payload.output_schema,
             &payload.plan,
         )?;
+        if payload.outer_rows.values().any(|row| {
+            row.weight > 0
+                && !row
+                    .values
+                    .contains_key(&payload.plan.outer_comparison_column_id)
+        }) {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "scalar_aggregate_filter_checkpoint_outer_comparison_column",
+            });
+        }
         if payload.logical_epoch != checkpoint.logical_epoch
             || payload.input_frontiers != checkpoint.input_frontiers
             || payload.input_event_time_frontiers != checkpoint.input_event_time_frontiers
@@ -576,7 +586,13 @@ impl ScalarAggregateFilterRuntime {
         input: &RelationInputBatch,
     ) -> Result<(), StandingProgramRuntimeError> {
         validate_input_matches_schema(input, &self.outer_input_schema, "scalar_aggregate_outer")?;
-        let columns = filter_project_input_column_ids(&self.plan.projection);
+        let mut columns = filter_project_input_column_ids(&self.plan.projection);
+        if !columns
+            .iter()
+            .any(|column| column == &self.plan.outer_comparison_column_id)
+        {
+            columns.push(self.plan.outer_comparison_column_id.clone());
+        }
         let delta = if let Some(empty_delta) =
             published_input_empty_delta(input, &self.outer_catalog)?
         {
@@ -642,18 +658,14 @@ impl ScalarAggregateFilterRuntime {
             {
                 empty_delta
             } else {
+                let primary_key_column = catalog_primary_key_column(&self.scalar_catalog)?;
                 arrow_record_batches_to_key_nullable_count_delta_batch(
                     &self.scalar_catalog,
                     &input.relation_id,
                     &input.relation_version,
                     &input.schema_fingerprint,
-                    &self.plan.outer_key_column_id,
-                    &self
-                        .plan
-                        .scalar_aggregate
-                        .input_column_id
-                        .clone()
-                        .unwrap_or_default(),
+                    &primary_key_column.column_id,
+                    &primary_key_column.column_id,
                     &input.batches,
                 )
                 .map_err(|_| {
@@ -679,7 +691,7 @@ impl ScalarAggregateFilterRuntime {
         {
             empty_delta
         } else {
-            arrow_record_batches_to_key_value_delta_batch(
+            arrow_record_batches_to_key_value_delta_batch_skipping_null_values(
                 &self.scalar_catalog,
                 &input.relation_id,
                 &input.relation_version,

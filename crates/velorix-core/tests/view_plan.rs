@@ -17,18 +17,20 @@ use velorix_core::{
         logical_view_plan_hash, lower_join_chain_to_binary_dag,
         lower_supported_filter_project_sql_to_logical_plan,
         lower_supported_join_view_sql_to_logical_plan,
-        lower_supported_latest_by_key_sql_to_logical_plan, lower_supported_sql_to_logical_plan,
+        lower_supported_latest_by_key_sql_to_logical_plan,
+        lower_supported_scalar_aggregate_filter_sql_to_logical_plan,
+        lower_supported_sql_to_logical_plan,
         lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_policy,
         lower_supported_tumbling_window_sql_to_logical_plan,
         lower_supported_view_sql_to_logical_plan, supported_join_view_plan_key_pairs,
         validate_logical_view_plan, validate_supported_analytic_row_number_sql,
         validate_supported_filter_project_sql, validate_supported_interval_join_sql,
         validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
-        validate_supported_recursive_cte_sql, validate_supported_temporal_join_sql,
-        validate_supported_tumbling_window_sql, validate_supported_view_sql,
-        AggregateOutputPredicateExpr, BuiltinScalarFunctionV1, JoinPredicateExpr,
-        LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1, LogicalPlanColumnRef,
-        LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
+        validate_supported_recursive_cte_sql, validate_supported_scalar_aggregate_filter_sql,
+        validate_supported_temporal_join_sql, validate_supported_tumbling_window_sql,
+        validate_supported_view_sql, AggregateOutputPredicateExpr, BuiltinScalarFunctionV1,
+        JoinPredicateExpr, LogicalPlanAggregateFunctionV1, LogicalPlanBinaryJoinStepV1,
+        LogicalPlanColumnRef, LogicalPlanCompositeJoinEqualityV1, LogicalPlanJoinKeyPairV1,
         LogicalPlanLatestByKeyFunctionV1, LogicalPlanStateKindV1, PredicateOp, RowPredicateExpr,
         RuntimeScalarTypeV1, ScalarLiteralV1, SupportedAggregateInputRelationSide,
         SupportedAggregateOutputIdentity, SupportedAnalyticWindowFunction,
@@ -10713,6 +10715,143 @@ fn recursive_base_predicates_normalize_literal_left_comparisons() {
             "literal-left normalization mismatch for `{operator}`"
         );
     }
+}
+
+#[test]
+fn scalar_aggregate_subquery_accepts_plain_aggregate_matrix() {
+    let catalogs = [scores_catalog(), accounts_catalog()];
+    for (aggregate, expected) in [
+        ("count(*)", LogicalPlanAggregateFunctionV1::Count),
+        ("count(a.limit)", LogicalPlanAggregateFunctionV1::Count),
+        ("count(all a.limit)", LogicalPlanAggregateFunctionV1::Count),
+        ("sum(a.limit)", LogicalPlanAggregateFunctionV1::Sum),
+        ("sum(all a.limit)", LogicalPlanAggregateFunctionV1::Sum),
+        ("min(a.limit)", LogicalPlanAggregateFunctionV1::Min),
+        ("max(a.limit)", LogicalPlanAggregateFunctionV1::Max),
+        ("avg(a.limit)", LogicalPlanAggregateFunctionV1::Avg),
+    ] {
+        let sql = format!(
+            "select s.user_id, s.score from scores s where s.score > (select {aggregate} from accounts a)"
+        );
+        let plan = validate_supported_scalar_aggregate_filter_sql(&sql, &catalogs).unwrap();
+        assert_eq!(plan.scalar_aggregate.function, expected, "SQL: {sql}");
+    }
+}
+
+#[test]
+fn scalar_aggregate_subquery_rejects_decimal_extrema_until_runtime_supports_them() {
+    let catalogs = [scores_catalog(), accounts_decimal_limit_catalog()];
+    let count_sql =
+        "select s.user_id, s.score from scores s where s.score > (select count(a.limit) from accounts a)";
+    let count_plan = validate_supported_scalar_aggregate_filter_sql(count_sql, &catalogs).unwrap();
+    assert_eq!(
+        count_plan.scalar_aggregate.function,
+        LogicalPlanAggregateFunctionV1::Count
+    );
+    for aggregate in [
+        "sum(a.limit)",
+        "avg(a.limit)",
+        "min(a.limit)",
+        "max(a.limit)",
+    ] {
+        let sql = format!(
+            "select s.user_id, s.score from scores s where s.score > (select {aggregate} from accounts a)"
+        );
+        let error = validate_supported_scalar_aggregate_filter_sql(&sql, &catalogs).unwrap_err();
+        assert!(
+            error.to_string().contains("Decimal128") && error.to_string().contains("runtime"),
+            "expected Decimal128 runtime-boundary rejection for `{sql}`, got `{error}`"
+        );
+    }
+}
+
+#[test]
+fn scalar_aggregate_logical_plan_uses_actual_key_and_projection_columns() {
+    let catalogs = [scores_catalog(), accounts_catalog()];
+    let key_only_sql =
+        "select s.user_id from scores s where s.score > (select sum(a.limit) from accounts a)";
+    let key_only_plan = lower_supported_scalar_aggregate_filter_sql_to_logical_plan(
+        key_only_sql,
+        &catalogs,
+        &scores_key_only_output_schema(),
+    )
+    .unwrap();
+    let renamed_sql = "select s.user_id, s.score as adjusted_score from scores s where s.score > (select sum(a.limit) from accounts a)";
+    let renamed_plan = lower_supported_scalar_aggregate_filter_sql_to_logical_plan(
+        renamed_sql,
+        &catalogs,
+        &scores_adjusted_projection_output_schema(),
+    )
+    .unwrap();
+    let key_project = key_only_plan
+        .nodes
+        .iter()
+        .find(|node| matches!(node, VelorixLogicalViewPlanNodeV1::Project { .. }))
+        .unwrap();
+    let VelorixLogicalViewPlanNodeV1::Project {
+        columns: key_columns,
+        computed_columns: key_computed,
+        ..
+    } = key_project
+    else {
+        unreachable!();
+    };
+    assert_eq!(key_columns.len(), 1);
+    assert!(key_computed.is_empty());
+    let renamed_project = renamed_plan
+        .nodes
+        .iter()
+        .find(|node| matches!(node, VelorixLogicalViewPlanNodeV1::Project { .. }))
+        .unwrap();
+    let VelorixLogicalViewPlanNodeV1::Project {
+        columns: renamed_columns,
+        computed_columns: renamed_computed,
+        ..
+    } = renamed_project
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        renamed_columns
+            .iter()
+            .map(|column| column.column_id.as_str())
+            .collect::<Vec<_>>(),
+        ["user_id", "score"]
+    );
+    assert!(renamed_computed.is_empty());
+}
+
+#[test]
+fn scalar_aggregate_subquery_rejects_function_modifiers_and_argument_metadata() {
+    let catalogs = [scores_catalog(), accounts_catalog()];
+    for aggregate in [
+        "count(distinct a.limit)",
+        "sum(a.limit) filter (where a.limit > 0)",
+        "sum(a.limit order by a.limit)",
+        "sum(a.limit) over ()",
+    ] {
+        let sql = format!(
+            "select s.user_id, s.score from scores s where s.score > (select {aggregate} from accounts a)"
+        );
+        let error = validate_supported_scalar_aggregate_filter_sql(&sql, &catalogs).unwrap_err();
+        assert!(
+            error.to_string().contains("modifier"),
+            "expected modifier rejection for `{sql}`, got `{error}`"
+        );
+    }
+}
+
+#[test]
+fn scalar_aggregate_subquery_rejects_typed_string_projection_until_runtime_supports_it() {
+    let catalogs = [scores_catalog(), accounts_catalog()];
+    let sql = "select s.user_id, lower(s.user_id) as normalized_user from scores s where s.score > (select sum(a.limit) from accounts a)";
+    let error = validate_supported_scalar_aggregate_filter_sql(sql, &catalogs).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("typed/string projections are not supported"),
+        "expected typed projection rejection, got {error}"
+    );
 }
 
 #[test]

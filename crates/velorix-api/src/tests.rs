@@ -11159,6 +11159,737 @@ async fn rest_count_distinct_view_materializes_outputs() {
 }
 
 #[tokio::test]
+async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state =
+        test_api_state_with_store(store.clone(), "api-test-scalar-aggregate-modifiers", false)
+            .await;
+    let router = app(state);
+
+    let mut nullable_accounts_catalog = test_accounts_catalog();
+    nullable_accounts_catalog.relation_schema.relation_id = "nullable_accounts".to_string();
+    nullable_accounts_catalog.relation_schema.relation_name = "nullable_accounts".to_string();
+    nullable_accounts_catalog.datafusion_registration.name = "nullable_accounts".to_string();
+    nullable_accounts_catalog.incremental_relation.relation_id = "nullable_accounts".to_string();
+    nullable_accounts_catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "limit")
+        .expect("nullable accounts limit column")
+        .nullable = true;
+    let nullable_schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&nullable_accounts_catalog.relation_schema)
+            .expect("nullable accounts catalog should fingerprint");
+    nullable_accounts_catalog.schema_fingerprint = nullable_schema_fingerprint.clone();
+    nullable_accounts_catalog
+        .incremental_relation
+        .schema_fingerprint = nullable_schema_fingerprint;
+
+    for catalog in [
+        test_scores_catalog(),
+        test_accounts_catalog(),
+        nullable_accounts_catalog,
+    ] {
+        let relation_response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({
+                "catalog": catalog,
+                "default_orders_sum_count": false
+            }),
+        )
+        .await;
+        assert_eq!(
+            relation_response.0,
+            StatusCode::CREATED,
+            "{relation_response:?}"
+        );
+    }
+
+    let input_relation_refs = vec![
+        InputRelationRef {
+            relation_id: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+        },
+        InputRelationRef {
+            relation_id: "accounts".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+        },
+    ];
+    let nullable_input_relation_refs = vec![
+        InputRelationRef {
+            relation_id: "scores".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+        },
+        InputRelationRef {
+            relation_id: "nullable_accounts".to_string(),
+            relation_version: "2026-05-24.v1".to_string(),
+        },
+    ];
+    let plain_cases = [
+        ("scalar_sum", "sum(a.limit)"),
+        ("scalar_count", "count(a.limit)"),
+        ("scalar_min", "min(a.limit)"),
+        ("scalar_max", "max(a.limit)"),
+        ("scalar_avg", "avg(a.limit)"),
+    ];
+    for (view_id, aggregate) in plain_cases {
+        let view_request = CreateViewRequest {
+            view_id: view_id.to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: input_relation_refs.clone(),
+            input_relations: Vec::new(),
+            sql: format!(
+                "select s.user_id, s.score from scores s where s.score > (select {aggregate} from accounts a)"
+            ),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("scalar aggregate plain-function matrix".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+        assert_eq!(view_response.1["query_enabled"], true, "{view_response:?}");
+    }
+
+    for (view_id, aggregate) in [
+        ("scalar_nullable_sum", "sum(a.limit)"),
+        ("scalar_nullable_count", "count(a.limit)"),
+        ("scalar_nullable_min", "min(a.limit)"),
+        ("scalar_nullable_max", "max(a.limit)"),
+        ("scalar_nullable_avg", "avg(a.limit)"),
+        ("scalar_nullable_count_star", "count(*)"),
+    ] {
+        let view_request = CreateViewRequest {
+            view_id: view_id.to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: nullable_input_relation_refs.clone(),
+            input_relations: Vec::new(),
+            sql: format!(
+                "select s.user_id, s.score from scores s where s.score > (select {aggregate} from nullable_accounts a)"
+            ),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("scalar aggregate nullable-input matrix".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let view_response =
+            call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+    }
+
+    let key_only_view_request = CreateViewRequest {
+        view_id: "scalar_sum_key_only".to_string(),
+        url_path: None,
+        output_relation_id: None,
+        input_relation_id: String::new(),
+        input_relation_version: String::new(),
+        input_relation_refs: input_relation_refs.clone(),
+        input_relations: Vec::new(),
+        sql: "select s.user_id from scores s where s.score > (select sum(a.limit) from accounts a)"
+            .to_string(),
+        source_kind: SqlSourceKind::StandingView,
+        output_relation_ids: Vec::new(),
+        sql_template: None,
+        description: Some("scalar aggregate key-only projection".to_string()),
+        request: Vec::new(),
+        response_schema: None,
+        response_formats: vec!["json".to_string()],
+        query_policy_id: None,
+    };
+    let key_only_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!(key_only_view_request),
+    )
+    .await;
+    assert_eq!(
+        key_only_response.0,
+        StatusCode::CREATED,
+        "{key_only_response:?}"
+    );
+    assert_eq!(
+        key_only_response.1["query_enabled"], true,
+        "{key_only_response:?}"
+    );
+
+    for (view_id, sql, modifier) in [
+        (
+            "scalar_sum_distinct_rejected",
+            "select s.user_id, s.score from scores s where s.score > (select sum(distinct a.limit) from accounts a)",
+            "DISTINCT",
+        ),
+        (
+            "scalar_count_distinct_rejected",
+            "select s.user_id, s.score from scores s where s.score > (select count(distinct a.limit) from accounts a)",
+            "DISTINCT",
+        ),
+        (
+            "scalar_sum_filter_rejected",
+            "select s.user_id, s.score from scores s where s.score > (select sum(a.limit) filter (where a.limit > 60) from accounts a)",
+            "FILTER",
+        ),
+        (
+            "scalar_typed_projection_rejected",
+            "select s.user_id, lower(s.user_id) as normalized_user from scores s where s.score > (select sum(a.limit) from accounts a)",
+            "UNSUPPORTED VIEW SQL",
+        ),
+    ] {
+        let view_request = CreateViewRequest {
+            view_id: view_id.to_string(),
+            url_path: None,
+            output_relation_id: None,
+            input_relation_id: String::new(),
+            input_relation_version: String::new(),
+            input_relation_refs: input_relation_refs.clone(),
+            input_relations: Vec::new(),
+            sql: sql.to_string(),
+            source_kind: SqlSourceKind::StandingView,
+            output_relation_ids: Vec::new(),
+            sql_template: None,
+            description: Some("scalar aggregate modifier must fail closed".to_string()),
+            request: Vec::new(),
+            response_schema: None,
+            response_formats: vec!["json".to_string()],
+            query_policy_id: None,
+        };
+        let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST, "{response:?}");
+        let error = response.1["error"].as_str().unwrap_or_default();
+        assert!(
+            !error.is_empty() && error.to_ascii_uppercase().contains(modifier),
+            "modifier rejection should identify {modifier}: {response:?}"
+        );
+    }
+
+    let ingest = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [
+                {
+                    "relation_id": "scores",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scalar-modifier-scores-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"user_id": "alice", "score": 100, "delta": 1},
+                        {"user_id": "bob", "score": 140, "delta": 1},
+                        {"user_id": "carol", "score": 190, "delta": 1}
+                    ]
+                },
+                {
+                    "relation_id": "accounts",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scalar-modifier-accounts-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"account_id": "a1", "limit": 50, "tier": "gold", "delta": 1},
+                        {"account_id": "a2", "limit": 50, "tier": "silver", "delta": 1},
+                        {"account_id": "a3", "limit": 80, "tier": "gold", "delta": 1}
+                    ]
+                },
+                {
+                    "relation_id": "nullable_accounts",
+                    "relation_version": "2026-05-24.v1",
+                    "stream_id": "scalar-modifier-nullable-accounts-stream",
+                    "partition_id": 0,
+                    "start_offset_inclusive": 0,
+                    "rows": [
+                        {"account_id": "na1", "limit": 50, "tier": "gold", "delta": 1},
+                        {"account_id": "na2", "limit": null, "tier": "silver", "delta": 1},
+                        {"account_id": "na3", "limit": 80, "tier": "gold", "delta": 1}
+                    ]
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
+    assert_eq!(
+        ingest.1["materialization"]["status"], "completed",
+        "{ingest:?}"
+    );
+
+    for (view_id, expected_rows) in [
+        ("scalar_sum", json!([{"user_id": "carol", "score": 190}])),
+        (
+            "scalar_count",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_min",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_max",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_avg",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+    ] {
+        let query = call_json(
+            &router,
+            Method::POST,
+            &format!("/v1/views/{view_id}/query"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(query.1["rows"], expected_rows, "{view_id}: {query:?}");
+    }
+
+    let key_only_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/scalar_sum_key_only/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(key_only_query.0, StatusCode::OK, "{key_only_query:?}");
+    assert_eq!(
+        key_only_query.1["rows"],
+        json!([{"user_id": "carol"}]),
+        "{key_only_query:?}"
+    );
+
+    for (view_id, expected_rows) in [
+        (
+            "scalar_nullable_sum",
+            json!([
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_count",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_min",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_max",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_avg",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_count_star",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+    ] {
+        let query = call_json(
+            &router,
+            Method::POST,
+            &format!("/v1/views/{view_id}/query"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(query.1["rows"], expected_rows, "{view_id}: {query:?}");
+    }
+
+    let views = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+    assert_eq!(views.0, StatusCode::OK, "{views:?}");
+    let view_ids = views.1["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|view| view["view_id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!view_ids.contains(&"scalar_sum_distinct_rejected"));
+    assert!(!view_ids.contains(&"scalar_count_distinct_rejected"));
+    assert!(!view_ids.contains(&"scalar_sum_filter_rejected"));
+    assert!(!view_ids.contains(&"scalar_typed_projection_rejected"));
+
+    let restarted_state =
+        test_api_state_with_store(store, "api-test-scalar-aggregate-modifiers-restarted", true)
+            .await;
+    assert_eq!(
+        restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        12
+    );
+    let restarted_router = app(restarted_state);
+    for (view_id, expected_rows) in [
+        ("scalar_sum", json!([{"user_id": "carol", "score": 190}])),
+        (
+            "scalar_count",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_min",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_max",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_avg",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        ("scalar_sum_key_only", json!([{"user_id": "carol"}])),
+        (
+            "scalar_nullable_sum",
+            json!([
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_count",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_min",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_max",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_avg",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+        (
+            "scalar_nullable_count_star",
+            json!([
+                {"user_id": "alice", "score": 100},
+                {"user_id": "bob", "score": 140},
+                {"user_id": "carol", "score": 190}
+            ]),
+        ),
+    ] {
+        let query = call_json(
+            &restarted_router,
+            Method::POST,
+            &format!("/v1/views/{view_id}/query"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(query.0, StatusCode::OK, "{query:?}");
+        assert_eq!(query.1["rows"], expected_rows, "{query:?}");
+    }
+}
+
+#[test]
+fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() {
+    let mut scalar_checkpoint = test_runtime_checkpoint(Vec::new());
+    scalar_checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+        codec_identity: scalar_checkpoint.checkpoint_codec_identity.clone(),
+        payload: json!({"runtime_kind": "scalar_aggregate_filter"}).to_string(),
+    });
+    assert_eq!(
+        crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
+            &scalar_checkpoint
+        )
+        .expect("scalar checkpoint payload should route without generic decoding"),
+        None
+    );
+
+    let mut temporal_checkpoint = test_runtime_checkpoint(Vec::new());
+    temporal_checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+        codec_identity: temporal_checkpoint.checkpoint_codec_identity.clone(),
+        payload: json!({"runtime_kind": "temporal_join_v1"}).to_string(),
+    });
+    assert_eq!(
+        crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
+            &temporal_checkpoint
+        )
+        .expect("temporal checkpoint payload should route to native row paging"),
+        Some(Vec::new())
+    );
+
+    for runtime_kind in [
+        "analytic_window_frame",
+        "two_input_semi_anti_join_project_v1",
+    ] {
+        let mut checkpoint = test_runtime_checkpoint(Vec::new());
+        checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: checkpoint.checkpoint_codec_identity.clone(),
+            payload: json!({"runtime_kind": runtime_kind}).to_string(),
+        });
+        assert_eq!(
+            crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
+                &checkpoint
+            )
+            .expect("native non-aggregate checkpoint should route without plan decoding"),
+            None
+        );
+    }
+
+    let generic_plan = json!({
+        "input_relation_id": "scores",
+        "group_key_column_id": "user_id",
+        "output_key_column_id": "user_id",
+        "sum_value_column_id": "score",
+        "aggregate_outputs": [],
+        "predicate": null
+    });
+    for runtime_kind in [Some("single_key_sum_count"), None] {
+        let mut checkpoint = test_runtime_checkpoint(Vec::new());
+        let mut payload = json!({"plan": generic_plan});
+        if let Some(runtime_kind) = runtime_kind {
+            payload["runtime_kind"] = json!(runtime_kind);
+        }
+        checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: checkpoint.checkpoint_codec_identity.clone(),
+            payload: payload.to_string(),
+        });
+        let aggregate_outputs =
+            crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
+                &checkpoint,
+            )
+            .expect("generic single-key checkpoint should decode its plan")
+            .expect("single-key checkpoint should expose aggregate outputs");
+        assert_eq!(aggregate_outputs.len(), 2);
+    }
+
+    let mut unknown_checkpoint = test_runtime_checkpoint(Vec::new());
+    unknown_checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+        codec_identity: unknown_checkpoint.checkpoint_codec_identity.clone(),
+        payload: json!({"runtime_kind": "future_runtime_kind"}).to_string(),
+    });
+    let error = crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
+        &unknown_checkpoint,
+    )
+    .expect_err("unknown explicit runtime kinds must fail closed");
+    assert!(error.to_string().contains("future_runtime_kind"));
+}
+
+#[tokio::test]
+async fn rest_scalar_decimal_aggregate_admission_rejects_nullable_and_nonnullable_inputs() {
+    fn decimal_catalog(
+        mut catalog: VelorixRelationCatalogV1,
+        relation_id: &str,
+        value_column_id: &str,
+        nullable: bool,
+    ) -> VelorixRelationCatalogV1 {
+        catalog.relation_schema.relation_id = relation_id.to_string();
+        catalog.relation_schema.relation_name = relation_id.to_string();
+        catalog.datafusion_registration.name = relation_id.to_string();
+        catalog.incremental_relation.relation_id = relation_id.to_string();
+        let value = catalog
+            .relation_schema
+            .columns
+            .iter_mut()
+            .find(|column| column.column_id == value_column_id)
+            .expect("decimal test value column");
+        value.logical_type = VelorixLogicalTypeV1::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        value.physical_arrow_type = ArrowPhysicalTypeV1::Decimal128 {
+            precision: 12,
+            scale: 2,
+        };
+        value.nullable = nullable;
+        let schema_fingerprint =
+            SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+        catalog.schema_fingerprint = schema_fingerprint.clone();
+        catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
+        catalog
+    }
+
+    let state = test_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "api-test-scalar-decimal-admission",
+        false,
+    )
+    .await;
+    let router = app(state);
+    let catalogs = [
+        decimal_catalog(
+            test_scores_catalog(),
+            "decimal_scores_nonnull",
+            "score",
+            false,
+        ),
+        decimal_catalog(
+            test_accounts_catalog(),
+            "decimal_accounts_nonnull",
+            "limit",
+            false,
+        ),
+        decimal_catalog(
+            test_scores_catalog(),
+            "decimal_scores_nullable",
+            "score",
+            true,
+        ),
+        decimal_catalog(
+            test_accounts_catalog(),
+            "decimal_accounts_nullable",
+            "limit",
+            true,
+        ),
+    ];
+    for catalog in catalogs {
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            json!({"catalog": catalog, "default_orders_sum_count": false}),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
+    }
+
+    let mut rejected_view_ids = Vec::new();
+    for (pair_name, outer_relation_id, scalar_relation_id) in [
+        (
+            "nonnull",
+            "decimal_scores_nonnull",
+            "decimal_accounts_nonnull",
+        ),
+        (
+            "nullable",
+            "decimal_scores_nullable",
+            "decimal_accounts_nullable",
+        ),
+    ] {
+        for aggregate in ["sum", "avg", "min", "max"] {
+            let view_id = format!("scalar_decimal_{aggregate}_{pair_name}_rejected");
+            let response = call_json(
+                &router,
+                Method::POST,
+                "/v1/views",
+                json!({
+                    "view_id": view_id,
+                    "input_relation_refs": [
+                        {"relation_id": outer_relation_id, "relation_version": "2026-05-24.v1"},
+                        {"relation_id": scalar_relation_id, "relation_version": "2026-05-24.v1"}
+                    ],
+                    "sql": format!(
+                        "select s.user_id from {outer_relation_id} s where s.score > (select {aggregate}(a.limit) from {scalar_relation_id} a)"
+                    ),
+                    "source_kind": "standing_view",
+                    "response_formats": ["json"]
+                }),
+            )
+            .await;
+            assert_eq!(response.0, StatusCode::BAD_REQUEST, "{response:?}");
+            assert!(!response.1["error"].as_str().unwrap_or_default().is_empty());
+            rejected_view_ids.push(view_id);
+        }
+    }
+
+    let views = call_json(&router, Method::GET, "/v1/views", Value::Null).await;
+    assert_eq!(views.0, StatusCode::OK, "{views:?}");
+    let view_ids = views.1["views"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|view| view["view_id"].as_str())
+        .collect::<Vec<_>>();
+    for view_id in rejected_view_ids {
+        assert!(
+            !view_ids.contains(&view_id.as_str()),
+            "{view_id} was installed"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rest_having_count_distinct_function_view_materializes_outputs() {
     let state = test_api_state_with_store(
         Arc::new(InMemory::new()),

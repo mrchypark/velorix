@@ -16976,15 +16976,15 @@ pub fn validate_supported_scalar_aggregate_filter_sql(
         return unsupported("scalar subquery must reference the second registered relation");
     }
     let inner_alias = Some(inner_table.alias.as_str());
-    let [SelectItem::UnnamedExpr(Expr::Function(Function { name, args, .. }))] =
-        inner_select.projection.as_slice()
+    let [SelectItem::UnnamedExpr(Expr::Function(function))] = inner_select.projection.as_slice()
     else {
         return unsupported("scalar subquery must project exactly one aggregate call");
     };
-    let function_name = name.to_string();
+    validate_scalar_subquery_aggregate_modifiers(function)?;
+    let function_name = function.name.to_string();
     let scalar_aggregate = scalar_subquery_aggregate_output(
         function_name.as_str(),
-        args,
+        &function.args,
         scalar_catalog,
         inner_alias,
     )?;
@@ -16996,9 +16996,9 @@ pub fn validate_supported_scalar_aggregate_filter_sql(
         outer_alias,
         None,
     )?;
-    if projection.value_columns.is_empty() {
+    if !projection.typed_value_columns.is_empty() {
         return unsupported(
-            "scalar aggregate filter materialized output requires at least one value column",
+            "scalar aggregate filter typed/string projections are not supported yet",
         );
     }
     Ok(SupportedScalarAggregateFilterPlanV1 {
@@ -17044,14 +17044,29 @@ fn scalar_subquery_aggregate_output(
     let FunctionArguments::List(argument_list) = args else {
         return unsupported("scalar subquery aggregate requires a normal argument list");
     };
+    if matches!(
+        argument_list.duplicate_treatment,
+        Some(DuplicateTreatment::Distinct)
+    ) || !argument_list.clauses.is_empty()
+    {
+        return unsupported("scalar subquery aggregate argument modifiers are not supported");
+    }
     let aggregate = match function_name.to_ascii_lowercase().as_str() {
-        "count" if argument_list.args.is_empty() => SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Count,
-            input_column_id: None,
-            input_relation_side: None,
-            input_expression: None,
-            output_column_id: "count".to_string(),
-        },
+        "count"
+            if argument_list.args.is_empty()
+                || matches!(
+                    argument_list.args.as_slice(),
+                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                ) =>
+        {
+            SupportedAggregateOutput {
+                function: LogicalPlanAggregateFunctionV1::Count,
+                input_column_id: None,
+                input_relation_side: None,
+                input_expression: None,
+                output_column_id: "count".to_string(),
+            }
+        }
         "count" => {
             let [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] = argument_list.args.as_slice()
             else {
@@ -17081,6 +17096,20 @@ fn scalar_subquery_aggregate_output(
                 "avg" => LogicalPlanAggregateFunctionV1::Avg,
                 _ => unreachable!(),
             };
+            if matches!(
+                function,
+                LogicalPlanAggregateFunctionV1::Sum
+                    | LogicalPlanAggregateFunctionV1::Avg
+                    | LogicalPlanAggregateFunctionV1::Min
+                    | LogicalPlanAggregateFunctionV1::Max
+            ) && matches!(
+                column.physical_arrow_type,
+                ArrowPhysicalTypeV1::Decimal128 { .. }
+            ) {
+                return unsupported(
+                    "scalar subquery Decimal128 SUM/AVG/MIN/MAX is unsupported until decimal runtime aggregation is implemented",
+                );
+            }
             match function {
                 LogicalPlanAggregateFunctionV1::Sum | LogicalPlanAggregateFunctionV1::Avg => {
                     validate_numeric_sum_column(catalog, column)?;
@@ -17102,6 +17131,19 @@ fn scalar_subquery_aggregate_output(
         }
     };
     Ok(aggregate)
+}
+
+fn validate_scalar_subquery_aggregate_modifiers(function: &Function) -> Result<(), ViewPlanError> {
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return unsupported("scalar subquery aggregate function modifiers are not supported");
+    }
+    Ok(())
 }
 
 pub fn lower_supported_scalar_aggregate_filter_sql_to_logical_plan(
@@ -17128,16 +17170,39 @@ fn scalar_aggregate_filter_logical_plan(
         catalog_for_relation_in_slice(catalogs, &supported.outer_input_relation_id)?;
     let output_relation = logical_relation_from_schema(output_schema);
     let outer_scan = logical_relation_from_catalog(outer_catalog);
-    let outer_key = column_ref(
-        &supported.outer_input_relation_id,
-        &supported.outer_key_column_id,
-    );
     let outer_comparison = column_ref(
         &supported.outer_input_relation_id,
         &supported.outer_comparison_column_id,
     );
     let filter_node_id = "scalar_aggregate_filter".to_string();
     let project_node_id = "scalar_aggregate_project".to_string();
+    let mut project_columns = Vec::new();
+    if let Some(output_key_input_column_id) = &supported.projection.output_key_input_column_id {
+        project_columns.push(column_ref(
+            &supported.outer_input_relation_id,
+            output_key_input_column_id,
+        ));
+    } else {
+        project_columns.push(column_ref(
+            &supported.outer_input_relation_id,
+            &supported.outer_key_column_id,
+        ));
+    }
+    let mut computed_columns = Vec::new();
+    for column in &supported.projection.value_columns {
+        if let Some(expression) = &column.expression {
+            computed_columns.push(LogicalPlanComputedColumnV1 {
+                output: column_ref(&output_relation.relation_id, &column.output_column_id),
+                input_relation_id: supported.outer_input_relation_id.clone(),
+                expression: expression.clone(),
+            });
+        } else {
+            project_columns.push(column_ref(
+                &supported.outer_input_relation_id,
+                &column.input_column_id,
+            ));
+        }
+    }
     let nodes = vec![
         VelorixLogicalViewPlanNodeV1::RelationScan {
             node_id: "outer_relation_scan".to_string(),
@@ -17155,11 +17220,8 @@ fn scalar_aggregate_filter_logical_plan(
         VelorixLogicalViewPlanNodeV1::Project {
             node_id: project_node_id.clone(),
             input: filter_node_id,
-            columns: vec![
-                outer_key,
-                column_ref(&supported.outer_input_relation_id, "score"),
-            ],
-            computed_columns: Vec::new(),
+            columns: project_columns,
+            computed_columns,
         },
         VelorixLogicalViewPlanNodeV1::Output {
             node_id: "output_materialized_view".to_string(),
