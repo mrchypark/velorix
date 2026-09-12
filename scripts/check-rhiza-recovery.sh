@@ -17,8 +17,8 @@ bucket=${RHIZA_RECOVERY_S3_BUCKET:-velorix-rhiza-recovery}
 prefix=${RHIZA_RECOVERY_S3_PREFIX:-recovery-$run_id}
 access_key=${RHIZA_RECOVERY_S3_ACCESS_KEY:-velorix-test-access}
 secret_key=${RHIZA_RECOVERY_S3_SECRET_KEY:-velorix-test-secret}
-minio_image=minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-mc_image=minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+minio_image=quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+mc_image=quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
 
 cleanup() {
     status=$?
