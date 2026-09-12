@@ -70,7 +70,7 @@ const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "materialized_output_late_materialization",
     "slatedb_state_reopen",
     "gc_dry_run_planning",
-    "gc_execution_evidence",
+    "gc_execution_denied",
 ];
 const S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     OBJECT_STORE_CAPABILITY_PROBE_WORKLOAD,
@@ -1546,8 +1546,10 @@ fn validate_security_release_provenance_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::ObjectStoreExt;
     use serde_json::json;
     use tempfile::tempdir;
+    use velorix_control::storage_admin::ObjectKey;
 
     fn write_artifact(name: &str, value: serde_json::Value) -> PathBuf {
         let mut path = env::temp_dir();
@@ -2493,16 +2495,21 @@ mod tests {
     async fn gc_production_evidence_rejects_empty_live_gc_run() {
         let dir = tempdir().unwrap();
         let store = local_object_store(dir.path()).unwrap();
-        let run = execute_s3_compatible_garbage_collection(
-            Arc::clone(&store),
-            "s3://velorix-test",
-            "run-empty",
-            GarbageCollectionPolicy {
-                retain_latest_manifests: 1,
-            },
-        )
-        .await
-        .unwrap();
+        let run = json!({
+            "schema_version": 1,
+            "run_id": "run-empty",
+            "policy": { "retain_latest_manifests": 1 },
+            "plan": { "retained_manifest_versions": [0], "candidates": [] },
+            "report": { "deleted": [], "skipped": [] }
+        });
+        let run_key = ObjectKey::garbage_collection_run("run-empty").unwrap();
+        store
+            .put(
+                &ObjectStorePath::from(run_key.as_str()),
+                Bytes::from(serde_json::to_vec(&run).unwrap()).into(),
+            )
+            .await
+            .unwrap();
         let error = generate_production_gc_run_evidence(
             store,
             "prod-a".to_string(),
@@ -2512,7 +2519,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(run.report.deleted.is_empty());
+        assert!(run["report"]["deleted"].as_array().unwrap().is_empty());
         assert!(format!("{error:#}").contains("at least one deleted candidate"));
     }
 
@@ -2535,6 +2542,41 @@ mod tests {
             evidence.deterministic_cost_compared_workloads,
             evidence.workload_metrics
         );
+    }
+
+    #[test]
+    fn benchmark_gate_migrates_historical_gc_baseline_but_requires_current_denial() {
+        let historical = BenchmarkGateResultV1::from_json_str(include_str!(
+            "../../../baselines/benchmark/local/pr-smoke.json"
+        ))
+        .unwrap();
+        assert!(historical
+            .workload_metrics
+            .iter()
+            .any(|workload| workload.name == "gc_execution_evidence"));
+        require_baseline_benchmark_workloads(BenchmarkBackend::Local, &historical).unwrap();
+
+        let mut current = historical.clone();
+        current
+            .workload_metrics
+            .iter_mut()
+            .find(|workload| workload.name == "gc_execution_evidence")
+            .unwrap()
+            .name = "gc_execution_denied".to_string();
+        current
+            .require_workloads(benchmark_gate_workloads_for_backend(
+                BenchmarkBackend::Local,
+            ))
+            .unwrap();
+
+        current
+            .workload_metrics
+            .retain(|workload| workload.name != "gc_execution_denied");
+        assert!(current
+            .require_workloads(benchmark_gate_workloads_for_backend(
+                BenchmarkBackend::Local
+            ))
+            .is_err());
     }
 }
 
@@ -9869,14 +9911,12 @@ fn run_benchmark_gate(
                     baseline.display()
                 )
             })?;
-        baseline_result
-            .require_workloads(benchmark_gate_workloads_for_backend(backend))
-            .with_context(|| {
-                format!(
-                    "benchmark baseline {} is missing required workload metrics",
-                    baseline.display()
-                )
-            })?;
+        require_baseline_benchmark_workloads(backend, &baseline_result).with_context(|| {
+            format!(
+                "benchmark baseline {} is missing required workload metrics",
+                baseline.display()
+            )
+        })?;
         if has_placeholder_commit(&baseline_result) {
             bail!(
                 "benchmark gate requires a real baseline, got placeholder commit {} in {}",
@@ -10017,6 +10057,31 @@ fn benchmark_gate_workloads_for_backend(backend: BenchmarkBackend) -> &'static [
         BenchmarkBackend::Local => LOCAL_BENCHMARK_GATE_WORKLOADS,
         BenchmarkBackend::S3Compatible => S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS,
     }
+}
+
+fn require_baseline_benchmark_workloads(
+    backend: BenchmarkBackend,
+    result: &BenchmarkGateResultV1,
+) -> anyhow::Result<()> {
+    let required = benchmark_gate_workloads_for_backend(backend);
+    if backend != BenchmarkBackend::Local {
+        result.require_workloads(required)?;
+        return Ok(());
+    }
+
+    let has_gc_workload = result.workload_metrics.iter().any(|workload| {
+        workload.name == "gc_execution_denied" || workload.name == "gc_execution_evidence"
+    });
+    if !has_gc_workload {
+        bail!("missing required workload metrics: gc_execution_denied (or historical gc_execution_evidence)");
+    }
+    let ordinary_required = required
+        .iter()
+        .copied()
+        .filter(|name| *name != "gc_execution_denied")
+        .collect::<Vec<_>>();
+    result.require_workloads(&ordinary_required)?;
+    Ok(())
 }
 
 fn reject_local_emulator_s3_benchmark(
