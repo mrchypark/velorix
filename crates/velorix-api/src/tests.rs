@@ -19150,6 +19150,112 @@ async fn rest_relation_admission_rejects_internal_published_view_output_source_k
 }
 
 #[tokio::test]
+async fn rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_restore() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state =
+        test_api_state_with_store(store.clone(), "api-test-recursive-outer-first-a", false).await;
+    let router = app(state);
+    let catalog = test_edges_catalog_for_e2e();
+    let relation_version = catalog.relation_schema.relation_version.clone();
+
+    let relation_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": catalog, "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(
+        relation_response.0,
+        StatusCode::CREATED,
+        "{relation_response:?}"
+    );
+
+    let sql = "with recursive fwd as (select src, dst from edges union distinct select r.src, e.dst from fwd r join edges e on r.dst = e.src), bwd as (select dst as src, src as dst from edges where src = 'isolated' union distinct select r.src, e.dst from bwd r join edges e on r.dst = e.src) select src, dst from fwd";
+    let view_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id": "recursive_outer_first",
+            "sql": sql,
+            "input_relation_id": "edges",
+            "input_relation_version": relation_version,
+            "source_kind": "standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+
+    let ingest_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [{
+                "relation_id": "edges",
+                "relation_version": "2026-08-14.v1",
+                "stream_id": "recursive-outer-first-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "rows": [
+                    {"edge_id": "e1", "src": "a", "dst": "b", "delta": 1},
+                    {"edge_id": "e2", "src": "b", "dst": "c", "delta": 1},
+                    {"edge_id": "e3", "src": "isolated", "dst": "leaf", "delta": 1}
+                ]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        ingest_response.0,
+        StatusCode::CREATED,
+        "{ingest_response:?}"
+    );
+
+    let expected_rows = json!([
+        {"src": "a", "dst": "b"},
+        {"src": "a", "dst": "c"},
+        {"src": "b", "dst": "c"},
+        {"src": "isolated", "dst": "leaf"}
+    ]);
+    let query_response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/recursive_outer_first/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query_response.0, StatusCode::OK, "{query_response:?}");
+    assert_eq!(
+        query_response.1["rows"], expected_rows,
+        "{query_response:?}"
+    );
+
+    let restored_state =
+        test_api_state_with_store(store, "api-test-recursive-outer-first-b", true).await;
+    assert_eq!(
+        restored_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let restored_query = call_json(
+        &app(restored_state),
+        Method::POST,
+        "/v1/views/recursive_outer_first/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(restored_query.0, StatusCode::OK, "{restored_query:?}");
+    assert_eq!(
+        restored_query.1["rows"], expected_rows,
+        "{restored_query:?}"
+    );
+}
+
+#[tokio::test]
 async fn phase8_families_derive_output_schemas_for_view_requests() {
     let state = test_public_api_state_with_store(
         Arc::new(InMemory::new()),

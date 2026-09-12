@@ -165,47 +165,6 @@ impl RecursiveFixpointRuntime {
         Ok(Some(Value::Object(row)))
     }
 
-    /// Evaluate a recursive candidate using a specific CTE config
-    /// (for mutually recursive CTEs).
-    fn recursive_candidate_with_config(
-        &self,
-        derived: &Value,
-        base: &RecursiveBaseRow,
-        config: &SecondCTEConfigV1,
-    ) -> Result<Option<Value>, StandingProgramRuntimeError> {
-        if !recursive_base_predicates_match(base, &config.recursive_base_predicate)? {
-            return Ok(None);
-        }
-        let derived_object = derived.as_object().ok_or_else(invalid_runtime_state)?;
-        let base_join = base
-            .values
-            .get(&config.recursive_join.base_column_id)
-            .ok_or_else(invalid_runtime_state)?;
-        let derived_join = derived_object
-            .get(&config.recursive_join.recursive_column_id)
-            .ok_or_else(invalid_runtime_state)?;
-        if derived_join != base_join {
-            return Ok(None);
-        }
-        let mut row = serde_json::Map::new();
-        for (index, item) in config.recursive_projection.iter().enumerate() {
-            let value = match item {
-                RecursiveProjectionItemV1::Recursive { column_id } => derived_object
-                    .get(column_id)
-                    .ok_or_else(invalid_runtime_state)?,
-                RecursiveProjectionItemV1::Base { column_id } => base
-                    .values
-                    .get(column_id)
-                    .ok_or_else(invalid_runtime_state)?,
-            };
-            row.insert(
-                self.plan.recursion_column_names[index].clone(),
-                value.clone(),
-            );
-        }
-        Ok(Some(Value::Object(row)))
-    }
-
     fn recompute_closure_from(
         &self,
         base_multiset: &BTreeMap<String, RecursiveBaseRow>,
@@ -221,16 +180,11 @@ impl RecursiveFixpointRuntime {
                 derived.insert(canonical_json(&row), row);
             }
         }
-        // Seed with second CTE's anchor rows (for mutually recursive CTEs)
-        if let Some(ref cte2) = self.plan.second_cte {
-            for base in base_multiset.values() {
-                if let Some(row) =
-                    self.anchor_row(base, &cte2.anchor_base_predicate, &cte2.anchor_projection)?
-                {
-                    derived.insert(canonical_json(&row), row);
-                }
-            }
-        }
+        // The grammar validates a second CTE for forward compatibility, but
+        // the current SQL contract exposes only the first CTE to the outer
+        // query and never lets the first CTE reference the second. Keep the
+        // second definition out of this reachable closure until the grammar
+        // grows a real second-output dependency and separate state contract.
         if derived.len() as u64 > self.plan.resource_contract.max_derived_rows {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "recursive_fixpoint_resource_contract",
@@ -268,27 +222,6 @@ impl RecursiveFixpointRuntime {
                     if !derived.contains_key(&key) && !new_keys.contains(&key) {
                         new_keys.insert(key.clone());
                         new_frontier.push((key, candidate));
-                    }
-                    // Evaluate second CTE's recursive term (for mutually recursive CTEs)
-                    if let Some(ref cte2) = self.plan.second_cte {
-                        work_units = work_units
-                            .checked_add(1)
-                            .ok_or_else(invalid_runtime_state)?;
-                        if work_units > self.plan.resource_contract.max_work_units_per_epoch {
-                            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                                field: "recursive_fixpoint_resource_contract",
-                            });
-                        }
-                        let Some(candidate2) =
-                            self.recursive_candidate_with_config(row, base, cte2)?
-                        else {
-                            continue;
-                        };
-                        let key2 = canonical_json(&candidate2);
-                        if !derived.contains_key(&key2) && !new_keys.contains(&key2) {
-                            new_keys.insert(key2.clone());
-                            new_frontier.push((key2, candidate2));
-                        }
                     }
                 }
             }
@@ -547,7 +480,7 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
                     idempotency_key: idempotency_key.clone(),
                     logical_epoch: *logical_epoch,
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
             logical_epoch: self.logical_epoch,
         };
         let payload = serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())?;
@@ -621,6 +554,9 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
         if compiled != payload.plan {
             return Err(invalid_checkpoint());
         }
+        if payload.logical_plan.view_sql != payload.view_sql {
+            return Err(invalid_checkpoint());
+        }
         validate_published_output(&payload.published_output)?;
         let mut applied_epochs = payload
             .applied_epochs
@@ -628,7 +564,7 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
             .map(|entry| (entry.idempotency_key, entry.logical_epoch))
             .collect();
         retain_recent_applied_epochs(&mut applied_epochs);
-        Ok(Self {
+        let runtime = Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
             input_schema: payload.input_schema,
@@ -643,7 +579,34 @@ impl StandingProgramRuntime for RecursiveFixpointRuntime {
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
             applied_epochs,
             logical_epoch: checkpoint.logical_epoch,
-        })
+        };
+        let recomputed = runtime
+            .recompute_closure_from(&runtime.base_multiset)
+            .map_err(|_| invalid_checkpoint())?;
+        let expected_output = DeltaBatch::from_records(
+            recomputed
+                .values()
+                .cloned()
+                .map(|row| {
+                    DeltaRecord::new(
+                        DeltaKey::from_json(row),
+                        DeltaValue::from_json(Value::Object(serde_json::Map::new())),
+                        1,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let expected_rows = expected_output
+            .net_rows()
+            .map_err(|_| invalid_checkpoint())?;
+        let published_rows = runtime
+            .published_output
+            .net_rows()
+            .map_err(|_| invalid_checkpoint())?;
+        if recomputed != runtime.derived_set || expected_rows != published_rows {
+            return Err(invalid_checkpoint());
+        }
+        Ok(runtime)
     }
 }
 

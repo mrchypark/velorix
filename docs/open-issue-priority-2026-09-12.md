@@ -16,7 +16,7 @@ acceptance remains outstanding.
 | Order | Issue | Classification / exposure | Verified anchor(s) | First bounded action and acceptance |
 |---:|---|---|---|---|
 | 1 | [#46](https://github.com/mrchypark/velorix/issues/46) | Confirmed P0; GC/manifest race can delete live objects | `crates/velorix-storage/src/state.rs:459,1202` | Apply approved fail-closed containment: zero deletes, release remains safe, and evidence is explicit. The true publish-race test remains separate eventual-coordinator acceptance. |
-| 2 | [#29](https://github.com/mrchypark/velorix/issues/29) | Confirmed P0; recursive CTE state conflation | `crates/velorix-runtime/src/materialized_view_runtime/recursive_fixpoint.rs:213,264` | Preserve the feature with full per-CTE derived/frontier state isolation. Test second-rule-only input and retraction. |
+| 2 | [#29](https://github.com/mrchypark/velorix/issues/29) | Confirmed P0; recursive CTE state conflation | `crates/velorix-runtime/src/materialized_view_runtime/recursive_fixpoint.rs:213,264` | Keep admission validation for the currently unreachable second CTE, but prune it from execution and strictly recompute/validate first-CTE closure on restore; test disjoint second-rule input and contaminated checkpoint rejection. |
 | 3 | [#11](https://github.com/mrchypark/velorix/issues/11) | Confirmed P0 residual; configured Meta owner/predecessor/pointer paths are already atomic, but standalone storage publication markers remain exposed | `crates/velorix-storage/src/state.rs:2920`; `crates/velorix-api/src/checkpoint_publication.rs` | Do not duplicate the existing Meta transaction. Audit and fence standalone storage publication markers; test owner change between marker validation and publication. |
 | 4 | [#48](https://github.com/mrchypark/velorix/issues/48) | Confirmed P1; stale missing candidate blocks valid latest recovery | `crates/velorix-storage/src/state.rs:1914,2481,2533` | Treat candidate as a hint, select authoritative latest publication first. Test stale/GC candidate followed by valid latest, and latest corruption must fail explicitly. |
 | 5 | [#47](https://github.com/mrchypark/velorix/issues/47) | Confirmed P1; per-object GC progress is recorded too late | `crates/velorix-storage/src/state.rs:1247,1295` | Persist plan/start/progress before deletion and resume idempotently after mid-run failure or lost completion response. This is downstream of #46’s root-protection coordination. |
@@ -48,3 +48,15 @@ acceptance remains outstanding.
 
 The effective execution order is therefore:
 `#46,#29,#11,#48,#47,#54,#45,#43,#44,#42,#41,#25,#30,#35,#40,#37,#38,#39,#49,#32,#33,#34,#52,#50,#51,#53,#63,#59,#57`, with #24 as the operational gate.
+
+## Dated progress — 2026-09-12
+
+PR #65 merged the #46 temporary fail-closed containment at commit
+`8c5e519fa033f342f8a1493fb44dc1911b1c8c96`; CI run `34678254479` passed all
+eight checks, including three-node cold recovery. The linked issue discussion
+explicitly keeps #46 and downstream retention-debt #47 open: containment is
+not the durable coordination or per-object progress fix.
+
+The #29 API regression now proves the reachable first-CTE closure across fresh
+API-state restore with a disjoint second-CTE anchor. Local validation passed;
+PR merge remains pending (the implementation is not yet merged).
