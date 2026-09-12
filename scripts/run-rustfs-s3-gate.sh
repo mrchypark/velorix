@@ -29,11 +29,23 @@ production_gc_prefix="${VELORIX_RUSTFS_PRODUCTION_GC_PREFIX:-${prefix}/productio
 production_gc_run_id="${VELORIX_RUSTFS_PRODUCTION_GC_RUN_ID:-rustfs-production-gc-${run_id}}"
 production_gc_deployment_id="${VELORIX_RUSTFS_PRODUCTION_GC_DEPLOYMENT_ID:-rustfs-s3-gate}"
 production_gc_authority_store_id="${VELORIX_RUSTFS_PRODUCTION_GC_AUTHORITY_STORE_ID:-s3://rustfs/${bucket}/${production_gc_prefix}}"
-run_production_gc_evidence="${VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE:-1}"
+run_production_gc_evidence="${VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE:-0}"
 production_gc_retain_latest_manifests="${VELORIX_RUSTFS_PRODUCTION_GC_RETAIN_LATEST_MANIFESTS:-1}"
 created_container=0
 created_network=0
 created_volume=0
+
+case "$run_production_gc_evidence" in
+  0) ;;
+  1)
+    echo "RustFS production GC is unavailable: durable cross-process coordinator is required" >&2
+    exit 75
+    ;;
+  *)
+    echo "VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE must be 0 or 1" >&2
+    exit 64
+    ;;
+esac
 
 require() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -341,26 +353,6 @@ cargo test -p velorix-storage --test multi_process_ingest_admission --features s
 benchmark_ran=false
 
 production_gc_generated=false
-if [ "$run_production_gc_evidence" = "1" ]; then
-  VELORIX_S3_PREFIX="$production_gc_prefix" cargo run -p velorix-cli -- \
-    gc-seed-s3-compatible-fixture \
-    --authority-store-id "$production_gc_authority_store_id" \
-    --seed-id "$production_gc_run_id" \
-    --json > "$production_gc_seed_path"
-  VELORIX_S3_PREFIX="$production_gc_prefix" cargo run -p velorix-cli -- \
-    gc-execute-s3-compatible \
-    --authority-store-id "$production_gc_authority_store_id" \
-    --retain-latest-manifests "$production_gc_retain_latest_manifests" \
-    --run-id "$production_gc_run_id" \
-    --json > "$production_gc_run_path"
-  VELORIX_S3_PREFIX="$production_gc_prefix" cargo run -p velorix-cli -- \
-    gc-production-evidence \
-    --deployment-id "$production_gc_deployment_id" \
-    --authority-store-id "$production_gc_authority_store_id" \
-    --gc-run-id "$production_gc_run_id" \
-    --json > "$production_gc_path"
-  production_gc_generated=true
-fi
 
 python3 - "$evidence_path" "$benchmark_path" "$benchmark_ran" "$container" "$image" "$volume" "$port" "$bucket" "$prefix" "$region" "$cargo_target_dir" "$production_gc_seed_path" "$production_gc_run_path" "$production_gc_path" "$production_gc_validation_path" "$production_gc_generated" "$production_gc_prefix" "$production_gc_run_id" "$production_gc_deployment_id" "$production_gc_authority_store_id" "$production_gc_retain_latest_manifests" <<'PY'
 import json
@@ -406,7 +398,7 @@ evidence = {
     ],
     "gate_detail_kind": [
         "s3_compatible_ingest_admission_crash_restart",
-        "s3_compatible_gc_execution_retention",
+        "s3_compatible_gc_execution_unavailable",
     ],
     "endpoint": f"http://127.0.0.1:{port}",
     "bucket": bucket,

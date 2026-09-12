@@ -608,6 +608,129 @@ fn state_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+fn gc_admin_digest_for_test(label: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+// Historical fixture only: production destructive GC is coordinator-gated.
+async fn install_historical_gc_fixture(
+    store: &dyn ObjectStore,
+    publisher: &CheckpointPublisher,
+    run_id: &str,
+    policy: GarbageCollectionPolicy,
+    plan: &GarbageCollectionPlan,
+    delete_candidates: bool,
+) {
+    let run = GarbageCollectionRunV1 {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        policy,
+        plan: plan.clone(),
+        report: GarbageCollectionReport {
+            deleted: plan.candidates.clone(),
+            skipped: Vec::new(),
+        },
+    };
+    let run_bytes = serde_json::to_vec(&run).unwrap();
+    store
+        .put(
+            &Path::from(ObjectKey::garbage_collection_run(run_id).unwrap().as_str()),
+            Bytes::from(run_bytes.clone()).into(),
+        )
+        .await
+        .unwrap();
+
+    for manifest_version in 0..=plan
+        .retained_manifest_versions
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+    {
+        let manifest = match publisher.read_manifest_by_version(manifest_version).await {
+            Ok(manifest) => manifest,
+            Err(_) => continue,
+        };
+        if plan.retained_manifest_versions.contains(&manifest_version) {
+            continue;
+        }
+        let deleted_keys = manifest
+            .state_objects
+            .iter()
+            .map(|reference| &reference.object_key)
+            .chain(
+                manifest
+                    .output_objects
+                    .iter()
+                    .map(|reference| &reference.object_key),
+            )
+            .filter(|key| {
+                plan.candidates
+                    .iter()
+                    .any(|candidate| &candidate.object_key == *key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if deleted_keys.is_empty() {
+            continue;
+        }
+        let manifest_key = manifest.object_key();
+        let manifest_bytes = store
+            .get(&Path::from(manifest_key.as_str()))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let record = CheckpointRetentionRecordV1::for_manifest(
+            &manifest,
+            &manifest_bytes,
+            run_id.to_string(),
+            policy,
+            plan.retained_manifest_versions.clone(),
+            deleted_keys.clone(),
+            "unix:0.000000001".to_string(),
+        );
+        let record_bytes = serde_json::to_vec(&record).unwrap();
+        store
+            .put(
+                &Path::from(ObjectKey::checkpoint_retention_record(manifest_version).as_str()),
+                Bytes::from(record_bytes.clone()).into(),
+            )
+            .await
+            .unwrap();
+        let transition_id = format!("gc-retired-{run_id}");
+        let transition = CheckpointGcTransitionRecordV1::payload_released_from_retention_record(
+            &record,
+            transition_id.clone(),
+            gc_admin_digest_for_test("velorix.gc-run.v1", &run_bytes),
+            gc_admin_digest_for_test("velorix.checkpoint-retention.v1", &record_bytes),
+            "unix:0.000000001".to_string(),
+            "checkpoint-publisher-gc".to_string(),
+        );
+        store
+            .put(
+                &Path::from(
+                    ObjectKey::checkpoint_gc_transition_record(manifest_version, &transition_id)
+                        .unwrap()
+                        .as_str(),
+                ),
+                Bytes::from(serde_json::to_vec(&transition).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        if delete_candidates {
+            for key in deleted_keys {
+                store.delete(&Path::from(key.as_str())).await.unwrap();
+            }
+        }
+    }
+}
+
 fn manifest(checkpoint_version: u64, state_ref: StateObjectRef) -> CheckpointManifest {
     CheckpointManifest {
         schema_version: 1,
@@ -858,14 +981,17 @@ async fn gc_execution_deletes_only_velorix_owned_candidates() {
         })
         .await
         .unwrap();
-    let report = publisher
+    let err = publisher
         .execute_garbage_collection_plan(&plan)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(report.deleted, plan.candidates);
-    assert!(!object_exists(store.as_ref(), orphan_state.object_key()).await);
-    assert!(!object_exists(store.as_ref(), orphan_output.object_key()).await);
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ));
+    assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
+    assert!(object_exists(store.as_ref(), orphan_output.object_key()).await);
     assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
     assert!(store.head(&slatedb_internal_path).await.is_ok());
 }
@@ -888,38 +1014,24 @@ async fn gc_execution_writes_stable_run_evidence() {
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    let run = publisher
+    let err = publisher
         .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(run.schema_version, 1);
-    assert_eq!(run.run_id, "run-0001");
-    assert_eq!(run.policy, policy);
-    assert_eq!(run.plan, plan);
-    assert_eq!(run.report.deleted.len(), 1);
-    assert_eq!(run.report.skipped, Vec::new());
-
-    let evidence_key = ObjectKey::garbage_collection_run("run-0001").unwrap();
-    let evidence_bytes = store
-        .get(&Path::from(evidence_key.as_str()))
-        .await
-        .unwrap()
-        .bytes()
-        .await
-        .unwrap();
-    let restored: GarbageCollectionRunV1 = serde_json::from_slice(&evidence_bytes).unwrap();
-    assert_eq!(restored, run);
-
-    let read_back = publisher
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ));
+    assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
+    assert!(publisher
         .read_garbage_collection_run_evidence("run-0001")
         .await
-        .unwrap();
-    assert_eq!(read_back, run);
+        .is_err());
 }
 
 #[tokio::test]
-async fn gc_execution_writes_retention_evidence_after_run_evidence_readback() {
+async fn gc_execution_denied_without_coordinator_no_retention_evidence() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let policy = GarbageCollectionPolicy {
@@ -936,59 +1048,23 @@ async fn gc_execution_writes_retention_evidence_after_run_evidence_readback() {
     publisher.publish_manifest(&manifest_1).await.unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    let run = publisher
+    let err = publisher
         .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
         .await
-        .unwrap();
-
-    let record = publisher.read_checkpoint_retention_record(0).await.unwrap();
-    assert_eq!(record.schema_version, 1);
-    assert_eq!(record.checkpoint_version, 0);
-    assert_eq!(record.manifest_key, manifest_0.object_key());
-    assert_eq!(record.gc_run_id, "run-0001");
-    assert_eq!(record.policy, policy);
-    assert_eq!(record.retained_manifest_versions, vec![1]);
-    assert_eq!(
-        record.deleted_candidate_keys,
-        vec![state_0.object_key().clone()]
-    );
-    assert_eq!(
-        record.manifest_digest,
-        manifest_digest_for_test(&manifest_0)
-    );
-    assert_eq!(
-        run.report.deleted[0].object_key,
-        state_0.object_key().clone()
-    );
-    let transition = publisher
-        .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
-        .await
-        .unwrap();
-    assert_eq!(
-        transition,
-        CheckpointGcTransitionRecordV1::payload_released_from_retention_record(
-            &record,
-            "gc-retired-run-0001".to_string(),
-            transition.gc_run_digest.clone(),
-            transition.retention_record_digest.clone(),
-            transition.created_at.clone(),
-            transition.emitter.clone(),
-        )
-    );
-    assert_eq!(
-        transition.transition,
-        CheckpointGcTransition::PayloadReleased
-    );
+        .unwrap_err();
     assert!(matches!(
-        publisher.read_checkpoint_retention_record(1).await,
-        Err(CheckpointPublishError::ObjectStore(
-            object_store::Error::NotFound { .. }
-        ))
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
     ));
+    assert!(publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .is_err());
+    assert!(publisher.read_checkpoint_retention_record(0).await.is_err());
 }
 
 #[tokio::test]
-async fn gc_execution_releases_manifest_retired_slatedb_state_refs() {
+async fn gc_execution_denied_without_coordinator_preserves_slatedb_state() {
     let (_temp_dir, store) = temp_store();
     let publisher =
         CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
@@ -1027,30 +1103,21 @@ async fn gc_execution_releases_manifest_retired_slatedb_state_refs() {
         }]
     );
 
-    let run = publisher
+    let err = publisher
         .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
         .await
-        .unwrap();
-
-    assert_eq!(run.report.deleted, plan.candidates);
+        .unwrap_err();
     assert!(matches!(
-        publisher.read_state_object(&state_ref_0).await,
-        Err(CheckpointPublishError::MissingStateObject(object_key))
-            if object_key == *state_0.object_key()
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
     ));
+    assert!(publisher
+        .read_garbage_collection_run_evidence("run-0001")
+        .await
+        .is_err());
     assert_eq!(
-        publisher.read_state_object(&state_ref_1).await.unwrap(),
-        Bytes::from_static(b"state-1")
-    );
-
-    let record = publisher.read_checkpoint_retention_record(0).await.unwrap();
-    assert_eq!(
-        record.deleted_candidate_keys,
-        vec![state_0.object_key().clone()]
-    );
-    assert_eq!(
-        record.manifest_digest,
-        manifest_digest_for_test(&manifest(0, state_ref_0))
+        publisher.read_state_object(&state_ref_0).await.unwrap(),
+        Bytes::from_static(b"state-0")
     );
 }
 
@@ -1194,10 +1261,8 @@ async fn checkpoint_admin_inspect_reports_retention_evidence_for_gc_retired_mani
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, true)
+        .await;
 
     let report = publisher.inspect_checkpoints().await.unwrap();
     let retired = &report.manifests[0];
@@ -1282,10 +1347,8 @@ async fn checkpoint_admin_inspect_degrades_when_gc_transition_record_read_fails(
         .await
         .unwrap();
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, true)
+        .await;
 
     let reader = CheckpointPublisher::new(Arc::new(ReadFailsStore::new(
         Arc::clone(&store),
@@ -1329,10 +1392,8 @@ async fn gc_verify_run_retention_evidence_accepts_readable_listed_run_with_match
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, false)
+        .await;
 
     let verified = publisher
         .verify_garbage_collection_run_retention_evidence("run-0001")
@@ -1364,10 +1425,8 @@ async fn gc_verify_run_retention_evidence_rejects_missing_retention_record() {
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, false)
+        .await;
     store
         .delete(&Path::from(
             ObjectKey::checkpoint_retention_record(0).as_str(),
@@ -1408,10 +1467,14 @@ async fn garbage_collection_never_reclaims_immutable_ingest_log_ranges() {
         .candidates
         .iter()
         .all(|candidate| candidate.object_key != ingest_key));
-    publisher
+    let err = publisher
         .execute_garbage_collection_plan(&plan)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ));
     assert!(store.head(&ingest_path).await.is_ok());
 }
 
@@ -1437,10 +1500,8 @@ async fn gc_verify_run_retention_evidence_rejects_missing_gc_transition_record()
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, false)
+        .await;
     store
         .delete(&Path::from(
             ObjectKey::checkpoint_gc_transition_record(0, "gc-retired-run-0001")
@@ -1528,10 +1589,8 @@ async fn checkpoint_admin_inspect_ignores_retention_record_with_incomplete_delet
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, false)
+        .await;
     let truncated_record = CheckpointRetentionRecordV1::for_manifest(
         &manifest_0,
         &serde_json::to_vec(&manifest_0).unwrap(),
@@ -1929,12 +1988,14 @@ async fn gc_ignores_publish_temp_attempt_objects() {
             kind: GarbageCollectionCandidateKind::RawStateObject,
         }],
     };
-    let report = publisher
+    let err = publisher
         .execute_garbage_collection_plan(&unsafe_plan)
         .await
-        .unwrap();
-
-    assert_eq!(report.deleted, Vec::new());
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ));
     assert!(object_exists(store.as_ref(), &temp_attempt).await);
 }
 
@@ -1981,7 +2042,7 @@ async fn gc_execution_rejects_caller_plan_that_targets_manifest_referenced_objec
 
     assert!(matches!(
         err,
-        CheckpointPublishError::GarbageCollectionCandidateStillReferenced { .. }
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
     ));
     assert!(object_exists(store.as_ref(), orphan_state.object_key()).await);
     assert!(object_exists(store.as_ref(), retained_state.object_key()).await);
@@ -2023,7 +2084,7 @@ async fn gc_execution_rejects_stale_plan_when_new_manifest_references_candidate(
 
     assert!(matches!(
         err,
-        CheckpointPublishError::GarbageCollectionCandidateStillReferenced { .. }
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
     ));
     assert!(object_exists(store.as_ref(), stale_candidate_state.object_key()).await);
 }
@@ -2058,9 +2119,10 @@ async fn gc_execution_fails_closed_when_manifest_revalidation_listing_fails() {
         .await
         .unwrap_err();
 
-    let err = err.to_string();
-    assert!(err.contains("prefix-listing-fails"));
-    assert!(err.contains("listing failed for v1/checkpoints/"));
+    assert!(matches!(
+        err,
+        CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ));
     assert!(object_exists(store.as_ref(), orphan_output.object_key()).await);
 }
 
@@ -2438,10 +2500,8 @@ async fn checkpoint_gc_transition_record_is_digest_bound() {
         .unwrap();
 
     let plan = publisher.plan_garbage_collection(policy).await.unwrap();
-    publisher
-        .execute_garbage_collection_plan_with_evidence("run-0001", policy, &plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(store.as_ref(), &publisher, "run-0001", policy, &plan, false)
+        .await;
 
     let transition = publisher
         .read_checkpoint_gc_transition_record(0, "gc-retired-run-0001")
@@ -2791,10 +2851,17 @@ async fn checkpoint_admin_inspect_treats_gc_retired_parent_payload_as_parent_lin
         })
         .await
         .unwrap();
-    publisher
-        .execute_garbage_collection_plan(&plan)
-        .await
-        .unwrap();
+    install_historical_gc_fixture(
+        store.as_ref(),
+        &publisher,
+        "run-0001",
+        GarbageCollectionPolicy {
+            retain_latest_manifests: 1,
+        },
+        &plan,
+        true,
+    )
+    .await;
 
     assert!(!object_exists(store.as_ref(), state_0.object_key()).await);
     assert!(!object_exists(store.as_ref(), output_0.object_key()).await);

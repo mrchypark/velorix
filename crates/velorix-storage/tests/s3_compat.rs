@@ -85,7 +85,7 @@ async fn s3_compatible_store_supports_authoritative_namespace_startup_capabiliti
 }
 
 #[tokio::test]
-async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence() -> TestResult {
+async fn s3_compatible_gc_execution_denied_without_coordinator() -> TestResult {
     let Some(config) = live_config() else {
         println!("skipping S3-compatible GC execution harness; set VELORIX_S3_COMPAT=1 to enable");
         return Ok(());
@@ -113,7 +113,7 @@ async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence()
     )?;
     let state_ref_0 = publisher.write_state_object(&state_0).await?;
     publisher
-        .publish_manifest(&gc_manifest(0, 0, 1, None, vec![state_ref_0]))
+        .publish_manifest(&gc_manifest(0, 0, 1, None, vec![state_ref_0.clone()]))
         .await?;
     let state_1 = StateObjectWrite::new(
         "s3_compatible_gc",
@@ -124,27 +124,34 @@ async fn s3_compatible_gc_execution_persists_listed_run_and_retention_evidence()
     )?;
     let state_ref_1 = publisher.write_state_object(&state_1).await?;
     publisher
-        .publish_manifest(&gc_manifest(1, 0, 2, Some(0), vec![state_ref_1]))
+        .publish_manifest(&gc_manifest(1, 0, 2, Some(0), vec![state_ref_1.clone()]))
         .await?;
 
     let policy = GarbageCollectionPolicy {
         retain_latest_manifests: 1,
     };
     let plan = publisher.plan_garbage_collection(policy).await?;
-    let run = publisher
+    let err = publisher
         .execute_garbage_collection_plan_with_evidence(&gc_config.run_id, policy, &plan)
-        .await?;
-    let verified = publisher
-        .verify_garbage_collection_run_retention_evidence(&gc_config.run_id)
-        .await?;
-
-    if run != verified {
-        return Err(test_error("verified GC run differed from executed run"));
+        .await
+        .expect_err("uncoordinated S3-compatible GC must fail closed");
+    if !matches!(
+        err,
+        velorix_storage::state::CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ) {
+        return Err(test_error("unexpected S3-compatible GC denial error"));
     }
-    if verified.report.deleted.is_empty() {
-        return Err(test_error(
-            "S3-compatible GC run did not delete any candidates",
-        ));
+    if publisher.read_state_object(&state_ref_0).await.is_err()
+        || publisher.read_state_object(&state_ref_1).await.is_err()
+    {
+        return Err(test_error("S3-compatible GC denial removed a state object"));
+    }
+    if publisher
+        .read_garbage_collection_run_evidence(&gc_config.run_id)
+        .await
+        .is_ok()
+    {
+        return Err(test_error("S3-compatible GC denial emitted run evidence"));
     }
 
     Ok(())

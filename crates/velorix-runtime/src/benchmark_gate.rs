@@ -135,6 +135,8 @@ pub enum BenchmarkGateError {
     MissingRequiredWorkload { name: String },
     #[error("benchmark baseline is missing workload metric {name}")]
     MissingBaselineWorkload { name: String },
+    #[error("GC denial workload must not write objects: put_count={put_count}, bytes_written={bytes_written}")]
+    GcDenialWroteObjects { put_count: u64, bytes_written: u64 },
     #[error("benchmark result is missing baseline workload metric {name}")]
     MissingCurrentWorkload { name: String },
     #[error("benchmark budget must be finite and non-negative, got {value}")]
@@ -433,6 +435,13 @@ fn compare_workload_metrics(
             .iter()
             .any(|workload| workload.name == baseline_workload.name)
         {
+            if baseline_workload.name == "gc_execution_evidence"
+                && current
+                    .iter()
+                    .any(|workload| workload.name == "gc_execution_denied")
+            {
+                continue;
+            }
             return Err(BenchmarkGateError::MissingCurrentWorkload {
                 name: baseline_workload.name.clone(),
             });
@@ -444,10 +453,18 @@ fn compare_workload_metrics(
             .iter()
             .find(|workload| workload.name == current_workload.name)
         else {
+            if current_workload.name == "gc_execution_denied" {
+                validate_gc_denial_metrics(current_workload)?;
+                continue;
+            }
             return Err(BenchmarkGateError::MissingBaselineWorkload {
                 name: current_workload.name.clone(),
             });
         };
+
+        if current_workload.name == "gc_execution_denied" {
+            validate_gc_denial_metrics(current_workload)?;
+        }
 
         if compare_wall_clock && is_performance_workload(&current_workload.name) {
             compare_lower_workload_metric(
@@ -486,6 +503,20 @@ fn compare_workload_metrics(
         }
     }
 
+    Ok(())
+}
+
+fn validate_gc_denial_metrics(
+    workload: &BenchmarkWorkloadMetricsV1,
+) -> Result<(), BenchmarkGateError> {
+    if let Some(requests) = &workload.object_requests {
+        if requests.put_count != 0 || requests.bytes_written != 0 {
+            return Err(BenchmarkGateError::GcDenialWroteObjects {
+                put_count: requests.put_count,
+                bytes_written: requests.bytes_written,
+            });
+        }
+    }
     Ok(())
 }
 
@@ -585,6 +616,9 @@ fn validate_workload_metrics(
                 name: name.to_string(),
             });
         }
+        if name == "gc_execution_denied" {
+            validate_gc_denial_metrics(workload)?;
+        }
     }
 
     Ok(())
@@ -618,7 +652,7 @@ fn is_object_backed_workload(name: &str) -> bool {
             | "materialized_output_late_materialization"
             | "slatedb_state_reopen"
             | "gc_dry_run_planning"
-            | "gc_execution_evidence"
+            | "gc_execution_denied"
     )
 }
 

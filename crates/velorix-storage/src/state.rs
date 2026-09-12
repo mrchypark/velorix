@@ -94,6 +94,8 @@ pub struct FencedOutputObjectWriteRequest {
 
 #[derive(Debug, Error)]
 pub enum CheckpointPublishError {
+    #[error("garbage collection requires a durable cross-process publication coordinator")]
+    GarbageCollectionCoordinationRequired,
     #[error(transparent)]
     ObjectKey(#[from] ObjectKeyError),
     #[error(transparent)]
@@ -1201,58 +1203,9 @@ impl CheckpointPublisher {
 
     pub async fn execute_garbage_collection_plan(
         &self,
-        plan: &GarbageCollectionPlan,
+        _plan: &GarbageCollectionPlan,
     ) -> Result<GarbageCollectionReport, CheckpointPublishError> {
-        let referenced = self
-            .referenced_garbage_collection_candidates_for_plan(plan)
-            .await?;
-        for candidate in &plan.candidates {
-            if !candidate.kind.matches_key(&candidate.object_key) {
-                continue;
-            }
-            if let Some(checkpoint_version) = referenced.get(&candidate.object_key) {
-                return Err(
-                    CheckpointPublishError::GarbageCollectionCandidateStillReferenced {
-                        object_key: candidate.object_key.clone(),
-                        checkpoint_version: *checkpoint_version,
-                    },
-                );
-            }
-        }
-
-        let slatedb_state_refs = self.slatedb_state_refs_for_plan(plan).await?;
-        let mut deleted = Vec::new();
-        let mut skipped = Vec::new();
-
-        for candidate in &plan.candidates {
-            if !candidate.kind.matches_key(&candidate.object_key) {
-                skipped.push(candidate.clone());
-                continue;
-            }
-
-            if candidate.kind == GarbageCollectionCandidateKind::SlateDbStateRef {
-                let Some(state_ref) = slatedb_state_refs.get(&candidate.object_key) else {
-                    skipped.push(candidate.clone());
-                    continue;
-                };
-
-                if self.state_store.release_state_object(state_ref).await? {
-                    deleted.push(candidate.clone());
-                } else {
-                    skipped.push(candidate.clone());
-                }
-                continue;
-            }
-
-            let path = Path::from(candidate.object_key.as_str());
-            match self.store.delete(&path).await {
-                Ok(()) => deleted.push(candidate.clone()),
-                Err(object_store::Error::NotFound { .. }) => skipped.push(candidate.clone()),
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        Ok(GarbageCollectionReport { deleted, skipped })
+        Err(CheckpointPublishError::GarbageCollectionCoordinationRequired)
     }
 
     pub async fn execute_garbage_collection_plan_with_evidence(
@@ -1794,91 +1747,6 @@ impl CheckpointPublisher {
             }
             Err(err) => Err(err.into()),
         }
-    }
-
-    async fn referenced_garbage_collection_candidates_for_plan(
-        &self,
-        plan: &GarbageCollectionPlan,
-    ) -> Result<HashMap<ObjectKey, u64>, CheckpointPublishError> {
-        let manifests = self.list_published_manifests().await?;
-        let manifests_by_version = manifests
-            .iter()
-            .map(|manifest| (manifest.checkpoint_version, manifest))
-            .collect::<HashMap<_, _>>();
-        let mut referenced = HashMap::new();
-
-        for checkpoint_version in &plan.retained_manifest_versions {
-            let manifest = manifests_by_version.get(checkpoint_version).ok_or(
-                CheckpointPublishError::MissingGarbageCollectionRetainedManifest(
-                    *checkpoint_version,
-                ),
-            )?;
-            Self::add_manifest_referenced_gc_keys(manifest, &mut referenced);
-        }
-
-        let newest_plan_retained = plan.retained_manifest_versions.iter().copied().max();
-        for manifest in manifests {
-            if newest_plan_retained.is_none_or(|version| manifest.checkpoint_version > version) {
-                Self::add_manifest_referenced_gc_keys(&manifest, &mut referenced);
-            }
-        }
-
-        Ok(referenced)
-    }
-
-    async fn slatedb_state_refs_for_plan(
-        &self,
-        plan: &GarbageCollectionPlan,
-    ) -> Result<HashMap<ObjectKey, StateObjectRef>, CheckpointPublishError> {
-        let slate_candidates = plan
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.kind == GarbageCollectionCandidateKind::SlateDbStateRef)
-            .map(|candidate| candidate.object_key.clone())
-            .collect::<HashSet<_>>();
-        if slate_candidates.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let retained = plan
-            .retained_manifest_versions
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let mut refs = HashMap::new();
-        for manifest in self.list_published_manifests().await? {
-            if retained.contains(&manifest.checkpoint_version) {
-                continue;
-            }
-            for state_ref in manifest.state_objects {
-                if state_ref.ref_type == StateRefType::SlateDbCheckpoint
-                    && slate_candidates.contains(&state_ref.object_key)
-                {
-                    refs.entry(state_ref.object_key.clone())
-                        .or_insert(state_ref);
-                }
-            }
-        }
-
-        Ok(refs)
-    }
-
-    fn add_manifest_referenced_gc_keys(
-        manifest: &CheckpointManifest,
-        referenced: &mut HashMap<ObjectKey, u64>,
-    ) {
-        referenced.extend(
-            manifest
-                .state_objects
-                .iter()
-                .map(|state_ref| (state_ref.object_key.clone(), manifest.checkpoint_version)),
-        );
-        referenced.extend(
-            manifest
-                .output_objects
-                .iter()
-                .map(|output_ref| (output_ref.object_key.clone(), manifest.checkpoint_version)),
-        );
     }
 
     fn slatedb_state_keys(manifests: &[CheckpointManifest]) -> HashSet<ObjectKey> {

@@ -199,6 +199,27 @@ fn benchmark_result_validation_fails_when_object_backed_workload_has_no_requests
 }
 
 #[test]
+fn benchmark_result_validation_rejects_gc_denial_object_writes() {
+    let mut result = local_smoke_result();
+    let denial = result
+        .workload_metrics
+        .iter_mut()
+        .find(|workload| workload.name == "gc_execution_denied")
+        .unwrap();
+    denial.object_requests.as_mut().unwrap().bytes_written = 1;
+
+    let error = result.validate().unwrap_err();
+
+    assert!(matches!(
+        error,
+        BenchmarkGateError::GcDenialWroteObjects {
+            put_count: 0,
+            bytes_written: 1
+        }
+    ));
+}
+
+#[test]
 fn benchmark_gate_can_require_specific_workload_names() {
     let result = local_smoke_result();
 
@@ -218,7 +239,7 @@ fn benchmark_gate_can_require_specific_workload_names() {
             "materialized_output_late_materialization",
             "slatedb_state_reopen",
             "gc_dry_run_planning",
-            "gc_execution_evidence",
+            "gc_execution_denied",
             "aggregate_composite_high_cardinality",
             "aggregate_composite_hot_key_skew",
             "inner_join_one_to_one",
@@ -345,18 +366,60 @@ fn benchmark_comparison_still_checks_capability_probe_object_requests() {
 }
 
 #[test]
-fn benchmark_comparison_fails_when_baseline_lacks_workload_metric() {
+fn benchmark_comparison_allows_missing_denial_baseline_workload() {
     let current = local_smoke_result();
     let mut baseline = local_smoke_result();
     baseline.workload_metrics.pop();
 
+    current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap();
+}
+
+#[test]
+fn benchmark_comparison_migrates_historical_gc_execution_evidence_to_denied() {
+    let current = local_smoke_result();
+    let mut baseline = local_smoke_result();
+    let denial = baseline
+        .workload_metrics
+        .iter_mut()
+        .find(|workload| workload.name == "gc_execution_denied")
+        .unwrap();
+    denial.name = "gc_execution_evidence".to_string();
+
+    current
+        .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
+        .unwrap();
+}
+
+#[test]
+fn benchmark_comparison_still_rejects_missing_ordinary_baseline_workload() {
+    let current = local_smoke_result();
+    let mut baseline = local_smoke_result();
+    baseline.workload_metrics.remove(0);
     let error = current
         .compare_against(&baseline, BenchmarkBudgetV1::relative(0.10))
         .unwrap_err();
+    assert!(
+        matches!(error, BenchmarkGateError::MissingBaselineWorkload { name } if name == "object_store_capability_probe")
+    );
+}
 
+#[test]
+fn benchmark_comparison_rejects_gc_denial_object_writes() {
+    let mut current = local_smoke_result();
+    let denial = current
+        .workload_metrics
+        .iter_mut()
+        .find(|workload| workload.name == "gc_execution_denied")
+        .unwrap();
+    denial.object_requests.as_mut().unwrap().put_count = 1;
+    let error = current
+        .compare_against(&local_smoke_result(), BenchmarkBudgetV1::relative(0.10))
+        .unwrap_err();
     assert!(matches!(
         error,
-        BenchmarkGateError::MissingBaselineWorkload { name } if name == "gc_execution_evidence"
+        BenchmarkGateError::GcDenialWroteObjects { put_count: 1, .. }
     ));
 }
 
@@ -372,7 +435,7 @@ fn benchmark_comparison_fails_when_current_lacks_baseline_workload_metric() {
 
     assert!(matches!(
         error,
-        BenchmarkGateError::MissingCurrentWorkload { name } if name == "gc_execution_evidence"
+        BenchmarkGateError::MissingCurrentWorkload { name } if name == "gc_execution_denied"
     ));
 }
 
@@ -493,7 +556,7 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
             p50_ms: 7.0,
             p95_ms: 7.0,
             object_requests: Some(ObjectRequestMetricsV1 {
-                put_count: 0,
+                put_count: 1,
                 get_count: 2,
                 list_count: 1,
                 range_read_count: 0,
@@ -572,15 +635,15 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
         in_memory_scale_metric("inner_join_hot_key_skew"),
         in_memory_scale_metric("inner_join_unmatched"),
         BenchmarkWorkloadMetricsV1 {
-            name: "gc_execution_evidence".to_string(),
+            name: "gc_execution_denied".to_string(),
             p50_ms: 4.0,
             p95_ms: 5.0,
             object_requests: Some(ObjectRequestMetricsV1 {
-                put_count: 1,
+                put_count: 0,
                 get_count: 4,
                 list_count: 4,
                 range_read_count: 0,
-                bytes_written: 1024,
+                bytes_written: 0,
                 bytes_read: 2048,
             }),
             scan_bytes: 0,
@@ -695,7 +758,7 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
             "p50_ms": 7.0,
             "p95_ms": 7.0,
             "object_requests": {
-                "put_count": 0,
+                "put_count": 1,
                 "get_count": 2,
                 "list_count": 1,
                 "range_read_count": 0,
@@ -845,15 +908,15 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
             "scan_bytes": 0
         },
         {
-            "name": "gc_execution_evidence",
+            "name": "gc_execution_denied",
             "p50_ms": 4.0,
             "p95_ms": 5.0,
             "object_requests": {
-                "put_count": 1,
+                "put_count": 0,
                 "get_count": 4,
                 "list_count": 4,
                 "range_read_count": 0,
-                "bytes_written": 1024,
+                "bytes_written": 0,
                 "bytes_read": 2048
             },
             "scan_bytes": 0

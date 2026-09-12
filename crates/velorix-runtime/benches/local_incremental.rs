@@ -88,8 +88,6 @@ struct GcDryRunPlanningWorkload {
     measurement: MeasuredWorkload,
     policy: GarbageCollectionPolicy,
     plan: GarbageCollectionPlan,
-    released_checkpoint_version: u64,
-    released_object_key: String,
 }
 
 fn main() -> BenchResult<()> {
@@ -310,8 +308,8 @@ async fn run() -> BenchResult<()> {
         total_records,
     )
     .await?;
-    let gc_execution_evidence =
-        gc_execution_evidence(&publisher, &metered_store, &gc_dry_run_planning).await?;
+    let gc_execution_denied =
+        gc_execution_denied(&publisher, &metered_store, &gc_dry_run_planning).await?;
     let slatedb_state_reopen = slatedb_state_reopen(
         Arc::clone(&store),
         Arc::clone(&metered_store),
@@ -395,10 +393,10 @@ async fn run() -> BenchResult<()> {
                     gc_dry_run_planning.measurement.scan_bytes,
                 ),
                 workload_metric(
-                    "gc_execution_evidence",
-                    &gc_execution_evidence.samples,
-                    gc_execution_evidence.object_requests,
-                    gc_execution_evidence.scan_bytes,
+                    "gc_execution_denied",
+                    &gc_execution_denied.samples,
+                    gc_execution_denied.object_requests,
+                    gc_execution_denied.scan_bytes,
                 ),
             ];
             workload_metrics.extend(materialized_output_workloads);
@@ -529,48 +527,30 @@ async fn gc_dry_run_planning(
         },
         policy,
         plan,
-        released_checkpoint_version: CHECKPOINT_VERSION,
-        released_object_key: previous_state_key.to_string(),
     })
 }
 
-async fn gc_execution_evidence(
+async fn gc_execution_denied(
     publisher: &CheckpointPublisher,
     metered_store: &MeteredObjectStore,
     planning: &GcDryRunPlanningWorkload,
 ) -> BenchResult<MeasuredWorkload> {
     let requests_before = metered_store.snapshot();
     let started = Instant::now();
-    let run = publisher
+    let error = publisher
         .execute_garbage_collection_plan_with_evidence(
             GC_EXECUTION_RUN_ID,
             planning.policy,
             &planning.plan,
         )
-        .await?;
-    let read_back = publisher
-        .read_garbage_collection_run_evidence(GC_EXECUTION_RUN_ID)
-        .await?;
-    let retention_record = publisher
-        .read_checkpoint_retention_record(planning.released_checkpoint_version)
-        .await?;
+        .await
+        .expect_err("uncoordinated GC must fail closed");
     let elapsed = started.elapsed();
 
-    assert_eq!(read_back, run);
-    assert_eq!(retention_record.gc_run_id, GC_EXECUTION_RUN_ID);
-    assert_eq!(
-        retention_record.retained_manifest_versions,
-        run.plan.retained_manifest_versions
-    );
-    assert!(run
-        .report
-        .deleted
-        .iter()
-        .any(|candidate| candidate.object_key.as_str() == planning.released_object_key));
-    assert!(retention_record
-        .deleted_candidate_keys
-        .iter()
-        .any(|object_key| object_key.as_str() == planning.released_object_key));
+    assert!(matches!(
+        error,
+        velorix_storage::state::CheckpointPublishError::GarbageCollectionCoordinationRequired
+    ));
 
     Ok(MeasuredWorkload {
         samples: vec![elapsed],

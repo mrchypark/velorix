@@ -62,11 +62,13 @@ This does not expose SlateDB internals or make object-request metering part of
 the state-store API. The GC dry-run workload prepares a small retained/orphan
 state-output set, calls `CheckpointPublisher::plan_garbage_collection`, asserts
 the retained checkpoint and candidates, and records local metered object-store
-requests. The local GC execution workload reuses that fixture, calls
-`execute_garbage_collection_plan_with_evidence`, reads back the persisted
-`GcRunV1`, verifies checkpoint-retention evidence for the released checkpoint
-object, and records local object-store requests. It does not test
-listing-consistency failure modes or provide S3-compatible evidence.
+requests. The local GC containment workload reuses that fixture, calls
+`execute_garbage_collection_plan_with_evidence`, and verifies the typed
+`GarbageCollectionCoordinationRequired` denial before any delete or run
+evidence write. It is denial/containment evidence, not GC execution evidence.
+Planning and historical evidence reads remain available; listing-consistency
+failure modes and S3-compatible deletion evidence require the durable
+coordinator and are not provided by this workload.
 
 ## V1 Gate-Enforced Workload Metrics
 
@@ -87,7 +89,7 @@ benchmark results:
 - `materialized_output_late_materialization`
 - `slatedb_state_reopen`
 - `gc_dry_run_planning`
-- `gc_execution_evidence`
+- `gc_execution_denied`
 
 The current `local_incremental` benchmark is storage/runtime primitive
 evidence, not public REST product-path evidence.
@@ -99,11 +101,11 @@ and restores that runtime, and verifies its materialized output after replay.
 full HTTP relation-ingest evidence. Product-path HTTP evidence should use a
 separate workload label once it measures the public API boundary end to end.
 
-S3-compatible benchmark gates do not require `gc_execution_evidence`, because
-live GC deletion is a separate release artifact path rather than a timing
-workload. Use `velorix-cli gc-execute-s3-compatible` to create the live
-S3-compatible `GcRunV1`, then `gc-production-evidence` to emit the release-bound
-production GC evidence artifact.
+`gc_execution_denied` must not be presented as deletion, retention, or
+production-GC evidence. The live `gc-execute-s3-compatible` CLI is unavailable
+until a durable cross-process coordinator is wired and accepted. Planning,
+historical evidence reads, and retention-debt accounting remain available;
+production deletion evidence can be emitted only after that coordinator gate.
 
 ## Broader Benchmark Coverage
 

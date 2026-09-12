@@ -31,9 +31,11 @@ required artifacts were missing, local-only, stale, or failed their artifact
 requirements. The release decision must come from the generated readiness report
 and its concrete evidence artifacts, not from this file.
 
-For RustFS production GC evidence, `gc-seed-s3-compatible-fixture` prepares
-the retired-checkpoint fixture and `gc-execute-s3-compatible` can create the live `GcRunV1`
-on the same authority. `gc-production-evidence` separately emits the
-verification artifact, and `rustfs-production-gc-evidence-validate` binds
-the seed, execute, and production evidence to one authority, run id, retention
-policy, and persisted-run digest.
+RustFS production GC evidence is currently blocked: `gc-execute-s3-compatible`
+must not be treated as available while the durable cross-process coordinator is
+absent, and no live `GcRunV1` deletion evidence is claimed. The seed/planning
+fixture, historical evidence reads, and retention-debt accounting remain
+available. Once coordination is implemented and accepted,
+`gc-production-evidence` can emit the verification artifact and
+`rustfs-production-gc-evidence-validate` can bind seed, execute, and production
+evidence to one authority, run id, retention policy, and persisted-run digest.
