@@ -24858,7 +24858,7 @@ fn mixed_join_type_output_schema() -> RelationSchema {
 }
 
 #[test]
-fn mutually_recursive_cte_materializes_bidirectional_closure() {
+fn recursive_cte_ignores_unreachable_second_cte() {
     let edges = edges_catalog();
     let input_schema = catalog_input_relation_schema(&edges).unwrap();
     let output_schema = recursive_reachability_output_schema();
@@ -24887,20 +24887,11 @@ fn mutually_recursive_cte_materializes_bidirectional_closure() {
             )],
         )
         .unwrap();
-    // Bidirectional closure at epoch 1 (both CTE anchors + fixpoint)
-    assert_reachability_page(
-        runtime.as_ref(),
-        1,
-        &[
-            ("a", "b"),
-            ("a", "c"),
-            ("b", "a"),
-            ("b", "b"),
-            ("b", "c"),
-            ("c", "b"),
-            ("c", "c"),
-        ],
-    );
+    // Only the first CTE is reachable from the outer SELECT.
+    assert_reachability_page(runtime.as_ref(), 1, &[("a", "b"), ("a", "c"), ("b", "c")]);
+
+    // A valid two-CTE checkpoint restores the SQL-reachable first closure.
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
 
     // Insert c->a (creates a cycle)
     runtime
@@ -24916,7 +24907,7 @@ fn mutually_recursive_cte_materializes_bidirectional_closure() {
             )],
         )
         .unwrap();
-    // Bidirectional closure with cycle includes cross-CTE pairs
+    // The first CTE closure over the cycle contains all nine ordered pairs.
     let page = runtime
         .materialized_view_page(
             ScopedViewId {
@@ -24932,11 +24923,129 @@ fn mutually_recursive_cte_materializes_bidirectional_closure() {
         )
         .unwrap();
     let batch = &page.batches[0];
-    assert!(
-        batch.num_rows() >= 6,
-        "bidirectional closure must include cross-CTE pairs, got {}",
-        batch.num_rows()
+    assert_eq!(batch.num_rows(), 9);
+    assert_reachability_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("a", "a"),
+            ("a", "b"),
+            ("a", "c"),
+            ("b", "a"),
+            ("b", "b"),
+            ("b", "c"),
+            ("c", "a"),
+            ("c", "b"),
+            ("c", "c"),
+        ],
     );
+
+    // Retraction recomputes the first CTE from the base relation, removing
+    // the cycle and restoring the original three-row closure.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("mut-epoch-3").unwrap(),
+            vec![relation_input(
+                &edges,
+                "mut-edges",
+                3,
+                4,
+                edges_rows_batch(&[("e3", "c", "a", -1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(runtime.as_ref(), 3, &[("a", "b"), ("a", "c"), ("b", "c")]);
+
+    // Restart after the retraction, then reinsert the edge and recover the
+    // complete first-CTE closure without any unreachable CTE rows.
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("mut-epoch-4").unwrap(),
+            vec![relation_input(
+                &edges,
+                "mut-edges",
+                4,
+                5,
+                edges_rows_batch(&[("e3", "c", "a", 1)]),
+            )],
+        )
+        .unwrap();
+    assert_reachability_page(
+        runtime.as_ref(),
+        4,
+        &[
+            ("a", "a"),
+            ("a", "b"),
+            ("a", "c"),
+            ("b", "a"),
+            ("b", "b"),
+            ("b", "c"),
+            ("c", "a"),
+            ("c", "b"),
+            ("c", "c"),
+        ],
+    );
+}
+
+#[test]
+fn recursive_cte_restore_rejects_unreachable_state_contamination() {
+    let edges = edges_catalog();
+    let input_schema = catalog_input_relation_schema(&edges).unwrap();
+    let output_schema = recursive_reachability_output_schema();
+    let sql = "with recursive fwd as (select src, dst from edges union distinct select r.src, e.dst from fwd r join edges e on r.dst = e.src), bwd as (select dst as src, src as dst from edges union distinct select r.src, e.dst from bwd r join edges e on r.dst = e.src) select src, dst from fwd";
+    let identity = standing_identity_with_view(sql, "reachability-contamination");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&edges),
+        sql,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("contamination-epoch-1").unwrap(),
+            vec![relation_input(
+                &edges,
+                "contamination-edges",
+                0,
+                2,
+                edges_rows_batch(&[("e1", "a", "b", 1), ("e2", "b", "c", 1)]),
+            )],
+        )
+        .unwrap();
+    let checkpoint = runtime.checkpoint().unwrap();
+    assert!(restore_standing_runtime(checkpoint.clone()).is_ok());
+
+    let mut contaminated = checkpoint.clone();
+    let state_payload = contaminated.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let reverse_key = serde_json::to_string(&json!({"dst": "a", "src": "b"})).unwrap();
+    payload["derived_set"][reverse_key] = json!({"src": "b", "dst": "a"});
+    payload["published_output"]["records"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "key": {"src": "b", "dst": "a"},
+            "value": {},
+            "weight": 1
+        }));
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    contaminated.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(contaminated).is_err());
+
+    let mut tampered_output = checkpoint;
+    let state_payload = tampered_output.state_payload.as_mut().unwrap();
+    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    payload["published_output"]["records"][0]["value"] = json!({"tampered": true});
+    assert!(serde_json::from_value::<DeltaBatch>(payload["published_output"].clone()).is_ok());
+    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    tampered_output.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
+    assert!(restore_standing_runtime(tampered_output).is_err());
 }
 
 fn temporal_join_rides_catalog() -> VelorixRelationCatalogV1 {
