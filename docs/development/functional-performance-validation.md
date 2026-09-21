@@ -136,3 +136,44 @@ single count proves causality. Preliminary raw-key/value experiments are not
 evidence for this wrapper path. This diagnostic neither changes nor replaces the
 existing baseline or cost gate, and it does not certify stable performance or
 production readiness.
+
+## Cost characterization results: 2026-09-21
+
+The final local run at `e78ca350d27e9936d34509fe446ff19a849d4e04`
+completed all seven functional cases and the fixed schedule of one warmup plus
+five measured executions. All evidence was retained; the overall result is
+**failed**, not a successful retry. Three measured cost gates passed and two
+failed, with the first failure recorded as `cost_gate:1`. Total elapsed time was
+465 seconds including builds, validation and gate execution.
+
+For `slatedb_state_reopen`, warmup LIST calls were 10 and the five measured counts
+were **13, 14, 9, 11, 9**. The unchanged baseline is 9 with a 25% budget, so the
+first two measurements exceeded it. Runtime-apply throughput across all five
+measurements, including those rejected by the cost gate, was min **66,170.44**,
+median **77,101.96**, max **91,691.22 rows/s**. These are diagnostic runtime-apply
+measurements, not ingest or HTTP throughput. The summary reports
+`comparable_to_baseline: true` for its tracked build/validation/baseline inputs;
+unrelated user script changes remain present and were not included in the local
+commit.
+
+The separate real-wrapper diagnostic completed ten alternating pairs: default
+settings produced LIST counts from **9 to 13**, while `maintenance_limited`
+produced **2** in each sample. All **20/20** readbacks verified successfully, and
+the diagnostic evidence passed independent validation. Its `git_dirty` flag is
+true and the diagnostic is not PR-smoke gate evidence. The observed difference
+helps characterize the maintenance-inclusive workload but does not identify the
+causal caller or prove general stability. Production settings, baseline and
+budget remain unchanged; the earlier failed run above remains valid evidence.
+
+Local, ignored artifacts (not shipped as repository documents):
+
+- `target/development-validation-cost-characterization-20260921/summary.json`
+- `target/development-validation-cost-characterization-20260921/metric-statistics.json`
+- `target/slatedb-state-reopen-diagnostic-final-20260921.json`
+- `target/development-validation-cost-team-run.json`
+
+Clippy, formatting, runtime library/integration tests, storage checks, shell
+contracts and workflow lint passed separately. Only local commits were created;
+no push was performed for this result. Security remediation remains deferred.
+No live REST, live S3 or deployment/no-PVC recovery acceptance was performed, and
+these results do not certify production readiness.
