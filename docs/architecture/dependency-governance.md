@@ -61,8 +61,9 @@ Hiqlite, and the internal materialized view runtime. The `mrchypark/hiqlite` git
 allowed in `deny.toml` while Velorix uses the pinned fork-main commit that carries
 the required metadata-backend authority-time API before an upstream release
 carries that support. The `mrchypark/slatedb` git source is also explicitly
-allowed for revision `5952708fa868f4e7e9a8055498ef4b231ec9ba20`, a v0.16.0
-backport of [upstream PR #2101](https://github.com/slatedb/slatedb/pull/2101).
+allowed for revision `ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342`, a v0.16.0
+backport of [upstream PR #2101](https://github.com/slatedb/slatedb/pull/2101)
+plus omission of empty optional manifest segments and default sequence trackers.
 It shares native WAL GC listings only for matching schedules. Replace this pin
 when an upstream release contains the fix and passes Velorix's checks.
 Each package review names an owner, review date, local

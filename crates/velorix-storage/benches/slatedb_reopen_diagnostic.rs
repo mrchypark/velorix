@@ -20,6 +20,7 @@ use velorix_storage::{
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+type WriteTrace = Arc<Mutex<Vec<Value>>>;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 struct Counts {
@@ -123,6 +124,7 @@ struct Meter {
     inner: Arc<dyn ObjectStore>,
     counts: Arc<Mutex<Counts>>,
     list_trace: Option<Arc<ListTrace>>,
+    write_trace: Option<WriteTrace>,
 }
 impl Meter {
     fn snapshot(&self) -> Counts {
@@ -138,10 +140,19 @@ impl fmt::Display for Meter {
 struct Upload {
     inner: Box<dyn MultipartUpload>,
     counts: Arc<Mutex<Counts>>,
+    path: Path,
+    write_trace: Option<WriteTrace>,
 }
 #[async_trait::async_trait]
 impl MultipartUpload for Upload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        if let Some(trace) = &self.write_trace {
+            trace
+                .lock()
+                .unwrap()
+                .push(json!({"method": "multipart_part",
+                "path": self.path.as_ref(), "attempted_bytes": data.content_length()}));
+        }
         self.counts.lock().unwrap().bytes_written += data.content_length() as u64;
         self.inner.put_part(data)
     }
@@ -160,6 +171,10 @@ impl ObjectStore for Meter {
         data: PutPayload,
         o: PutOptions,
     ) -> object_store::Result<PutResult> {
+        if let Some(trace) = &self.write_trace {
+            trace.lock().unwrap().push(json!({"method": "put",
+                "path": p.as_ref(), "attempted_bytes": data.content_length()}));
+        }
         {
             let mut c = self.counts.lock().unwrap();
             c.put += 1;
@@ -176,6 +191,8 @@ impl ObjectStore for Meter {
         Ok(Box::new(Upload {
             inner: self.inner.put_multipart_opts(p, o).await?,
             counts: self.counts.clone(),
+            path: p.clone(),
+            write_trace: self.write_trace.clone(),
         }))
     }
     async fn get_opts(&self, p: &Path, o: GetOptions) -> object_store::Result<GetResult> {
@@ -266,6 +283,9 @@ async fn sample(controlled: bool, payload: &[u8]) -> Result<Value, Error> {
         inner: Arc::new(LocalFileSystem::new_with_prefix(dir.path())?),
         counts: Arc::new(Mutex::new(Counts::default())),
         list_trace: list_trace.clone(),
+        write_trace: std::env::var_os("VELORIX_DIAGNOSTIC_TRACE_WRITE")
+            .filter(|value| value == "1")
+            .map(|_| Arc::new(Mutex::new(Vec::new()))),
     });
     let started = Instant::now();
     let mut before = Counts::default();
@@ -319,13 +339,26 @@ async fn sample(controlled: bool, payload: &[u8]) -> Result<Value, Error> {
         }
     }
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let write_trace = meter
+        .write_trace
+        .as_ref()
+        .map(|trace| trace.lock().unwrap().clone());
+    if let Some(events) = &write_trace {
+        let traced_bytes: u64 = events
+            .iter()
+            .map(|event| event["attempted_bytes"].as_u64().unwrap())
+            .sum();
+        if traced_bytes != meter.snapshot().bytes_written {
+            return Err("write trace bytes differ from meter bytes".into());
+        }
+    }
     let list_trace = list_trace
         .as_ref()
         .map(|trace| serde_json::to_value(&*trace.events.lock().unwrap()))
         .transpose()?;
     Ok(json!({"elapsed_ms": elapsed_ms,
         "object_requests": meter.snapshot(), "readback_verified": true, "phases": phases,
-        "list_trace": list_trace}))
+        "list_trace": list_trace, "write_trace": write_trace}))
 }
 
 async fn open(controlled: bool, store: Arc<dyn ObjectStore>) -> Result<SlateDbStateStore, Error> {
@@ -431,6 +464,8 @@ async fn main() -> Result<(), Error> {
         serde_json::to_string_pretty(&json!({"schema_version": 1, "diagnostic_only": true,
         "gate_evidence": false, "comparable_to_pr_smoke_baseline": false, "component": "Velorix SlateDbStateStore transaction and marker path", "samples_per_mode_requested": count,
         "list_trace_enabled": std::env::var_os("VELORIX_DIAGNOSTIC_TRACE_LIST").is_some_and(|value| value == "1"),
+        "write_trace_enabled": std::env::var_os("VELORIX_DIAGNOSTIC_TRACE_WRITE").is_some_and(|value| value == "1"),
+        "write_trace_scope": "Attempted payload bytes, including rejected requests; not committed bytes or network traffic",
         "git_commit": commit, "git_dirty": dirty, "pair_order": "odd: default first; even: maintenance_limited first",
         "sample_timeout_seconds": 30, "failed": failed, "fixture_payload_bytes": payload.len(),
         "fixture_payload_sha256": Sha256::digest(&payload).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),

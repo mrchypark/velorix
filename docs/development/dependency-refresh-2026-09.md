@@ -24,7 +24,7 @@ crates.io sparse index. Existing user script changes are outside this update.
 | reqwest | 0.13.4 | 0.13.5 resolved | Compatible range update |
 | rcgen | 0.14.9 | 0.14.10 resolved | TLS fixture regression checks |
 | uuid | 1.26.0 | 1.26.1 resolved | Compatible range update |
-| SlateDB | 0.15.0 | 0.16.0 WAL-GC fork, revision `5952708f` | Compatibility and fork tests passed; prior PR smoke exceeded the bytes-written budget; performance hold remains unresolved |
+| SlateDB | 0.15.0 | 0.16.0 fork, revision `ad8e14d2` | WAL-GC listing and empty-manifest-field optimizations; see the write-gate investigation below |
 | Rhiza | exact 0.12.0 | exact 0.12.2 | Backend tests and local three-node recovery passed; later migration boundaries held |
 | Hiqlite | pinned fork revision | Unchanged | Required authority-time API and fork main remain at the same revision |
 
@@ -73,7 +73,7 @@ to preserve that contract. Governance descriptions refer to the actual pinned
 Git fork, including the remaining transitive exceptions. Existing exception
 expiration dates and policy requirements remain unchanged.
 
-## Verification status
+## Verification before the manifest encoding optimization
 
 Workspace tests and clippy, Rust 1.98.0 checks, optional-backend tests, the local
 three-node recovery drill, cargo-deny and governance validation passed before
@@ -109,8 +109,8 @@ ignored files under `target/development-validation/`.
 
 ### SlateDB WAL GC fork
 
-The candidate now pins `mrchypark/slatedb` at
-`5952708fa868f4e7e9a8055498ef4b231ec9ba20`. This is v0.16.0 plus a narrow
+The first candidate pinned `mrchypark/slatedb` at
+`5952708fa868f4e7e9a8055498ef4b231ec9ba20`. This was v0.16.0 plus a narrow
 WAL GC change, not an upgrade to upstream main. The upstream contribution is
 [slatedb/slatedb#2101](https://github.com/slatedb/slatedb/pull/2101).
 Native regular-WAL and fence-WAL collectors share one fresh listing only when
@@ -134,8 +134,59 @@ maintenance-limited control (two LISTs each). Untraced bytes written remained
 passed. The single separate PR-smoke run passed result validation but failed
 the unchanged gate: bytes written were 10,984 versus baseline 8,660 (+26.8%),
 above the 25% budget. No retry or baseline change was made. Velorix push and
-merge remain on hold for that separate regression.
+merge were held for that separate regression.
 The upstream PR also needs the contributor's own CLA signature.
+
+### Write-gate investigation and encoding optimization
+
+The gate counts attempted PUT payload bytes, not committed file sizes or
+network traffic. SlateDB adds a request ID as metadata for conditional writes.
+LocalFileSystem rejects that metadata, so SlateDB retries without it.
+Both 0.15 and 0.16 use this fallback. The V2 manifest format in 0.16 increases
+the metadata payload, so fallback attempts also count the larger payload twice.
+The failed gate reported 10,984 bytes against an 8,660-byte baseline.
+Its unchanged 25% allowance permits at most 10,825 bytes.
+
+The opt-in `VELORIX_DIAGNOSTIC_TRACE_WRITE=1` trace records attempted payload
+bytes by object path and asserts that their sum equals the diagnostic meter.
+A typical pre-fix sample attributed 8,052 bytes to manifests, 1,390 to WAL,
+388 to compaction metadata, and 963 to an SST. This component diagnostic uses
+different metadata from the full gate, so its total is not the gate result.
+
+Revision `7ee2887c992346039b2d09356607871d54f5f236` adds one encoding change:
+omit the optional `segments` vector when it is empty. Both 0.15 and 0.16
+decoders already interpret an absent vector as an empty collection.
+Non-empty segments, required fields, fencing, shutdown writes, durability,
+maintenance settings, the benchmark workload, and the gate budget are unchanged.
+This first encoding change passed 34 codec tests, clippy, and 2,147 tests
+in the `ci-cross` profile (one skipped). Its first gate run still failed:
+10,840 bytes, 15 above the limit. The planned remaining runs stopped.
+
+The final pin, `ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342`, also omits the
+optional sequence tracker only when it exactly matches the initial state.
+Both arrays must be empty, capacity and interval must retain their defaults,
+and the last-recorded timestamp must be absent. Non-default or recorded trackers
+remain serialized. The existing decoders restore the default for an absent field.
+The final fork passed 35 codec tests, 56 sequence-tracker tests, clippy, and
+2,150 tests in `ci-cross` (one skipped). PR #2101 covers only the WAL-GC change;
+the encoding changes are additional fork commits.
+
+The final code passed the unchanged PR-smoke gate in all three planned runs.
+Each run wrote 10,648 bytes for `slatedb_state_reopen`, down 336 bytes from the
+failed 10,984-byte run. This is 22.96% above the historical baseline, within
+the 25% allowance. LIST counts were 8, 9, and 8. No baseline, threshold,
+workload, or maintenance configuration changed. The first intermediate failure
+and all final results remain under `target/velorix-bench/`.
+
+Workspace formatting and clippy, 54 runtime library tests, 249 runtime
+integration tests, and four durability tests passed. Cargo-deny and governance
+validation passed with the CI commands, including all-feature metadata and
+JSON diagnostics captured from stderr. An earlier local governance invocation
+read an empty stdout log and omitted optional features; its failure was a
+verification-command error, not a reason to change policy exceptions.
+These PR-smoke gates compare cost metrics, not latency or throughput regressions.
+Measurements used the working tree over `d7c7bc9` with the final fork pin above;
+the benchmark's commit field alone does not identify the uncommitted pin.
 
 ### Completed SlateDB-specific evidence
 

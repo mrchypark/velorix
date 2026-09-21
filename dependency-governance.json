@@ -42,7 +42,7 @@
       "owner": "state",
       "reviewed_on": "2026-09-22",
       "audit_status": "local_reviewed_pinned_fork_until_upstream_release_contains_shared_wal_gc_listing",
-      "feature_policy": "Use mrchypark/slatedb revision 5952708fa868f4e7e9a8055498ef4b231ec9ba20: v0.16.0 plus shared native WAL GC listings for matching schedules. The patch passed independent local review and backport tests; it is not an external audit. Do not duplicate SlateDB storage internals in Velorix.",
+      "feature_policy": "Use mrchypark/slatedb revision ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342: v0.16.0 plus shared native WAL GC listings for matching schedules and omission of empty optional manifest segments and default sequence trackers. The patches passed independent local review and backport tests; this is not an external audit. Do not duplicate SlateDB storage internals in Velorix.",
       "replacement_plan": "Track https://github.com/slatedb/slatedb/pull/2101 and switch to an upstream release containing the fix. Re-run durability, LIST trace, performance gates, and dependency checks before replacing the pin."
     },
     {
