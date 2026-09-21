@@ -84,3 +84,17 @@ Live REST, live S3 and deployment recovery are explicitly `not_run`; security is
 For live recovery acceptance, separately provide an authorized durable object
 store and run the existing deployment/recovery workflows. Keep private cluster
 identifiers and credentials out of tracked files and GitHub reports.
+
+## Initial execution: 2026-09-21
+
+At `607cc0b`, all seven functional cases passed. The final measured run failed
+the unchanged cost gate: `slatedb_state_reopen` made 13 LIST requests against a
+baseline of 9 (44.4%, above the 25% budget). Across warmup and three measurements,
+LIST counts were 9, 9, 10, and 13. Earlier successful runs do not override this
+failure. The workload includes open/write/close/reopen/read/close with SlateDB's
+default background maintenance enabled; its request costs can vary with task
+scheduling. This observation alone does not establish a new product regression.
+No baseline, budget, production setting, or failed artifact was changed to make
+the result pass. Stabilizing or separately characterizing maintenance-inclusive
+costs remains follow-up work; this profile provides verification, not a promise
+that every measured workload already meets its budget.
