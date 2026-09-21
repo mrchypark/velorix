@@ -224,7 +224,10 @@ impl StateObjectStore for SlateDbStateStore {
             serde_json::to_vec(&marker)?,
         )?;
         match txn.commit().await {
-            Ok(_) => {
+            Ok(handle) => {
+                if let Some(handle) = handle {
+                    handle.await_durable().await?;
+                }
                 let mut state_ref = state.object_ref();
                 state_ref.ref_type = StateRefType::SlateDbCheckpoint;
                 state_ref.slatedb = Some(metadata);
@@ -327,7 +330,9 @@ impl StateObjectStore for SlateDbStateStore {
 
         txn.delete(metadata.state_key.as_bytes())?;
         txn.delete(marker_key.as_bytes())?;
-        txn.commit().await?;
+        if let Some(handle) = txn.commit().await? {
+            handle.await_durable().await?;
+        }
 
         Ok(true)
     }
@@ -367,7 +372,13 @@ impl SlateDbStateStore {
 }
 
 fn state_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 fn state_marker_key(state_key: &str) -> String {
@@ -375,6 +386,28 @@ fn state_marker_key(state_key: &str) -> String {
         "{SLATEDB_STATE_MARKER_PREFIX}/{}",
         state_digest(state_key.as_bytes())
     )
+}
+
+#[cfg(test)]
+mod digest_compatibility_tests {
+    use super::{state_digest, state_marker_key};
+
+    #[test]
+    fn sha256_upgrade_preserves_checkpoint_digest_and_marker_bytes() {
+        assert_eq!(
+            state_digest(&[0, 255]),
+            "sha256:06eb7d6a69ee19e5fbdf749018d3d2abfa04bcbd1365db312eb86dc7169389b8"
+        );
+        assert_eq!(
+            state_digest(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            state_digest(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(state_marker_key("abc"), "__velorix_state_ref_v1/sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "msrv": {
     "minimum_rust_version": "1.98.0",
-    "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 54.1.0, kube 4.2.0, and the internal materialized view runtime."
+    "policy": "CI and package updates keep the workspace buildable on the declared MSRV; the current floor follows DataFusion 55.1.0, kube 4.2.0, and the internal materialized view runtime."
   },
   "package_reviews": [
     {
@@ -193,8 +193,8 @@
       "crate": "base64",
       "owner": "metadata",
       "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite metadata backend and existing HTTP/TLS dependency graph introduce base64 versions from multiple upstream stacks.",
-      "replacement_plan": "Upgrade hiqlite and HTTP/TLS dependencies when upstream base64 dependency ranges converge.",
+      "reason": "Direct Velorix consumers use base64 0.23.1; transitive HTTP, Kubernetes, metadata, and signature stacks still use 0.22.1, while fastwebsockets uses 0.21.7.",
+      "replacement_plan": "Upgrade transitive HTTP, Kubernetes, metadata, and signature dependencies when their base64 ranges converge; retain standard padded wire-format compatibility tests.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -211,8 +211,8 @@
       "crate": "sha2",
       "owner": "metadata",
       "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite metadata backend introduces a sha2 line alongside existing hashing dependencies.",
-      "replacement_plan": "Upgrade hiqlite and hashing dependencies when upstream sha2 ranges converge.",
+      "reason": "Direct Velorix consumers and hiqlite use sha2 0.11; s3-simple, spow, and signature dependencies retain sha2 0.10.9.",
+      "replacement_plan": "Upgrade transitive S3 and signature dependencies when sha2 ranges converge; preserve checkpoint digests and marker-key byte compatibility.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -360,21 +360,39 @@
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
-      "kind": "unmaintained",
-      "crate": "bincode",
+      "kind": "duplicate",
+      "crate": "num-bigint",
+      "owner": "runtime",
+      "expires_on": "2026-09-30",
+      "reason": "Arrow-buffer and Parquet 59.3 use num-bigint 0.5 while other transitive consumers retain 0.4.",
+      "replacement_plan": "Converge the remaining transitive numeric dependencies when their compatible ranges include num-bigint 0.5; preserve query and Parquet tests.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "pem",
       "owner": "metadata",
       "expires_on": "2026-09-30",
-      "reason": "The Hiqlite metadata backend currently introduces a bincode advisory while the metadata backend is still using a local checkout bridge.",
-      "replacement_plan": "Upgrade hiqlite or switch to upstream hiqlite main/release when its dependency graph removes the bincode advisory.",
+      "reason": "rcgen uses pem 4 while other transitive certificate and signature consumers retain pem 3.",
+      "replacement_plan": "Upgrade transitive certificate and signature dependencies when their pem ranges converge; retain certificate and signature wire compatibility checks.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "sqlparser",
+      "owner": "runtime",
+      "expires_on": "2026-09-30",
+      "reason": "Velorix admission uses sqlparser 0.63 while DataFusion 55.1 uses 0.62. Admission AST types stay inside core; the DataFusion boundary accepts SQL text.",
+      "replacement_plan": "Converge the parser versions when DataFusion advances its compatible parser range; retain fail-closed admission and DataFusion query conformance tests.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "unmaintained",
-      "crate": "paste",
-      "owner": "runtime",
+      "crate": "bincode",
+      "owner": "metadata",
       "expires_on": "2026-09-30",
-      "reason": "Temporary allowance for a transitive unmaintained advisory while upstream replacement options are tracked.",
-      "replacement_plan": "Remove the transitive paste dependency through upstream package upgrades or replace the dependent package before expiry.",
+      "reason": "The metadata backend uses a revision-pinned mrchypark/hiqlite git fork whose dependency graph introduces the bincode unmaintained advisory.",
+      "replacement_plan": "Upgrade hiqlite or switch to upstream hiqlite main/release when its dependency graph removes the bincode advisory.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {

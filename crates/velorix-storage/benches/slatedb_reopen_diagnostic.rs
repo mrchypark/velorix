@@ -311,7 +311,7 @@ async fn main() -> Result<(), Error> {
         "gate_evidence": false, "comparable_to_pr_smoke_baseline": false, "component": "Velorix SlateDbStateStore transaction and marker path", "samples_per_mode_requested": count,
         "git_commit": commit, "git_dirty": dirty, "pair_order": "odd: default first; even: maintenance_limited first",
         "sample_timeout_seconds": 30, "failed": failed, "fixture_payload_bytes": payload.len(),
-        "fixture_payload_sha256": format!("{:x}", Sha256::digest(&payload)),
+        "fixture_payload_sha256": Sha256::digest(&payload).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         "measurement_notes": "Local object-store API calls, not cloud requests. PUT attempts and submitted bytes; successful GET/range returned bytes; LIST invocations. HEAD/delete/copy/RSS unmeasured. Phase boundaries may include asynchronous work. Both modes use write_state_object transaction and marker creation with default durable commit and periodic flush. Maintenance-limited mode disables compaction and GC and delays manifest polling; it does not remove all background work. No authoritative capability preflight or full gate workload. Stability is observational, not a performance gate. No retries.", "modes": modes}))?
     );
     if failed {

@@ -5,6 +5,15 @@ The declared MSRV remains Rust `1.98.0`; CI installs that version and runs
 `cargo check --workspace --all-targets --locked` to enforce the declared MSRV
 against the locked dependency graph.
 
+The current query dependency train is DataFusion `55.1.0` with Arrow/Parquet
+`59.3.0`; the declared MSRV remains unchanged. Velorix's admission parser uses
+sqlparser `0.63.0`, while DataFusion retains `0.62.0`. These AST types are not
+exchanged: admission ASTs stay inside `velorix-core`, and the DataFusion query
+boundary receives SQL text through `SessionContext::sql`. Parser acceptance
+does not imply materialized-view support; unsupported ordering and cast shapes
+must continue to fail closed. The duplicate parser versions require explicit
+review against the final cargo-deny diagnostics, not an advisory suppression.
+
 Development and normal CI builds are pinned to Rust `1.98.1` in
 `rust-toolchain.toml` and every non-MSRV `dtolnay/rust-toolchain` action. The
 official `rust:1.98.1-bookworm` image tag was not available when this policy

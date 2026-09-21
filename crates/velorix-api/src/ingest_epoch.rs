@@ -1252,7 +1252,14 @@ pub(super) fn ingest_epoch_manifest_id(
     let mut hasher = Sha256::new();
     hasher.update(b"velorix.ingest-epoch.manifest.v1\0");
     hasher.update(&bytes);
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 pub(super) async fn persist_ingest_epoch_view_convergence(
@@ -2016,7 +2023,14 @@ pub(super) fn epoch_ingest_idempotency_key<'a>(
         hasher.update(b"\0");
         hasher.update(part.as_bytes());
     }
-    EpochIdempotencyKey::new(format!("epoch:sha256:{:x}", hasher.finalize()))
+    EpochIdempotencyKey::new(format!(
+        "epoch:sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 pub(super) fn next_standing_runtime_logical_epoch(

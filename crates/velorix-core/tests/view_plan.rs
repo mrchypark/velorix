@@ -6537,6 +6537,19 @@ fn single_key_aggregate_sql_rejects_explicit_null_ordering_top_k() {
 }
 
 #[test]
+fn sqlparser_upgrade_rejects_unsupported_order_and_cast_forms() {
+    let catalog = purchases_catalog_without_value_role();
+    for sql in [
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum using > limit 1",
+        "select user_id, sum(amount) as sum, count(*) as count from purchases group by user_id order by sum with fill limit 1",
+        "select user_id, cast(amount as bigint array) as amount from purchases",
+        "select user_id, cast(amount as bigint format '999') as amount from purchases",
+    ] {
+        assert!(validate_supported_view_sql(sql, &catalog).is_err(), "must fail closed: {sql}");
+    }
+}
+
+#[test]
 fn single_key_aggregate_sql_lowers_order_by_metric_then_key_top_k() {
     let catalog = scores_catalog();
     let output_schema = scores_output_schema();

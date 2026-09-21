@@ -11986,7 +11986,7 @@ fn validate_aggregate_top_k(
         order_output_column_id: output_column_id,
         order_input_column_id: None,
         tie_breaker_output_column_id,
-        descending: order.options.asc == Some(false),
+        descending: supported_order_ascending(order)? == Some(false),
         limit: top_k_bounds.limit,
         offset: top_k_bounds.offset,
     }))
@@ -12001,7 +12001,7 @@ fn validate_top_k_key_tie_breaker(
             "ORDER BY NULLS/WITH FILL is not supported for materialized top-k views",
         );
     }
-    if tie_breaker.options.asc == Some(false) {
+    if supported_order_ascending(tie_breaker)? == Some(false) {
         return unsupported("materialized top-k key tie-breaker must be ASC");
     }
     let Expr::Identifier(identifier) = &tie_breaker.expr else {
@@ -12014,6 +12014,45 @@ fn validate_top_k_key_tie_breaker(
         return unsupported("materialized top-k key tie-breaker must reference the output key");
     }
     Ok(())
+}
+
+fn supported_order_ascending(order: &OrderByExpr) -> Result<Option<bool>, ViewPlanError> {
+    match &order.options.sort {
+        None => Ok(None),
+        Some(sqlparser::ast::OrderBySort::Asc) => Ok(Some(true)),
+        Some(sqlparser::ast::OrderBySort::Desc) => Ok(Some(false)),
+        Some(sqlparser::ast::OrderBySort::Using(_)) => {
+            unsupported("ORDER BY USING is not supported for materialized views")
+        }
+    }
+}
+
+#[cfg(test)]
+mod sqlparser_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn sort_adapter_preserves_direction_and_rejects_using_operator() {
+        for (suffix, expected) in [("", None), (" ASC", Some(true)), (" DESC", Some(false))] {
+            let query =
+                parse_single_query(&format!("SELECT x FROM input ORDER BY x{suffix}")).unwrap();
+            let OrderByKind::Expressions(orders) = &query.order_by.as_ref().unwrap().kind else {
+                panic!("expected explicit order expressions");
+            };
+            assert_eq!(supported_order_ascending(&orders[0]).unwrap(), expected);
+        }
+        // GenericDialect rejects this syntax today; also reject its AST should
+        // dialect support expand in a future parser release.
+        assert!(parse_single_query("SELECT x FROM input ORDER BY x USING >").is_err());
+        let mut query = parse_single_query("SELECT x FROM input ORDER BY x").unwrap();
+        let OrderByKind::Expressions(orders) = &mut query.order_by.as_mut().unwrap().kind else {
+            panic!("expected explicit order expressions");
+        };
+        orders[0].options.sort = Some(sqlparser::ast::OrderBySort::Using(ObjectName(vec![
+            sqlparser::ast::ObjectNamePart::Identifier(Ident::new(">")),
+        ])));
+        assert!(supported_order_ascending(&orders[0]).is_err());
+    }
 }
 
 enum AggregateTopKBindingContext<'a> {
@@ -12480,7 +12519,7 @@ fn validate_latest_top_k(
         order_output_column_id,
         order_input_column_id: None,
         tie_breaker_output_column_id: None,
-        descending: order.options.asc != Some(true),
+        descending: supported_order_ascending(order)? != Some(true),
         limit: top_k_bounds.limit,
         offset: top_k_bounds.offset,
     }))
@@ -12779,7 +12818,7 @@ fn validate_filter_project_top_k(
         order_output_column_id: output_column_id,
         order_input_column_id,
         tie_breaker_output_column_id,
-        descending: order.options.asc != Some(true),
+        descending: supported_order_ascending(order)? != Some(true),
         limit: top_k_bounds.limit,
         offset: top_k_bounds.offset,
     }))
@@ -13115,7 +13154,7 @@ fn validate_row_number_projection<'a>(
             if tie_breaker.with_fill.is_some() || tie_breaker.options.nulls_first.is_some() {
                 return unsupported("ROW_NUMBER tie-breaker NULLS/WITH FILL is not supported");
             }
-            if tie_breaker.options.asc == Some(false) {
+            if supported_order_ascending(tie_breaker)? == Some(false) {
                 return unsupported("ROW_NUMBER primary key tie-breaker must be ASC");
             }
             if !expression_references_column(&tie_breaker.expr, key_column, relation_alias) {
@@ -13142,7 +13181,7 @@ fn validate_row_number_projection<'a>(
         function: function_kind,
         partition_column,
         order_column,
-        order_descending: order.options.asc == Some(false),
+        order_descending: supported_order_ascending(order)? == Some(false),
         output_row_number_column_id: alias.value.clone(),
         implicit_primary_key_tie_breaker,
     })
@@ -13537,14 +13576,12 @@ fn supported_filter_project_bound_projection_expr(
             kind,
             expr,
             data_type,
-            array,
             format,
         } => {
             if !matches!(
                 kind,
                 CastKind::Cast | CastKind::DoubleColon | CastKind::TryCast | CastKind::SafeCast
-            ) || *array
-                || format.is_some()
+            ) || format.is_some()
             {
                 return unsupported("computed projection CAST form is not supported");
             }
@@ -17407,7 +17444,7 @@ pub fn validate_supported_analytic_window_frame_sql(
         output_key_input_column_id,
         partition_column_id: partition_column.column_id.clone(),
         order_column_id: order_column.column_id.clone(),
-        order_descending: order.options.asc == Some(false),
+        order_descending: supported_order_ascending(order)? == Some(false),
         frame_preceding,
         frame_following,
         function: function_spec,

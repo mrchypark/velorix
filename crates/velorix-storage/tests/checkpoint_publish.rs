@@ -605,7 +605,13 @@ fn slatedb_state_ref(state: &StateObjectWrite) -> StateObjectRef {
 }
 
 fn state_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 fn gc_admin_digest_for_test(label: &str, bytes: &[u8]) -> String {
@@ -613,7 +619,14 @@ fn gc_admin_digest_for_test(label: &str, bytes: &[u8]) -> String {
     hasher.update(label.as_bytes());
     hasher.update(b"\0");
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 // Historical fixture only: production destructive GC is coordinator-gated.

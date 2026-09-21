@@ -6461,6 +6461,21 @@ async fn rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_bind
 
     for (view_id, sql, refs) in [
             (
+                "corpus_order_using_operator",
+                "select user_id, sum(score) as sum, count(*) as count from scores group by user_id order by sum using > limit 1",
+                scores.clone(),
+            ),
+            (
+                "corpus_cast_array",
+                "select user_id, cast(score as bigint array) as score from scores",
+                scores.clone(),
+            ),
+            (
+                "corpus_cast_format",
+                "select user_id, cast(score as bigint format '999') as score from scores",
+                scores.clone(),
+            ),
+            (
                 "corpus_window_row_number",
                 "select user_id, row_number() over (partition by user_id order by score) as row_number from scores",
                 scores.clone(),
