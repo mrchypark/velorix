@@ -30,6 +30,13 @@ jobs:
       - name: Check development validation contract
         run: sh scripts/check-development-validation-contract.sh
 
+      - name: Characterize SlateDB reopen maintenance costs
+        run: |
+          mkdir -p target/development-validation
+          cargo bench --locked -p velorix-storage --features benchmark-diagnostics \
+            --bench slatedb_reopen_diagnostic \
+            > target/development-validation/slatedb-reopen-diagnostic.json
+
       - name: Collect functional and performance evidence
         run: sh scripts/run-development-validation.sh
 

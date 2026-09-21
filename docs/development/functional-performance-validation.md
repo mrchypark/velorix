@@ -44,6 +44,13 @@ One warmup and three measured executions run sequentially by default; `--repeats
 accepts 1–10. Every execution, including warmup, must pass the existing benchmark
 schema validator and unchanged local PR smoke cost gate at a 25% regression
 threshold against `baselines/benchmark/local/pr-smoke.json`.
+An explicit cost regression is recorded as a failed run, but the remaining fixed
+warmup/measurement schedule still executes. Statistics include rejected measured
+runs, and any rejected gate makes the final summary failed and exit nonzero.
+There are no retries or selective samples. Functional/build failures, malformed
+benchmark data, validator failures and other gate errors still stop immediately.
+Completed measurement counts are separate from passed counts; rejected runs retain
+their gate exit code and log (the CLI produces no gate JSON on rejection).
 This is a cost gate, not a latency/throughput gate; speed measurements remain
 `diagnostic_only`. Dirty Rust/build inputs set `comparable_to_baseline: false`,
 even when the diagnostic cost gate passes. A dirty baseline independently also
@@ -98,3 +105,34 @@ No baseline, budget, production setting, or failed artifact was changed to make
 the result pass. Stabilizing or separately characterizing maintenance-inclusive
 costs remains follow-up work; this profile provides verification, not a promise
 that every measured workload already meets its budget.
+
+## Separate SlateDB maintenance diagnostic
+
+Run the feature-gated diagnostic independently of the existing benchmark gate:
+
+```sh
+mkdir -p target/development-validation
+VELORIX_DIAGNOSTIC_SAMPLES=10 cargo bench --locked -p velorix-storage \
+  --features benchmark-diagnostics --bench slatedb_reopen_diagnostic \
+  > target/development-validation/slatedb-reopen-diagnostic.json
+```
+
+`VELORIX_DIAGNOSTIC_SAMPLES` optionally selects 1–30 samples. The manual
+Development validation workflow collects this JSON after the contract checks
+and before the functional/performance profile; its existing artifact upload
+retains both kinds of evidence.
+
+This diagnostic exercises the actual `SlateDbStateStore` wrapper path, with a
+fresh store for each sample and verified readback after reopen. It alternates
+the order of default settings and `maintenance_limited` settings. The latter
+disable compaction and garbage collection and use a 3,600-second manifest poll
+interval, while leaving the 100-millisecond flush interval unchanged. These
+settings are diagnostic-feature-only and do not alter production defaults.
+
+Raw per-phase object-store call counts describe calls observed during each
+phase, not wire requests or proof that a particular foreground/background caller
+caused them. Compare the distributions and raw samples rather than assuming a
+single count proves causality. Preliminary raw-key/value experiments are not
+evidence for this wrapper path. This diagnostic neither changes nor replaces the
+existing baseline or cost gate, and it does not certify stable performance or
+production readiness.

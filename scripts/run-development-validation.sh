@@ -85,6 +85,8 @@ finish() {
          completed_warmup_runs:([$performance[0][] | select(.warmup)]|length),
          requested_measured_runs:$repeats,
          completed_measured_runs:([$performance[0][] | select(.warmup|not)]|length),
+         passed_measured_runs:([$performance[0][] | select((.warmup|not) and .status=="passed")]|length),
+         failed_gate_runs:([$performance[0][] | select(.gate_exit_code!=0)]|length),
          metric_statistics:{artifact:"metric-statistics.json",scope:"measured_runs_excluding_warmup",values:$statistics[0]},
          metric_semantics:{rows_per_second:"runtime apply only: 4096 rows across 256 batches; excludes ingest, checkpoint, recovery and HTTP",
            peak_rss_bytes:"terminal RSS sample, not measured high-water peak",
@@ -134,19 +136,31 @@ bench=$(jq -rs '[.[] | select(.reason=="compiler-artifact" and .target.name=="lo
 cargo build --locked -p velorix-cli --release --message-format=json > "$out/cli-build.jsonl" 2> "$out/cli-build.log"
 cli=$(jq -rs '[.[] | select(.reason=="compiler-artifact" and (.target.kind|index("bin"))!=null and .executable!=null) | .executable] | unique | if length==1 then .[0] else error("expected one CLI executable") end' "$out/cli-build.jsonl")
 i=0
+first_gate_failure=
 while [ "$i" -le "$repeats" ]; do
     stage="benchmark:$i"
     begin=$(date +%s)
     "$bench" > "$out/benchmark-$i.json" 2> "$out/benchmark-$i.log"
     jq -e 'type=="object" and (.metrics|type=="object")' "$out/benchmark-$i.json" >/dev/null
     "$cli" benchmark-validate --result "$out/benchmark-$i.json" > "$out/validate-$i.log" 2>&1
+    gate_code=0
     "$cli" benchmark-gate --gate-level pr-smoke --backend local \
         --baseline "$root/baselines/benchmark/local/pr-smoke.json" --result "$out/benchmark-$i.json" \
-        --max-regression-fraction 0.25 --json > "$out/gate-$i.json" 2> "$out/gate-$i.log"
-    jq -e 'type=="object"' "$out/gate-$i.json" >/dev/null
-    jq --argjson run "$i" --argjson seconds "$(($(date +%s)-begin))" \
-        '. + [{run:$run,warmup:($run==0),status:"passed",seconds:$seconds,
-          result:("benchmark-"+($run|tostring)+".json"),gate:("gate-"+($run|tostring)+".json")}]' \
+        --max-regression-fraction 0.25 --json > "$out/gate-$i.json" 2> "$out/gate-$i.log" || gate_code=$?
+    if [ "$gate_code" -eq 0 ]; then
+        jq -e 'type=="object"' "$out/gate-$i.json" >/dev/null
+    else
+        # The CLI emits no JSON on rejection. Only its explicit regression
+        # errors permit continuing; invalid evidence/tool failures remain fatal.
+        stage="cost_gate:$i"
+        grep -Fx 'Error: benchmark result exceeds gate' "$out/gate-$i.log" >/dev/null || exit "$gate_code"
+        grep -Eq 'benchmark (workload [^ ]+ )?metric .* regressed by .*over budget ' "$out/gate-$i.log" || exit "$gate_code"
+        [ -n "$first_gate_failure" ] || first_gate_failure=$i
+    fi
+    jq --argjson run "$i" --argjson seconds "$(($(date +%s)-begin))" --argjson gate_code "$gate_code" \
+        '. + [{run:$run,warmup:($run==0),status:(if $gate_code==0 then "passed" else "failed" end),seconds:$seconds,
+          gate_exit_code:$gate_code,gate_log:("gate-"+($run|tostring)+".log"),
+          result:("benchmark-"+($run|tostring)+".json"),gate:(if $gate_code==0 then "gate-"+($run|tostring)+".json" else null end)}]' \
         "$out/performance.json" > "$out/performance.next.json"
     mv "$out/performance.next.json" "$out/performance.json"
     i=$((i+1))
@@ -163,3 +177,7 @@ jq -s '
     .[($p|join("."))] = {min:($values|min),median:($values|median),max:($values|max)})
 ' "$@" > "$out/metric-statistics.json"
 stage=complete
+if [ -n "$first_gate_failure" ]; then
+    stage="cost_gate:$first_gate_failure"
+    exit 1
+fi

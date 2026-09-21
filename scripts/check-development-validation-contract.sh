@@ -37,13 +37,34 @@ case "$(basename "$0")" in
         fi
         exit 0 ;;
     bench)
+        case "$VALIDATION_FAKE_MODE" in gate_first|gate_middle)
+            count=0
+            [ ! -f "$VALIDATION_FAKE_COUNTER" ] || count=$(cat "$VALIDATION_FAKE_COUNTER")
+            printf '%s\n' "$((count+1))" > "$VALIDATION_FAKE_COUNTER"
+            value=$((count*10))
+            if [ "$VALIDATION_FAKE_MODE:$count" = gate_middle:2 ]; then value=200; fi
+            printf '{"metrics":{"rows_per_second":%s,"object_requests":{"put_count":2}}}\n' "$value"
+            exit 0 ;;
+        esac
         if [ "$VALIDATION_FAKE_MODE" = invalid ]; then echo invalid; else
             printf '{"metrics":{"rows_per_second":10,"object_requests":{"put_count":2}}}\n'
         fi
         exit 0 ;;
     cli)
+        [ "$VALIDATION_FAKE_MODE:$1" != validator:benchmark-validate ] || exit 1
         if [ "$1" = benchmark-gate ]; then
-            [ "$VALIDATION_FAKE_MODE" != gate ] || exit 1
+            rejected=false
+            case "$VALIDATION_FAKE_MODE:$*" in
+                gate:*) rejected=true ;;
+                gate_first:*benchmark-0.json*) rejected=true ;;
+                gate_middle:*benchmark-2.json*) rejected=true ;;
+                gate_error:*) echo 'failed to validate benchmark baseline' >&2; exit 1 ;;
+            esac
+            if [ "$rejected" = true ]; then
+                echo 'Error: benchmark result exceeds gate' >&2
+                echo 'benchmark workload fixture metric put_count regressed by 0.500, over budget 0.250' >&2
+                exit 1
+            fi
             echo '{}'
         fi
         exit 0 ;;
@@ -65,7 +86,7 @@ jq -e '.status=="passed" and .release_certified==false and (.functional|length)=
 jq -e '.rows_per_second=={min:10,median:10,max:10}' "$tmp/success/metric-statistics.json" >/dev/null
 jq -e '.completed_warmup_runs==1 and .completed_measured_runs==2 and .metric_statistics.values.rows_per_second.median==10 and .latency_throughput_status=="diagnostic_only" and .evidence_scope.live_rest=="not_run" and .evidence_scope.security=="deferred" and (.baseline.sha256|length)==64' "$tmp/success/summary.json" >/dev/null
 if sh "$root/scripts/run-development-validation.sh" --output "$tmp/success" > "$tmp/reuse.log" 2>&1; then exit 1; fi
-for mode in missing failure zero invalid gate; do
+for mode in missing failure zero invalid validator gate_error gate; do
     export VALIDATION_FAKE_MODE=$mode
     if sh "$root/scripts/run-development-validation.sh" --output "$tmp/$mode" --repeats 1 > "$tmp/$mode.log" 2>&1; then
         echo "Expected rejection: $mode" >&2; exit 1
@@ -76,6 +97,16 @@ for mode in missing failure zero invalid gate; do
         jq -e '.completed_warmup_runs==0 and .metric_statistics.values==null' "$tmp/$mode/summary.json" >/dev/null ;;
     esac
 done
+for mode in gate_first gate_middle; do
+    export VALIDATION_FAKE_MODE=$mode
+    export VALIDATION_FAKE_COUNTER="$tmp/$mode.count"
+    if sh "$root/scripts/run-development-validation.sh" --output "$tmp/$mode" --repeats 3 > "$tmp/$mode.log" 2>&1; then exit 1; fi
+    jq -e '.status=="failed" and .failed_gate_runs==1 and .completed_measured_runs==3 and (.performance|length)==4 and .performance[3].status=="passed"' "$tmp/$mode/summary.json" >/dev/null
+done
+jq -e '.stage=="cost_gate:0" and .passed_measured_runs==3 and .performance[0].gate_exit_code==1 and .metric_statistics.values.rows_per_second=={min:10,median:20,max:30}' "$tmp/gate_first/summary.json" >/dev/null
+jq -e '.stage=="cost_gate:2" and .passed_measured_runs==2 and .performance[2].gate_exit_code==1 and .metric_statistics.values.rows_per_second=={min:10,median:30,max:200}' "$tmp/gate_middle/summary.json" >/dev/null
+jq -e '.failed_gate_runs==2 and .completed_measured_runs==1 and .passed_measured_runs==0 and .metric_statistics.values.rows_per_second.median==10' "$tmp/gate/summary.json" >/dev/null
+for mode in invalid validator gate_error; do [ ! -e "$tmp/$mode/benchmark-1.json" ]; done
 for mode in baseline_dirty build_dirty validation_dirty; do
     export VALIDATION_FAKE_MODE=$mode
     sh "$root/scripts/run-development-validation.sh" --output "$tmp/$mode" --repeats 1 > "$tmp/$mode.log" 2>&1

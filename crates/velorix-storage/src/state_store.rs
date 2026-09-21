@@ -68,6 +68,22 @@ impl SlateDbStateStore {
         Ok(Self { db, db_path })
     }
 
+    /// Diagnostic-only constructor. Production constructors retain default settings.
+    #[cfg(feature = "benchmark-diagnostics")]
+    #[doc(hidden)]
+    pub async fn open_with_settings_for_diagnostics(
+        db_path: impl Into<Path>,
+        object_store: Arc<dyn ObjectStore>,
+        settings: slatedb::config::Settings,
+    ) -> Result<Self, CheckpointPublishError> {
+        let db_path = db_path.into();
+        let db = slatedb::Db::builder(db_path.clone(), object_store)
+            .with_settings(settings)
+            .build()
+            .await?;
+        Ok(Self { db, db_path })
+    }
+
     /// Opens a SlateDB state store after validating the authoritative state
     /// namespace from shared startup capability evidence.
     pub async fn open_authoritative(
