@@ -60,7 +60,12 @@ database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer,
 Hiqlite, and the internal materialized view runtime. The `mrchypark/hiqlite` git source is explicitly
 allowed in `deny.toml` while Velorix uses the pinned fork-main commit that carries
 the required metadata-backend authority-time API before an upstream release
-carries that support. Each package review names an owner, review date, local
+carries that support. The `mrchypark/slatedb` git source is also explicitly
+allowed for revision `5952708fa868f4e7e9a8055498ef4b231ec9ba20`, a v0.16.0
+backport of [upstream PR #2101](https://github.com/slatedb/slatedb/pull/2101).
+It shares native WAL GC listings only for matching schedules. Replace this pin
+when an upstream release contains the fix and passes Velorix's checks.
+Each package review names an owner, review date, local
 audit status, feature policy, and replacement plan. This is the required local
 audit workflow for the release gate.
 

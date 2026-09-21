@@ -224,7 +224,10 @@ impl StateObjectStore for SlateDbStateStore {
             serde_json::to_vec(&marker)?,
         )?;
         match txn.commit().await {
-            Ok(_) => {
+            Ok(handle) => {
+                if let Some(handle) = handle {
+                    handle.await_durable().await?;
+                }
                 let mut state_ref = state.object_ref();
                 state_ref.ref_type = StateRefType::SlateDbCheckpoint;
                 state_ref.slatedb = Some(metadata);
@@ -327,7 +330,9 @@ impl StateObjectStore for SlateDbStateStore {
 
         txn.delete(metadata.state_key.as_bytes())?;
         txn.delete(marker_key.as_bytes())?;
-        txn.commit().await?;
+        if let Some(handle) = txn.commit().await? {
+            handle.await_durable().await?;
+        }
 
         Ok(true)
     }

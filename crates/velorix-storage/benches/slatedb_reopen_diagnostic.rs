@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use slatedb::config::Settings;
 use std::{
+    backtrace::Backtrace,
     fmt,
     ops::Range,
     process::Command,
@@ -29,6 +30,82 @@ struct Counts {
     bytes_written: u64,
     bytes_read: u64,
 }
+
+#[derive(Debug, Serialize)]
+struct ListTraceEvent {
+    sequence: u64,
+    method: &'static str,
+    prefix: Option<String>,
+    invocation_offset: Option<String>,
+    observed_phase: String,
+    caller_category: &'static str,
+    #[serde(serialize_with = "serialize_slate_frames")]
+    slatedb_frames: Backtrace,
+    elapsed_ms: f64,
+}
+
+fn serialize_slate_frames<S: serde::Serializer>(
+    stack: &Backtrace,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let frames: Vec<String> = format!("{stack:?}")
+        .split("}, {")
+        .filter(|frame| frame.contains("slatedb") || frame.contains("state_store"))
+        .map(str::to_string)
+        .collect();
+    frames.serialize(serializer)
+}
+
+#[derive(Debug)]
+struct ListTrace {
+    started: Instant,
+    phase: Mutex<String>,
+    events: Mutex<Vec<ListTraceEvent>>,
+}
+
+impl ListTrace {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            phase: Mutex::new("before_open".to_string()),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_phase(&self, phase: &str) {
+        *self.phase.lock().unwrap() = phase.to_string();
+    }
+
+    fn record(
+        &self,
+        method: &'static str,
+        prefix: Option<&Path>,
+        invocation_offset: Option<&Path>,
+    ) {
+        let mut events = self.events.lock().unwrap();
+        let sequence = events.len() as u64 + 1;
+        let elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let observed_phase = self.phase.lock().unwrap().clone();
+        // Resolve symbols only after both database handles have closed.
+        let slatedb_frames = Backtrace::force_capture();
+        let caller_category = match prefix.map(ToString::to_string).as_deref() {
+            Some(prefix) if prefix.contains("manifest") => "manifest_path",
+            Some(prefix) if prefix.contains("compactions") => "compaction_path",
+            Some(prefix) if prefix.contains("wal") => "wal_path",
+            _ => "other_path",
+        };
+        events.push(ListTraceEvent {
+            sequence,
+            method,
+            prefix: prefix.map(ToString::to_string),
+            invocation_offset: invocation_offset.map(ToString::to_string),
+            observed_phase,
+            caller_category,
+            slatedb_frames,
+            elapsed_ms,
+        });
+    }
+}
 impl Counts {
     fn delta(self, before: Self) -> Self {
         Self {
@@ -45,6 +122,7 @@ impl Counts {
 struct Meter {
     inner: Arc<dyn ObjectStore>,
     counts: Arc<Mutex<Counts>>,
+    list_trace: Option<Arc<ListTrace>>,
 }
 impl Meter {
     fn snapshot(&self) -> Counts {
@@ -132,6 +210,9 @@ impl ObjectStore for Meter {
     }
     fn list(&self, p: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.counts.lock().unwrap().list += 1;
+        if let Some(trace) = &self.list_trace {
+            trace.record("list", p, None);
+        }
         self.inner.list(p)
     }
     fn list_with_offset(
@@ -140,10 +221,16 @@ impl ObjectStore for Meter {
         offset: &Path,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.counts.lock().unwrap().list += 1;
+        if let Some(trace) = &self.list_trace {
+            trace.record("list_with_offset", p, Some(offset));
+        }
         self.inner.list_with_offset(p, offset)
     }
     async fn list_with_delimiter(&self, p: Option<&Path>) -> object_store::Result<ListResult> {
         self.counts.lock().unwrap().list += 1;
+        if let Some(trace) = &self.list_trace {
+            trace.record("list_with_delimiter", p, None);
+        }
         self.inner.list_with_delimiter(p).await
     }
     async fn copy_opts(&self, from: &Path, to: &Path, o: CopyOptions) -> object_store::Result<()> {
@@ -172,9 +259,13 @@ fn phase(meter: &Meter, before: &mut Counts, phases: &mut Vec<Value>, name: &str
 
 async fn sample(controlled: bool, payload: &[u8]) -> Result<Value, Error> {
     let dir = tempfile::tempdir()?;
+    let list_trace = std::env::var_os("VELORIX_DIAGNOSTIC_TRACE_LIST")
+        .filter(|value| value == "1")
+        .map(|_| Arc::new(ListTrace::new()));
     let meter = Arc::new(Meter {
         inner: Arc::new(LocalFileSystem::new_with_prefix(dir.path())?),
         counts: Arc::new(Mutex::new(Counts::default())),
+        list_trace: list_trace.clone(),
     });
     let started = Instant::now();
     let mut before = Counts::default();
@@ -186,25 +277,55 @@ async fn sample(controlled: bool, payload: &[u8]) -> Result<Value, Error> {
         "slatedb-state-reopen",
         Bytes::copy_from_slice(payload),
     )?;
+    if let Some(trace) = &list_trace {
+        trace.set_phase("open");
+    }
     let db = open(controlled, meter.clone()).await?;
     phase(&meter, &mut before, &mut phases, "open");
+    if let Some(trace) = &list_trace {
+        trace.set_phase("write_state_object");
+    }
     let state_ref = db.write_state_object(&state).await?;
     phase(&meter, &mut before, &mut phases, "write_state_object");
+    if let Some(trace) = &list_trace {
+        trace.set_phase("close");
+    }
     db.close().await?;
     phase(&meter, &mut before, &mut phases, "close");
+    if let Some(trace) = &list_trace {
+        trace.set_phase("reopen");
+    }
     let reopened = open(controlled, meter.clone()).await?;
     phase(&meter, &mut before, &mut phases, "reopen");
+    if let Some(trace) = &list_trace {
+        trace.set_phase("readback");
+    }
     let readback = reopened.read_state_object(&state_ref).await?;
     let matches = readback.as_ref() == payload;
     phase(&meter, &mut before, &mut phases, "readback");
+    if let Some(trace) = &list_trace {
+        trace.set_phase("reopened_close");
+    }
     reopened.close().await?;
     phase(&meter, &mut before, &mut phases, "reopened_close");
     if !matches {
         return Err("readback did not match fixture".into());
     }
-    Ok(
-        json!({"elapsed_ms": started.elapsed().as_secs_f64()*1000.0, "object_requests": meter.snapshot(), "readback_verified": true, "phases": phases}),
-    )
+    if let Some(trace) = &list_trace {
+        let traced = trace.events.lock().unwrap().len() as u64;
+        let observed = meter.snapshot().list;
+        if traced != observed {
+            return Err(format!("LIST trace count {traced} != meter count {observed}").into());
+        }
+    }
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let list_trace = list_trace
+        .as_ref()
+        .map(|trace| serde_json::to_value(&*trace.events.lock().unwrap()))
+        .transpose()?;
+    Ok(json!({"elapsed_ms": elapsed_ms,
+        "object_requests": meter.snapshot(), "readback_verified": true, "phases": phases,
+        "list_trace": list_trace}))
 }
 
 async fn open(controlled: bool, store: Arc<dyn ObjectStore>) -> Result<SlateDbStateStore, Error> {
@@ -309,10 +430,11 @@ async fn main() -> Result<(), Error> {
         "{}",
         serde_json::to_string_pretty(&json!({"schema_version": 1, "diagnostic_only": true,
         "gate_evidence": false, "comparable_to_pr_smoke_baseline": false, "component": "Velorix SlateDbStateStore transaction and marker path", "samples_per_mode_requested": count,
+        "list_trace_enabled": std::env::var_os("VELORIX_DIAGNOSTIC_TRACE_LIST").is_some_and(|value| value == "1"),
         "git_commit": commit, "git_dirty": dirty, "pair_order": "odd: default first; even: maintenance_limited first",
         "sample_timeout_seconds": 30, "failed": failed, "fixture_payload_bytes": payload.len(),
         "fixture_payload_sha256": Sha256::digest(&payload).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-        "measurement_notes": "Local object-store API calls, not cloud requests. PUT attempts and submitted bytes; successful GET/range returned bytes; LIST invocations. HEAD/delete/copy/RSS unmeasured. Phase boundaries may include asynchronous work. Both modes use write_state_object transaction and marker creation with default durable commit and periodic flush. Maintenance-limited mode disables compaction and GC and delays manifest polling; it does not remove all background work. No authoritative capability preflight or full gate workload. Stability is observational, not a performance gate. No retries.", "modes": modes}))?
+        "measurement_notes": "Local object-store API calls, not cloud requests. PUT attempts and submitted bytes; successful GET/range returned bytes; LIST invocations. HEAD/delete/copy/RSS unmeasured. Phase labels are observed temporal windows selected by the diagnostic and are not causal attribution. Both modes use write_state_object transaction and marker creation with default durable commit and periodic flush. Maintenance-limited mode disables compaction and GC and delays manifest polling; it does not remove all background work and is not a production setting. No authoritative capability preflight or full gate workload. Stability is observational, not a performance gate. No retries. Opt-in LIST traces record the synchronous stack at wrapper invocation, concise SlateDB frames, and a prefix-derived path category; they do not prove the complete asynchronous parent chain, initiating cause, or stream-consumption caller.", "modes": modes}))?
     );
     if failed {
         return Err("diagnostic sample failed; see JSON".into());

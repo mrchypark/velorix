@@ -137,6 +137,49 @@ evidence for this wrapper path. This diagnostic neither changes nor replaces the
 existing baseline or cost gate, and it does not certify stable performance or
 production readiness.
 
+### Fixed-schedule LIST trace (SlateDB 0.16)
+
+For the 0.16 compatibility investigation, the actual `SlateDbStateStore` object
+store wrapper was sampled with `VELORIX_DIAGNOSTIC_SAMPLES=5` once with
+`VELORIX_DIAGNOSTIC_TRACE_LIST=1` and once without it. An initial instrumented
+run recorded 34 default events versus untraced LIST counts of 12, 10, 9, 10, 11.
+Because in-call symbolization perturbed scheduling, the final implementation
+captures raw stacks at invocation and resolves symbols after both DB handles
+close. Raw stack capture still has overhead; traced timings are not performance
+evidence. The earlier artifacts are retained, not replaced by a favorable sample.
+
+The final fixed-five traced default counts were **12, 11, 12, 9, 12**; untraced
+counts were **12, 11, 10, 11, 12**. Each maintenance-limited sample recorded 2.
+All 20 readbacks verified. Trace counts matched LIST counts for all ten traced
+samples, and disabled samples recorded no events. Actual frames attributed the
+56 default calls to startup manifest loading (10), compactor fencing (10),
+manifest GC (9), WAL GC (17), compacted SST GC (5), and compactions GC (5).
+These are calls at the local object-store boundary, not measured cloud requests.
+Each event retains the LIST method, prefix, offset when
+applicable, an observed temporal phase, and concise SlateDB-specific frames.
+These phases describe when the wrapper observed the call; they do not establish
+an initiating cause or a complete asynchronous parent chain. Final artifacts:
+`target/development-validation/slatedb-reopen-list-trace-n5-deferred.json` and
+`target/development-validation/slatedb-reopen-untraced-n5-deferred.json`.
+
+No production settings were changed and no production LIST reduction was
+implemented. Only diagnostic symbolization overhead was reduced. In
+particular, the maintenance-limited mode is not a production recommendation;
+the unchanged baseline and cost gate remain the acceptance criteria. The full
+trace and matching untraced sample outputs are local ignored artifacts under
+`target/development-validation/`.
+
+The repeated WAL scans have distinct callers' policies: SlateDB 0.16 schedules
+regular WAL GC and fence-object GC independently. Both call
+`SlateDbWalGc::collect` and list the WAL prefix; regular GC selects nonempty
+objects while fence GC selects zero-byte objects. Fence GC defaults to dry-run,
+which prevents deletion but not enumeration. A possible upstream optimization
+is one enumeration per combined GC cycle with independent age, dry-run and
+deletion policies. This is not implemented or proven safe here: it needs
+concurrency, deletion-error and independent-policy tests in SlateDB. Its public
+builder API does not expose shared enumeration. Do not substitute a stale
+Velorix cache or disable fence maintenance to improve the gate.
+
 ## Cost characterization results: 2026-09-21
 
 The final local run at `e78ca350d27e9936d34509fe446ff19a849d4e04`

@@ -24,7 +24,7 @@ crates.io sparse index. Existing user script changes are outside this update.
 | reqwest | 0.13.4 | 0.13.5 resolved | Compatible range update |
 | rcgen | 0.14.9 | 0.14.10 resolved | TLS fixture regression checks |
 | uuid | 1.26.0 | 1.26.1 resolved | Compatible range update |
-| SlateDB | 0.15.0 | 0.15.0 held | 0.16.0 compatibility passed, but PR smoke measured 10,984 bytes written vs 8,660 baseline (+26.836%); hold pending performance review |
+| SlateDB | 0.15.0 | 0.16.0 WAL-GC fork, revision `5952708f` | Compatibility and fork tests passed; prior PR smoke exceeded the bytes-written budget; performance hold remains unresolved |
 | Rhiza | exact 0.12.0 | exact 0.12.2 | Backend tests and local three-node recovery passed; later migration boundaries held |
 | Hiqlite | pinned fork revision | Unchanged | Required authority-time API and fork main remain at the same revision |
 
@@ -82,17 +82,60 @@ governance, a fresh local three-node recovery drill, workspace clippy and runtim
 tests (54 library and 249 integration) passed again. PR CI passed all
 non-benchmark checks, but the PR-smoke benchmark failed its unchanged
 bytes-written budget: 10,984 bytes versus an 8,660-byte baseline (+26.836%).
-SlateDB 0.16 is held pending fixed-schedule, same-harness attribution; the
-active dependency is 0.15.0. No baseline or threshold was changed.
-After this hold, formatting, workspace clippy, runtime tests (54 library and
+SlateDB 0.16 is restored for fixed-schedule, same-harness trace investigation;
+the PR-smoke performance regression remains unresolved. No baseline or threshold
+was changed. After this investigation, formatting, workspace clippy, runtime tests (54 library and
 249 integration), all four storage durability tests, cargo-deny and governance
 validation passed. A single local benchmark still failed the unchanged gate:
 SlateDB reopen made 12 LIST requests against baseline 9 (+33.3%). No retry was
-performed. Holding 0.16 therefore does not resolve the separate cost-gate issue;
+performed. Restoring 0.16 likewise does not resolve the separate cost-gate issue;
 merge remains blocked pending its diagnosis and verification.
 Pre-refresh throughput and cost figures remain historical evidence. Existing
 performance baselines and budgets are unchanged. Local tests do not certify
 live S3, process-crash durability, cluster rollout or production readiness.
+
+Before the fork, the opt-in `VELORIX_DIAGNOSTIC_TRACE_LIST=1` wrapper trace was run with fixed
+N=5 samples both enabled and disabled. The final implementation defers stack
+symbolization until after close; default traced counts were 12, 11, 12, 9, 12
+and untraced counts were 12, 11, 10, 11, 12. All 20 readbacks verified.
+Actual caller frames identify startup manifest loads, compactor fencing, and
+manifest/WAL/compacted-SST/compactions GC. Disabled runs recorded no trace
+events. These are synchronous wrapper observations with concise SlateDB
+frames and an observed temporal phase, not initiating-cause or complete async
+caller attribution. No production setting or LIST-reduction optimization was
+changed; only diagnostic symbolization overhead was reduced. The
+maintenance-limited comparison remains diagnostic only. Artifacts are local
+ignored files under `target/development-validation/`.
+
+### SlateDB WAL GC fork
+
+The candidate now pins `mrchypark/slatedb` at
+`5952708fa868f4e7e9a8055498ef4b231ec9ba20`. This is v0.16.0 plus a narrow
+WAL GC change, not an upgrade to upstream main. The upstream contribution is
+[slatedb/slatedb#2101](https://github.com/slatedb/slatedb/pull/2101).
+Native regular-WAL and fence-WAL collectors share one fresh listing only when
+both policies have matching intervals. Each keeps its own age, dry-run, and
+deletion rules. Custom collectors and unequal schedules keep separate listings.
+The focused test measures two WAL LIST calls becoming one per combined cycle;
+this does not mean that total database LIST calls or latency are halved.
+
+The upstream patch passed 2,279 tests (one skipped), all-feature/all-target
+clippy, and formatting. The v0.16.0 backport passed 2,146 tests (one skipped)
+and the same lint checks. Both include tests for partial listing failure,
+objects created during a collection cycle, and deletion failure. Velorix
+workspace clippy, 54 runtime library tests, 249 runtime integration tests, and
+four storage durability tests also passed with this pin.
+After the fork, fixed N=5 default-mode LIST counts were 10, 9, 11, 9, 12 with tracing and
+9, 10, 11, 9, 11 without tracing. The untraced mean fell from 11.2 to 10.0
+calls in these samples; this small scheduled-GC sample is not a stable latency
+or production-cost guarantee. All 20 readbacks passed, including the unchanged
+maintenance-limited control (two LISTs each). Untraced bytes written remained
+10,793 in four samples and 9,589 in one. Cargo-deny and governance validation
+passed. The single separate PR-smoke run passed result validation but failed
+the unchanged gate: bytes written were 10,984 versus baseline 8,660 (+26.8%),
+above the 25% budget. No retry or baseline change was made. Velorix push and
+merge remain on hold for that separate regression.
+The upstream PR also needs the contributor's own CLA signature.
 
 ### Completed SlateDB-specific evidence
 
@@ -142,8 +185,8 @@ file path/size/hash manifests. The driver bounds each operation to 60 seconds.
 This manual cross-version preparation is not added as a heavy build to ordinary
 CI. The orchestrated local run completed all 12 recorded phases successfully;
 invalid arguments and a mismatched old lock were rejected before output creation.
-The 0.16 compatibility evidence remains useful, but the active workspace is
-held at 0.15 while the bytes-written regression is investigated.
+The active workspace pins the 0.16 WAL-GC fork described above. Compatibility evidence
+does not resolve the outstanding PR-smoke performance regression.
 
 ## Primary references
 
