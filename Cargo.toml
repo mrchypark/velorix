@@ -42,7 +42,7 @@ ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rcgen = "0.14"
-slatedb = { version = "0.16.0", default-features = false }
+slatedb = { version = "0.15.0", default-features = false }
 sigstore-trust-root = { version = "0.11", default-features = false }
 sigstore-types = "0.11"
 sigstore-verify = { version = "0.11", default-features = false, features = ["rustls"] }

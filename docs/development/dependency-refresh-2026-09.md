@@ -24,7 +24,7 @@ crates.io sparse index. Existing user script changes are outside this update.
 | reqwest | 0.13.4 | 0.13.5 resolved | Compatible range update |
 | rcgen | 0.14.9 | 0.14.10 resolved | TLS fixture regression checks |
 | uuid | 1.26.0 | 1.26.1 resolved | Compatible range update |
-| SlateDB | 0.15.0 | 0.16.0 | Local ACK durability, cross-version fixture and workspace tests passed |
+| SlateDB | 0.15.0 | 0.15.0 held | 0.16.0 compatibility passed, but PR smoke measured 10,984 bytes written vs 8,660 baseline (+26.836%); hold pending performance review |
 | Rhiza | exact 0.12.0 | exact 0.12.2 | Backend tests and local three-node recovery passed; later migration boundaries held |
 | Hiqlite | pinned fork revision | Unchanged | Required authority-time API and fork main remain at the same revision |
 
@@ -79,15 +79,26 @@ Workspace tests and clippy, Rust 1.98.0 checks, optional-backend tests, the loca
 three-node recovery drill, cargo-deny and governance validation passed before
 the final Rhiza 0.12.2 patch. After that patch, backend tests/clippy, cargo-deny,
 governance, a fresh local three-node recovery drill, workspace clippy and runtime
-tests (54 library and 249 integration) passed again. Current PR CI is pending.
+tests (54 library and 249 integration) passed again. PR CI passed all
+non-benchmark checks, but the PR-smoke benchmark failed its unchanged
+bytes-written budget: 10,984 bytes versus an 8,660-byte baseline (+26.836%).
+SlateDB 0.16 is held pending fixed-schedule, same-harness attribution; the
+active dependency is 0.15.0. No baseline or threshold was changed.
+After this hold, formatting, workspace clippy, runtime tests (54 library and
+249 integration), all four storage durability tests, cargo-deny and governance
+validation passed. A single local benchmark still failed the unchanged gate:
+SlateDB reopen made 12 LIST requests against baseline 9 (+33.3%). No retry was
+performed. Holding 0.16 therefore does not resolve the separate cost-gate issue;
+merge remains blocked pending its diagnosis and verification.
 Pre-refresh throughput and cost figures remain historical evidence. Existing
 performance baselines and budgets are unchanged. Local tests do not certify
 live S3, process-crash durability, cluster rollout or production readiness.
 
 ### Completed SlateDB-specific evidence
 
-SlateDB 0.16 commits return a write handle before object-store durability; both
-write and release now await it before acknowledging success. Its universal
+SlateDB 0.16 commits return a write handle before object-store durability; the
+0.16 candidate's write and release paths awaited it before acknowledging
+success. Its universal
 ManifestV2 writes also require cross-version checks, despite the V2 decoder
 already present in 0.15.
 
@@ -131,6 +142,8 @@ file path/size/hash manifests. The driver bounds each operation to 60 seconds.
 This manual cross-version preparation is not added as a heavy build to ordinary
 CI. The orchestrated local run completed all 12 recorded phases successfully;
 invalid arguments and a mismatched old lock were rejected before output creation.
+The 0.16 compatibility evidence remains useful, but the active workspace is
+held at 0.15 while the bytes-written regression is investigated.
 
 ## Primary references
 
