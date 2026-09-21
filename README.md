@@ -75,3 +75,9 @@ cargo bench -p velorix-runtime --bench local_incremental
 
 See [How to use Velorix locally](docs/how-to.md) for a complete REST workflow,
 including durable restart recovery.
+
+For a standalone development check without deployment or security-audit setup,
+run `sh scripts/run-development-validation.sh`. It verifies selected in-process
+API scenarios and repeats the local runtime benchmark with the existing cost
+gate. See [functional and performance validation](docs/development/functional-performance-validation.md)
+for evidence scopes and limitations; this is not a production-readiness gate.
