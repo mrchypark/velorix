@@ -651,7 +651,14 @@ impl SchemaFingerprintV1 {
         hasher.update(SCHEMA_FINGERPRINT_V1_DOMAIN);
         hasher.update(canonical_json);
 
-        Ok(Self(format!("sha256:{:x}", hasher.finalize())))
+        Ok(Self(format!(
+            "sha256:{}",
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )))
     }
 
     pub fn as_str(&self) -> &str {

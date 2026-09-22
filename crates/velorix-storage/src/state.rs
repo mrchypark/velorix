@@ -2936,7 +2936,14 @@ fn checkpoint_admin_record_digest(label: &str, bytes: &[u8]) -> String {
     hasher.update(b"\0");
     hasher.update(bytes);
 
-    format!("sha256:{:x}", hasher.finalize())
+    format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 fn retention_conflict_error(checkpoint_version: u64) -> CheckpointPublishError {

@@ -287,7 +287,14 @@ pub fn manifest_body_digest(manifest_bytes: &[u8]) -> String {
     hasher.update(b"velorix.checkpoint-manifest.v1\0");
     hasher.update(manifest_bytes);
 
-    format!("sha256:{:x}", hasher.finalize())
+    format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 pub(crate) fn manifest_digest(manifest_bytes: &[u8]) -> String {

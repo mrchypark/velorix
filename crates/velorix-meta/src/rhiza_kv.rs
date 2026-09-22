@@ -219,6 +219,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn base64_upgrade_preserves_binary_kv_wire_fixture() {
+        let bytes = [0, 1, 2, 127, 128, 254, 255];
+        assert_eq!(STANDARD.encode(bytes), "AAECf4D+/w==");
+        assert_eq!(STANDARD.decode("AAECf4D+/w==").unwrap(), bytes);
+        assert_eq!(STANDARD.encode([]), "");
+        assert_eq!(STANDARD.encode([0]), "AA==");
+        assert_eq!(STANDARD.encode([0, 255]), "AP8=");
+        assert_eq!(STANDARD.decode("AA==").unwrap(), [0]);
+        assert_eq!(STANDARD.decode("AP8=").unwrap(), [0, 255]);
+    }
+
     fn receipt(status: &str, code: Option<&str>) -> rhizadb::MutationReceipt {
         serde_json::from_value(json!({"status": status, "error_code": code})).unwrap()
     }

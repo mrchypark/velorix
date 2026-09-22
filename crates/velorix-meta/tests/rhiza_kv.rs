@@ -108,13 +108,16 @@ async fn snapshot_load_rejects_missing_page_and_full_digest_mismatch() {
         .await
         .unwrap();
     let snap = RhizaKvSnapshot::new(kv.clone());
-    let page_hash = format!("{:x}", Sha256::digest(b"page"));
+    let page_hash = Sha256::digest(b"page")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let manifest = json!({
         "schema_version": 1,
         "generation": 1,
         "pages": [page_hash],
         "len": 4,
-        "content_digest": format!("{:x}", Sha256::digest(b"wrong"))
+        "content_digest": Sha256::digest(b"wrong").iter().map(|byte| format!("{byte:02x}")).collect::<String>()
     });
     assert!(kv
         .put_if_absent(

@@ -463,7 +463,14 @@ fn payload_digest(
     hasher.update([0]);
     hasher.update(payload);
 
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 fn encode_arrow_ipc_stream(

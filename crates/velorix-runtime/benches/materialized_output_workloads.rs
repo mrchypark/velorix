@@ -751,5 +751,11 @@ fn millis(duration: Duration) -> f64 {
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }

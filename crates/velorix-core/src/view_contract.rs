@@ -398,7 +398,14 @@ fn stable_serialized_hash<T: Serialize>(
 pub fn stable_bytes_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 /// Synthesizes the runtime planning descriptor for a published-view-output
 /// input relation. The descriptor mirrors the producer's signed binding: the

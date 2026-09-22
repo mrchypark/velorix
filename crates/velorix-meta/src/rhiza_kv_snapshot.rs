@@ -125,8 +125,10 @@ impl RhizaKvSnapshot {
         let mut pages = Vec::new();
         for chunk in bytes.chunks(PAGE_BYTES) {
             let hash = digest(chunk);
-            let page_request_id =
-                format!("{:x}", Sha256::digest(format!("page:{request_id}:{hash}")));
+            let page_request_id = Sha256::digest(format!("page:{request_id}:{hash}"))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
             self.kv
                 .put_if_absent(
                     page_request_id,
@@ -183,5 +185,8 @@ impl RhizaKvSnapshot {
     }
 }
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }

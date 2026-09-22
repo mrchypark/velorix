@@ -1474,7 +1474,10 @@ fn first_sha256_hex(contents: &str) -> Option<String> {
 
 fn file_sha256(path: &Path) -> anyhow::Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>())
 }
 
 fn validate_security_release_provenance_identity(

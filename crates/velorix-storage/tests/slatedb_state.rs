@@ -19,8 +19,11 @@ fn temp_store() -> (TempDir, Arc<dyn object_store::ObjectStore>) {
 
 fn state_marker_key(state_key: &str) -> String {
     format!(
-        "__velorix_state_ref_v1/sha256:{:x}",
+        "__velorix_state_ref_v1/sha256:{}",
         Sha256::digest(state_key.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
     )
 }
 

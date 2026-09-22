@@ -689,7 +689,13 @@ pub fn deterministic_request_digest(
         end_offset_exclusive,
         payload_digest,
     )?;
-    Ok(format!("sha256:{:x}", Sha256::digest(identity)))
+    Ok(format!(
+        "sha256:{}",
+        Sha256::digest(identity)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 pub fn deterministic_request_id(
@@ -711,7 +717,13 @@ pub fn deterministic_request_id(
 }
 
 fn digest_bytes(payload: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(payload))
+    format!(
+        "sha256:{}",
+        Sha256::digest(payload)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 fn validate_publication_match(

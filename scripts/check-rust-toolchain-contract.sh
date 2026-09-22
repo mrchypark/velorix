@@ -31,7 +31,11 @@ if ! printf '%s\n' "$toolchain_refs" | awk -v build="$build_toolchain" -v minimu
     exit 1
 fi
 
-test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$build_toolchain" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 11
+# Development validation is an additional, explicitly pinned build consumer.
+# Keep the inventory count and its specific workflow assertion: a count alone
+# could pass if this consumer disappeared and an unrelated reference was added.
+test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$build_toolchain" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 12
+grep -Fqx "        uses: dtolnay/rust-toolchain@$build_toolchain" .github/workflows/development-validation.yml
 test "$(printf '%s\n' "$toolchain_refs" | awk -v ref="dtolnay/rust-toolchain@$msrv" '$0 == ref { count += 1 } END { print count + 0 }')" -eq 1
 grep -Fqx "        uses: dtolnay/rust-toolchain@$msrv" .github/workflows/ci.yml
 

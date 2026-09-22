@@ -1,0 +1,49 @@
+name: Development validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  development-validation:
+    name: Functional and performance evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check development validation contract
+        run: sh scripts/check-development-validation-contract.sh
+
+      - name: Characterize SlateDB reopen maintenance costs
+        run: |
+          mkdir -p target/development-validation
+          cargo bench --locked -p velorix-storage --features benchmark-diagnostics \
+            --bench slatedb_reopen_diagnostic \
+            > target/development-validation/slatedb-reopen-diagnostic.json
+
+      - name: Collect functional and performance evidence
+        run: sh scripts/run-development-validation.sh
+
+      - name: Retain development validation evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: development-validation-evidence
+          path: target/development-validation/
+          if-no-files-found: warn
