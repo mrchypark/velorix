@@ -5863,7 +5863,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.16.0"
-source = "git+https://github.com/mrchypark/slatedb?rev=ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342#ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342"
+source = "git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -5906,7 +5906,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.16.0"
-source = "git+https://github.com/mrchypark/slatedb?rev=ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342#ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342"
+source = "git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f"
 dependencies = [
  "chrono",
  "log",
@@ -5921,7 +5921,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.16.0"
-source = "git+https://github.com/mrchypark/slatedb?rev=ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342#ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342"
+source = "git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f"
 dependencies = [
  "async-trait",
  "bytes",

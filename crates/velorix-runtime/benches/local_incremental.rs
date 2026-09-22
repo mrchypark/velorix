@@ -91,6 +91,10 @@ struct GcDryRunPlanningWorkload {
 }
 
 fn main() -> BenchResult<()> {
+    if std::env::var("VELORIX_SQL_FAMILY_DIAGNOSTIC").as_deref() == Ok("1") {
+        println!("{}", scale_group_key_workloads::sql_family_diagnostics()?);
+        return Ok(());
+    }
     tokio::runtime::Runtime::new()?.block_on(run())
 }
 

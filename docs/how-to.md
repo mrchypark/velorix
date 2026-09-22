@@ -208,8 +208,9 @@ ingest state from the same bucket and `VELORIX_S3_PREFIX`.
 ## Unsupported SQL Fails During Admission
 
 Velorix accepts only SQL shapes supported by its internal materialized runtime.
-For example, the following unsupported aggregate returns HTTP `400` and does
-not register a fake fallback view:
+For example, global median is unsupported and returns HTTP `400` without
+registering a fallback view. Grouped median over an admitted Int64 column is
+supported; standalone global aggregate views currently support only `COUNT(*)`.
 
 ```bash
 curl -sS -i -X POST \
@@ -219,7 +220,7 @@ curl -sS -i -X POST \
     "view_id": "unsupported_median",
     "input_relation_id": "scores",
     "input_relation_version": "2026-05-24.v1",
-    "sql": "select user_id, median(score) from scores group by user_id",
+    "sql": "select median(score) from scores",
     "response_formats": ["json"]
   }'
 ```

@@ -600,6 +600,20 @@ pub trait StandingProgramRuntime {
         input_changes: Vec<RelationInputBatch>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError>;
 
+    /// Apply an epoch for consumers that only need changes and frontiers.
+    /// Implementations may avoid constructing full output snapshots. The state,
+    /// checkpoints, deltas and failure/idempotency semantics are unchanged.
+    fn apply_changes_delta_only(
+        &mut self,
+        logical_epoch: LogicalEpoch,
+        idempotency_key: EpochIdempotencyKey,
+        input_changes: Vec<RelationInputBatch>,
+    ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        let mut commit = self.apply_changes(logical_epoch, idempotency_key, input_changes)?;
+        commit.output_batches.clear();
+        Ok(commit)
+    }
+
     fn materialized_view_page(
         &self,
         view: ScopedViewId,

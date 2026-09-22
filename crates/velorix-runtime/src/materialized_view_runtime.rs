@@ -8860,9 +8860,10 @@ fn apply_published_output_delta(
         .combine(output_delta)
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
-    let published = DeltaBatch::from_records(rows);
-    validate_published_output(&published)?;
-    Ok(published)
+    if rows.iter().any(|row| row.weight != 1) {
+        return Err(invalid_runtime_state());
+    }
+    Ok(DeltaBatch::from_records(rows))
 }
 
 fn apply_filter_project_full_output_delta(

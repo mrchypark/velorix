@@ -17,6 +17,8 @@ use velorix_core::{
     view_plan::SupportedAggregateOutput,
 };
 
+use velorix_core::delta::DeltaRecord;
+
 use super::{
     canonical_json, fixed_sum_count_outputs, invalid_runtime_state, project_aggregate_value,
 };
@@ -289,10 +291,19 @@ pub(super) fn materialized_generic_delta_to_record_batch(
     output_schema: &RelationSchema,
     state: &DeltaBatch,
 ) -> Result<RecordBatch, StandingProgramRuntimeError> {
+    let rows = state.net_rows().map_err(|_| invalid_runtime_state())?;
+    materialized_generic_rows_to_record_batch(output_schema, &rows)
+}
+
+// Call only with already consolidated rows; weights and column values are still
+// validated here. This avoids sorting a freshly consolidated snapshot again.
+pub(super) fn materialized_generic_rows_to_record_batch(
+    output_schema: &RelationSchema,
+    rows: &[DeltaRecord],
+) -> Result<RecordBatch, StandingProgramRuntimeError> {
     let [key_column, value_columns @ ..] = output_schema.columns.as_slice() else {
         return Err(invalid_runtime_state());
     };
-    let rows = state.net_rows().map_err(|_| invalid_runtime_state())?;
     let mut keys = Vec::new();
     let mut column_values = vec![Vec::new(); value_columns.len()];
     for row in rows {
