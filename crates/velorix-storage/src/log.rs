@@ -2376,13 +2376,15 @@ impl IngestLog {
                 require_materialized_admission,
             )
             .await?;
+        // Reuse this observation only within this load. Active-state reconstruction
+        // below remains fresh; cross-writer safety still relies on the index CAS.
+        let admission_bodies = self.list_admission_record_bodies().await?;
         let indexed_expired_admission_keys = self
-            .list_expired_orphan_admission_keys(stream_id, partition_id)
+            .list_expired_orphan_admission_keys(stream_id, partition_id, &admission_bodies)
             .await?;
-        let mut indexed_admissions = self
-            .list_admission_records()
-            .await?
+        let mut indexed_admissions = admission_bodies
             .into_iter()
+            .map(|(_, admission)| admission)
             .filter(|admission| {
                 admission.stream_id == stream_id && admission.partition_id == partition_id
             })
@@ -2475,11 +2477,12 @@ impl IngestLog {
         &self,
         stream_id: &str,
         partition_id: u32,
+        admission_bodies: &[(Bytes, DurableIngestAdmissionRecordV1)],
     ) -> Result<HashSet<ObjectKey>, IngestLogError> {
         let expiry_decisions = self.list_admission_expiry_decisions().await?;
         let mut expired = HashSet::new();
 
-        for (admission_bytes, admission) in self.list_admission_record_bodies().await? {
+        for (admission_bytes, admission) in admission_bodies {
             if admission.stream_id != stream_id || admission.partition_id != partition_id {
                 continue;
             }
@@ -2488,9 +2491,9 @@ impl IngestLog {
             }
             if expiry_decisions
                 .iter()
-                .any(|decision| decision.expires_admission(&admission_bytes, &admission))
+                .any(|decision| decision.expires_admission(admission_bytes, admission))
             {
-                expired.insert(admission.admission_record_key);
+                expired.insert(admission.admission_record_key.clone());
             }
         }
 

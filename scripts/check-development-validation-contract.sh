@@ -82,7 +82,7 @@ export VALIDATION_FAKE_MODE=success
 sh "$root/scripts/run-development-validation.sh" --help > "$tmp/help.log"
 if sh "$root/scripts/run-development-validation.sh" --repeats 0 > "$tmp/invalid-args.log" 2>&1; then exit 1; fi
 sh "$root/scripts/run-development-validation.sh" --output "$tmp/success" --repeats 2 > "$tmp/success.log" 2>&1
-jq -e '.status=="passed" and .release_certified==false and (.functional|length)==7 and (.performance|length)==3' "$tmp/success/summary.json" >/dev/null
+jq -e '.status=="passed" and .release_certified==false and (.functional|length)==17 and (.performance|length)==3' "$tmp/success/summary.json" >/dev/null
 jq -e '.rows_per_second=={min:10,median:10,max:10}' "$tmp/success/metric-statistics.json" >/dev/null
 jq -e '.completed_warmup_runs==1 and .completed_measured_runs==2 and .metric_statistics.values.rows_per_second.median==10 and .latency_throughput_status=="diagnostic_only" and .evidence_scope.live_rest=="not_run" and .evidence_scope.security=="deferred" and (.baseline.sha256|length)==64' "$tmp/success/summary.json" >/dev/null
 if sh "$root/scripts/run-development-validation.sh" --output "$tmp/success" > "$tmp/reuse.log" 2>&1; then exit 1; fi

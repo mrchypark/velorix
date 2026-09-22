@@ -2692,6 +2692,267 @@ fn runtime_materializes_count_only_aggregate_and_restores_state() {
 }
 
 #[test]
+fn filter_project_delta_only_matches_snapshots_rollback_and_restore() {
+    let catalog = scores_catalog();
+    for sql in [
+        "select user_id, score from scores where score > 0",
+        "select user_id, score * 2 as score from scores where score > 0",
+        "select user_id, score from scores order by score desc limit 1",
+        "select distinct user_id, score from scores",
+    ] {
+        let identity = standing_identity_with_view(sql, "positive_scores");
+        let create = || {
+            create_standing_runtime_with_sql_and_catalogs(
+                &identity,
+                std::slice::from_ref(&catalog),
+                sql,
+                &[catalog_input_relation_schema(&catalog).unwrap()],
+                &[scores_projection_output_schema()],
+            )
+            .unwrap()
+        };
+        let mut ordinary = create();
+        let mut incremental = create();
+        let batch = |start, rows: &[(&str, i64, i64)]| RelationInputBatch {
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            stream_id: "scores-stream".into(),
+            partition_id: 0,
+            schema_fingerprint: catalog.schema_fingerprint.to_string(),
+            start_offset_inclusive: start,
+            end_offset_exclusive: start + rows.len() as u64,
+            event_time_watermark: None,
+            batches: vec![scores_rows_batch(rows)],
+        };
+        let mut offset = 0;
+        for (epoch, rows) in [
+            vec![("alice", 10, 1), ("bob", 20, 1)],
+            vec![
+                ("alice", 10, -1),
+                ("alice", 11, 1),
+                ("bob", 20, -1),
+                ("bob", 20, 1),
+            ],
+            vec![("carol", 30, 1)],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let epoch = epoch as u64 + 1;
+            let input = batch(offset, &rows);
+            let key = EpochIdempotencyKey::new(format!("epoch-{epoch}")).unwrap();
+            let expected = ordinary
+                .apply_changes(epoch, key.clone(), vec![input.clone()])
+                .unwrap();
+            let actual = incremental
+                .apply_changes_delta_only(epoch, key.clone(), vec![input.clone()])
+                .unwrap();
+            assert!(actual.output_batches.is_empty());
+            assert_eq!(
+                actual.output_deltas[0].delta.net_rows().unwrap(),
+                expected.output_deltas[0].delta.net_rows().unwrap()
+            );
+            assert_eq!(
+                incremental.checkpoint().unwrap(),
+                ordinary.checkpoint().unwrap(),
+                "{sql}"
+            );
+            let repeated = incremental
+                .apply_changes_delta_only(epoch, key, vec![input])
+                .unwrap();
+            assert!(repeated.output_deltas.is_empty());
+            assert!(repeated.output_batches.is_empty());
+            offset += rows.len() as u64;
+            if epoch == 2 {
+                incremental = restore_standing_runtime(incremental.checkpoint().unwrap()).unwrap();
+            }
+        }
+        let before = incremental.checkpoint().unwrap();
+        if sql.contains("where score > 0") {
+            let mut torn = before.clone();
+            let state = torn.state_payload.as_mut().unwrap();
+            let mut payload: Value = serde_json::from_str(&state.payload).unwrap();
+            payload["published_output"]["records"] = json!([]);
+            state.payload = serde_json::to_string(&payload).unwrap();
+            torn.state_root.content_hash = stable_bytes_hash(state.payload.as_bytes());
+            assert!(restore_standing_runtime(torn).is_err());
+        }
+        // Rejected ordinary calls must not alter delta-only state or frontiers.
+        for (epoch, key) in [(4, "epoch-3"), (3, "stale-epoch")] {
+            assert!(incremental
+                .apply_changes(
+                    epoch,
+                    EpochIdempotencyKey::new(key).unwrap(),
+                    vec![batch(offset, &[("dave", 40, 1)])],
+                )
+                .is_err());
+            assert_eq!(incremental.checkpoint().unwrap(), before);
+        }
+        assert!(incremental
+            .apply_changes_delta_only(
+                4,
+                EpochIdempotencyKey::new("retry").unwrap(),
+                vec![batch(offset, &[("absent", 99, -1)])]
+            )
+            .is_err());
+        assert_eq!(incremental.checkpoint().unwrap(), before);
+        let input = batch(offset, &[("carol", 30, -1)]);
+        ordinary
+            .apply_changes(
+                4,
+                EpochIdempotencyKey::new("retry").unwrap(),
+                vec![input.clone()],
+            )
+            .unwrap();
+        incremental
+            .apply_changes_delta_only(4, EpochIdempotencyKey::new("retry").unwrap(), vec![input])
+            .unwrap();
+        assert_eq!(
+            incremental.checkpoint().unwrap(),
+            ordinary.checkpoint().unwrap()
+        );
+        // Switching back to snapshot mode must preserve its original contract.
+        let input = batch(offset + 1, &[("dave", 40, 1)]);
+        let expected = ordinary
+            .apply_changes(
+                5,
+                EpochIdempotencyKey::new("snapshot").unwrap(),
+                vec![input.clone()],
+            )
+            .unwrap();
+        let actual = incremental
+            .apply_changes(
+                5,
+                EpochIdempotencyKey::new("snapshot").unwrap(),
+                vec![input],
+            )
+            .unwrap();
+        assert_eq!(
+            actual.output_batches[0].batches,
+            expected.output_batches[0].batches
+        );
+        assert_eq!(
+            incremental.checkpoint().unwrap(),
+            ordinary.checkpoint().unwrap()
+        );
+    }
+}
+
+#[test]
+fn filter_project_emits_only_changed_rows_and_preserves_failed_epoch() {
+    let catalog = scores_catalog();
+    let sql = "select user_id, score from scores where score > 0";
+    let identity = standing_identity_with_view(sql, "positive_scores");
+    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        sql,
+        &[catalog_input_relation_schema(&catalog).unwrap()],
+        &[scores_projection_output_schema()],
+    )
+    .unwrap();
+    let batch = |start, rows: &[(&str, i64, i64)]| RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "scores-stream".into(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive: start,
+        end_offset_exclusive: start + rows.len() as u64,
+        event_time_watermark: None,
+        batches: vec![scores_rows_batch(rows)],
+    };
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("initial").unwrap(),
+            vec![batch(0, &[("alice", 10, 1), ("bob", 20, 1)])],
+        )
+        .unwrap();
+    let commit = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("insert").unwrap(),
+            vec![batch(2, &[("carol", 30, 1)])],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 1);
+    assert_eq!(
+        commit.output_deltas[0].delta.records()[0].key.as_json(),
+        &json!("carol")
+    );
+    assert_eq!(
+        commit.output_deltas[0].delta.records()[0].value.as_json(),
+        &json!({"score":30})
+    );
+    assert_eq!(commit.output_batches[0].batches[0].num_rows(), 3);
+    let before = runtime.checkpoint().unwrap();
+    assert!(runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("retry").unwrap(),
+            vec![batch(3, &[("missing", 99, -1)])]
+        )
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let commit = runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("retry").unwrap(),
+            vec![batch(3, &[("carol", 30, -1)])],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 1);
+    assert_eq!(commit.output_deltas[0].delta.records()[0].weight, -1);
+    assert_eq!(commit.output_batches[0].batches[0].num_rows(), 2);
+    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_projected_scores_page(restored.as_ref(), 3, &[("alice", 10), ("bob", 20)]);
+    let duplicate = runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("retry").unwrap(),
+            vec![batch(3, &[("carol", 30, -1)])],
+        )
+        .unwrap();
+    assert!(duplicate.output_deltas.is_empty());
+    let changed = restored
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("mixed").unwrap(),
+            vec![batch(
+                4,
+                &[
+                    ("alice", 10, -1),
+                    ("alice", 11, 1),
+                    ("bob", 20, -1),
+                    ("bob", 20, 1),
+                ],
+            )],
+        )
+        .unwrap();
+    let expected = DeltaBatch::from_records([
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("alice")),
+            DeltaValue::from_json(json!({"score":10})),
+            -1,
+        ),
+        DeltaRecord::new(
+            DeltaKey::from_json(json!("alice")),
+            DeltaValue::from_json(json!({"score":11})),
+            1,
+        ),
+    ]);
+    assert_eq!(changed.output_deltas[0].delta.records().len(), 2);
+    assert_eq!(
+        changed.output_deltas[0].delta.net_rows().unwrap(),
+        expected.net_rows().unwrap()
+    );
+    assert_projected_scores_page(restored.as_ref(), 4, &[("alice", 11), ("bob", 20)]);
+}
+
+#[test]
 fn runtime_materializes_filter_project_view_and_restores_state() {
     let catalog = scores_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();

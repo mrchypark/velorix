@@ -1,7 +1,7 @@
 use std::{error::Error, sync::Arc, time::Duration, time::Instant};
 
 use arrow::{
-    array::{ArrayRef, Int64Array, StringArray},
+    array::{ArrayRef, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
@@ -62,6 +62,186 @@ enum Distribution {
 pub(super) fn run() -> BenchResult<Vec<ScaleWorkloadMeasurement>> {
     let corpus: Corpus = serde_json::from_str(CORPUS)?;
     corpus.scale_workloads.iter().map(run_workload).collect()
+}
+
+/// Separate native-runtime evidence: never mixed into the unchanged cost-gate corpus.
+pub(super) fn sql_family_diagnostics() -> BenchResult<serde_json::Value> {
+    let delta_only = std::env::var("VELORIX_SQL_FAMILY_DELTA_ONLY").as_deref() == Ok("1");
+    let mut results = Vec::new();
+    for total_rows in [4096_u64, 65536] {
+        for aggregate in [false, true] {
+            let sql = if aggregate {
+                "SELECT customer_id, SUM(amount) AS total, COUNT(*) AS order_count, MIN(amount) AS minimum, MAX(amount) AS maximum, AVG(amount) AS average FROM scale_orders GROUP BY customer_id"
+            } else {
+                "SELECT order_id, amount * 2 AS doubled FROM scale_orders WHERE amount >= 50"
+            };
+            let workload = ScaleWorkload {
+                id: if aggregate {
+                    "aggregate_min_max_avg"
+                } else {
+                    "filter_project"
+                }
+                .into(),
+                sql: sql.into(),
+                distribution: Distribution::HotKeySkew,
+                total_rows,
+                batch_rows: 512,
+                distinct_groups: 256,
+                hot_group_basis_points: 9000,
+            };
+            validate(&workload)?;
+            let catalog = scale_orders_catalog()?;
+            let fields = if aggregate {
+                vec![
+                    ("customer_id", SqlDataType::Utf8),
+                    ("total", SqlDataType::Int64),
+                    ("order_count", SqlDataType::Int64),
+                    ("minimum", SqlDataType::Int64),
+                    ("maximum", SqlDataType::Int64),
+                    ("average", SqlDataType::Float64),
+                ]
+            } else {
+                vec![
+                    ("order_id", SqlDataType::Utf8),
+                    ("doubled", SqlDataType::Int64),
+                ]
+            };
+            let key = fields[0].0.to_string();
+            let schema = RelationSchema {
+                relation_id: VIEW_ID.into(),
+                relation_name: VIEW_ID.into(),
+                relation_version: "2026-08-10.v1".into(),
+                schema_fingerprint: stable_bytes_hash(sql.as_bytes()),
+                columns: fields
+                    .into_iter()
+                    .map(|(name, data_type)| ColumnSchema {
+                        name: name.into(),
+                        data_type,
+                        nullable: false,
+                    })
+                    .collect(),
+                primary_key: vec![key],
+            };
+            let mut identity = identity(&workload);
+            identity.output_schema_hash = schema.schema_fingerprint.clone();
+            let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+                &identity,
+                std::slice::from_ref(&catalog),
+                sql,
+                &[catalog_input_relation_schema(&catalog)?],
+                &[schema],
+            )
+            .map_err(std::io::Error::other)?;
+            let mut samples = Vec::new();
+            for (epoch, start) in (0..total_rows).step_by(512).enumerate() {
+                let inputs = vec![RelationInputBatch {
+                    encoding: RelationInputEncodingV1::SourceRelationV1,
+                    relation_id: RELATION_ID.into(),
+                    relation_version: catalog.relation_schema.relation_version.clone(),
+                    stream_id: workload.id.clone(),
+                    partition_id: 0,
+                    schema_fingerprint: catalog.schema_fingerprint.to_string(),
+                    start_offset_inclusive: start,
+                    end_offset_exclusive: start + 512,
+                    event_time_watermark: None,
+                    batches: vec![input_batch(&workload, start, start + 512)?],
+                }];
+                let started = Instant::now();
+                let key = EpochIdempotencyKey::new(format!("diagnostic-{epoch}"))?;
+                if delta_only {
+                    runtime.apply_changes_delta_only(epoch as u64 + 1, key, inputs)?;
+                } else {
+                    runtime.apply_changes(epoch as u64 + 1, key, inputs)?;
+                }
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            // Build the oracle independently from input row numbers, outside timed apply.
+            let mut expected = std::collections::BTreeMap::<String, (i64, i64, i64, i64)>::new();
+            for row in 0..total_rows {
+                let amount = (row % 101 + 1) as i64;
+                if aggregate {
+                    let key = format!("customer-{:06}", group_index(&workload, row) / 64);
+                    let value = expected.entry(key).or_insert((0, 0, i64::MAX, i64::MIN));
+                    value.0 += amount;
+                    value.1 += 1;
+                    value.2 = value.2.min(amount);
+                    value.3 = value.3.max(amount);
+                } else if amount >= 50 {
+                    expected.insert(format!("order-{row:08}"), (amount * 2, 0, 0, 0));
+                }
+            }
+            let expected_rows = expected.len();
+            let mut page_token = None;
+            loop {
+                let page = runtime.materialized_view_page(
+                    ScopedViewId {
+                        tenant_id: identity.tenant_id.clone(),
+                        program_id: identity.program_id.clone(),
+                        view_id: VIEW_ID.into(),
+                    },
+                    SnapshotPageRequest {
+                        committed_epoch: Some(total_rows / 512),
+                        page_token,
+                        max_rows: Some(1024),
+                    },
+                )?;
+                for batch in &page.batches {
+                    let keys = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    for row in 0..batch.num_rows() {
+                        let value = expected.remove(keys.value(row)).ok_or_else(|| {
+                            std::io::Error::other("unexpected/duplicate diagnostic output key")
+                        })?;
+                        let integer = |column| {
+                            batch
+                                .column(column)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .value(row)
+                        };
+                        assert_eq!(integer(1), value.0);
+                        if aggregate {
+                            assert_eq!(integer(2), value.1);
+                            assert_eq!(integer(3), value.2);
+                            assert_eq!(integer(4), value.3);
+                            let average = batch
+                                .column(5)
+                                .as_any()
+                                .downcast_ref::<Float64Array>()
+                                .unwrap()
+                                .value(row);
+                            assert!((average - value.0 as f64 / value.1 as f64).abs() < 1e-10);
+                        }
+                    }
+                }
+                page_token = page.next_page_token;
+                if page_token.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                expected.is_empty(),
+                "diagnostic output omitted expected rows"
+            );
+            let total_ms: f64 = samples.iter().sum();
+            samples.sort_by(f64::total_cmp);
+            results.push(serde_json::json!({"family":workload.id,"rows":total_rows,
+                "batch_rows":512,"sample_count":samples.len(),"input_hot_group_basis_points":9000,"output_rows":expected_rows,
+                "apply_rows_per_second":total_rows as f64 * 1000.0 / total_ms,
+                "apply_p50_ms":samples[(samples.len() - 1) / 2],
+                "apply_p95_ms":samples[(samples.len() * 95).div_ceil(100) - 1],
+                "exact_output_verified":true}));
+        }
+    }
+    Ok(
+        serde_json::json!({"schema_version":1,"scope":"native_runtime_apply_only",
+        "epoch_output":if delta_only { "delta_only" } else { "full_snapshot" },
+        "object_storage_measured":false,"performance_gate":false,"workloads":results}),
+    )
 }
 
 fn run_workload(workload: &ScaleWorkload) -> BenchResult<ScaleWorkloadMeasurement> {

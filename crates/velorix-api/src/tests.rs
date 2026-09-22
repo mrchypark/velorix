@@ -18946,6 +18946,272 @@ async fn public_1_0_admits_event_time_window_sql_by_default() {
 }
 
 #[tokio::test]
+async fn rest_http_two_writers_materialize_exact_aggregate_with_latency_diagnostics() {
+    let state =
+        test_public_api_state_with_store(Arc::new(InMemory::new()), "http-load", false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app(state))
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    let base = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    for (path, body) in [
+        (
+            "/v1/relations",
+            json!({"catalog":test_order_facts_catalog(),"default_orders_sum_count":false}),
+        ),
+        (
+            "/v1/views",
+            json!({"view_id":"http_orders_by_user","input_relation_id":"order_facts",
+            "input_relation_version":"2026-08-10.v1",
+            "sql":"select user_id, sum(amount) as sum, count(*) as count from order_facts group by user_id",
+            "source_kind":"standing_view","response_formats":["json"]}),
+        ),
+    ] {
+        let response = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status.as_u16(), 201, "{body}");
+    }
+    // Independent streams, sequential offsets within each stream, and an 87.5% hot key.
+    // This is bounded loopback load, not a production throughput certification.
+    let writer = |writer_id: usize| {
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            let mut samples = Vec::new();
+            for batch in 0..32 {
+                let rows: Vec<_> = (0..8)
+                    .map(|row| {
+                        json!({
+                            "order_id":format!("{writer_id}-{batch}-{row}"),
+                            "user_id":if row == 7 { "cold" } else { "hot" },
+                            "category":"load","amount":1,"delta":1
+                        })
+                    })
+                    .collect();
+                let started = std::time::Instant::now();
+                let response = client
+                    .post(format!("{base}/v1/relations/order_facts/ingest"))
+                    .json(&json!({"relation_version":"2026-08-10.v1",
+                        "stream_id":format!("http-writer-{writer_id}"),"partition_id":0,
+                        "start_offset_inclusive":batch * 8,"rows":rows}))
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = response.text().await.unwrap();
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(status.as_u16(), 201, "{body}");
+            }
+            samples
+        }
+    };
+    let started = std::time::Instant::now();
+    let (mut samples, other) = tokio::join!(writer(0), writer(1));
+    let ingest_seconds = started.elapsed().as_secs_f64();
+    samples.extend(other);
+    samples.sort_by(f64::total_cmp);
+    assert_eq!(samples.len(), 64);
+    let query_started = std::time::Instant::now();
+    let response = client
+        .post(format!("{base}/v1/views/http_orders_by_user/query"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    let query_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+    let mut rows = body["rows"].as_array().unwrap().clone();
+    rows.sort_by_key(Value::to_string);
+    let mut expected = vec![
+        json!({"user_id":"hot","sum":448,"count":448}),
+        json!({"user_id":"cold","sum":64,"count":64}),
+    ];
+    expected.sort_by_key(Value::to_string);
+    assert_eq!(rows, expected);
+    eprintln!(
+        "{}",
+        json!({"scope":"loopback_http_in_memory_store","writers":2,
+        "rows":512,"requests":samples.len(),"errors":0,"batch_rows":8,
+        "ingest_rows_per_second":512.0 / ingest_seconds,
+        "ingest_p50_ms":samples[31],"ingest_p95_ms":samples[60],
+        "query_ms":query_ms,"performance_gate":false})
+    );
+    let _ = shutdown_tx.send(());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn rest_join_families_materialize_retract_and_restart() {
+    for interval in [false, true] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = test_public_api_state_with_store(store.clone(), "join-family-a", false).await;
+        let router = app(state);
+        let (catalogs, sql, left_rows, right_rows, expected, after_retract) = if interval {
+            (
+                vec![
+                    test_interval_side_catalog_for_e2e("rides", "ride_id", "booking_start", "booking_end_time"),
+                    test_interval_side_catalog_for_e2e("vehicles", "vehicle_id", "capacity_start_time", "capacity_end"),
+                ],
+                "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time",
+                json!([{"ride_id":"r1","booking_start":10,"booking_end_time":20,"delta":1}]),
+                json!([
+                    {"vehicle_id":"v1","capacity_start_time":15,"capacity_end":25,"delta":1},
+                    {"vehicle_id":"v2","capacity_start_time":18,"capacity_end":22,"delta":1},
+                    {"vehicle_id":"touch_right","capacity_start_time":20,"capacity_end":30,"delta":1},
+                    {"vehicle_id":"touch_left","capacity_start_time":0,"capacity_end":10,"delta":1},
+                    {"vehicle_id":"disjoint","capacity_start_time":30,"capacity_end":40,"delta":1}
+                ]),
+                json!([
+                    {"ride_id":"r1","booking_start":10,"booking_end_time":20,"vehicle_id":"v1"},
+                    {"ride_id":"r1","booking_start":10,"booking_end_time":20,"vehicle_id":"v2"}
+                ]),
+                json!([{ "ride_id":"r1","booking_start":10,"booking_end_time":20,"vehicle_id":"v2"}]),
+            )
+        } else {
+            (
+                vec![generic_adapter_catalog(test_scores_catalog()), generic_adapter_catalog(test_accounts_catalog())],
+                "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a",
+                json!([{"user_id":"alice","score":10,"delta":1},{"user_id":"bob","score":5,"delta":1}]),
+                json!([{"account_id":"a1","limit":100,"tier":"gold","delta":1},{"account_id":"a2","limit":50,"tier":"silver","delta":1}]),
+                json!([
+                    {"user_id":"alice","account_id":"a1","score":10,"tier":"gold"},
+                    {"user_id":"alice","account_id":"a2","score":10,"tier":"silver"},
+                    {"user_id":"bob","account_id":"a1","score":5,"tier":"gold"},
+                    {"user_id":"bob","account_id":"a2","score":5,"tier":"silver"}
+                ]),
+                json!([
+                    {"user_id":"alice","account_id":"a2","score":10,"tier":"silver"},
+                    {"user_id":"bob","account_id":"a2","score":5,"tier":"silver"}
+                ]),
+            )
+        };
+        let refs: Vec<_> = catalogs
+            .iter()
+            .map(|catalog| {
+                json!({
+                    "relation_id":catalog.relation_schema.relation_id,
+                    "relation_version":catalog.relation_schema.relation_version
+                })
+            })
+            .collect();
+        for catalog in catalogs {
+            let response = call_json(
+                &router,
+                Method::POST,
+                "/v1/relations",
+                json!({"catalog":catalog,"default_orders_sum_count":false}),
+            )
+            .await;
+            assert_eq!(
+                response.0,
+                StatusCode::CREATED,
+                "interval={interval}: {response:?}"
+            );
+        }
+        let response = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            json!({
+                "view_id":"join_pairs","input_relation_refs":refs,"sql":sql,
+                "source_kind":"standing_view","response_formats":["json"]
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.0,
+            StatusCode::CREATED,
+            "interval={interval}: {response:?}"
+        );
+        for (index, rows) in [&left_rows, &right_rows].into_iter().enumerate() {
+            let response = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
+                "relation_id":refs[index]["relation_id"],"relation_version":refs[index]["relation_version"],
+                "stream_id":format!("join-stream-{index}"),"partition_id":0,"start_offset_inclusive":0,"rows":rows
+            }]})).await;
+            assert_eq!(
+                response.0,
+                StatusCode::CREATED,
+                "interval={interval}: {response:?}"
+            );
+        }
+        let restarted = test_public_api_state_with_store(store, "join-family-b", true).await;
+        assert_eq!(
+            restarted
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        let restarted_router = app(restarted);
+        for current in [&router, &restarted_router] {
+            let response = call_json(
+                current,
+                Method::POST,
+                "/v1/views/join_pairs/query",
+                json!({}),
+            )
+            .await;
+            assert_eq!(
+                response.0,
+                StatusCode::OK,
+                "interval={interval}: {response:?}"
+            );
+            let mut actual = response.1["rows"].as_array().unwrap().clone();
+            let mut expected = expected.as_array().unwrap().clone();
+            actual.sort_by_key(Value::to_string);
+            expected.sort_by_key(Value::to_string);
+            assert_eq!(actual, expected, "interval={interval}");
+        }
+        let mut retracted = right_rows[0].clone();
+        retracted["delta"] = json!(-1);
+        let response = call_json(&restarted_router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
+            "relation_id":refs[1]["relation_id"],"relation_version":refs[1]["relation_version"],
+            "stream_id":"join-stream-1","partition_id":0,"start_offset_inclusive":right_rows.as_array().unwrap().len(),"rows":[retracted]
+        }]})).await;
+        assert_eq!(
+            response.0,
+            StatusCode::CREATED,
+            "interval={interval}: {response:?}"
+        );
+        let response = call_json(
+            &restarted_router,
+            Method::POST,
+            "/v1/views/join_pairs/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            response.0,
+            StatusCode::OK,
+            "interval={interval}: {response:?}"
+        );
+        let mut actual = response.1["rows"].as_array().unwrap().clone();
+        let mut expected = after_retract.as_array().unwrap().clone();
+        actual.sort_by_key(Value::to_string);
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(actual, expected, "interval={interval}");
+    }
+}
+
+#[tokio::test]
 async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-temporal-asof-a", false).await;
