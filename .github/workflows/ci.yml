@@ -130,6 +130,11 @@ jobs:
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Install recovery fixture XML parser
+        run: |
+          timeout 120s sudo apt-get update
+          timeout 120s sudo apt-get install -y --no-install-recommends libxml2-utils
+
       - name: Test Rhiza backend
         run: cargo test -p velorix-meta --features 'hiqlite-backend rhiza-backend' --tests
 

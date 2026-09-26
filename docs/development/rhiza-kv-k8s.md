@@ -65,7 +65,9 @@ durability behavior.
 
 ## Local recovery regression and proof boundaries
 
-`sh scripts/check-rhiza-recovery.sh` starts a digest-pinned, isolated MinIO
+`sh scripts/check-rhiza-recovery.sh` builds official Versity Gateway v1.8.0
+(`fd04bc1df2656298577b82667a4195c77f8c7563`) into a run-local binary directory,
+then starts an isolated loopback POSIX-backed S3
 fixture and runs three native Rhiza nodes through the real `RhizaKvMetaStore`
 snapshot/CAS path. It checks cross-node reads, competing checkpoint CAS writes
 (one winner), continued operation with two voters, and fail-closed operation
@@ -73,12 +75,32 @@ without quorum. It then closes all nodes, retains their old directories, opens
 three empty working directories, and reads the exact acknowledged catalog,
 owner claim, and winning checkpoint without recreating those records.
 
-The local drill passed on 2026-09-05, including an independent rerun in 18.53
+The fixture requires Go, GNU `timeout`, netcat, curl with native AWS SigV4, and
+`xmllint` (CI installs `libxml2-utils` only in the Rhiza job). Signed requests use
+the same `us-east-1` region as Rhiza. Source builds, startup, client operations and tests are bounded. The
+server binds only loopback, uses run-local scratch storage, and cleanup signals
+only its own supervisor PID. Source SHAs and Go binary build information are
+retained with the evidence; this changes fixture transport, not the S3 backend
+or recovery assertions. Signed probes require conditional creation to succeed
+once, duplicate creation and a wrong ETag to return 412 without changing the
+body, and a matching ETag update to succeed. XML listings must be valid,
+non-truncated, and nonempty.
+
+These probes and the drill do not certify full S3 semantics or production
+compatibility. In this pinned gateway, GET metadata and body opening are not
+protected by the publication lock, so concurrent replacement can mix an old
+ETag with a new body. Rhiza obtains CAS tokens through separate HEAD requests;
+publisher claims and archive heads also check versions around reads. Recovery
+pins and GC locks lack that second HEAD check. Concurrent DELETE and unexpected
+metadata-error handling remain unverified limits. The drill's competing CAS
+assertion concerns Rhiza's replicated metadata, not general S3 atomicity.
+
+The former MinIO-backed local drill passed on 2026-09-05, including an independent rerun in 18.53
 seconds. GitHub Actions runs this ignored integration test explicitly and
 retains its logs and JSON evidence. The JSON summarizes passing assertions;
 the test and logs are the underlying evidence.
 
-This is a graceful cold-restart test, not a SIGKILL or power-loss test. MinIO
+This is a graceful cold-restart test, not a SIGKILL or power-loss test. The gateway
 remains available while metadata nodes lose local state. Neither this drill nor
 the Kubernetes fixture establishes recovery from loss of the object-store
 provider itself, migration of existing metadata, or production cutover.

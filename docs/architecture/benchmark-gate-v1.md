@@ -27,11 +27,21 @@ and object request metrics for object-backed workloads.
 Initial gates should use regression budgets rather than absolute targets. Local
 filesystem and S3-compatible baselines are separate and not interchangeable.
 The committed local PR-smoke baseline is a non-placeholder, conservative
-threshold derived from repeated local measurements. The current baseline is the
-component-wise conservative envelope of seven runs at commit
+threshold derived from repeated local measurements. The initial documented
+calibration used the component-wise conservative envelope of seven runs at commit
 `fec9e8cce84a96c2747a700430f9091f172f550a` on 2026-08-09: minimum throughput
 and maximum latency, resource, scan, and object-request values. All seven source
-runs pass the resulting baseline with the PR gate's 25% budget. The local PR
+runs passed the resulting baseline with the PR gate's 25% budget. The current
+baseline has mixed provenance: on 2026-09-27, explicit acceptance of official
+SlateDB 0.16.0 recalibrated only `slatedb_state_reopen` bytes written (8,660 to
+10,984) and LIST count (9 to 12), using the maxima of one preserved official
+full-workload run plus seven fixed additional runs. All eight pass the resulting
+gate. Every other field, including the historical baseline commit, remains
+unchanged; that commit does not identify the later two-field recalibration.
+The [comparison report](../development/slatedb-upstream-comparison-2026-09-27.md)
+and [per-run evidence](../development/slatedb-upstream-calibration-2026-09-27.json)
+record source hashes, the original failures and exact scope. The 25% budget is
+unchanged. The local PR
 gate blocks on deterministic structural and cost metrics: bytes per row, PUTs
 per GiB, object request counts and bytes, spill bytes, and scan bytes. It still
 records throughput, latency, and peak RSS, but those host-sensitive values are

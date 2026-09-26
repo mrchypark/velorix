@@ -1,0 +1,251 @@
+{
+  "schema_version": 1,
+  "decision": "explicit_user_acceptance_of_official_0.16.0_cost_tradeoff",
+  "source_commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+  "package": {
+    "name": "slatedb",
+    "version": "0.16.0",
+    "source": "registry+https://github.com/rust-lang/crates.io-index",
+    "checksum": "fb40332f41e231926df3a0ef742c05316b43368ba4b520433d2a1eba1ab00f0f"
+  },
+  "schedule": "Original official run plus seven additional fixed sequential full-workload runs; no retries; no compilation overlap; all samples retained",
+  "environment": "env -i preserving PATH, HOME and TMPDIR; default GC and production state wrapper",
+  "commands": {
+    "build": "cargo build --release -p velorix-runtime --bench local_incremental -p velorix-cli --bin velorix-cli",
+    "run": "env -i PATH=... HOME=... TMPDIR=... timeout 300 target/slatedb-upstream-comparison/official/local_incremental",
+    "validate": "velorix-cli benchmark-validate --result RUN.json",
+    "gate": "velorix-cli benchmark-gate --gate-level pr-smoke --backend local --baseline baselines/benchmark/local/pr-smoke.json --result RUN.json --max-regression-fraction 0.25 --json"
+  },
+  "build_source_scope": "Dependency source/checksum changes only on cost-benchmark compilation path; local_incremental.rs and production state_store.rs unchanged. Temporary diagnostic-only extension did not participate in the cost workload and was removed. Exact dependency and diagnostic patches retained in target/slatedb-upstream-comparison.",
+  "baseline": {
+    "original_commit": "d8f8673add87d28f678b4ad6ab7f261b4008d5c2",
+    "provenance": "Mixed: all original fields retained except the two explicitly listed SlateDB workload cost values. Original baseline commit remains historical and does not identify this recalibration.",
+    "max_regression_fraction": 0.25,
+    "changed_workload": "slatedb_state_reopen",
+    "fields": {
+      "bytes_written": {
+        "old": 8660,
+        "new": 10984
+      },
+      "list_count": {
+        "old": 9,
+        "new": 12
+      }
+    },
+    "rule": "Measured componentwise maxima over all eight full-workload runs for these two fields only; all other metrics unchanged"
+  },
+  "bytes_only_gate": {
+    "sample": "run-3",
+    "exit_code": 1,
+    "error": "benchmark workload slatedb_state_reopen metric list_count regressed by 0.333, over budget 0.250"
+  },
+  "samples": [
+    {
+      "path": "target/slatedb-upstream-comparison/official/cost.json",
+      "sha256": "39a32dfcb4378c993a3399cdcfd834001fab899aea1eab5afef0372d6f06eea3",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 15.873875,
+        "p95_ms": 15.873875,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 4,
+          "list_count": 10,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 2022
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-1.json",
+      "sha256": "f22d8bc96cf1a9bd5a35af9ec00f1f5a215ce54f3bf2fb4810fbb489bba916e2",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 46.152792,
+        "p95_ms": 46.152792,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 6,
+          "list_count": 11,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 3242
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-2.json",
+      "sha256": "a066b8d8a1903693c8dd1a442dc9e87096f0ce68857e2a9537d381298b7ad4a5",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 13.745417,
+        "p95_ms": 13.745417,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 5,
+          "list_count": 11,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 2632
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-3.json",
+      "sha256": "c8165be760d691345261d0b5c67d7c03ebf6fcad903087b9c6c7c474df5ca911",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 28.934834,
+        "p95_ms": 28.934834,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 5,
+          "list_count": 12,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 2632
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-4.json",
+      "sha256": "1109f86e78680c0d32ae9bcdad9d5e56015fc47aa4fb3f6edd3f927bf3103f05",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 17.238583,
+        "p95_ms": 17.238583,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 5,
+          "list_count": 12,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 2632
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-5.json",
+      "sha256": "aa5027ac08c6f471daefb2ddac3904c1cb7f3460b30524bb745077238941267c",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 13.345583,
+        "p95_ms": 13.345583,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 4,
+          "list_count": 10,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 2022
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-6.json",
+      "sha256": "5a435610f3d647856e8b6151728bf6469f0c5e2ef3dc5fb4df8171964422864d",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 24.478666999999998,
+        "p95_ms": 24.478666999999998,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 4,
+          "list_count": 10,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 2022
+        },
+        "scan_bytes": 0
+      }
+    },
+    {
+      "path": "target/slatedb-upstream-comparison/accepted-upstream/calibration/run-7.json",
+      "sha256": "7abd7cad05c88b1bbfb5803590dd9af53980af06c9a2c84be534a04f04b51fa9",
+      "commit": "70776eafac9fc0a9149809abee11a4daab4a7d20",
+      "gate_level": "pr_smoke",
+      "backend": "local",
+      "backend_evidence_scope": "live_or_native",
+      "workload": "local_incremental",
+      "slatedb": {
+        "name": "slatedb_state_reopen",
+        "p50_ms": 13.890917,
+        "p95_ms": 13.890917,
+        "object_requests": {
+          "put_count": 35,
+          "get_count": 6,
+          "list_count": 10,
+          "range_read_count": 2,
+          "bytes_written": 10984,
+          "bytes_read": 3242
+        },
+        "scan_bytes": 0
+      }
+    }
+  ],
+  "sha256": {
+    "official_lock": "ba43b6ad1815334a1ef990992aed78fbe73053e9188bae1af938e8179c4cd02b",
+    "official_benchmark_binary": "727778a070d40829436c06b4b100d2ee62e28e4323c680754a656a6c38c8bd94",
+    "official_cli_binary": "28326a8f66769bddd2a0934072d249be49358f2d3f45cc015a9fd6517e35b5a4",
+    "cost_harness_source": "83786f854e1ac9c33d1d80c3d018e656858f4ac8be44f3da77e8b160148931c3",
+    "production_state_wrapper": "b17c6f4ef813009af368365947229056aacade40fcf27cd6794daeb72115aff9",
+    "dependency_dirty_patch": "4a15f751b14cb951da1a61c8ab9dc189b2729dd0af9bf5c4f65a44e757b4ba86"
+  },
+  "dependency_dirty_patch": "diff --git a/Cargo.lock b/Cargo.lock\nindex 4bf6dca..5f3b1ff 100644\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -5863,7 +5863,8 @@ checksum = \"0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5\"\n [[package]]\n name = \"slatedb\"\n version = \"0.16.0\"\n-source = \"git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f\"\n+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n+checksum = \"fb40332f41e231926df3a0ef742c05316b43368ba4b520433d2a1eba1ab00f0f\"\n dependencies = [\n  \"async-channel\",\n  \"async-trait\",\n@@ -5906,7 +5907,8 @@ dependencies = [\n [[package]]\n name = \"slatedb-common\"\n version = \"0.16.0\"\n-source = \"git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f\"\n+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n+checksum = \"6b77f238f348e95e1653a5235f880ac703011b82582bd556f2aba405abf8180e\"\n dependencies = [\n  \"chrono\",\n  \"log\",\n@@ -5921,7 +5923,8 @@ dependencies = [\n [[package]]\n name = \"slatedb-txn-obj\"\n version = \"0.16.0\"\n-source = \"git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f\"\n+source = \"registry+https://github.com/rust-lang/crates.io-index\"\n+checksum = \"1ad63b6c250219e26d71f497820f970274c301f896366daa56915f2a05df0e0a\"\n dependencies = [\n  \"async-trait\",\n  \"bytes\",\ndiff --git a/Cargo.toml b/Cargo.toml\nindex 5b9f541..4fe60a2 100644\n--- a/Cargo.toml\n+++ b/Cargo.toml\n@@ -42,7 +42,7 @@ ring = \"0.17\"\n rustls = { version = \"0.23\", default-features = false, features = [\"ring\"] }\n reqwest = { version = \"0.13\", default-features = false, features = [\"json\", \"rustls\"] }\n rcgen = \"0.14\"\n-slatedb = { git = \"https://github.com/mrchypark/slatedb\", rev = \"4b0a95a86c68b94d2fd368db76a0b75791951d5f\", default-features = false }\n+slatedb = { version = \"=0.16.0\", default-features = false }\n sigstore-trust-root = { version = \"0.11\", default-features = false }\n sigstore-types = \"0.11\"\n sigstore-verify = { version = \"0.11\", default-features = false, features = [\"rustls\"] }\n",
+  "verification": {
+    "all_eight_recalibrated_gates": "pass",
+    "format": "pass",
+    "workspace_clippy_all_targets_deny_warnings": "pass",
+    "runtime_lib_tests_passed": 54,
+    "runtime_integration_tests_passed": 251,
+    "cargo_deny": "pass",
+    "dependency_governance": "pass",
+    "reused_official_storage_evidence": {
+      "durability_tests_passed": 4,
+      "state_tests_passed": 10,
+      "bidirectional_compatibility": "pass"
+    }
+  }
+}
