@@ -60,12 +60,13 @@ database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer,
 Hiqlite, and the internal materialized view runtime. The `mrchypark/hiqlite` git source is explicitly
 allowed in `deny.toml` while Velorix uses the pinned fork-main commit that carries
 the required metadata-backend authority-time API before an upstream release
-carries that support. The `mrchypark/slatedb` git source is also explicitly
-allowed for revision `ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342`, a v0.16.0
-backport of [upstream PR #2101](https://github.com/slatedb/slatedb/pull/2101)
-plus omission of empty optional manifest segments and default sequence trackers.
-It shares native WAL GC listings only for matching schedules. Replace this pin
-when an upstream release contains the fix and passes Velorix's checks.
+carries that support. SlateDB uses exact crates.io 0.16.0 with default features
+disabled; its former Git-source allowance has been removed. The user accepted
+the official release's measured storage-cost increase. Default GC and durable
+commit acknowledgments remain enabled. The
+[comparison report](../development/slatedb-upstream-comparison-2026-09-27.md)
+preserves the original gate failure, scoped measured baseline recalibration,
+durability tests and bidirectional persisted-state compatibility evidence.
 Each package review names an owner, review date, local
 audit status, feature policy, and replacement plan. This is the required local
 audit workflow for the release gate.

@@ -40,10 +40,10 @@
     {
       "subject": "slatedb",
       "owner": "state",
-      "reviewed_on": "2026-09-22",
-      "audit_status": "local_reviewed_pinned_fork_until_upstream_release_contains_shared_wal_gc_listing",
-      "feature_policy": "Use mrchypark/slatedb revision ad8e14d2180bdef4edbd1ab2cbc514a6efcb8342: v0.16.0 plus shared native WAL GC listings for matching schedules and omission of empty optional manifest segments and default sequence trackers. The patches passed independent local review and backport tests; this is not an external audit. Do not duplicate SlateDB storage internals in Velorix.",
-      "replacement_plan": "Track https://github.com/slatedb/slatedb/pull/2101 and switch to an upstream release containing the fix. Re-run durability, LIST trace, performance gates, and dependency checks before replacing the pin."
+      "reviewed_on": "2026-09-27",
+      "audit_status": "local_reviewed_official_release_with_accepted_cost_tradeoff",
+      "feature_policy": "Use exact crates.io SlateDB 0.16.0 with default-features=false, default GC, and durable commit acknowledgments. The user accepts the measured upstream storage-cost increase over the former fork. See docs/development/slatedb-upstream-comparison-2026-09-27.md for the original failed gate, scoped baseline recalibration, durability and bidirectional compatibility evidence. This is not an external audit. Do not duplicate SlateDB storage internals in Velorix.",
+      "replacement_plan": "Review future official releases against durability, persisted-state compatibility, default-config cost gates and dependency checks. Preserve the 25% gate budget and require documented measured evidence for baseline changes."
     },
     {
       "subject": "foyer",

@@ -5863,7 +5863,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.16.0"
-source = "git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb40332f41e231926df3a0ef742c05316b43368ba4b520433d2a1eba1ab00f0f"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -5906,7 +5907,8 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.16.0"
-source = "git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b77f238f348e95e1653a5235f880ac703011b82582bd556f2aba405abf8180e"
 dependencies = [
  "chrono",
  "log",
@@ -5921,7 +5923,8 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.16.0"
-source = "git+https://github.com/mrchypark/slatedb?rev=4b0a95a86c68b94d2fd368db76a0b75791951d5f#4b0a95a86c68b94d2fd368db76a0b75791951d5f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad63b6c250219e26d71f497820f970274c301f896366daa56915f2a05df0e0a"
 dependencies = [
  "async-trait",
  "bytes",
