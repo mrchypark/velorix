@@ -65,13 +65,22 @@ durability behavior.
 
 ## Local recovery regression and proof boundaries
 
-`sh scripts/check-rhiza-recovery.sh` starts a digest-pinned, isolated MinIO
+`sh scripts/check-rhiza-recovery.sh` builds official MinIO and mc at pinned
+commits into a run-local binary directory, then starts an isolated MinIO
 fixture and runs three native Rhiza nodes through the real `RhizaKvMetaStore`
 snapshot/CAS path. It checks cross-node reads, competing checkpoint CAS writes
 (one winner), continued operation with two voters, and fail-closed operation
 without quorum. It then closes all nodes, retains their old directories, opens
 three empty working directories, and reads the exact acknowledged catalog,
 owner claim, and winning checkpoint without recreating those records.
+
+The fixture requires Go and GNU `timeout`. MinIO and mc use the source commits
+matching the former container releases; unavailable public images are no longer
+required. Source builds, startup, client operations and tests are bounded. The
+server binds only loopback, uses run-local scratch storage, and cleanup signals
+only its own supervisor PID. Source SHAs and Go binary build information are
+retained with the evidence; this changes fixture transport, not the S3 backend
+or recovery assertions.
 
 The local drill passed on 2026-09-05, including an independent rerun in 18.53
 seconds. GitHub Actions runs this ignored integration test explicitly and
