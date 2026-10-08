@@ -33,13 +33,11 @@ Environment equivalents:
   VELORIX_COMPLETE_PRODUCT_ENV_REPORT
 
 The generated env file is a template. It includes every external input needed
-by scripts/complete-vind-product.sh for the current product-complete scope,
-can optionally embed the Hiqlite backend-time release env template. Actual
-external S3/OSS, object-store durability attestation, public/enterprise ingress,
-and trusted Hiqlite release/Sigstore provenance are excluded by default; set
-VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3=1,
-VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS=1, or
-VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE=1 before generation to include
+by scripts/complete-vind-product.sh for the current product-complete scope.
+Actual external S3/OSS, object-store durability attestation, and
+public/enterprise ingress are excluded by default; set
+VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3=1 or
+VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS=1 before generation to include
 those placeholders. It creates no product-complete evidence and no PVCs.
 EOF
 }
@@ -83,19 +81,9 @@ fi
 
 cd "$repo_root"
 
-product_dir="$(dirname "$product_evidence")"
-hiqlite_env="${product_dir}/hiqlite-backend-time-release.env"
-hiqlite_report="${product_dir}/hiqlite-backend-time-release-env.json"
-
-scripts/write-hiqlite-backend-time-release-env.sh \
-  --product-evidence "$product_evidence" \
-  --output "$hiqlite_env" \
-  --report "$hiqlite_report" >/dev/null
-
-python3 - "$product_evidence" "$output_file" "$report_file" "$hiqlite_env" "$hiqlite_report" <<'PY'
+python3 - "$product_evidence" "$output_file" "$report_file" <<'PY'
 import json
 import os
-import re
 import shlex
 import sys
 from datetime import datetime, timezone
@@ -104,8 +92,6 @@ from pathlib import Path
 product_path = Path(sys.argv[1])
 output_path = Path(sys.argv[2])
 report_path = Path(sys.argv[3])
-hiqlite_env_path = Path(sys.argv[4])
-hiqlite_report_path = Path(sys.argv[5])
 
 if not product_path.is_file():
     raise SystemExit(f"missing product evidence: {product_path}")
@@ -113,14 +99,11 @@ with product_path.open("r", encoding="utf-8") as f:
     product = json.load(f)
 if product.get("evidence_kind") != "velorix_product_slice_evidence":
     raise SystemExit("product evidence_kind must be velorix_product_slice_evidence")
-hiqlite_env_text = hiqlite_env_path.read_text(encoding="utf-8")
-hiqlite_report = json.loads(hiqlite_report_path.read_text(encoding="utf-8"))
 
 product_dir = product_path.parent
 prefix = f"product/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-release-handoff"
 external_s3_required = os.environ.get("VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3", "0") == "1"
 public_ingress_required = os.environ.get("VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS", "0") == "1"
-hiqlite_release_required = os.environ.get("VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE", "0") == "1"
 scope_warnings = []
 if not public_ingress_required:
     scope_warnings.append(
@@ -130,21 +113,15 @@ if not external_s3_required:
     scope_warnings.append(
         "object_store_external_authority_out_of_scope_does_not_prove_object_store_durability"
     )
-if not hiqlite_release_required:
-    scope_warnings.append(
-        "hiqlite_backend_time_release_out_of_scope_does_not_prove_sigstore_ci_release_provenance"
-    )
 
 values = {
     "VELORIX_VIND_PRODUCT_DIR": str(product_dir),
     "VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3": "1" if external_s3_required else "0",
     "VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS": "1" if public_ingress_required else "0",
-    "VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE": "1" if hiqlite_release_required else "0",
     "VELORIX_COMPLETE_PRODUCT_LOCAL_EVIDENCE": "1",
     "VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3": "1",
     "VELORIX_COMPLETE_PRODUCT_INGRESS": "1",
     "VELORIX_COMPLETE_PRODUCT_DURABILITY": "1",
-    "VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME": "1",
     "AWS_ENDPOINT_URL": "https://S3_OR_OSS_ENDPOINT",
     "AWS_ACCESS_KEY_ID": "REPLACE_WITH_ACCESS_KEY",
     "AWS_SECRET_ACCESS_KEY": "REPLACE_WITH_SECRET_KEY",
@@ -222,10 +199,6 @@ placeholder_keys.extend(
     for key, value in values.items()
     if any(marker in value for marker in ["PUBLIC_HOST.", "INGRESS_CONTROLLER", "TLS_SECRET_NAME", "S3_OR_OSS_ENDPOINT"])
 )
-for line in hiqlite_env_text.splitlines():
-    match = re.match(r"export\s+([A-Z0-9_]+)=(.*)$", line)
-    if hiqlite_release_required and match and "REPLACE_WITH" in match.group(2):
-        placeholder_keys.append(match.group(1))
 
 placeholder_set = set(placeholder_keys)
 secret_placeholders = sorted(
@@ -234,7 +207,6 @@ secret_placeholders = sorted(
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
-        "VELORIX_CI_SIGSTORE_BUNDLE_BASE64",
     }
 )
 
@@ -280,30 +252,6 @@ placeholder_groups = [
         ],
         "secret_placeholders": [],
     },
-    {
-        "step": "release_identity",
-        "description": "Velorix release/source and CI workflow identity validated by scripts/check-hiqlite-backend-time-release-inputs.sh.",
-        "placeholders": [
-            "VELORIX_RELEASE_COMMIT",
-            "VELORIX_SOURCE_REVISION",
-            "VELORIX_CI_WORKFLOW_RUN_ID",
-            "VELORIX_CI_JOB_WORKFLOW_REF",
-        ],
-        "secret_placeholders": [],
-    },
-    {
-        "step": "sigstore_provenance",
-        "description": "Sigstore bundle and digest for trusted Hiqlite backend-time release attestation.",
-        "placeholders": [
-            "VELORIX_CI_SIGSTORE_BUNDLE_BASE64",
-            "VELORIX_CI_SIGSTORE_BUNDLE_SHA256",
-        ],
-        "secret_placeholders": [
-            key
-            for key in ["VELORIX_CI_SIGSTORE_BUNDLE_BASE64"]
-            if key in placeholder_set
-        ],
-    },
 ]
 for group in placeholder_groups:
     group["placeholders"] = [
@@ -318,8 +266,7 @@ lines = [
     "# This file is 0600 because it may be edited to contain real credentials.",
     "# Actual external S3/OSS is excluded by default. Regenerate with VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3=1 to include S3 and durability-review inputs.",
     "# Public/enterprise ingress is excluded by default. Regenerate with VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS=1 to include public ingress/TLS/auth inputs.",
-    "# Trusted Hiqlite release/Sigstore provenance is excluded by default. Regenerate with VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE=1 to include release identity and Sigstore inputs.",
-    "# Default local_diagnostic_complete may prove local/internal REST TLS/auth and Hiqlite backend-time boundary only; product_complete remains false until every release/product gate is required and passes.",
+    "# Default local_diagnostic_complete may prove local/internal REST TLS/auth boundary only; product_complete remains false until every release/product gate is required and passes.",
     "# When S3 scope is enabled, reuse an existing Kubernetes S3 Secret by setting VELORIX_S3_CREDENTIALS_SECRET_MANAGED=0, setting VELORIX_S3_CREDENTIALS_SECRET_NAME, and blank AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY/AWS_SESSION_TOKEN.",
     "",
 ]
@@ -328,14 +275,6 @@ for key, value in values.items():
 
 lines.extend(
     [
-        "",
-        "# Hiqlite backend-time release provenance inputs.",
-        "# These exports are generated by scripts/write-hiqlite-backend-time-release-env.sh.",
-        "# The embedded template carries release/Sigstore fields such as VELORIX_CI_SIGSTORE_BUNDLE_BASE64.",
-        "",
-        hiqlite_env_text.rstrip()
-        if hiqlite_release_required
-        else "# Release/Sigstore env template omitted because VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE=0.",
         "",
         "# Verify inputs without creating product-complete evidence:",
         f"# VELORIX_COMPLETE_PRODUCT_DRY_RUN=1 scripts/complete-vind-product.sh --env-file {output_path}",
@@ -355,15 +294,10 @@ report = {
     "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "product_evidence": str(product_path),
     "env_file": str(output_path),
-    "hiqlite_release_env": str(hiqlite_env_path),
-    "hiqlite_release_env_report": str(hiqlite_report_path),
-    "hiqlite_release_required": hiqlite_release_required,
     "placeholders": sorted(placeholder_set),
     "placeholder_count": len(placeholder_set),
     "secret_placeholders": secret_placeholders,
     "placeholder_groups": placeholder_groups,
-    "derived_from_product_evidence": hiqlite_report.get("derived_from_product_evidence") or [],
-    "fixed_release_values": hiqlite_report.get("fixed_release_values") or [],
     "scope_warnings": scope_warnings,
     "creates_product_complete_evidence": False,
     "next_action": (

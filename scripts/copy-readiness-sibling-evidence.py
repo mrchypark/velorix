@@ -95,46 +95,6 @@ def product_siblings(artifact: Path, doc: dict) -> list[Path]:
         )
     )
 
-    hiqlite = metadata.get("hiqlite_authority_attestation")
-    if hiqlite:
-        if hiqlite.get("evidence") != "hiqlite-authority-attestation.json":
-            raise SystemExit(
-                "product hiqlite_authority_attestation.evidence must be hiqlite-authority-attestation.json"
-            )
-        result.append(
-            sibling(
-                artifact,
-                "hiqlite-authority-attestation.json",
-                "product Hiqlite authority evidence",
-            )
-        )
-        if hiqlite.get("authority_kind") == "velorix_managed_hiqlite":
-            for key, expected in {
-                "namespace_pvc_list": "no-pvc-namespace.json",
-                "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",
-                "manifest": "velorix-hiqlite.yaml",
-            }.items():
-                filename = (hiqlite.get("no_pvc_evidence_files") or {}).get(key)
-                if filename != expected:
-                    raise SystemExit(
-                        f"product hiqlite_authority_attestation.no_pvc_evidence_files.{key} must be {expected}"
-                    )
-                result.append(sibling(artifact, expected, "product Hiqlite no-PVC evidence"))
-
-    hiqlite_backend_time = metadata.get("hiqlite_backend_time_attestation")
-    if hiqlite_backend_time:
-        if hiqlite_backend_time.get("evidence") != "hiqlite-backend-time-attestation.json":
-            raise SystemExit(
-                "product hiqlite_backend_time_attestation.evidence must be hiqlite-backend-time-attestation.json"
-            )
-        result.append(
-            sibling(
-                artifact,
-                "hiqlite-backend-time-attestation.json",
-                "product Hiqlite backend-time evidence",
-            )
-        )
-
     ingress = auth.get("ingress_tls_auth_attestation")
     if ingress:
         if ingress.get("evidence") != "ingress-tls-auth-attestation.json":

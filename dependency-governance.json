@@ -54,12 +54,12 @@
       "replacement_plan": "Replace or disable Foyer if cache behavior conflicts with authority-path object storage or SlateDB ownership."
     },
     {
-      "subject": "hiqlite",
+      "subject": "rhizadb",
       "owner": "metadata",
-      "reviewed_on": "2026-05-31",
-      "audit_status": "local_reviewed_pinned_fork_main_until_upstream_release_contains_authority_time",
-      "feature_policy": "Use the pinned mrchypark/hiqlite fork-main commit that contains Velorix's required authority-time API. Do not claim production standing-runtime fencing until backend-authoritative time and multi-replica adversarial evidence are proven.",
-      "replacement_plan": "Switch to the upstream released hiqlite version after a release includes the required authority-time support. Re-run cargo-deny plus metadata capability tests after each switch."
+      "reviewed_on": "2026-10-08",
+      "audit_status": "local_reviewed_published_release_with_recovery_evidence",
+      "feature_policy": "Use exact crates.io rhizadb 0.19.0 for the metadata service. Local tests cover authenticated peer identities, WAL continuity, and operator-managed generation recovery without PVCs. Backend-authoritative bounded time and production multi-writer safety remain unproven; preserve fail-closed admission. This is not an external audit.",
+      "replacement_plan": "Review published SDK upgrades against metadata conformance, peer authentication, and generation-recovery tests before changing the pin."
     },
     {
       "subject": "materialized_view_runtime",
@@ -73,345 +73,156 @@
   "exceptions": [
     {
       "kind": "duplicate",
-      "crate": "cpufeatures",
-      "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by sha2 and DataFusion/object_store transitive dependencies while upstream graphs converge.",
-      "replacement_plan": "Upgrade sha2/DataFusion/object_store dependency ranges when upstream graphs converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
       "crate": "foldhash",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by hashbrown and DataFusion transitive dependencies while upstream graphs converge.",
-      "replacement_plan": "Upgrade hashbrown/DataFusion dependency ranges when upstream graphs converge.",
+      "expires_on": "2027-01-08",
+      "reason": "Two lines coexist in the all-features graph: foldhash 0.1.5 for hashbrown 0.15.5 (petgraph 0.8.3, tokio-util 0.7.19) and foldhash 0.2.0 for datafusion-common 55.1.0 plus hashbrown 0.16.1 and 0.17.1.",
+      "replacement_plan": "Re-run `cargo tree -i foldhash` after petgraph, tokio-util, and hashbrown widen their ranges; delete this exception the first time a single foldhash line remains.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "getrandom",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
-      "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "Three lines coexist. Examples of the normal and build introducers: getrandom 0.2.17 via ring 0.17.14 and the proc-macro const-random-macro 0.1.16 (via const-random 0.1.18 and ahash 0.8.12); getrandom 0.3.4 via ahash 0.8.12 and rand_core 0.9.5; getrandom 0.4.3 via rand 0.10.3, tempfile 3.27.0, uuid 1.26.1, and the build dependency jobserver 0.1.35 (via cc 1.4.7).",
+      "replacement_plan": "Ring is not the only holder of the 0.2 line; const-random-macro reaches it through ahash. Re-check the version-qualified inverse getrandom trees after the ring/rustls, rand, and const-random release trains; delete the exception only when a single getrandom line remains.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "hashbrown",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by DataFusion, kube-runtime, and related transitive dependency families while upstream graphs converge.",
-      "replacement_plan": "Upgrade DataFusion, kube-runtime, and related dependency families when their ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "Four lines coexist: hashbrown 0.14.5 via dashmap 6.2.1, hashbrown 0.15.5 via petgraph 0.8.3 and tokio-util 0.7.19, hashbrown 0.16.1 via kube-runtime 4.2.0, and hashbrown 0.17.1 via arrow-array and parquet 59.3.0, DataFusion 55.1.0, indexmap 2.14.2, and lru 0.18.4.",
+      "replacement_plan": "Each line tracks a distinct upstream family. Re-run `cargo tree -i hashbrown` quarterly and collapse as kube-runtime, petgraph, tokio-util, and dashmap widen their ranges; keep the entry only while more than one line remains.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "heck",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by code-generation transitive dependencies while upstream graphs converge.",
-      "replacement_plan": "Upgrade code-generation dependencies when upstream ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "Build-time-only duplicate: heck 0.4.1 via ouroboros_macro 0.18.5; heck 0.5.0 via clap_derive 4.6.7 and the prost-build 0.14.4 build dependency. None of these are linked into a Velorix binary.",
+      "replacement_plan": "ouroboros_macro is the last heck 0.4 consumer. Re-check the version-qualified inverse heck trees and retire the exception when ouroboros_macro is replaced, upgraded to heck 0.5, or dropped from the graph.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "object_store",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Velorix intentionally carries object_store 0.14 for authority paths and DataFusion's object_store 0.13 for scan paths until the version boundary can be unified.",
-      "replacement_plan": "Unify authority and scan object_store clients when DataFusion and Velorix authority paths can share one compatible version.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "quick-xml",
-      "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "object_store 0.14 uses fixed quick-xml 0.41, while the pinned Hiqlite -> cryptr -> s3-simple dependency path still carries quick-xml 0.39.",
-      "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency when its upstream range moves to quick-xml 0.41 or newer.",
+      "expires_on": "2027-01-08",
+      "reason": "Velorix authority paths and slatedb 0.16.0 select object_store 0.14.2, while DataFusion's object_store 0.13 (0.13.2) comes via datafusion 55.1.0 and parquet 59.3.0. The scan boundary receives SQL text, so no object_store type crosses it.",
+      "replacement_plan": "Unify authority and scan object_store clients when DataFusion widens its object_store requirement to 0.14; then delete this exception and keep only the authority-path pin. Until then keep 0.14 on authority create/read/list/range behavior without weakening create-only semantics.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "rand",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
-      "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "rand 0.9.5 comes from DataFusion 55.1.0 crates, fail-parallel 0.6.0, slatedb 0.16.0, slatedb-common 0.16.0, and ulid 1.2.1; rand 0.10.3 comes from object_store 0.14.2.",
+      "replacement_plan": "Both lines are pinned by release trains. Re-check the version-qualified inverse rand trees after the SlateDB and object_store upgrades and delete the exception when the DataFusion and SlateDB families reach 0.10.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "rand_core",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by current random/crypto dependency families while upstream graphs converge.",
-      "replacement_plan": "Upgrade random/crypto dependency families when upstream ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "rand_core 0.9.5 comes from rand 0.9.5, rand_chacha 0.9.0, and rand_xoshiro 0.7.0; rand_core 0.10.1 comes from chacha20 0.10.2, getrandom 0.4.3, and rand 0.10.3.",
+      "replacement_plan": "Converges with the rand exception. Re-check the version-qualified inverse rand_core trees alongside the rand trees and delete this entry when a single rand_core line remains.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "thiserror",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by mixed upstream crates while their dependency ranges converge.",
-      "replacement_plan": "Upgrade mixed upstream crates when their dependency ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "thiserror 1.0.69 comes only from slatedb 0.16.0 and slatedb-txn-obj 0.16.0; thiserror 2.0.20 is used by kube-client, kube-core, and kube-runtime 4.2.0, object_store 0.13.2 and 0.14.2, duration-str 0.11.3, json-patch 4.2.0, jsonpath-rust 1.0.11, and the Velorix workspace crates.",
+      "replacement_plan": "Track the next SlateDB 0.16.x patch that moves to thiserror 2. Re-run `cargo tree -i thiserror` after each SlateDB update and delete the entry once slatedb and slatedb-txn-obj select 2.0.20.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "thiserror-impl",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions follow the thiserror duplicate and will converge with upstream dependency ranges.",
-      "replacement_plan": "Upgrade alongside thiserror when upstream dependency ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "thiserror-impl 1.0.69 and 2.0.20 follow the thiserror 1.0.69 (slatedb) and 2.0.20 (kube, object_store, Velorix crates) split. Both are build-time proc macros and are not linked into Velorix binaries.",
+      "replacement_plan": "Remove together with the thiserror exception once SlateDB advances. Re-check with `cargo tree -i thiserror-impl` in the same pass as `cargo tree -i thiserror`.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "winnow",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Duplicate versions are introduced by SlateDB/figment/toml transitive dependencies while upstream graphs converge.",
-      "replacement_plan": "Upgrade SlateDB/figment/toml dependency ranges when upstream graphs converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "aws-lc-sys",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite metadata backend and existing TLS/S3 dependency graph introduce multiple aws-lc-sys lines while upstream crypto dependencies converge.",
-      "replacement_plan": "Upgrade hiqlite and TLS/S3 dependencies, or switch to upstream hiqlite, when the aws-lc-sys dependency ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "winnow 0.6.26 comes from duration-str 0.11.3; winnow 0.7.15 comes from toml_edit 0.22.27 via toml 0.8.23.",
+      "replacement_plan": "duration-str is the only 0.6 consumer. Re-run `cargo tree -i winnow` after a duration-str release and delete the entry when duration-str selects 0.7.15.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "base64",
       "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Direct Velorix consumers use base64 0.23.1; transitive HTTP, Kubernetes, metadata, and signature stacks still use 0.22.1, while fastwebsockets uses 0.21.7.",
-      "replacement_plan": "Upgrade transitive HTTP, Kubernetes, metadata, and signature dependencies when their base64 ranges converge; retain standard padded wire-format compatibility tests.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "chacha20",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite metadata backend introduces crypto transitive dependencies that differ from existing crypto-family versions.",
-      "replacement_plan": "Upgrade hiqlite and crypto dependencies when upstream crypto-family ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "sha2",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Direct Velorix consumers and hiqlite use sha2 0.11; s3-simple, spow, and signature dependencies retain sha2 0.10.9.",
-      "replacement_plan": "Upgrade transitive S3 and signature dependencies when sha2 ranges converge; preserve checkpoint digests and marker-key byte compatibility.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "untrusted",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite metadata backend and existing rustls/ring graph introduce multiple untrusted versions while TLS dependencies converge.",
-      "replacement_plan": "Upgrade hiqlite and TLS dependencies when upstream untrusted ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "block-buffer",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Current hashing and crypto transitive families select multiple block-buffer versions.",
-      "replacement_plan": "Upgrade the hashing and crypto dependency families when their block-buffer ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "const-oid",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned metadata and signing dependency families select multiple const-oid versions.",
-      "replacement_plan": "Upgrade the metadata and signing dependency families when their const-oid ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "base64 0.23.1 is used by arrow-cast 59.3.0, datafusion-functions 55.1.0, object_store 0.14.2, parquet 59.3.0, reqwest 0.13.5, and velorix-meta; base64 0.22.1 is used by hyper-util 0.1.20, k8s-openapi 0.28.0, kube-client 4.2.0, pem 3.0.6, rhizadb 0.19.0, serde-saphyr 0.0.29, tonic 0.14.6, and tower-http 0.6.11. The pem 4.0.0 -> base64 0.23.1 edge is dev-only and is excluded here.",
+      "replacement_plan": "The 0.22.1 line is held by the HTTP, Kubernetes, and Rhiza metadata stacks. Re-check the version-qualified inverse base64 trees after kube, tonic, and rhizadb upgrades and delete the entry when those families select 0.23.1; retain standard padded wire-format compatibility tests either way.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "crypto-common",
       "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Current hashing and crypto transitive families select multiple crypto-common versions.",
-      "replacement_plan": "Upgrade the hashing and crypto dependency families when their crypto-common ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "derive_more",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Current metadata and signing dependency families select multiple derive_more versions.",
-      "replacement_plan": "Upgrade the metadata and signing dependency families when their derive_more ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "derive_more-impl",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The derive_more duplicate brings matching derive_more-impl versions.",
-      "replacement_plan": "Remove alongside the derive_more duplicate when upstream ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "crypto-common 0.1.7 is required by digest 0.10.7, which comes from crc-fast 1.10.0 via object_store 0.14.2; crypto-common 0.2.2 is required by digest 0.11.3, which comes from md-5 0.11.0 and sha2 0.11.0.",
+      "replacement_plan": "Retire together with the digest exception once object_store 0.14.x moves crc-fast to a digest 0.11 line. Verify with `cargo tree -i crypto-common` in the same pass as `cargo tree -i digest`.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "digest",
       "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Current hashing and crypto transitive families select multiple digest versions.",
-      "replacement_plan": "Upgrade the hashing and crypto dependency families when their digest ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "rand_chacha",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Current random and crypto transitive families select multiple rand_chacha versions.",
-      "replacement_plan": "Upgrade the random and crypto dependency families when their rand_chacha ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "digest 0.10.7 comes from crc-fast 1.10.0 (object_store 0.14.2); digest 0.11.3 comes from md-5 0.11.0 and sha2 0.11.0.",
+      "replacement_plan": "crc-fast is the single 0.10 consumer. Re-check `cargo tree -i digest` after each object_store upgrade and drop the exception once crc-fast selects 0.11.3.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "itertools",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "DataFusion and object_store 0.14 currently select adjacent itertools release lines.",
-      "replacement_plan": "Unify when the DataFusion and object_store dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "spin",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "Hiqlite and SlateDB-related dependency families select supported but distinct spin release lines.",
-      "replacement_plan": "Upgrade the metadata and storage dependency families when their spin ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "itertools 0.14.0 is used by object_store 0.13.2, prost-derive 0.14.4, and the prost-build 0.14.4 build dependency; itertools 0.15.0 is used by DataFusion 55.1.0 crates and object_store 0.14.2.",
+      "replacement_plan": "Converges with the object_store exception: once DataFusion moves off object_store 0.13.2 the 0.14 line is limited to the prost build/derive family. Re-check the version-qualified inverse itertools trees after each DataFusion release train.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "syn",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Current derive macro families span syn 2 and syn 3 while upstream migrations are incomplete.",
-      "replacement_plan": "Upgrade remaining derive macro dependencies when they support a shared syn line.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "phf",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces server-side transitive dependencies that carry phf alongside existing parsers.",
-      "replacement_plan": "Upgrade hiqlite and parser/HTTP dependencies when upstream phf dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "phf_shared",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the phf duplicate introduced by server-compatible features.",
-      "replacement_plan": "Upgrade alongside phf when upstream dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "serde_spanned",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x dependencies alongside existing toml 0.8 users.",
-      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "toml",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and introduces toml 1.x alongside existing toml 0.8 users.",
-      "replacement_plan": "Upgrade hiqlite and toml/figment users when their dependency ranges converge.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "toml_datetime",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The pinned mrchypark/hiqlite full client feature set must match the server stream API and follows the toml duplicate introduced by server-compatible features.",
-      "replacement_plan": "Upgrade alongside toml when upstream dependency ranges converge.",
+      "expires_on": "2027-01-08",
+      "reason": "Build-time-only duplicate. Examples of syn 2.0.119 introducers are kube-derive 4.2.0, prost-derive 0.14.4, sqlparser_derive 0.5.0, thiserror-impl 1.0.69, and several proc-macro support crates. Examples of syn 3.0.6 introducers are serde_derive 1.0.229, clap_derive 4.6.7, datafusion-macros 55.1.0, thiserror-impl 2.0.20, tokio-macros 2.7.2, and yoke-derive 0.8.4.",
+      "replacement_plan": "Track releases of kube-derive, prost-derive, sqlparser_derive, and thiserror 1.0.69 that adopt syn 3. Re-check the version-qualified inverse syn trees quarterly and delete the entry when only the syn 3 line remains; re-verify after any yoke-derive bump.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "num-bigint",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Arrow-buffer and Parquet 59.3 use num-bigint 0.5 while other transitive consumers retain 0.4.",
-      "replacement_plan": "Converge the remaining transitive numeric dependencies when their compatible ranges include num-bigint 0.5; preserve query and Parquet tests.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "pem",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "rcgen uses pem 4 while other transitive certificate and signature consumers retain pem 3.",
-      "replacement_plan": "Upgrade transitive certificate and signature dependencies when their pem ranges converge; retain certificate and signature wire compatibility checks.",
+      "expires_on": "2027-01-08",
+      "reason": "arrow-buffer 59.3.0 and parquet 59.3.0 use num-bigint 0.5.1, while datafusion-sql 55.1.0 still pulls bigdecimal 0.4.10 on num-bigint 0.4.8.",
+      "replacement_plan": "Follow bigdecimal's num-bigint requirement. Re-check `cargo tree -i num-bigint` after the DataFusion release train and keep query and Parquet tests intact when bigdecimal widens to 0.5.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
       "kind": "duplicate",
       "crate": "sqlparser",
       "owner": "runtime",
-      "expires_on": "2026-09-30",
-      "reason": "Velorix admission uses sqlparser 0.63 while DataFusion 55.1 uses 0.62. Admission AST types stay inside core; the DataFusion boundary accepts SQL text.",
-      "replacement_plan": "Converge the parser versions when DataFusion advances its compatible parser range; retain fail-closed admission and DataFusion query conformance tests.",
+      "expires_on": "2027-01-08",
+      "reason": "sqlparser 0.63.0 is used by velorix-core admission; sqlparser 0.62.0 is used by datafusion, datafusion-common, datafusion-expr, and datafusion-sql 55.1.0. Admission AST types stay inside velorix-core and the DataFusion boundary receives SQL text.",
+      "replacement_plan": "Converge when DataFusion widens its parser range to 0.63. Re-check `cargo tree -i sqlparser` after each DataFusion release and retain fail-closed admission plus DataFusion query conformance tests regardless of the parser split.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "unmaintained",
-      "crate": "bincode",
-      "owner": "metadata",
-      "expires_on": "2026-09-30",
-      "reason": "The metadata backend uses a revision-pinned mrchypark/hiqlite git fork whose dependency graph introduces the bincode unmaintained advisory.",
-      "replacement_plan": "Upgrade hiqlite or switch to upstream hiqlite main/release when its dependency graph removes the bincode advisory.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "advisory",
-      "crate": "quick-xml:RUSTSEC-2026-0194",
-      "owner": "storage",
-      "expires_on": "2026-09-30",
-      "reason": "The authority path is fixed on quick-xml 0.41, but the pinned Hiqlite -> cryptr -> s3-simple dependency path still selects quick-xml 0.39.",
-      "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
-    },
-    {
-      "kind": "advisory",
-      "crate": "quick-xml:RUSTSEC-2026-0195",
-      "owner": "storage",
-      "expires_on": "2026-09-30",
-      "reason": "The authority path is fixed on quick-xml 0.41, but the pinned Hiqlite -> cryptr -> s3-simple dependency path still selects quick-xml 0.39.",
-      "replacement_plan": "Upgrade the Hiqlite/cryptr S3 dependency to quick-xml 0.41 or newer, then remove the deny.toml exception.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_security_approval_and_updated_plan"
     }
   ]
 }

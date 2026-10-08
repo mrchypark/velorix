@@ -10,9 +10,6 @@ doc_path="${repo_root}/docs/development/vind-product.md"
 release_copy_path="${repo_root}/scripts/copy-readiness-sibling-evidence.py"
 attest_path="${repo_root}/scripts/attest-ingress-tls-auth.sh"
 durability_attest_path="${repo_root}/scripts/attest-object-store-durability-policy.sh"
-backend_time_attest_path="${repo_root}/scripts/attest-hiqlite-backend-time.sh"
-backend_time_release_preflight_path="${repo_root}/scripts/check-hiqlite-backend-time-release-inputs.sh"
-backend_time_release_env_path="${repo_root}/scripts/write-hiqlite-backend-time-release-env.sh"
 external_rustfs_path="${repo_root}/scripts/run-vind-product-external-rustfs.sh"
 external_s3_path="${repo_root}/scripts/run-vind-product-external-s3.sh"
 durability_assess_path="${repo_root}/scripts/assess-object-store-durability-policy.sh"
@@ -34,10 +31,9 @@ complete_input_preflight_path="${repo_root}/scripts/write-complete-vind-product-
 next_product_step_path="${repo_root}/scripts/next-vind-product-step.sh"
 crate_boundary_policy_path="${repo_root}/scripts/check-crate-boundary-policy.sh"
 no_external_runtime_artifacts_path="${repo_root}/scripts/check-no-external-runtime-artifacts.sh"
-hiqlite_backup_restore_evidence_path="${repo_root}/scripts/check-hiqlite-backup-restore-evidence.sh"
 s3_checkpoint_fault_matrix_runner_path="${repo_root}/scripts/run-s3-checkpoint-fault-matrix.sh"
 
-python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$backend_time_attest_path" "$backend_time_release_preflight_path" "$backend_time_release_env_path" "$external_rustfs_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$rest_join_smoke_path" "$stress_chaos_soak_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" "$crate_boundary_policy_path" "$no_external_runtime_artifacts_path" "$hiqlite_backup_restore_evidence_path" "$s3_checkpoint_fault_matrix_runner_path" <<'PY'
+python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$external_rustfs_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$rest_join_smoke_path" "$stress_chaos_soak_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" "$crate_boundary_policy_path" "$no_external_runtime_artifacts_path" "$s3_checkpoint_fault_matrix_runner_path" <<'PY'
 import json
 import os
 import re
@@ -48,7 +44,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-script_path, first_e2e_path, cli_path, meta_cargo_path, doc_path, release_copy_path, attest_path, durability_attest_path, backend_time_attest_path, backend_time_release_preflight_path, backend_time_release_env_path, external_rustfs_path, external_s3_path, durability_assess_path, attach_rest_path, rest_api_smoke_path, rest_join_smoke_path, stress_chaos_soak_path, product_completion_report_path, refresh_deployed_images_path, product_ingress_attest_path, product_ingress_apply_path, product_ingress_attach_path, product_ingress_complete_path, object_store_durability_attach_path, object_store_durability_complete_path, product_complete_path, failover_evidence_writer_path, complete_input_preflight_path, next_product_step_path, crate_boundary_policy_path, no_external_runtime_artifacts_path, hiqlite_backup_restore_evidence_path, s3_checkpoint_fault_matrix_runner_path = sys.argv[1:]
+script_path, first_e2e_path, cli_path, meta_cargo_path, doc_path, release_copy_path, attest_path, durability_attest_path, external_rustfs_path, external_s3_path, durability_assess_path, attach_rest_path, rest_api_smoke_path, rest_join_smoke_path, stress_chaos_soak_path, product_completion_report_path, refresh_deployed_images_path, product_ingress_attest_path, product_ingress_apply_path, product_ingress_attach_path, product_ingress_complete_path, object_store_durability_attach_path, object_store_durability_complete_path, product_complete_path, failover_evidence_writer_path, complete_input_preflight_path, next_product_step_path, crate_boundary_policy_path, no_external_runtime_artifacts_path, s3_checkpoint_fault_matrix_runner_path = sys.argv[1:]
 repo_root = Path(script_path).parents[1]
 fixture_ref_digest = "a" * 64
 fixture_source_revision = "9f1c0e2d4b6a8c0f13579bdf2468ace013579bdf"
@@ -330,9 +326,6 @@ def readyz_authoritative_jq_fixture():
 s3_checkpoint_fault_matrix_evidence_path = (
     repo_root / "scripts" / "check-s3-checkpoint-fault-matrix-evidence.sh"
 )
-hiqlite_restore_drill_evidence_path = (
-    repo_root / "scripts" / "check-hiqlite-restore-drill-evidence.sh"
-)
 upgrade_repair_gc_fault_matrix_evidence_path = (
     repo_root / "scripts" / "check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh"
 )
@@ -387,12 +380,6 @@ with open(attest_path, "r", encoding="utf-8") as f:
     attest = f.read()
 with open(durability_attest_path, "r", encoding="utf-8") as f:
     durability_attest = f.read()
-with open(backend_time_attest_path, "r", encoding="utf-8") as f:
-    backend_time_attest = f.read()
-with open(backend_time_release_preflight_path, "r", encoding="utf-8") as f:
-    backend_time_release_preflight = f.read()
-with open(backend_time_release_env_path, "r", encoding="utf-8") as f:
-    backend_time_release_env = f.read()
 with open(external_rustfs_path, "r", encoding="utf-8") as f:
     external_rustfs = f.read()
 with open(external_s3_path, "r", encoding="utf-8") as f:
@@ -560,64 +547,6 @@ def excludes_old_external_runtime_terms(text):
     )
 
 
-def hiqlite_backup_restore_evidence_policy_has_pass_fail_coverage():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        valid = tmpdir / "valid.json"
-        invalid = tmpdir / "invalid.json"
-        valid.write_text(
-            json.dumps(
-                {
-                    "authority_kind": "velorix_managed_hiqlite",
-                    "metadata_authority_storage_mode": "object-store-backup-restore-with-ephemeral-node-disk",
-                    "backup_restore_configured": True,
-                    "nodes": [
-                        "velorix-meta-0:8200",
-                        "velorix-meta-1:8200",
-                        "velorix-meta-2:8200",
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        invalid.write_text(
-            json.dumps(
-                {
-                    "authority_kind": "velorix_managed_hiqlite",
-                    "metadata_authority_storage_mode": "emptyDir-only",
-                    "backup_restore_configured": False,
-                    "nodes": ["velorix-meta-0:8200"],
-                    "volumeClaimTemplates": [],
-                }
-            ),
-            encoding="utf-8",
-        )
-        pass_result = subprocess.run(
-            [hiqlite_backup_restore_evidence_path, str(valid)],
-            cwd=repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        fail_result = subprocess.run(
-            [hiqlite_backup_restore_evidence_path, str(invalid)],
-            cwd=repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    if pass_result.returncode != 0 or fail_result.returncode == 0:
-        return False
-    try:
-        pass_payload = json.loads(pass_result.stdout)
-    except json.JSONDecodeError:
-        return False
-    return (
-        pass_payload.get("status") == "pass"
-        and pass_payload.get("restore_drill_verified") is False
-        and "backup_restore_configured" in fail_result.stderr
-        and "volumeclaimtemplates" in fail_result.stderr.lower()
-    )
 
 
 def s3_checkpoint_fault_matrix_evidence_policy_has_pass_fail_coverage():
@@ -787,92 +716,6 @@ def s3_checkpoint_fault_matrix_evidence_policy_has_pass_fail_coverage():
     )
 
 
-def hiqlite_restore_drill_evidence_policy_has_pass_fail_coverage():
-    target_dir = repo_root / "target" / "vind-contract-fixtures"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="hiqlite-restore-drill-", dir=target_dir) as raw_dir:
-        fixture_dir = Path(raw_dir)
-        valid = fixture_dir / "valid.json"
-        compat = fixture_dir / "compat.json"
-        invalid = fixture_dir / "invalid.json"
-        valid_payload = add_fixture_ref_digests(
-            add_fixture_release_identity(
-                {
-                    "evidence_kind": "hiqlite_total_voter_loss_restore_drill",
-                    "status": "pass",
-                    "deployment_id": "release-deployment",
-                    "authority_store_id": "s3://release-authority/velorix-product/current",
-                    "no_pvc": True,
-                    "voter_count": 3,
-                    "total_voter_loss_exercised": True,
-                    "restored_from_object_store_backup": True,
-                    "acknowledged_metadata_writes_survived": True,
-                    "catalog_verified": True,
-                    "owner_epoch_verified": True,
-                    "checkpoint_pointer_verified": True,
-                    "post_restore_ingest_query_verified": True,
-                    "restore_drill_verified": True,
-                    "evidence_refs": {
-                        "object_store_backup": "s3://release-evidence/hiqlite/object-store-backup.json",
-                        "total_voter_loss_log": "s3://release-evidence/hiqlite/total-voter-loss-log.json",
-                        "restore_log": "s3://release-evidence/hiqlite/restore-log.json",
-                        "metadata_write_survival": "s3://release-evidence/hiqlite/metadata-write-survival.json",
-                        "post_restore_ingest_query": "s3://release-evidence/hiqlite/post-restore-ingest-query.json",
-                    },
-                }
-            )
-        )
-        valid.write_text(json.dumps(valid_payload), encoding="utf-8")
-        compat_payload = dict(valid_payload)
-        compat_payload["evidence_kind"] = "hiqlite_no_pvc_three_voter_backup_restore"
-        compat.write_text(json.dumps(compat_payload), encoding="utf-8")
-        invalid.write_text(
-            json.dumps(
-                {
-                    "evidence_kind": "hiqlite_total_voter_loss_restore_drill",
-                    "status": "pass",
-                    "no_pvc": False,
-                    "voter_count": 1,
-                    "restore_drill_verified": False,
-                    "volumeClaimTemplates": [],
-                }
-            ),
-            encoding="utf-8",
-        )
-        pass_result = subprocess.run(
-            [hiqlite_restore_drill_evidence_path, valid],
-            cwd=repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        compat_result = subprocess.run(
-            [hiqlite_restore_drill_evidence_path, compat],
-            cwd=repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        fail_result = subprocess.run(
-            [hiqlite_restore_drill_evidence_path, invalid],
-            cwd=repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    if pass_result.returncode != 0 or compat_result.returncode != 0 or fail_result.returncode == 0:
-        return False
-    try:
-        pass_payload = json.loads(pass_result.stdout)
-    except json.JSONDecodeError:
-        return False
-    return (
-        pass_payload.get("status") == "pass"
-        and pass_payload.get("evidence_kind") == "hiqlite_total_voter_loss_restore_drill"
-        and pass_payload.get("restore_drill_verified") is True
-        and "restore_drill_verified" in fail_result.stderr
-        and "volumeclaimtemplates" in fail_result.stderr.lower()
-    )
 
 
 def upgrade_repair_gc_fault_matrix_evidence_policy_has_pass_fail_coverage():
@@ -1439,8 +1282,6 @@ def durability_false_ready_fixture_rejected():
                 "0",
                 "--durability-mode",
                 "1",
-                "--hiqlite-mode",
-                "0",
             ],
             cwd=repo_root,
             text=True,
@@ -1491,125 +1332,6 @@ def durability_false_ready_fixture_rejected():
         )
 
 
-def hiqlite_release_input_required_wins_over_will_run_fixture():
-    target_dir = repo_root / "target" / "vind-contract-fixtures"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="hiqlite-next-step-", dir=target_dir) as raw_dir:
-        fixture_dir = Path(raw_dir)
-        report_path = fixture_dir / "product-completion-report.json"
-        report = {
-            "schema_version": 1,
-            "report_kind": "velorix_product_completion_report",
-            "product_complete": False,
-            "gate_summary": {"pass": 9, "blocked": 0, "diagnostic": 1, "missing": 0},
-            "completion_handoff": {
-                "env_file": "target/velorix-product/complete-vind-product.env",
-                "next_action": "scripts/complete-vind-product.sh --env-file target/velorix-product/complete-vind-product.env",
-            },
-            "completion_execution_plan": {
-                "run_order": ["hiqlite_backend_time"],
-                "will_run_steps": ["hiqlite_backend_time"],
-                "blocked_steps": [],
-                "waiting_steps": [],
-                "steps": {
-                    "hiqlite_backend_time": {
-                        "state": "release_preflight_required",
-                        "will_run": True,
-                        "mode": "1",
-                        "helper": "scripts/check-hiqlite-backend-time-release-inputs.sh + scripts/attest-hiqlite-backend-time.sh",
-                        "status": "deferred_to_release_preflight",
-                        "missing_count": 0,
-                        "invalid_count": 0,
-                        "missing_subjects": [],
-                        "invalid_subjects": [],
-                    }
-                },
-            },
-            "completion_plan": {
-                "input_required_steps": ["hiqlite_backend_time_release"],
-                "waiting_steps": [],
-                "runnable_steps": [],
-                "blocked_without_action_steps": [],
-                "steps": [
-                    {
-                        "id": "hiqlite_backend_time_release",
-                        "state": "input_required",
-                        "status": "diagnostic",
-                        "summary": "Hiqlite backend-time release provenance is incomplete",
-                        "next_action": "scripts/write-hiqlite-backend-time-release-env.sh --product-evidence target/velorix-product/product-evidence.json && scripts/check-hiqlite-backend-time-release-inputs.sh --env-file target/velorix-product/hiqlite-backend-time-release.env --product-evidence target/velorix-product/product-evidence.json",
-                        "input_summary_requires_input": True,
-                        "input_summary": {
-                            "placeholder_count": 2,
-                            "secret_placeholder_count": 1,
-                            "placeholders": [
-                                "VELORIX_RELEASE_COMMIT",
-                                "VELORIX_CI_SIGSTORE_BUNDLE_BASE64",
-                            ],
-                            "secret_placeholders": ["VELORIX_CI_SIGSTORE_BUNDLE_BASE64"],
-                            "preflight_steps": [
-                                {
-                                    "step": "hiqlite_backend_time",
-                                    "status": "deferred_to_release_preflight",
-                                    "ready": None,
-                                    "missing_count": 0,
-                                    "invalid_count": 0,
-                                    "missing_subjects": [],
-                                    "invalid_subjects": [],
-                                }
-                            ],
-                            "release_preflight": {
-                                "evidence": "hiqlite-backend-time-release-preflight.json",
-                                "status": "blocked",
-                                "missing_count": 1,
-                                "invalid_count": 1,
-                                "missing": [
-                                    {
-                                        "subject": "VELORIX_CI_SIGSTORE_BUNDLE_BASE64",
-                                        "detail": "VELORIX_CI_SIGSTORE_BUNDLE_BASE64 is required",
-                                    }
-                                ],
-                                "invalid": [
-                                    {
-                                        "subject": "VELORIX_RELEASE_COMMIT",
-                                        "detail": "VELORIX_RELEASE_COMMIT still contains a REPLACE_WITH placeholder",
-                                    }
-                                ],
-                                "missing_subjects": ["VELORIX_CI_SIGSTORE_BUNDLE_BASE64"],
-                                "invalid_subjects": ["VELORIX_RELEASE_COMMIT"],
-                            },
-                            "creates_product_complete_evidence": False,
-                        },
-                    }
-                ],
-            },
-        }
-        report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        result = subprocess.run(
-            [
-                str(repo_root / "scripts" / "next-vind-product-step.sh"),
-                "--report",
-                str(report_path),
-                "--json",
-            ],
-            cwd=repo_root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if result.returncode != 0:
-            return False
-        next_step = json.loads(result.stdout)
-        step = next_step.get("next_step") or {}
-        return (
-            next_step.get("state") == "input_required"
-            and step.get("id") == "hiqlite_backend_time"
-            and step.get("gate") == "hiqlite_backend_time_release"
-            and step.get("gate_state") == "input_required"
-            and step.get("will_run") is True
-            and "write-hiqlite-backend-time-release-env.sh" in (step.get("command") or "")
-            and "complete-vind-product.sh --env-file" not in (step.get("command") or "")
-            and (step.get("input_summary") or {}).get("release_preflight", {}).get("status") == "blocked"
-        )
 
 
 def external_s3_out_of_scope_fixture_completes_required_gates():
@@ -1656,25 +1378,6 @@ def external_s3_out_of_scope_fixture_completes_required_gates():
             },
             "metadata_store": {
                 "standing_runtime_adversarial_smoke": {"status": "pass"},
-                "hiqlite_backend_time_assessment": {
-                    "validated": True,
-                    "evidence": "hiqlite-backend-time-assessment.json",
-                    "backend_time_source_kind": "raft_replicated_authority_time",
-                    "bounded_wall_clock_failover": True,
-                    "can_generate_product_complete_backend_time_attestation": True,
-                },
-                "hiqlite_backend_time_attestation": {
-                    "validated": True,
-                    "evidence": "hiqlite-backend-time-attestation.json",
-                    "authoritative_backend_time": True,
-                    "time_source_kind": "raft_replicated_authority_time",
-                    "bounded_wall_clock_failover": True,
-                    "release_validator_fail_closed": True,
-                    "trusted_for_release_validator": False,
-                    "trusted_for_product_complete": False,
-                    "attestation_origin": "diagnostic_deployed_product",
-                    "source_kind": "local_diagnostic",
-                },
             },
             "standing_runtime_fencing": {
                 "required_mode": True,
@@ -1809,25 +1512,6 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
             },
             "metadata_store": {
                 "standing_runtime_adversarial_smoke": {"status": "pass"},
-                "hiqlite_backend_time_assessment": {
-                    "validated": True,
-                    "evidence": "hiqlite-backend-time-assessment.json",
-                    "backend_time_source_kind": "raft_replicated_authority_time",
-                    "bounded_wall_clock_failover": True,
-                    "can_generate_product_complete_backend_time_attestation": True,
-                },
-                "hiqlite_backend_time_attestation": {
-                    "validated": True,
-                    "evidence": "hiqlite-backend-time-attestation.json",
-                    "authoritative_backend_time": True,
-                    "time_source_kind": "raft_replicated_authority_time",
-                    "bounded_wall_clock_failover": True,
-                    "release_validator_fail_closed": True,
-                    "trusted_for_release_validator": False,
-                    "trusted_for_product_complete": False,
-                    "attestation_origin": "diagnostic_deployed_product",
-                    "source_kind": "local_diagnostic",
-                },
             },
             "standing_runtime_fencing": {
                 "required_mode": True,
@@ -1926,11 +1610,6 @@ checks = {
     "product evidence redaction fixture removes environment identifiers": evidence_redaction_fixture(),
     "authoritative readyz jq assignment fixture rejects malformed capability": readyz_authoritative_jq_fixture(),
     "rejects stale durability attestation false-ready fixture": durability_false_ready_fixture_rejected(),
-    "Hiqlite release input-required gate wins over will-run fixture": hiqlite_release_input_required_wins_over_will_run_fixture(),
-    "defines admin API curl helper": (
-        "curl_admin_api()" in script
-        and 'authorization: Bearer ${admin_bearer_token}' in script
-    ),
     "removes obsolete view readiness contract from product smoke": (
         ("view-" + "compile-deploy") not in script
         and ("api_compile" + "_deploy") not in script
@@ -1942,12 +1621,6 @@ checks = {
         and '"contract": "no PersistentVolumeClaim objects in the Velorix product namespace"'
         in script
     ),
-    "records Hiqlite authority sibling evidence": (
-        "hiqlite_authority_sibling_attestation" in script
-        and '"evidence": "hiqlite-authority-attestation.json"' in script
-        and 'cp "$hiqlite_authority_attestation_file" "$hiqlite_authority_sibling_attestation"'
-        in script
-    ),
     "meta deployment uses recreate rollout to avoid concurrent metadata writers": (
         "name: velorix-meta" in script
         and re.search(
@@ -1956,34 +1629,8 @@ checks = {
             re.S,
         )
     ),
-    "external Hiqlite reuse does not mutate the authority secret": (
-        'hiqlite_api_secret_ref_name="velorix-hiqlite-auth"' in script
-        and 'if [ "$hiqlite_deploy" = "1" ]; then' in script
-        and 'hiqlite_api_secret_ref_name="velorix-meta-hiqlite-auth"' in script
-        and "name: velorix-meta-hiqlite-auth" in script
-        and "name: ${hiqlite_api_secret_ref_name}" in script
-    ),
-    "managed Hiqlite selectors are stable across reruns": (
-        re.search(
-            r"name: velorix-hiqlite-headless.*?spec:\s+clusterIP: None\s+selector:\s+app: velorix-hiqlite\s+ports:",
-            script,
-            re.S,
-        )
-        and re.search(
-            r"name: velorix-hiqlite\s+namespace: \$\{namespace\}.*?spec:\s+selector:\s+app: velorix-hiqlite\s+ports:",
-            script,
-            re.S,
-        )
-        and re.search(
-            r"kind: StatefulSet\s+metadata:\s+name: velorix-hiqlite.*?selector:\s+matchLabels:\s+app: velorix-hiqlite\s+template:",
-            script,
-            re.S,
-        )
-    ),
     "product Services use stable selectors across reruns": (
         "remove_service_run_id_selector()" in script
-        and "remove_service_run_id_selector velorix-hiqlite-headless" in script
-        and "remove_service_run_id_selector velorix-hiqlite" in script
         and "remove_service_run_id_selector velorix-meta" in script
         and "remove_service_run_id_selector velorix-api" in script
         and re.search(
@@ -1996,42 +1643,6 @@ checks = {
             script,
             re.S,
         )
-    ),
-    "generates and validates Hiqlite encryption keys compatible with cryptr": (
-        "secrets.token_bytes(32)" in script
-        and "validate_hiqlite_enc_keys()" in script
-        and "VELORIX_HIQLITE_ENC_KEYS key {key_id} must decode to exactly 32 bytes" in script
-        and 'validate_hiqlite_enc_keys "$hiqlite_enc_key_active" "$hiqlite_enc_keys"' in script
-    ),
-    "uses Hiqlite remote client node addresses without URL schemes": (
-        "validate_hiqlite_nodes_for_remote_client()" in script
-        and 'hiqlite_nodes="velorix-hiqlite-0.velorix-hiqlite-headless:8200,velorix-hiqlite-1.velorix-hiqlite-headless:8200,velorix-hiqlite-2.velorix-hiqlite-headless:8200"'
-        in script
-        and "must use Hiqlite remote client addresses without URL schemes" in script
-        and 'validate_hiqlite_nodes_for_remote_client "$hiqlite_nodes"' in script
-    ),
-    "compiles Hiqlite remote client with server-compatible stream API features": (
-        'features = ["full"]' in meta_cargo
-        and "server image uses `--features server`, which enables `full`" in meta_cargo
-    ),
-    "Docker product builds include local Hiqlite authority-time source context": (
-        "VELORIX_HIQLITE_LOCAL_SOURCE_DIR" in script
-        and "--build-context" in script
-        and "velorix-hiqlite-source=${hiqlite_local_source_dir}" in script
-        and "COPY --from=velorix-hiqlite-source . /hiqlite" in (repo_root / "Dockerfile.api").read_text()
-        and "COPY --from=velorix-hiqlite-source . /hiqlite" in (repo_root / "Dockerfile.meta").read_text()
-        and "COPY --from=velorix-hiqlite-source . /hiqlite" in (repo_root / "Dockerfile.ingest-writer").read_text()
-        and "COPY --from=velorix-hiqlite-source . /hiqlite" in (repo_root / "Dockerfile.all-in-one").read_text()
-        and "COPY --from=velorix-hiqlite-source . ./hiqlite" in (repo_root / "Dockerfile.hiqlite").read_text()
-        and "--path /workspace/hiqlite/hiqlite" in (repo_root / "Dockerfile.hiqlite").read_text()
-    ),
-    "Hiqlite required fencing is governed by capability evidence, not stale static block": (
-        "VELORIX_STANDING_RUNTIME_FENCING=required is not yet supported with VELORIX_META_BACKEND=hiqlite"
-        not in script
-        and "run_hiqlite_backend_time_assessment" in script
-        and "VELORIX_REQUIRE_HIQLITE_BACKEND_TIME" in script
-        and "production_multi_writer_safe" in script
-        and "bounded_wall_clock_failover" in script
     ),
     "records ingress/TLS/auth sibling evidence": (
         "ingress_tls_auth_sibling_attestation" in script
@@ -2381,299 +1992,6 @@ checks = {
         and "readiness_report_rejects_release_product_evidence_with_pvc_in_no_pvc_namespace_sibling"
         in cli
     ),
-    "release validator validates Hiqlite authority sibling evidence": (
-        '"/metadata_store/hiqlite_authority_attestation"' in cli
-        and 'format!("{prefix}/evidence")' in cli
-        and '"hiqlite-authority-attestation.json"' in cli
-        and '"product Hiqlite authority evidence"' in cli
-        and "validate_product_hiqlite_authority_sibling" in cli
-        and "validate_product_managed_hiqlite_no_pvc_siblings" in cli
-        and '"namespace_pvc_list"' in cli
-        and '"no-pvc-hiqlite-statefulset.json"' in cli
-        and '"velorix-hiqlite.yaml"' in cli
-        and "readiness_report_rejects_hiqlite_authority_with_mismatched_sibling_evidence"
-        in cli
-        and "readiness_report_rejects_managed_hiqlite_authority_with_pvc_statefulset_sibling"
-        in cli
-    ),
-    "release validator validates Hiqlite backend-time evidence": (
-        '"/metadata_store/hiqlite_backend_time_attestation"' in cli
-        and '"hiqlite-backend-time-attestation.json"' in cli
-        and '"product Hiqlite backend-time evidence"' in cli
-        and '"authority_sampled_unix_time_ms_in_raft_operation"' in cli
-        and '"metrics_time_source_rejected"' in cli
-        and '"raft_log_index_time_source_rejected"' in cli
-        and '"distributed_lock_ttl_source_rejected"' in cli
-        and "read_sibling_json_artifact" in cli
-        and "does not match {summary_pointer}" in cli
-        and '"/evidence_files"' in cli
-        and "sha256 mismatch" in cli
-        and "standing-runtime failover smoke observed_failover_ms does not match"
-        in cli
-        and "metadata adversarial smoke log missing" in cli
-        and "HIQLITE_BACKEND_TIME_ALLOWED_ATTESTERS" in cli
-        and "validate_recent_hiqlite_backend_time_attested_at" in cli
-        and "attester is not allowlisted" in cli
-        and "parse_product_standing_runtime_fencing_capability" in cli
-        and "validate_release_standing_runtime_fencing_capability" in cli
-        and "standing-runtime capability schema is invalid" in cli
-        and "validate_product_hiqlite_backend_time_trusted_provenance" in cli
-        and "validate_full_git_commit_sha" in cli
-        and "requires --release-commit" in cli
-        and "source_revision does not match release_commit" in cli
-        and "HIQLITE_BACKEND_TIME_REQUIRED_SUBJECT_IMAGE_ROLES" in cli
-        and "missing array /subject_images" in cli
-        and "missing required role {required_role}" in cli
-        and "subject_images hiqlite-authority image_digest does not match" in cli
-        and "validate_product_deployed_image_evidence" in cli
-        and "subject_images {role} image_digest does not match product deployed image evidence" in cli
-        and '"deployed_images": deployed_images' in script
-        and "VELORIX_API_IMAGE_DIGEST" in script
-        and "VELORIX_META_IMAGE_DIGEST" in script
-        and "velorix-api-deployment-observed.json" in script
-        and "velorix-meta-deployment-observed.json" in script
-        and "validate_hiqlite_backend_time_failover_evidence" in cli
-        and "release_bounded_wall_clock_failover" in cli
-        and "release_ci_deployed_product" in cli
-        and "authority_time_observed" in cli
-        and "HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE_KIND" in cli
-        and "canonical_bundle_sha256 mismatch" in cli
-        and "requires trusted CI provenance" in cli
-        and "Ed25519 signature is verified" in cli
-        and "full Sigstore certificate-chain and transparency-log verification" in cli
-        and "validate_hiqlite_backend_time_ci_identity" in cli
-        and "validate_hiqlite_backend_time_trusted_release_ref" in cli
-        and "refs/heads/main or refs/tags/v*" in cli
-        and "VELORIX_CI_WORKFLOW_REF" in backend_time_attest
-        and "require_trusted_release_ref" in backend_time_attest
-        and "must use refs/heads/main or refs/tags/v*" in backend_time_attest
-        and "github_actions_oidc" in cli
-        and "token.actions.githubusercontent.com" in cli
-        and "job_workflow_ref does not match release_commit" in cli
-        and "validate_hiqlite_backend_time_signature_bundle" in cli
-        and "sigstore_rekor_dsse" in cli
-        and "signature_algorithm is unsupported" in cli
-        and "public_key_sha256 does not match public_key_base64" in cli
-        and "Ed25519 signature verification failed" in cli
-        and "validate_hiqlite_backend_time_sigstore_bundle" in cli
-        and "sigstore_bundle_sha256 does not match sigstore_bundle_base64" in cli
-        and "Sigstore bundle verification failed" in cli
-        and "verified Rekor integrated time is missing" in cli
-        and "signed_payload_sha256 does not match canonical_bundle_sha256" in cli
-        and "subject_image_digest does not match" in cli
-        and "velorix_ci_evidence_bundle_provenance" in cli
-        and "trusted CI provenance over the canonical backend-time evidence bundle"
-        in cli
-    ),
-    "Hiqlite backend-time assessment detects authority-time support": (
-        (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").is_file()
-        and '"velorix_hiqlite_backend_time_assessment"'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"required_mode_supported": required_mode_supported'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"can_generate_product_complete_backend_time_attestation": required_mode_supported'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"authority_time_transaction_api": authority_time_transaction_api'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"authority_unix_ms_transaction_param": authority_unix_ms_param'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"raft_replicated_authority_time_payload": raft_replicated_authority_time_payload'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"owner_read_uses_authority_time": owner_read_uses_authority_time'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"checkpoint_publish_insert_uses_authority_time": checkpoint_publish_insert_uses_authority_time'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"unsafe_runtime_time_sources_absent": unsafe_runtime_sources_absent'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and "VELORIX_HIQLITE_BACKEND_TIME_UPDATE_PRODUCT_EVIDENCE"
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"hiqlite_backend_time_assessment"'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and '"trusted_for_product_complete": False'
-        in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-        and "VELORIX_HIQLITE_BACKEND_TIME_ASSESS"
-        in (repo_root / "scripts" / "run-vind-product.sh").read_text()
-        and "run_hiqlite_backend_time_assessment"
-        in (repo_root / "scripts" / "run-vind-product.sh").read_text()
-        and "VELORIX_REQUIRE_HIQLITE_BACKEND_TIME"
-        in (repo_root / "docs" / "development" / "vind-product.md").read_text()
-        and "metadata_store.hiqlite_backend_time_assessment"
-        in (repo_root / "docs" / "development" / "vind-product.md").read_text()
-        and "scripts/assess-hiqlite-backend-time.sh"
-        in (repo_root / "docs" / "architecture" / "hiqlite-meta-service.md").read_text()
-        and "trusted_for_product_complete=false"
-        in (repo_root / "docs" / "architecture" / "hiqlite-meta-service.md").read_text()
-    ),
-    "Hiqlite backend-time attestation candidate binds deployed smoke evidence": (
-        (repo_root / "scripts" / "attest-hiqlite-backend-time.sh").is_file()
-        and '"velorix_hiqlite_backend_time_attestation"' in backend_time_attest
-        and "hiqlite-backend-time-assessment.json" in backend_time_attest
-        and "readyz.json" in backend_time_attest
-        and "multi-replica-fencing-smoke.json" in backend_time_attest
-        and "standing-runtime-failover-smoke.json" in backend_time_attest
-        and "velorix-meta-smoke.log" in backend_time_attest
-        and "observed_failover_ms" in backend_time_attest
-        and "trusted_for_release_validator" in backend_time_attest
-        and "VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE" in backend_time_attest
-        and "VELORIX_RELEASE_COMMIT" in backend_time_attest
-        and "VELORIX_API_IMAGE_DIGEST" in backend_time_attest
-        and "VELORIX_META_IMAGE_DIGEST" in backend_time_attest
-        and "VELORIX_HIQLITE_IMAGE_DIGEST" in backend_time_attest
-        and "VELORIX_CI_OIDC_SUBJECT" in backend_time_attest
-        and "VELORIX_CI_WORKFLOW_REF" in backend_time_attest
-        and "VELORIX_CI_JOB_WORKFLOW_REF" in backend_time_attest
-        and "VELORIX_CI_SIGNING_CERTIFICATE_SHA256" in backend_time_attest
-        and "VELORIX_CI_PUBLIC_KEY_BASE64" in backend_time_attest
-        and "VELORIX_CI_PUBLIC_KEY_SHA256" in backend_time_attest
-        and "VELORIX_CI_SIGNATURE_BASE64" in backend_time_attest
-        and "VELORIX_CI_SIGSTORE_BUNDLE_BASE64" in backend_time_attest
-        and "VELORIX_CI_SIGSTORE_BUNDLE_SHA256" in backend_time_attest
-        and "VELORIX_CI_SIGSTORE_CERTIFICATE_IDENTITY" in backend_time_attest
-        and "VELORIX_HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_FILE" in backend_time_attest
-        and "VELORIX_CI_TRANSPARENCY_LOG_ID" in backend_time_attest
-        and "VELORIX_CI_TRANSPARENCY_LOG_INDEX" in backend_time_attest
-        and "VELORIX_CI_INCLUSION_PROOF_SHA256" in backend_time_attest
-        and "release_failover_shape" in backend_time_attest
-        and "attestation_origin" in backend_time_attest
-        and "diagnostic_release_failover_included" in backend_time_attest
-        and "trusted backend-time provenance requires release-shaped failover evidence" in backend_time_attest
-        and '"subject_images": subject_images' in backend_time_attest
-        and '"ci_identity": {' in backend_time_attest
-        and '"signature_bundle": signature_bundle' in backend_time_attest
-        and "require_full_git_sha" in backend_time_attest
-        and "full_git_sha_or_empty" in backend_time_attest
-        and 'source_repository = require_env("VELORIX_SOURCE_REPOSITORY")' in backend_time_attest
-        and "VELORIX_SOURCE_REPOSITORY must be github.com/mrchypark/velorix" in backend_time_attest
-        and 'source_revision = require_env("VELORIX_SOURCE_REVISION")' in backend_time_attest
-        and 'authority.get("source_revision") or ""' in backend_time_attest
-        and 'os.environ.get("VELORIX_SOURCE_REVISION", "").strip() or str(\n        authority.get("source_revision") or ""' not in backend_time_attest
-        and "must be the Velorix release commit, not metadata_store.hiqlite_authority_attestation.source_revision"
-        in backend_time_attest
-        and "source revision must match VELORIX_RELEASE_COMMIT" in backend_time_attest
-        and "velorix_ci_evidence_bundle_provenance" in backend_time_attest
-        and "canonical_bundle_sha256" in backend_time_attest
-        and "canonical_bundle_entries" in backend_time_attest
-        and "without_metadata_store_hiqlite_backend_time_attestation" in backend_time_attest
-        and "without_metadata_store_hiqlite_backend_time_attestation" in cli
-        and "release_bounded_wall_clock_failover" in backend_time_attest
-        and "release_ci_deployed_product" in backend_time_attest
-        and "authority_time_observed" in backend_time_attest
-        and "trusted_for_product_complete = False" in backend_time_attest
-        and "release_validator_fail_closed" in backend_time_attest
-        and "VELORIX_HIQLITE_BACKEND_TIME_ATTESTATION_UPDATE_PRODUCT_EVIDENCE"
-        in backend_time_attest
-        and "hiqlite_backend_time_attestation" in backend_time_attest
-        and "VELORIX_HIQLITE_BACKEND_TIME_ATTEST" in script
-        and "run_hiqlite_backend_time_attestation" in script
-        and "VELORIX_HIQLITE_BACKEND_TIME_ATTESTATION_UPDATE_PRODUCT_EVIDENCE=1"
-        in script
-        and re.search(
-            r"run_hiqlite_backend_time_assessment\s+run_hiqlite_backend_time_attestation\s+write_product_evidence",
-            script,
-            re.S,
-        )
-        and '"hiqlite_backend_time_attestation": hiqlite_backend_time_attestation'
-        in script
-        and "Hiqlite backend-time attestation is diagnostic and release validator remains fail-closed"
-        in script
-        and "scripts/attest-hiqlite-backend-time.sh" in doc
-        and "scripts/write-hiqlite-backend-time-release-env.sh" in doc
-        and "scripts/check-hiqlite-backend-time-release-inputs.sh" in doc
-        and "--env-file target/velorix-product/hiqlite-backend-time-release.env"
-        in doc
-        and "velorix_hiqlite_backend_time_release_preflight" in backend_time_release_preflight
-        and "--env-file PATH" in backend_time_release_preflight
-        and "VELORIX_HIQLITE_BACKEND_TIME_RELEASE_ENV_FILE" in backend_time_release_preflight
-        and "product_evidence_explicit" in backend_time_release_preflight
-        and "output_file_explicit" in backend_time_release_preflight
-        and "source_env_file_preserving_overrides" in backend_time_release_preflight
-        and "VELORIX_CI_SIGSTORE_BUNDLE_BASE64" in backend_time_release_preflight
-        and "VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST" in backend_time_release_preflight
-        and "Refusing to run with shell xtrace enabled because release/Sigstore inputs may be logged"
-        in backend_time_release_preflight
-        and "velorix_hiqlite_backend_time_release_env_template" in backend_time_release_env
-        and "scripts/check-hiqlite-backend-time-release-inputs.sh --env-file"
-        in backend_time_release_env
-        and "hiqlite-backend-time-release.env" in backend_time_release_env
-        and "hiqlite-backend-time-release-env.json" in backend_time_release_env
-        and "VELORIX_API_IMAGE_DIGEST" in backend_time_release_env
-        and "VELORIX_META_IMAGE_DIGEST" in backend_time_release_env
-        and "VELORIX_HIQLITE_IMAGE_DIGEST" in backend_time_release_env
-        and '"VELORIX_SOURCE_REPOSITORY": "github.com/mrchypark/velorix"' in backend_time_release_env
-        and '"fixed_release_values": fixed_release_values' in backend_time_release_env
-        and "GITHUB_SHA" in backend_time_release_env
-        and "hiqlite_authority_source_revision" in backend_time_release_env
-        and 'source_revision = require_git_sha(\n    "VELORIX_SOURCE_REVISION",\n    require_env("VELORIX_SOURCE_REVISION"),\n    allow_missing=True,\n)' in backend_time_release_preflight
-        and 'source_revision = env("VELORIX_SOURCE_REVISION") or authority_source_revision'
-        not in backend_time_release_preflight
-        and "must be the Velorix release commit, not metadata_store.hiqlite_authority_attestation.source_revision"
-        in backend_time_release_preflight
-        and "VELORIX_SOURCE_REPOSITORY must be github.com/mrchypark/velorix"
-        in backend_time_release_preflight
-        and "authority_source_revision_sha" in backend_time_release_preflight
-        and "trusted_workflow_ref_prefix" in backend_time_release_preflight
-        and "VELORIX_CI_OIDC_SUBJECT must match trusted release workflow ref"
-        in backend_time_release_preflight
-        and "VELORIX_CI_JOB_WORKFLOW_REF must match VELORIX_RELEASE_COMMIT"
-        in backend_time_release_preflight
-        and "VELORIX_CI_SIGSTORE_CERTIFICATE_IDENTITY must match trusted release workflow ref"
-        in backend_time_release_preflight
-        and "ci_identity.workflow_ref" in backend_time_release_preflight
-        and "ci_identity.sigstore_certificate_identity" in backend_time_release_preflight
-        and "never from the\nHiqlite authority source revision" in doc
-        and "rejects a 40-character Hiqlite authority revision" in doc
-        and "attestation\ngenerator enforces the same boundary" in doc
-        and "preflight and attestation generation reject any other repository value" in doc
-        and "VELORIX_CI_JOB_WORKFLOW_REF` is pinned to `VELORIX_RELEASE_COMMIT" in doc
-        and "VELORIX_CI_SIGSTORE_CERTIFICATE_IDENTITY` names the same trusted workflow ref" in doc
-        and "still contains a REPLACE_WITH placeholder" in backend_time_release_preflight
-        and '"placeholder": "REPLACE_WITH" in value' in backend_time_release_preflight
-        and "still contains a\n`REPLACE_WITH_*` placeholder" in doc
-        and "VELORIX_CI_SIGSTORE_BUNDLE_BASE64" in backend_time_release_env
-        and "REPLACE_WITH_SIGSTORE_BUNDLE_BASE64" in backend_time_release_env
-        and "refs/heads/main" in backend_time_release_env
-        and "refs/tags/v" in backend_time_release_env
-        and "does not create release provenance" in backend_time_release_env
-        and 'VELORIX_SOURCE_REPOSITORY="github.com/mrchypark/velorix"' in release_gate
-        and "VELORIX_CI_SIGSTORE_BUNDLE_BASE64 is required for product-complete release readiness"
-        in backend_time_release_preflight
-        and 'require_sha(\n    "VELORIX_CI_SIGSTORE_BUNDLE_SHA256"'
-        in backend_time_release_preflight
-        and '"sha256:" + hashlib.sha256(sigstore_bundle_bytes).hexdigest()'
-        in backend_time_release_preflight
-        and "VELORIX_CI_SIGSTORE_BUNDLE_SHA256 must match VELORIX_CI_SIGSTORE_BUNDLE_BASE64"
-        in backend_time_release_preflight
-        and "Sigstore bundle missing verificationMaterial" in backend_time_release_preflight
-        and "Sigstore bundle missing signing certificate rawBytes" in backend_time_release_preflight
-        and "Sigstore bundle missing Rekor tlogEntries" in backend_time_release_preflight
-        and "Sigstore bundle missing tlogEntries[0].inclusionProof" in backend_time_release_preflight
-        and 'allow_missing=False,\n)' in backend_time_release_preflight
-        and 'sigstore_bundle_sha256 = require_env("VELORIX_CI_SIGSTORE_BUNDLE_SHA256")'
-        in backend_time_attest
-        and 'or f"sha256:{hashlib.sha256(sigstore_bundle_bytes).hexdigest()}"'
-        not in backend_time_attest
-        and '"VELORIX_CI_SIGSTORE_BUNDLE_SHA256": "sha256:REPLACE_WITH_SIGSTORE_BUNDLE_SHA256"'
-        in backend_time_release_env
-        and "failover evidence requires evidence_scope='release_ci_deployed_product'" in backend_time_release_preflight
-        and "scripts/check-hiqlite-backend-time-release-inputs.sh" in product_completion_report
-        and "VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE=1" in doc
-        and "--update-product-evidence" in product_completion_report
-        and "Regenerate Hiqlite backend-time attestation in release CI" in product_completion_report
-        and "trusted_for_release_validator" in product_completion_report
-        and "release_validator_fail_closed" in product_completion_report
-        and "scripts/attest-hiqlite-backend-time.sh"
-        in (repo_root / "docs" / "architecture" / "hiqlite-meta-service.md").read_text()
-    ),
-    "managed Hiqlite authority evidence records live local source revision": (
-        '"source_revision": source_revision' in script
-        and 'git -C "$hiqlite_local_source_dir" rev-parse --short HEAD' in script
-        and 'git -C "$hiqlite_local_source_dir" status --porcelain' in script
-        and 'hiqlite_source_dirty="+dirty"' in script
-        and '"source_revision": "mrchypark/hiqlite@26c6d22a72d7bd0a1e2de073fc4c076ddad4e588"' in cli
-        and '"source_revision": "sebadob/hiqlite@3e2112c"' not in script
-        and '"source_revision": "sebadob/hiqlite@abcdefabcdefabcdefabcdefabcdefabcdefabcd"'
-        not in cli
-    ),
     "multi-replica product smoke attaches to writer owner before writes": (
         "start_api_writer_owner_port_forward_for_smoke()" in script
         and "smoke-owner-rest-attach.json" in script
@@ -2786,8 +2104,7 @@ checks = {
         "data_plane_token_rejected_on_admin_route=true" in doc
         and "api.auth.local_tls_auth_smoke.passed=true" in doc
         and "no-pvc-namespace.json" in doc
-        and "hiqlite-authority-attestation.json" in doc
-        and "ingress-tls-auth-attestation.json" in doc
+            and "ingress-tls-auth-attestation.json" in doc
         and "ingest-writer-job-log.json" in doc
         and "scripts/run-vind-product-external-rustfs.sh" in doc
         and "external-rustfs.env" in doc
@@ -2884,7 +2201,6 @@ checks = {
         and '"env_review_flags"' in product_completion_report
         and '"authority_ready"' in product_completion_report
         and '"authority"' in product_completion_report
-        and '"hiqlite-backend-time-release-preflight.json"' in product_completion_report
         and '"input_summary"' in product_completion_report
         and '"missing": redacted_issues(step.get("missing") or [])'
         in product_completion_report
@@ -2920,8 +2236,6 @@ checks = {
         and 'item["status"] in {"pass", "out_of_scope"} for item in gates'
         in product_completion_report
         and "next_actions" in product_completion_report
-        and "hiqlite-backend-time-release-preflight.json" in product_completion_report
-        and "hiqlite-backend-time-release-env.json" in product_completion_report
         and "complete-vind-product-input-preflight.json" in product_completion_report
         and "complete-vind-product-env.json" in product_completion_report
         and "complete-vind-product-plan.json" in product_completion_report
@@ -2955,7 +2269,6 @@ checks = {
         and "missing_count" in product_completion_report
         and "invalid_count" in product_completion_report
         and "placeholder_count" in product_completion_report
-        and "--env-file target/velorix-product/hiqlite-backend-time-release.env"
         in product_completion_report
         and "public_ingress_tls_auth" in product_completion_report
         and "tls_auth_boundary" in product_completion_report
@@ -2980,7 +2293,6 @@ checks = {
         and "creates_product_complete_evidence" in product_completion_report
         and 'blocked_by=None\n            if object_store_real_authority\n            else ["object_store_external_authority"]'
         in product_completion_report
-        and "hiqlite_backend_time" in product_completion_report
         and "deployed_image_digests" in product_completion_report
         and "does not create product-complete evidence" in product_completion_report
         and "VELORIX_VIND_PRODUCT_COMPLETION_REPORT" in script
@@ -3017,7 +2329,6 @@ checks = {
         and "redacted `missing` and `invalid` issue subjects/details" in doc
         and "`missing_subjects` and `invalid_subjects`" in doc
         and "redacted `release_preflight` summary" in doc
-        and "`hiqlite-backend-time-release-preflight.json`" in doc
         and "placeholder_groups" in doc
         and "secret_placeholders" in doc
         and "report is diagnostic only" in doc
@@ -3059,10 +2370,6 @@ checks = {
         and "guidance[durability].prerequisite" in next_product_step
         and "guidance[durability].review_flags" in next_product_step
         and "guidance[durability].cost" in next_product_step
-        and "guidance[hiqlite_backend_time].scope" in next_product_step
-        and "guidance[hiqlite_backend_time].release_identity" in next_product_step
-        and "guidance[hiqlite_backend_time].sigstore" in next_product_step
-        and "guidance[hiqlite_backend_time].failover" in next_product_step
         and "redacted_env_value" in next_product_step
         and 'return "<secret>"' in next_product_step
         and "--doctor" in next_product_step
@@ -3098,8 +2405,6 @@ checks = {
         and "redacted effective env-field status" in doc
         and "present/placeholder/length\nfor secret fields" in doc
         and "guidance[external_s3].*" in doc
-        and "For `ingress`, `durability`, and `hiqlite_backend_time`, the same doctor output\nprints gate-specific `guidance[...]` lines" in doc
-        and "Doctor output also expands Hiqlite release preflight\nmissing/invalid details, ingress bearer-token-source booleans" in doc
         and "The top-level input preflight intentionally mirrors the ingress helper's bearer\ntoken-source requirement" in doc
         and "It also mirrors the ingress attestation endpoint shape checks" in doc
         and "the product\ningress host must be a public DNS hostname, not `localhost`" in doc
@@ -3173,12 +2478,6 @@ checks = {
         and "elif preflight_step_ready ingress" in product_complete
         and "product_external_s3_ready && preflight_step_ready durability" in product_complete
         and "complete product input preflight failed" in product_complete
-        and "scripts/check-hiqlite-backend-time-release-inputs.sh" in product_complete
-        and "scripts/write-hiqlite-backend-time-release-env.sh" in product_complete
-        and "run_hiqlite_backend_time_release_preflight()" in product_complete
-        and "VELORIX_HIQLITE_BACKEND_TIME_RELEASE_ENV_FORCE" in product_complete
-        and "hiqlite_backend_time=using_existing_release_env" in product_complete
-        and "hiqlite_backend_time=diagnostic_attestation" in product_complete
         and "--attester complete-vind-product" in product_complete
         and "--env-file \"$release_env\"" in product_complete
         and ". \"$release_env\"" not in product_complete
@@ -3187,7 +2486,6 @@ checks = {
         and "VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST=1" in product_complete
         and "release_failover_requested" in product_complete
         and "scripts/smoke-vind-standing-runtime-failover.sh" in product_complete
-        and "scripts/attest-hiqlite-backend-time.sh" in product_complete
         and "scripts/report-vind-product-completion.sh" in product_complete
         and "VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3" in product_complete
         and "VELORIX_COMPLETE_PRODUCT_INGRESS" in product_complete
@@ -3197,7 +2495,6 @@ checks = {
         and "VELORIX_API_AUTH_HEADER" in product_complete
         and "VELORIX_ADMIN_AUTH_HEADER" in product_complete
         and "VELORIX_COMPLETE_PRODUCT_DURABILITY" in product_complete
-        and "VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME" in product_complete
 	        and "--env-file" in product_complete
 	        and "source_env_file_preserving_overrides" in product_complete
 	        and "VELORIX_COMPLETE_PRODUCT_ENV_FILE" in product_complete
@@ -3243,11 +2540,9 @@ checks = {
         and "complete-vind-product.env" in complete_product_env
         and "complete-vind-product-env.json" in complete_product_env
         and "--env-file {output_path}" in complete_product_env
-        and "scripts/write-hiqlite-backend-time-release-env.sh" in complete_product_env
         and "VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3" in complete_product_env
         and "VELORIX_COMPLETE_PRODUCT_INGRESS" in complete_product_env
         and "VELORIX_COMPLETE_PRODUCT_DURABILITY" in complete_product_env
-        and "VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME" in complete_product_env
         and "AWS_ENDPOINT_URL" in complete_product_env
         and "S3_OR_OSS_ENDPOINT" in complete_product_env
         and "VELORIX_OBJECT_STORE_VERSIONING_OR_OBJECT_LOCK_ENABLED" in complete_product_env
@@ -3258,8 +2553,6 @@ checks = {
 	        and "placeholder_groups" in complete_product_env
 	        and "the file acts as defaults" in doc
         and "take precedence over values exported by the\nenv file" in doc
-        and "preserves an existing\n`hiqlite-backend-time-release.env`" in doc
-        and "VELORIX_HIQLITE_BACKEND_TIME_RELEASE_ENV_FORCE=1" in doc
         and "VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3" in complete_product_env
         and "VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS" in complete_product_env
         and "external_s3_required" in complete_product_env
@@ -3271,7 +2564,6 @@ checks = {
         and "object_store_durability_review" in complete_product_env
         and "release_identity" in complete_product_env
         and "sigstore_provenance" in complete_product_env
-        and "always writes a local diagnostic\n`hiqlite-backend-time-attestation.json`" in doc
         and "VELORIX_COMPLETE_PRODUCT_DRY_RUN" in product_complete
         and "complete-vind-product-plan.json" in product_complete
         and "product_complete=" in product_complete
@@ -3471,35 +2763,9 @@ checks["release validator validates no-PVC sibling evidence"] = (
     and "product no-PVC namespace evidence" in cli
 )
 
-checks["release validator validates Hiqlite authority sibling evidence"] = (
-    "validate_product_hiqlite_authority_attestation" in cli
-    and "validate_product_hiqlite_authority_sibling" in cli
-    and '"hiqlite-authority-attestation.json"' in cli
-    and "product Hiqlite authority evidence" in cli
-)
 
-checks["Hiqlite backend-time assessment detects authority-time support"] = (
-    (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").is_file()
-    and "velorix_hiqlite_backend_time_assessment" in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-    and "can_generate_product_complete_backend_time_attestation" in (repo_root / "scripts" / "assess-hiqlite-backend-time.sh").read_text()
-    and "VELORIX_REQUIRE_HIQLITE_BACKEND_TIME" in doc
-)
 
-checks["Hiqlite backend-time attestation candidate binds deployed smoke evidence"] = (
-    (repo_root / "scripts" / "attest-hiqlite-backend-time.sh").is_file()
-    and "velorix_hiqlite_backend_time_attestation" in backend_time_attest
-    and "hiqlite-backend-time-assessment.json" in backend_time_attest
-    and "standing-runtime-failover-smoke.json" in backend_time_attest
-    and "trusted_for_product_complete = False" in backend_time_attest
-    and "release_validator_fail_closed" in backend_time_attest
-)
 
-checks["managed Hiqlite authority evidence records live local source revision"] = (
-    '"source_revision": source_revision' in script
-    and 'git -C "$hiqlite_local_source_dir" rev-parse --short HEAD' in script
-    and 'git -C "$hiqlite_local_source_dir" status --porcelain' in script
-    and 'hiqlite_source_dirty="+dirty"' in script
-)
 
 checks["local standing-runtime failover smoke stays explicitly non-product-complete"] = (
     (repo_root / "scripts" / "smoke-vind-standing-runtime-failover.sh").is_file()
@@ -3520,7 +2786,6 @@ checks["release validator validates ingress/TLS/auth sibling evidence"] = (
 checks["documentation describes product evidence field"] = (
     "data_plane_token_rejected_on_admin_route=true" in doc
     and "no-pvc-namespace.json" in doc
-    and "hiqlite-authority-attestation.json" in doc
     and "ingress-tls-auth-attestation.json" in doc
     and "ingest-writer-job-log.json" in doc
     and "object_store_external_authority_out_of_scope_does_not_prove_object_store_durability"
@@ -3726,21 +2991,18 @@ checks["product completion report summarizes blockers without forging evidence"]
     and "remove the blocking verdict" in product_completion_report
     and "remove the Block 1.0 verdict" not in product_completion_report
     and "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in product_completion_report
-    and "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" in product_completion_report
     and "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"
     in product_completion_report
     and "VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in product_completion_report
     and "VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" in product_completion_report
     and "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" in product_completion_report
     and '"VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE"' not in product_completion_report
-    and '"VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE"' not in product_completion_report
     and '"VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE"'
     not in product_completion_report
     and '"VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE"' not in product_completion_report
     and '"VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE"' not in product_completion_report
     and '"VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE"' not in product_completion_report
     and "s3_checkpoint_fault_matrix" in product_completion_report
-    and "hiqlite_total_voter_loss_restore_drill" in product_completion_report
     and "upgrade_rollback_repair_gc_fault_matrix" in product_completion_report
     and "deployment_id, s3:// authority_store_id" in product_completion_report
     and "rolling_upgrade, rollback_after_upgrade, corrupt_latest_checkpoint_repair" in product_completion_report
@@ -3751,7 +3013,6 @@ checks["product completion report summarizes blockers without forging evidence"]
     and "VELORIX_PRODUCT_DEPLOYMENT_ID=REPLACE_WITH_DEPLOYMENT_ID" in product_completion_report
     and "VELORIX_AUTHORITY_STORE_ID=s3://REPLACE_WITH_BUCKET/REPLACE_WITH_PREFIX" in product_completion_report
     and "check-s3-checkpoint-fault-matrix-evidence.sh" in product_completion_report
-    and "check-hiqlite-restore-drill-evidence.sh" in product_completion_report
     and "check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh"
     in product_completion_report
     and "Fail if architecture critique still blocks 1.0" in release_gate
@@ -3835,14 +3096,13 @@ required_dockerfiles = (
     "Dockerfile.api",
     "Dockerfile.meta",
     "Dockerfile.ingest-writer",
-    "Dockerfile.hiqlite",
     "Dockerfile.all-in-one",
 )
 
 checks["GHCR deployment images use committed digest-pinned Rust builders and record digest evidence"] = (
-    "- name: hiqlite" in ghcr_workflow
-    and "dockerfile: Dockerfile.hiqlite" in ghcr_workflow
-    and "velorix-hiqlite" in ghcr_workflow
+    "- name: meta" in ghcr_workflow
+    and "dockerfile: Dockerfile.meta" in ghcr_workflow
+    and "velorix-hiqlite" not in ghcr_workflow
     and all(
         required_rust_builder
         in (repo_root / dockerfile).read_text(encoding="utf-8")
@@ -3854,10 +3114,55 @@ checks["GHCR deployment images use committed digest-pinned Rust builders and rec
     and "1.95.0-bookworm" not in ghcr_workflow
     and "steps.build.outputs.digest" in ghcr_workflow
     and "source_ref=" in ghcr_workflow
-    and ghcr_workflow.count("actions/checkout@v5") == 2
+    and ghcr_workflow.count("actions/checkout@v5") == 1
     and "actions/upload-artifact@v6" in ghcr_workflow
     and "VELORIX_SOURCE_REF: ${{ github.sha }}" in ghcr_workflow
     and 'test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"' in ghcr_workflow
+)
+
+checks["removed Hiqlite deployment surface stays absent"] = (
+    not (repo_root / "Dockerfile.hiqlite").exists()
+    and all(
+        not (repo_root / "scripts" / name).exists()
+        for name in (
+            "assess-hiqlite-backend-time.sh",
+            "attest-hiqlite-backend-time.sh",
+            "check-hiqlite-backend-time-release-inputs.sh",
+            "check-hiqlite-backup-restore-evidence.sh",
+            "check-hiqlite-restore-drill-evidence.sh",
+            "run-hiqlite-restore-drill.sh",
+            "write-hiqlite-backend-time-release-env.sh",
+        )
+    )
+    and "VELORIX_HIQLITE" not in script
+    and "velorix-hiqlite-source" not in script
+    and "velorix-hiqlite" not in ghcr_workflow
+    and "hiqlite" not in release_gate.lower()
+    and "hiqlite" not in first_e2e.lower()
+    and not any(
+        "hiqlite" in path.read_text(encoding="utf-8").lower()
+        for path in sorted((repo_root / ".github" / "workflows").glob("*.yml"))
+    )
+    and not any(
+        "hiqlite" in (repo_root / dockerfile).read_text(encoding="utf-8").lower()
+        for dockerfile in required_dockerfiles
+    )
+)
+
+checks["product images build the Rhiza metadata backend with the shared Go/FFI toolchain"] = (
+    all(
+        '--features "rhiza-backend"' in (repo_root / dockerfile).read_text(encoding="utf-8")
+        and "hiqlite-backend" not in (repo_root / dockerfile).read_text(encoding="utf-8")
+        for dockerfile in ("Dockerfile.meta", "Dockerfile.all-in-one")
+    )
+    and all(
+        "ARG GO_VERSION=1.27.0" in (repo_root / dockerfile).read_text(encoding="utf-8")
+        and "ARG GO_TARBALL_SHA256=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685"
+        in (repo_root / dockerfile).read_text(encoding="utf-8")
+        and "GOTOOLCHAIN=local" in (repo_root / dockerfile).read_text(encoding="utf-8")
+        for dockerfile in ("Dockerfile.meta", "Dockerfile.all-in-one")
+    )
+    and "'rhiza-backend'" in (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 )
 
 checks["deployment emits explicit no-PVC emptyDir storage only"] = (
@@ -3874,7 +3179,8 @@ checks["production ingest writer uses Meta partition authority without Kubernete
     and 'VELORIX_INGEST_WRITER_PARTITION_OWNER_ID' in script
     and 'VELORIX_META_GRPC_ENDPOINT' in script
     and 'name: velorix-meta-auth' in script
-    and 'VELORIX_INGEST_WRITER_SMOKE=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite' in script
+    and "VELORIX_INGEST_WRITER_SMOKE=1 requires VELORIX_META_ENABLED=1 and a durable metadata backend"
+    in script
     and 'serviceAccountName: velorix-ingest-writer-append' in script
     and 'meta_partition_authority' in ingest_writer
     and 'GrpcMetaStore::connect' in ingest_writer
@@ -3893,12 +3199,10 @@ checks["external immutable images pull without changing local-load defaults"] = 
     and 'ingest_writer_image_digest="${VELORIX_INGEST_WRITER_IMAGE_DIGEST:-}"' in script
     and 'api_image_pull_policy="Never"' in script
     and 'meta_image_pull_policy="Never"' in script
-    and 'hiqlite_image_pull_policy="Never"' in script
     and 'ingest_writer_image_pull_policy="Never"' in script
     and 'image_load_mode" = "none"' in script
     and 'imagePullPolicy: ${api_image_pull_policy}' in script
     and 'imagePullPolicy: ${meta_image_pull_policy}' in script
-    and 'imagePullPolicy: ${hiqlite_image_pull_policy}' in script
     and 'imagePullPolicy: ${ingest_writer_image_pull_policy}' in script
     and 'imagePullSecrets:' in script
     and 'immutable_image_reference' in script
@@ -3907,7 +3211,7 @@ checks["external immutable images pull without changing local-load defaults"] = 
 checks["metadata deployment explicitly selects the executable local topology"] = (
     'meta_mode="${VELORIX_META_MODE:-development}"' in script
     and 'meta_backend="${VELORIX_META_BACKEND:-memory}"' in script
-    and 'hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"' in script
+    and "VELORIX_META_BACKEND=hiqlite was removed" in script
     and '- name: VELORIX_META_MODE' in script
     and 'value: "${meta_mode}"' in script
     and 'VELORIX_META_TRANSPORT_SECURITY_ATTESTATION' not in script
@@ -4003,32 +3307,27 @@ checks["product Dockerfiles reject external runtime artifact paths"] = (
 
 checks["release gate requires critique live evidence validators"] = (
     "s3-checkpoint-fault-matrix-evidence-path" in release_gate
-    and "hiqlite-restore-drill-evidence-path" in release_gate
     and "upgrade-rollback-repair-gc-fault-matrix-evidence-path" in release_gate
     and "query-output-isolation-evidence-path" in release_gate
     and "security-release-provenance-evidence-path" in release_gate
     and "remaining-release-readiness-evidence-path" in release_gate
     and "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in release_gate
-    and "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" in release_gate
     and "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH" in release_gate
     and "VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in release_gate
     and "VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" in release_gate
     and "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" in release_gate
     and "S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH" in release_gate
-    and "HIQLITE_RESTORE_DRILL_RELEASE_PATH" in release_gate
     and "UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH" in release_gate
     and "QUERY_OUTPUT_ISOLATION_RELEASE_PATH" in release_gate
     and "SECURITY_RELEASE_PROVENANCE_RELEASE_PATH" in release_gate
     and "REMAINING_RELEASE_READINESS_RELEASE_PATH" in release_gate
     and 'test -f "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH"' in release_gate
-    and 'test -f "$HIQLITE_RESTORE_DRILL_RELEASE_PATH"' in release_gate
     and 'test -f "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH"'
     in release_gate
     and 'test -f "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH"' in release_gate
     and 'test -f "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH"' in release_gate
     and 'test -f "$REMAINING_RELEASE_READINESS_RELEASE_PATH"' in release_gate
     and "release gate requires inputs.s3-checkpoint-fault-matrix-evidence-path" in release_gate
-    and "release gate requires inputs.hiqlite-restore-drill-evidence-path" in release_gate
     and "release gate requires inputs.upgrade-rollback-repair-gc-fault-matrix-evidence-path"
     in release_gate
     and "release gate requires inputs.query-output-isolation-evidence-path" in release_gate
@@ -4036,7 +3335,6 @@ checks["release gate requires critique live evidence validators"] = (
     and "release gate requires inputs.remaining-release-readiness-evidence-path" in release_gate
     and "Validate critique release evidence" in release_gate
     and "scripts/check-s3-checkpoint-fault-matrix-evidence.sh" in release_gate
-    and "scripts/check-hiqlite-restore-drill-evidence.sh" in release_gate
     and "scripts/check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh" in release_gate
     and "scripts/check-query-output-isolation-evidence.sh" in release_gate
     and "scripts/check-security-release-provenance-evidence.sh" in release_gate
@@ -4050,13 +3348,6 @@ checks["release gate requires critique live evidence validators"] = (
     not in release_gate
     and "--s3-checkpoint-fault-matrix-evidence" in release_doc
     and 'scripts/check-s3-checkpoint-fault-matrix-evidence.sh "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH"'
-    in release_doc
-    and '--hiqlite-restore-drill-evidence "$HIQLITE_RESTORE_DRILL_RELEASE_PATH"'
-    in release_gate
-    and '--hiqlite-restore-drill-evidence "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"'
-    not in release_gate
-    and "--hiqlite-restore-drill-evidence" in release_doc
-    and 'scripts/check-hiqlite-restore-drill-evidence.sh "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"'
     in release_doc
     and '--upgrade-rollback-repair-gc-fault-matrix-evidence "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_RELEASE_PATH"'
     in release_gate
@@ -4092,7 +3383,6 @@ checks["release gate requires critique live evidence validators"] = (
     in product_completion_report
     and "source_revision must match VELORIX_RELEASE_COMMIT" in product_completion_report
     and "s3_checkpoint_fault_matrix_evidence: Option<PathBuf>" in cli
-    and "hiqlite_restore_drill_evidence: Option<PathBuf>" in cli
     and "upgrade_rollback_repair_gc_fault_matrix_evidence: Option<PathBuf>" in cli
     and "query_output_isolation_evidence: Option<PathBuf>" in cli
     and "security_release_provenance_evidence: Option<PathBuf>" in cli
@@ -4112,8 +3402,6 @@ checks["release gate requires critique live evidence validators"] = (
     in cli
     and '"s3-checkpoint-fault-matrix-evidence",\n            &artifacts.s3_checkpoint_fault_matrix_evidence'
     in cli
-    and '"hiqlite-restore-drill-evidence",\n            &artifacts.hiqlite_restore_drill_evidence'
-    in cli
     and '"upgrade-rollback-repair-gc-fault-matrix-evidence",\n            &artifacts.upgrade_rollback_repair_gc_fault_matrix_evidence'
     in cli
     and '"query-output-isolation-evidence",\n            &artifacts.query_output_isolation_evidence'
@@ -4131,14 +3419,12 @@ checks["production readiness status delegates to generated evidence gate"] = (
     and "The static Markdown matrix was removed" in production_readiness_status
     and "concrete evidence artifacts, not from this file" in production_readiness_status
     and "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" in production_readiness_status
-    and "$VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH" in production_readiness_status
     and "$VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH"
     in production_readiness_status
     and "$VELORIX_QUERY_OUTPUT_ISOLATION_EVIDENCE_PATH" in production_readiness_status
     and "$VELORIX_SECURITY_RELEASE_PROVENANCE_EVIDENCE_PATH" in production_readiness_status
     and "$VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH" in production_readiness_status
     and "$S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE\"" not in production_readiness_status
-    and "$HIQLITE_RESTORE_DRILL_EVIDENCE\"" not in production_readiness_status
     and "$UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE\""
     not in production_readiness_status
     and "$QUERY_OUTPUT_ISOLATION_EVIDENCE\"" not in production_readiness_status
@@ -4156,17 +3442,6 @@ checks["dependency governance docs do not overclaim release readiness"] = (
     and "not a 1.0 release\nblocker" not in dependency_governance_doc
 )
 
-checks["Hiqlite backup-restore evidence validator is explicit configuration evidence"] = (
-    os.access(hiqlite_backup_restore_evidence_path, os.X_OK)
-    and hiqlite_backup_restore_evidence_policy_has_pass_fail_coverage()
-    and '"schema_version": 8' in first_e2e
-    and "HiqliteNoPvcThreeVoterBackupRestore" in control_readiness
-    and "kubernetes_status missing hiqlite_no_pvc_three_voter_backup_restore evidence"
-    in control_readiness
-    and "release_readiness_requires_hiqlite_no_pvc_backup_restore_evidence"
-    in control_readiness
-    and "first_e2e_readiness_does_not_require_release_fault_matrices" in control_readiness
-)
 
 checks["S3 checkpoint fault matrix evidence validator is live-release only"] = (
     os.access(s3_checkpoint_fault_matrix_evidence_path, os.X_OK)
@@ -4196,26 +3471,6 @@ checks["S3 checkpoint fault matrix runner aggregates only real scenario evidence
     in release_doc
 )
 
-checks["Hiqlite restore drill evidence validator proves total voter loss"] = (
-    os.access(hiqlite_restore_drill_evidence_path, os.X_OK)
-    and hiqlite_restore_drill_evidence_policy_has_pass_fail_coverage()
-    and "Record deployment_id and an s3:// authority_store_id"
-    in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
-    and "object_store_backup" in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
-    and "metadata_write_survival" in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
-    and "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH"
-    in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
-    and "HIQLITE_RESTORE_DRILL_EVIDENCE:-"
-    not in (repo_root / "scripts" / "run-hiqlite-restore-drill.sh").read_text(encoding="utf-8")
-    and "deployment_id" in product_completion_report
-    and "s3:// authority_store_id" in product_completion_report
-    and "evidence_kind=hiqlite_total_voter_loss_restore_drill" in product_completion_report
-    and "post_restore_ingest_query" in product_completion_report
-    and "hiqlite_no_pvc_three_voter_backup_restore" in release_doc
-    and "hiqlite_total_voter_loss_restore_drill" in release_doc
-    and "compatibility evidence kind" in release_doc
-    and "live restore drill" in release_doc
-)
 
 upgrade_repair_gc_fault_matrix_runner = upgrade_repair_gc_fault_matrix_runner_path.read_text(
     encoding="utf-8"
@@ -4283,8 +3538,6 @@ checks["security release provenance evidence validator is live-release only"] = 
     and "security/release provenance" in release_doc.lower()
     and "release image digests for `velorix-api` and `velorix-meta`"
     in release_doc
-    and "Hiqlite authority image digest is\n  bound by the separate Hiqlite backend-time trusted provenance attestation"
-    in release_doc
 )
 
 remaining_release_readiness_runner = remaining_release_readiness_runner_path.read_text(
@@ -4326,22 +3579,17 @@ checks["metadata server production startup fails closed"] = (
     and "VELORIX_META_TRANSPORT_SECURITY is required in production mode" in meta
     and "production metadata transport must use native-mtls" in meta
     and "service-mesh-mtls is operator-attested and not verified by this binary" in meta
-    and "VELORIX_HIQLITE_API_SECRET" in meta
-    and "production VELORIX_HIQLITE_NODES must contain exactly three unique voter nodes" in meta
     and "serve_config_requires_explicit_mode_and_backend" in meta
     and "development_memory_config_defaults_to_loopback_only" in meta
-    and "development_hiqlite_config_allows_authenticated_cluster_bind" in meta
     and "development_durable_cluster_bind_requires_bearer_authentication" in meta
     and "development_non_loopback_opt_in_requires_exact_boolean_value" in meta
     and "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK must be exactly 0 or 1" in meta
     and "MetaBackendKind::Memory || bearer_token.is_none()" in meta
     and "production_config_rejects_missing_durable_backend_and_memory_backend" in meta
     and "production_config_requires_auth_and_native_transport_security" in meta
-    and "production_hiqlite_requires_exactly_three_unique_voter_nodes" in meta
     and "The metadata server is fail-open by default" in architecture_critique
     and "Resolved by current code evidence: production startup now requires explicit"
     in architecture_critique
-    and "requires exactly three unique Hiqlite voter nodes" in architecture_critique
     and "development mode defaults to loopback-only binding" in architecture_critique
 )
 
@@ -4597,7 +3845,6 @@ checks["checkpoint recovery repair and GC blocker remains evidence-bound"] = (
     and "s3_compatible_test_status.evidence_kind" in release_doc
     and "s3_compatible_checkpoint_fault_matrix" in release_doc
     and "kubernetes_status.evidence_kind" in release_doc
-    and "hiqlite_no_pvc_three_voter_backup_restore" in release_doc
     and "gc_status.evidence_kind" in release_doc
     and "upgrade_rollback_repair_gc_fault_matrix" in release_doc
     and '"/v1/standing-runtime/ingest-epoch-failures/repair"' in api

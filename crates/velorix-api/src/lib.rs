@@ -63,7 +63,6 @@ use velorix_control::{
         INGEST_SOURCE_IDENTITY_GENERATION_V1, RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
         STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
         STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
-        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
         STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
         STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL,
@@ -7849,7 +7848,6 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
         }
         MetaStoreError::Remote(_)
         | MetaStoreError::Oss(_)
-        | MetaStoreError::Hiqlite(_)
         | MetaStoreError::Rhiza(_)
         | MetaStoreError::RhizaIndeterminate { .. }
         | MetaStoreError::RhizaContention { .. } => ApiError::internal(error),
@@ -8575,8 +8573,7 @@ fn validate_logical_standing_runtime_fencing(
     }
     if !matches!(
         capability.lease_authority_kind.as_str(),
-        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_HIQLITE_RAFT_SERIALIZED
-            | STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME
+        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME
     ) {
         missing.push("recognized_lease_authority");
     }

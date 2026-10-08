@@ -1,8 +1,17 @@
 #!/bin/sh
 set -eu
 
-# Run the native three-voter/no-PVC recovery drill against an isolated local
-# source-pinned Versity Gateway. Failure logs are retained under target/ for diagnosis.
+# Run the native three-voter recovery drill against an isolated local
+# source-pinned Versity Gateway. Failure logs are retained under target/ for
+# diagnosis.
+#
+# Scope: this drill starts three local Rhiza processes and therefore exercises
+# no Kubernetes at all. It proves the Rhiza-level guarantees below (quorum loss
+# fails closed, an emptied working directory fails closed, a cold restart
+# recovers from the original disks plus the shared object store) and nothing
+# about a deployment shape. The emptyDir/no-PVC Kubernetes proof belongs to
+# scripts/run-rhiza-kv-k8s-fixture.sh and scripts/run-rhiza-kv-k8s-gate.sh;
+# this evidence kind must never be cited as it.
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 evidence_root="$repo_root/target/rhiza-recovery-evidence"
@@ -138,12 +147,15 @@ fi
 
 {
     printf '%s\n' '{'
-    printf '  "evidence_kind": "rhiza_three_node_no_pvc_recovery",\n'
+    printf '  "evidence_kind": "rhiza_three_native_node_local_recovery",\n'
+    printf '  "scope": "native_local_processes_without_kubernetes",\n'
+    printf '  "no_pvc_deployment_proven": false,\n'
     printf '  "three_native_nodes": true,\n'
     printf '  "cross_node_linearizable_read_and_cas": true,\n'
     printf '  "one_node_loss_retains_quorum": true,\n'
     printf '  "quorum_loss_fails_closed": true,\n'
-    printf '  "empty_working_directory_recovery": true,\n'
+    printf '  "emptied_working_directory_fails_closed": true,\n'
+    printf '  "restart_recovers_from_disk_and_object_store": true,\n'
     printf '  "shutdown_mode": "graceful_cold_restart",\n'
     printf '  "abrupt_crash_tested": false,\n'
     printf '  "object_store_fixture": "isolated_versitygw_posix_not_provider_loss",\n'

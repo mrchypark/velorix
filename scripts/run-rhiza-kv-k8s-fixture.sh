@@ -3,26 +3,47 @@
 set -eu
 
 # TEST-ONLY fallback for a cluster without an approved external S3 endpoint.
-# This fixture proves Meta recovery against a separate ephemeral S3 service; it
+# This fixture proves Meta recovery against a separate ephemeral object store; it
 # is not evidence of provider loss, production object-store durability, or a
 # production cutover.
+#
+# The object store is the official Versity Gateway, on its POSIX driver with an
+# emptyDir root. Versity is the gateway this repository already builds from
+# source for `scripts/check-rhiza-recovery.sh`, so the Kubernetes fixture and
+# the local recovery drill speak S3 to the same implementation rather than to
+# two different emulations. The bucket is a directory created directly in that
+# POSIX root, which is how the POSIX driver represents a bucket, so no separate
+# provisioning client and no `mc` image are needed.
+#
+# It changes nothing about the recovery mechanism. The official Rhiza operator
+# still performs the whole-generation recovery; this wrapper only supplies a
+# throwaway object store and generates the source generation's peer identities.
 
 CDPATH=
 export CDPATH
-repo_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+
+# shellcheck source=scripts/rhiza-kv-k8s-lib.sh
+. "$script_dir/rhiza-kv-k8s-lib.sh"
+
 context=${VELORIX_K8S_CONTEXT:-}
 meta_image=${VELORIX_RHIZA_META_IMAGE:-}
+operator_image_pin=${VELORIX_RHIZA_OPERATOR_IMAGE:-$rhiza_official_operator_image}
+operator_image_override=${VELORIX_RHIZA_OPERATOR_IMAGE_OVERRIDE:-}
+operator_image_provenance=${VELORIX_RHIZA_OPERATOR_IMAGE_PROVENANCE:-}
 namespace=${VELORIX_RHIZA_NAMESPACE:-}
 run_nonce=$(date -u +%Y%m%d-%H%M%S)-$$
 run_id=${VELORIX_RHIZA_RUN_ID:-rhiza-kv-f-${run_nonce}}
 probe_id=${VELORIX_RHIZA_PROBE_ID:-rhiza-kv-fixture-probe-${run_nonce}}
+recovery_id=${VELORIX_RHIZA_RECOVERY_ID:-rhiza-kv-fixture-gen-${run_nonce}}
 execute=${VELORIX_RHIZA_FIXTURE_EXECUTE:-0}
 cleanup=${VELORIX_RHIZA_FIXTURE_CLEANUP:-0}
-minio_image=${VELORIX_RHIZA_FIXTURE_MINIO_IMAGE:-}
-mc_image=${VELORIX_RHIZA_FIXTURE_MC_IMAGE:-}
+versity_image=${VELORIX_RHIZA_FIXTURE_VERSITY_IMAGE:-}
 evidence_dir=${VELORIX_RHIZA_EVIDENCE_DIR:-"$repo_root/target/rhiza-kv-k8s-fixture"}
-fixture_label="rhiza-kv-fixture"
-minio_service=minio
+fixture_label=rhiza-kv-fixture
+versity_service=versity
+versity_port=7070
 bucket="rhiza-${run_id}"
 
 die() {
@@ -46,11 +67,16 @@ umask 077
 
 require_nonempty VELORIX_K8S_CONTEXT "$context"
 require_nonempty VELORIX_RHIZA_META_IMAGE "$meta_image"
-require_nonempty VELORIX_RHIZA_FIXTURE_MINIO_IMAGE "$minio_image"
-require_nonempty VELORIX_RHIZA_FIXTURE_MC_IMAGE "$mc_image"
-case "$meta_image:$minio_image:$mc_image" in
-  *@sha256:*:*@sha256:*:*@sha256:*) ;;
-  *) die "Meta, MinIO, and mc fixture images must be immutable sha256 references" ;;
+require_nonempty VELORIX_RHIZA_FIXTURE_VERSITY_IMAGE "$versity_image"
+# The gate owns the operator image decision, including the digest pin and any
+# explicit override. The fixture only requires that at least one of its inputs
+# is set, and forwards all three unchanged.
+if [ -z "$operator_image_pin" ] && [ -z "$operator_image_override" ]; then
+  die "set VELORIX_RHIZA_OPERATOR_IMAGE, or VELORIX_RHIZA_OPERATOR_IMAGE_OVERRIDE with VELORIX_RHIZA_OPERATOR_IMAGE_PROVENANCE"
+fi
+case "$meta_image:$versity_image" in
+  *@sha256:*:*@sha256:*) ;;
+  *) die "Meta and Versity Gateway fixture images must be immutable sha256 references" ;;
 esac
 case "$execute:$cleanup" in
   0:0|0:1|1:0|1:1) ;;
@@ -63,6 +89,9 @@ esac
 case "$probe_id" in
   *[!A-Za-z0-9._-]*|'') die "VELORIX_RHIZA_PROBE_ID must be a nonempty DNS-safe value" ;;
 esac
+case "$recovery_id" in
+  *[!A-Za-z0-9._-]*|'') die "VELORIX_RHIZA_RECOVERY_ID must be a nonempty DNS-safe recovery id" ;;
+esac
 if [ -z "$namespace" ]; then
   namespace="velorix-rhiza-validation-fixture-${run_nonce}"
 fi
@@ -71,7 +100,7 @@ case "$namespace" in
   *) die "VELORIX_RHIZA_NAMESPACE must use the fixture validation prefix" ;;
 esac
 [ "${#namespace}" -le 63 ] || die "VELORIX_RHIZA_NAMESPACE is too long for Kubernetes"
-for safe_value in "$namespace" "$run_id" "$probe_id" "$bucket"; do
+for safe_value in "$namespace" "$run_id" "$probe_id" "$recovery_id" "$bucket"; do
   if printf '%s' "$safe_value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
     die "fixture identifiers must not contain control characters"
   fi
@@ -147,44 +176,77 @@ run_openssl openssl x509 -req -in "$client_csr" -CA "$ca_cert" -CAkey "$ca_key" 
   -out "$client_cert" -days 2 -sha256 -extfile "$client_ext"
 chmod 600 "$private_dir"/*
 
-if ! openssl rand -hex 16 >"$private_dir/minio-access-key" 2>"$private_dir/rand-access.error"; then
+# Versity Gateway takes its root credentials from these two variables. Random
+# per-run values only: the fixture is disposable and shares no credential with
+# any other environment.
+if ! openssl rand -hex 16 >"$private_dir/versity-access-key" 2>"$private_dir/rand-access.error"; then
   die "could not generate fixture credentials"
 fi
-if ! openssl rand -hex 32 >"$private_dir/minio-secret-key" 2>"$private_dir/rand.error"; then
+if ! openssl rand -hex 32 >"$private_dir/versity-secret-key" 2>"$private_dir/rand.error"; then
   die "could not generate fixture credentials"
 fi
-minio_access_key=$(cat "$private_dir/minio-access-key")
-minio_secret_key=$(cat "$private_dir/minio-secret-key")
+versity_access_key=$(cat "$private_dir/versity-access-key")
+versity_secret_key=$(cat "$private_dir/versity-secret-key")
 printf '%s' "$bucket" >"$private_dir/bucket"
-if ! openssl rand -hex 16 >"$private_dir/voter-seed" 2>>"$private_dir/rand.error"; then
-  die "could not generate fixture voter tokens"
+if ! openssl rand -hex 16 >"$private_dir/peer-token-seed" 2>>"$private_dir/rand.error"; then
+  die "could not generate fixture peer tokens"
 fi
-voter_seed=$(cat "$private_dir/voter-seed")
-members_json=$(jq -cn --arg ns "$namespace" --arg seed "$voter_seed" '[range(0;3) as $i | {node_id:("velorix-meta-"+($i|tostring)), url:("https://velorix-meta-"+($i|tostring)+".velorix-meta."+$ns+".svc.cluster.local:9090"), peer_url:("quic://velorix-meta-"+($i|tostring)+".velorix-meta."+$ns+".svc.cluster.local:8200"), token:($seed+"-"+($i|tostring))}]')
+peer_token_seed=$(cat "$private_dir/peer-token-seed")
+
+# Generate the source generation's peer identities. Three random peer tokens,
+# the derived public key for each node against this run's source cluster ID, a
+# membership document carrying only those public keys, and the node-keyed
+# peer-token map. Both are handed to the gate, so the fixture exercises the same
+# preflight derivation check as an operator-supplied document.
+fixture_token_0="${peer_token_seed}-0"
+fixture_token_1="${peer_token_seed}-1"
+fixture_token_2="${peer_token_seed}-2"
+fixture_key_0=$(rhiza_derive_public_key "$private_dir" "$fixture_token_0" "$run_id" velorix-meta-0) || die "could not derive the velorix-meta-0 fixture peer public key"
+fixture_key_1=$(rhiza_derive_public_key "$private_dir" "$fixture_token_1" "$run_id" velorix-meta-1) || die "could not derive the velorix-meta-1 fixture peer public key"
+fixture_key_2=$(rhiza_derive_public_key "$private_dir" "$fixture_token_2" "$run_id" velorix-meta-2) || die "could not derive the velorix-meta-2 fixture peer public key"
+# The membership document carries public material only. Private peer tokens are
+# handed to the gate separately as a node-keyed object and reach the workload
+# only through the standard native RHIZA_PEER_TOKENS map.
+members_json=$(jq -cn --arg ns "$namespace" --arg k0 "$fixture_key_0" --arg k1 "$fixture_key_1" --arg k2 "$fixture_key_2" '
+  [range(0;3) as $i | {
+    node_id: ("velorix-meta-" + ($i|tostring)),
+    url: ("https://velorix-meta-" + ($i|tostring) + ".velorix-meta." + $ns + ".svc.cluster.local:9090"),
+    peer_url: ("quic://velorix-meta-" + ($i|tostring) + ".velorix-meta." + $ns + ".svc.cluster.local:8200"),
+    public_key: ([$k0, $k1, $k2][$i])
+  }]
+')
+peer_tokens_json=$(jq -cn --arg t0 "$fixture_token_0" --arg t1 "$fixture_token_1" --arg t2 "$fixture_token_2" '{"velorix-meta-0": $t0, "velorix-meta-1": $t1, "velorix-meta-2": $t2}')
 
 server_tls_secret="rhiza-${run_id}-server-tls"
 client_tls_secret="rhiza-${run_id}-client-tls"
-fixture_secret="rhiza-${run_id}-minio"
+fixture_secret="rhiza-${run_id}-versity"
 server_tls_yaml="$private_dir/server-tls.yaml"
 client_tls_yaml="$private_dir/client-tls.yaml"
 fixture_secret_yaml="$private_dir/fixture-secret.yaml"
+versity_endpoint="${versity_service}.${namespace}.svc.cluster.local:${versity_port}"
 
-if [ "$execute" = 0 ]; then
-  # Let the generic gate perform its normal read-only contract checks with the
-  # generated fixture inputs, but do not create a namespace or cluster object.
+# Every input the gate needs, including the three operator-image inputs, is
+# passed through unchanged. The gate remains the only place that decides which
+# operator image runs, so the fixture cannot silently diverge from it.
+run_gate() {
   VELORIX_K8S_CONTEXT="$context" \
   VELORIX_RHIZA_NAMESPACE="$namespace" \
   VELORIX_RHIZA_RUN_ID="$run_id" \
   VELORIX_RHIZA_PROBE_ID="$probe_id" \
+  VELORIX_RHIZA_RECOVERY_ID="$recovery_id" \
   VELORIX_RHIZA_META_IMAGE="$meta_image" \
+  VELORIX_RHIZA_OPERATOR_IMAGE="$operator_image_pin" \
+  VELORIX_RHIZA_OPERATOR_IMAGE_OVERRIDE="$operator_image_override" \
+  VELORIX_RHIZA_OPERATOR_IMAGE_PROVENANCE="$operator_image_provenance" \
   VELORIX_RHIZA_MEMBERS_JSON="$members_json" \
+  VELORIX_RHIZA_PEER_TOKENS="$peer_tokens_json" \
   VELORIX_RHIZA_OBJECT_STORE_PROVIDER=s3 \
-  VELORIX_RHIZA_OBJECT_STORE_ENDPOINT="${minio_service}.${namespace}.svc.cluster.local:9000" \
+  VELORIX_RHIZA_OBJECT_STORE_ENDPOINT="$versity_endpoint" \
   VELORIX_RHIZA_OBJECT_STORE_BUCKET="$bucket" \
   VELORIX_RHIZA_OBJECT_STORE_REGION=us-east-1 \
-  VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY="$minio_access_key" \
-  VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY="$minio_secret_key" \
-  VELORIX_RHIZA_OBJECT_STORE_INSECURE=1 \
+  VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY="$versity_access_key" \
+  VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY="$versity_secret_key" \
+  VELORIX_RHIZA_OBJECT_STORE_INSECURE=true \
   VELORIX_RHIZA_META_BEARER_TOKEN="fixture-meta-${run_id}" \
   VELORIX_RHIZA_ADMIN_TOKEN="fixture-admin-${run_id}" \
   VELORIX_RHIZA_SERVER_TLS_SECRET="$server_tls_secret" \
@@ -196,9 +258,17 @@ if [ "$execute" = 0 ]; then
   VELORIX_RHIZA_CLIENT_TLS_KEY_FILE="$client_key" \
   VELORIX_RHIZA_CLIENT_TLS_CA_FILE="$ca_cert" \
   VELORIX_RHIZA_EVIDENCE_DIR="$evidence_dir" \
-  VELORIX_RHIZA_EXECUTE=0 \
-  scripts/run-rhiza-kv-k8s-gate.sh
-  jq -n --arg run_id "$run_id" '{schema_version: 1, status: "fixture_preflight_pass", fixture_only: true, run_id: $run_id, no_cluster_mutation: true, production_durability_evidence: false}' >"$evidence_dir/fixture-evidence.json"
+  VELORIX_RHIZA_EXECUTE="$1" \
+  VELORIX_RHIZA_CLEANUP="$cleanup" \
+  "$script_dir/run-rhiza-kv-k8s-gate.sh"
+}
+
+if [ "$execute" = 0 ]; then
+  # Let the generic gate perform its normal read-only contract checks with the
+  # generated fixture inputs, but do not create a namespace or cluster object.
+  run_gate 0
+  jq -n --arg run_id "$run_id" --arg object_store_fixture versitygw_posix_emptydir \
+    '{schema_version: 2, status: "fixture_preflight_pass", fixture_only: true, run_id: $run_id, recovery_performed_by: "official-rhiza-operator", object_store_fixture: $object_store_fixture, no_cluster_mutation: true, production_durability_evidence: false}' >"$evidence_dir/fixture-evidence.json"
   chmod 600 "$evidence_dir/fixture-evidence.json"
   echo "rhiza KV Kubernetes fixture preflight passed; set VELORIX_RHIZA_FIXTURE_EXECUTE=1 for the test-only fixture"
   exit 0
@@ -224,8 +294,8 @@ if ! kubectl --context "$context" apply -f "$client_tls_yaml" >"$evidence_dir/cl
   die "could not apply fixture client TLS Secret"
 fi
 
-printf '%s' "$minio_access_key" >"$private_dir/access-key"
-printf '%s' "$minio_secret_key" >"$private_dir/secret-key"
+printf '%s' "$versity_access_key" >"$private_dir/access-key"
+printf '%s' "$versity_secret_key" >"$private_dir/secret-key"
 if ! kubectl --context "$context" -n "$namespace" create secret generic "$fixture_secret" \
   --from-file=access-key="$private_dir/access-key" --from-file=secret-key="$private_dir/secret-key" --from-file=bucket="$private_dir/bucket" \
   --dry-run=client -o yaml >"$fixture_secret_yaml" 2>"$private_dir/fixture-secret.error"; then
@@ -235,12 +305,21 @@ if ! kubectl --context "$context" apply -f "$fixture_secret_yaml" >"$evidence_di
   die "could not apply fixture object-store Secret"
 fi
 
+# The official Versity Gateway on its POSIX driver. The bucket is created as a
+# directory in that root before the server starts, because a directory is how
+# the POSIX driver represents a bucket; that is why this fixture needs no
+# provisioning client and no separate bucket Job.
+#
+# The gateway runs as a non-root user with a RuntimeDefault seccomp profile and
+# an emptyDir at /data; this Pod spec deliberately does not set
+# readOnlyRootFilesystem. Its own credentials come from the fixture Secret, so
+# no credential appears in this manifest.
 fixture_manifest="$private_dir/fixture.yaml"
 cat >"$fixture_manifest" <<EOF
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${minio_service}
+  name: ${versity_service}
   namespace: ${namespace}
   labels:
     velorix.dev/rhiza-kv-fixture: ${run_id}
@@ -250,13 +329,13 @@ spec:
     velorix.dev/rhiza-kv-fixture: ${run_id}
   ports:
     - name: s3
-      port: 9000
+      port: ${versity_port}
       targetPort: s3
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ${minio_service}
+  name: ${versity_service}
   namespace: ${namespace}
   labels:
     app: ${fixture_label}
@@ -274,106 +353,63 @@ spec:
         velorix.dev/rhiza-kv-fixture: ${run_id}
     spec:
       terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - name: minio
-          image: ${minio_image}
-          args: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+        - name: versity
+          image: ${versity_image}
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - >-
+              mkdir -p "/data/\$VERSITY_BUCKET";
+              exec /usr/local/bin/versitygw --port :${versity_port}
+              --region us-east-1 posix /data
           env:
-            - name: MINIO_ROOT_USER
+            - name: ROOT_ACCESS_KEY_ID
               valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: access-key}}
-            - name: MINIO_ROOT_PASSWORD
+            - name: ROOT_SECRET_ACCESS_KEY
               valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: secret-key}}
+            - name: VERSITY_BUCKET
+              valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: bucket}}
           ports:
             - name: s3
-              containerPort: 9000
-            - name: console
-              containerPort: 9001
+              containerPort: ${versity_port}
           readinessProbe:
-            httpGet:
-              path: /minio/health/ready
-              port: s3
+            # An unauthenticated list is rejected with 403, which still proves
+            # the listener is serving; only a closed port fails this probe.
+            exec:
+              command: ["/bin/sh", "-ec", "wget -q -O /dev/null http://127.0.0.1:${versity_port}/ || [ \$? -eq 1 ]"]
             periodSeconds: 3
             timeoutSeconds: 5
-            failureThreshold: 20
+            failureThreshold: 30
           volumeMounts:
             - name: data
               mountPath: /data
       volumes:
         - name: data
           emptyDir: {}
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-bucket-${run_id}
-  namespace: ${namespace}
-  labels:
-    app: ${fixture_label}
-    velorix.dev/rhiza-kv-fixture: ${run_id}
-spec:
-  backoffLimit: 3
-  template:
-    metadata:
-      labels:
-        app: ${fixture_label}-bucket
-        velorix.dev/rhiza-kv-fixture: ${run_id}
-    spec:
-      restartPolicy: OnFailure
-      containers:
-        - name: mc
-          image: ${mc_image}
-          command: ["/bin/sh", "-ec"]
-          args:
-            - >-
-              mc alias set fixture http://${minio_service}.${namespace}.svc.cluster.local:9000
-              "\$MINIO_ACCESS_KEY" "\$MINIO_SECRET_KEY";
-              mc mb --ignore-existing "fixture/\$MINIO_BUCKET"
-          env:
-            - name: MINIO_ACCESS_KEY
-              valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: access-key}}
-            - name: MINIO_SECRET_KEY
-              valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: secret-key}}
-            - name: MINIO_BUCKET
-              valueFrom: {secretKeyRef: {name: ${fixture_secret}, key: bucket}}
 EOF
 chmod 600 "$fixture_manifest"
 if ! kubectl --context "$context" apply -f "$fixture_manifest" >"$evidence_dir/fixture-apply.out" 2>"$evidence_dir/fixture-apply.error"; then
-  die "could not apply the test-only MinIO fixture"
+  die "could not apply the test-only Versity Gateway fixture"
 fi
-if ! kubectl --context "$context" -n "$namespace" rollout status deployment/${minio_service} --timeout=5m >"$evidence_dir/minio-rollout.out" 2>"$evidence_dir/minio-rollout.error"; then
-  die "the test-only MinIO fixture did not become ready"
-fi
-bucket_job="minio-bucket-${run_id}"
-if ! kubectl --context "$context" -n "$namespace" wait --for=condition=complete "job/${bucket_job}" --timeout=5m >"$evidence_dir/bucket-job.out" 2>"$evidence_dir/bucket-job.error"; then
-  die "the test-only MinIO bucket setup failed"
+if ! kubectl --context "$context" -n "$namespace" rollout status deployment/${versity_service} --timeout=5m >"$evidence_dir/versity-rollout.out" 2>"$evidence_dir/versity-rollout.error"; then
+  die "the test-only Versity Gateway fixture did not become ready"
 fi
 if ! kubectl --context "$context" -n "$namespace" get pvc -o name >"$evidence_dir/pvc-check.out" 2>"$evidence_dir/pvc-check.error"; then
   die "could not inspect fixture PVCs"
 fi
 [ ! -s "$evidence_dir/pvc-check.out" ] || die "the test-only fixture namespace contains a PVC"
 
-VELORIX_K8S_CONTEXT="$context" \
-VELORIX_RHIZA_NAMESPACE="$namespace" \
-VELORIX_RHIZA_RUN_ID="$run_id" \
-VELORIX_RHIZA_PROBE_ID="$probe_id" \
-VELORIX_RHIZA_META_IMAGE="$meta_image" \
-VELORIX_RHIZA_MEMBERS_JSON="$members_json" \
-VELORIX_RHIZA_OBJECT_STORE_PROVIDER=s3 \
-VELORIX_RHIZA_OBJECT_STORE_ENDPOINT="${minio_service}.${namespace}.svc.cluster.local:9000" \
-VELORIX_RHIZA_OBJECT_STORE_BUCKET="$bucket" \
-VELORIX_RHIZA_OBJECT_STORE_REGION=us-east-1 \
-VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY="$minio_access_key" \
-VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY="$minio_secret_key" \
-VELORIX_RHIZA_OBJECT_STORE_INSECURE=1 \
-VELORIX_RHIZA_META_BEARER_TOKEN="fixture-meta-${run_id}" \
-VELORIX_RHIZA_ADMIN_TOKEN="fixture-admin-${run_id}" \
-VELORIX_RHIZA_SERVER_TLS_SECRET="$server_tls_secret" \
-VELORIX_RHIZA_CLIENT_TLS_SECRET="$client_tls_secret" \
-VELORIX_RHIZA_EVIDENCE_DIR="$evidence_dir" \
-VELORIX_RHIZA_EXECUTE=1 \
-VELORIX_RHIZA_CLEANUP="$cleanup" \
-scripts/run-rhiza-kv-k8s-gate.sh
+run_gate 1
 
-jq -n --arg run_id "$run_id" '{schema_version: 1, status: "fixture_pass", fixture_only: true, run_id: $run_id, external_provider_failure_evidence: false, production_durability_evidence: false}' >"$evidence_dir/fixture-evidence.json"
+jq -n --arg run_id "$run_id" --arg object_store_fixture versitygw_posix_emptydir \
+  '{schema_version: 2, status: "fixture_pass", fixture_only: true, run_id: $run_id, recovery_performed_by: "official-rhiza-operator", object_store_fixture: $object_store_fixture, external_provider_failure_evidence: false, production_durability_evidence: false}' >"$evidence_dir/fixture-evidence.json"
 chmod 600 "$evidence_dir/fixture-evidence.json"
-echo "rhiza KV Kubernetes TEST-ONLY fixture passed: no-PVC metadata recovery verified against ephemeral MinIO"
+echo "rhiza KV Kubernetes TEST-ONLY fixture passed: the official operator replaced the lost no-PVC generation against an ephemeral Versity Gateway"

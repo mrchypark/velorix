@@ -12,7 +12,7 @@ builder_base='FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392
 test "$(sed -n 's/^rust-version = "\([^"]*\)"$/\1/p' Cargo.toml)" = "$msrv"
 test "$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)" = "$build_toolchain"
 
-for dockerfile in Dockerfile.api Dockerfile.all-in-one Dockerfile.meta Dockerfile.ingest-writer Dockerfile.hiqlite; do
+for dockerfile in Dockerfile.api Dockerfile.all-in-one Dockerfile.meta Dockerfile.ingest-writer; do
     grep -Fqx "$builder_base" "$dockerfile"
     grep -Fqx "RUN rustup toolchain install $build_toolchain --profile minimal --no-self-update \\" "$dockerfile"
     grep -Fqx "    && rustup default $build_toolchain \\" "$dockerfile"

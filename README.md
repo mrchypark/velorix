@@ -31,8 +31,8 @@ Main components:
   and runtime-independent domain types.
 - `velorix-runtime`: internal materialized view runtime and query execution.
 - `velorix-storage`: object-key policy and durable registries.
-- `velorix-meta`: metadata service backends, including in-memory and Hiqlite
-  modes.
+- `velorix-meta`: metadata service backends, including in-memory, object-store,
+  and Rhiza KV modes.
 - `velorix-k8s`: Kubernetes startup validation and operator-facing contracts.
 
 ## Query and View Model

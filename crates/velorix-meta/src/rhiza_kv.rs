@@ -18,13 +18,17 @@ pub enum RhizaKvError {
 #[derive(Clone)]
 pub struct RhizaKvStore {
     db: Arc<rhizadb::Db>,
+    /// The address the native recovery listener actually bound, when
+    /// [`RhizaKvStore::open_operator_managed`] started one. `None` means this
+    /// store serves no operator endpoints.
+    recovery_address: Option<String>,
 }
 
 impl RhizaKvStore {
     pub async fn open_config(config: rhizadb::Config) -> Result<Self, RhizaKvError> {
         tokio::task::spawn_blocking(move || {
             rhizadb::Db::open(config)
-                .map(|db| Self { db: Arc::new(db) })
+                .map(Self::shared)
                 .map_err(|e| RhizaKvError::Operation {
                     code: e.code,
                     message: e.message,
@@ -42,8 +46,70 @@ impl RhizaKvStore {
     ) -> Result<Self, RhizaKvError> {
         Self::open_config(rhizadb::Config::new(data_dir.into()).node_id(node_id.into())).await
     }
+
+    /// Open the database from the canonical `RHIZA_*` process environment and
+    /// start the private recovery listener before the handle is shared.
+    ///
+    /// The Rhiza Operator replaces `RHIZA_CLUSTER_ID`, `RHIZA_CLUSTER_MEMBERS`,
+    /// `RHIZA_PEER_TOKENS`, `RHIZA_ADMIN_TOKEN`, and
+    /// `RHIZA_OBJSTORE_DURABILITY` between generations, so native reads that
+    /// environment itself on every process start. This method never constructs a
+    /// `rhizadb::Config`, never names a Velorix-owned `RHIZA_*` shadow, and
+    /// never mutates the environment at runtime.
+    ///
+    /// `start_operator` takes `&mut Db`, which is why open and operator startup
+    /// share one blocking task: the listener must be running before the handle
+    /// is wrapped in `Arc`, and it is closed by the same `Db` that owns the
+    /// metadata operations.
+    pub async fn open_operator_managed(
+        recovery_bind: impl Into<String> + Send + 'static,
+    ) -> Result<Self, RhizaKvError> {
+        let recovery_bind = recovery_bind.into();
+        tokio::task::spawn_blocking(move || {
+            let mut db = rhizadb::Db::open_from_env().map_err(operation)?;
+            let address = db.start_operator(&recovery_bind).map_err(operation)?;
+            eprintln!("rhiza operator recovery listener bound at {address}");
+            Ok(Self {
+                db: Arc::new(db),
+                recovery_address: Some(address),
+            })
+        })
+        .await
+        .map_err(|e| RhizaKvError::Operation {
+            code: "join_error".into(),
+            message: format!("Rhiza operator open task failed: {e}"),
+        })?
+    }
+
     pub fn from_db(db: rhizadb::Db) -> Self {
-        Self { db: Arc::new(db) }
+        Self::shared(db)
+    }
+
+    fn shared(db: rhizadb::Db) -> Self {
+        Self {
+            db: Arc::new(db),
+            recovery_address: None,
+        }
+    }
+
+    /// The bound address of the native recovery listener, if this store started
+    /// one. Native returns the real address, so a `:0` request reports the port
+    /// actually in use.
+    pub fn recovery_address(&self) -> Option<&str> {
+        self.recovery_address.as_deref()
+    }
+
+    /// Native local readiness. This is not quorum: the Operator distinguishes
+    /// them, and a learner cloning this binary must be able to answer
+    /// `/recovery/status` and local readiness before it has a quorum.
+    pub async fn ready(&self) -> Result<bool, RhizaKvError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || db.ready().map_err(operation))
+            .await
+            .map_err(|e| RhizaKvError::Operation {
+                code: "join_error".into(),
+                message: format!("Rhiza ready task failed: {e}"),
+            })?
     }
 
     pub async fn get(
@@ -191,6 +257,13 @@ impl RhizaKvStore {
             code: "join_error".into(),
             message: e.to_string(),
         })?
+    }
+}
+
+fn operation(e: rhizadb::Error) -> RhizaKvError {
+    RhizaKvError::Operation {
+        code: e.code,
+        message: e.message,
     }
 }
 

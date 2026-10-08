@@ -77,13 +77,11 @@ EXECUTION_TO_GATE = {
     "external_s3": "object_store_external_authority",
     "ingress": "public_ingress_tls_auth",
     "durability": "object_store_durability_policy",
-    "hiqlite_backend_time": "hiqlite_backend_time_release",
 }
 STEP_TITLES = {
     "external_s3": "Provide and validate nonlocal S3/OSS authority",
     "ingress": "Provide and attest public ingress/TLS/auth",
     "durability": "Review and attest object-store durability policy",
-    "hiqlite_backend_time": "Provide trusted Hiqlite release provenance",
     "local_evidence": "Refresh local product evidence",
     "final_report": "Regenerate product completion report",
 }
@@ -310,15 +308,6 @@ def doctor_guidance_lines(next_step: dict, summary: dict):
             "guidance[durability].scope=The helper records and attaches an operator review; it does not create buckets, lifecycle rules, replication, encryption policy, object lock, or PVCs.",
             "guidance[durability].cost=Cost-controls review must cover retention, lifecycle/delete policy, replication or backup scope, and expected object churn for the chosen prefix.",
             "guidance[durability].sequence=After external_s3 passes, run validate-only and then execute scripts/complete-vind-object-store-durability.sh against the same product evidence directory.",
-        ]
-    if step_id == "hiqlite_backend_time":
-        return [
-            "guidance[hiqlite_backend_time].scope=Product-complete Hiqlite backend-time evidence is release-CI scoped; the local diagnostic attestation is intentionally not enough.",
-            "guidance[hiqlite_backend_time].env_template=Use hiqlite-backend-time-release.env as the release input template and replace every REPLACE_WITH_* value before validation.",
-            "guidance[hiqlite_backend_time].release_identity=VELORIX_SOURCE_REVISION and VELORIX_RELEASE_COMMIT must be the same 40-character Velorix release commit; do not use metadata_store.hiqlite_authority_attestation.source_revision.",
-            "guidance[hiqlite_backend_time].sigstore=Provide VELORIX_CI_SIGSTORE_BUNDLE_BASE64 and matching VELORIX_CI_SIGSTORE_BUNDLE_SHA256 from trusted release CI; the bundle is treated as secret and xtrace is refused by the preflight.",
-            "guidance[hiqlite_backend_time].failover=Release-scoped standing-runtime failover evidence must prove trusted_for_product_complete=true, authority time observed, and post-failover owner epoch increase.",
-            "guidance[hiqlite_backend_time].sequence=Run scripts/check-hiqlite-backend-time-release-inputs.sh with the release env file, then regenerate scripts/attest-hiqlite-backend-time.sh with trusted provenance in release CI.",
         ]
     return []
 

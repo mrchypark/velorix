@@ -191,8 +191,8 @@ Location:
 * Lines: 873–893
 * File: `docs/architecture/ingest-admission-contract.md`
 * Lines: 1298–1328
-* File: `docs/architecture/hiqlite-meta-service.md`
-* Lines: 1031–1107
+* File: `docs/architecture/meta-service.md`
+* Section: `Meta Service` (product truth that must not be relabeled to clear a release gate)
 
 Issue:
 
@@ -347,8 +347,8 @@ Verification:
 
 Location:
 
-* File: `docs/architecture/hiqlite-meta-service.md`
-* Lines: 900–967, 1031–1107, 1136–1182
+* File: `docs/architecture/meta-service.md`
+* Sections: `Meta Service`, `Rhiza KV service mode`, `Deployment Shape`, `Required Product Semantics`
 * File: `crates/velorix-meta/Cargo.toml`
 * Lines: 2371–2394
 
@@ -361,7 +361,11 @@ Issue:
 
 Current status:
 
-* Partially mitigated, still open: release evidence now distinguishes managed Hiqlite authority, backend-time support and local failover smoke from product-complete evidence. The remaining blocker is a trusted no-PVC Hiqlite authority disaster-recovery test proving acknowledged metadata writes survive total voter loss through the permitted durable stores.
+* Superseded path: the product metadata authority is now the embedded Rhiza KV
+  backend, and it reports `production_multi_writer_safe=false` with
+  `bounded_wall_clock_failover=false`. The no-PVC blocker below still stands, and
+  the demonstrated evidence is a manual `RhizaRecovery` generation replacement,
+  not automatic operator fencing or production-safe fencing.
 
 Why It Matters:
 
