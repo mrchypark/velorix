@@ -328,34 +328,52 @@ They are outside this harness's contract and are not covered by it.
 
 ## Isolated kind evidence, 0.19.0 operator path
 
-The 0.19.0 harness passed end to end on 2026-10-07 against an explicitly
-selected disposable kind context, on a single `arm64` control-plane node, with
-the official operator performing the recovery. Evidence is under
-`target/rhiza-kv-k8s-e2e019a/`, with `final-snapshot/` holding the operator
-journal, both Pod inventories, the applied manifests, the probe logs, and the
-final cluster state.
+The 0.19.0 harness passed end to end again on 2026-10-08, on the current
+branch source, against an explicitly selected disposable kind context, on a
+single `arm64` control-plane node, with the official operator performing the
+recovery. Evidence is under `/tmp/velorix-prepush-k8s-evidence/`, with
+`gate/` holding everything the harness wrote and `final-snapshot/` holding the
+operator journal, both Pod inventories, the applied manifests, the probe logs,
+and the final cluster state, all copied out before the disposable cluster was
+deleted. The earlier 2026-10-07 copy under `target/rhiza-kv-k8s-e2e019a/` was
+removed with the ignored `target/` tree and is not cited below.
 
 | fact | value |
 | --- | --- |
+| Meta image | `docker.io/library/velorix-meta@sha256:ec7ff64afd55c6d929fd15ceddcf5e1a938d3b1f954ea566387628f3faa70886`, built fresh for `linux/arm64`, confirmed as the running `imageID` of all three recovered Pods |
 | recovery performed by | the official operator, `phase`/`stage` `Complete` |
 | archive capture | `certified suffix captured from 3/3 reachable pod endpoints` |
 | `recoveredTip` | `2`, positive |
-| source cluster | `rhiza-kv-e2e019a` |
-| target cluster | `rhiza-r-40e755acdf6adcbb1059b22b`, a different identity |
+| source cluster | `rhiza-kv-e2e019prepush` |
+| target cluster | `rhiza-r-04115df1c7ee148c61295531`, a different identity |
 | source StatefulSet UID | preserved across the whole generation replacement |
 | recovered Pods | three new Pod UIDs, all owned by that UID, all created after the recovery request |
 | PVCs in the namespace | zero |
 | pre-loss probe | `catalog_store_outcome=Created` |
 | post-recovery probe | `smoke verified ... mutations=0` for the same `catalog_probe_id` |
 | per-Pod post-recovery probe | `mutations=0` against each of the three recovered voters |
-| post-recovery write | supplemental probe created a distinct catalog (`Created`), then verified it read-only (`mutations=0`) |
+| post-recovery write | supplemental probe with its own id returned `catalog_store_outcome=Created`, proving the recovered generation is a live voter set |
 
-The operator ran as a locally built `arm64` binary of upstream tag `v0.19.0`
-commit `abb87a0336cba8fee3fd1d9e5a0bf797de5b25b8`, resolved by its real digest,
-because upstream publishes `linux/amd64` only. The evidence records that run as
+The operator ran as a locally built `arm64` binary
+`docker.io/library/rhiza-operator@sha256:46e6694606eaed7d19dcb83538ff2e48dc11947b24260051c4472aaae50e45ff`,
+compiled from a fresh clone of upstream tag `v0.19.0` commit
+`abb87a0336cba8fee3fd1d9e5a0bf797de5b25b8` with the unmodified upstream
+`Dockerfile.operator`, because upstream publishes `linux/amd64` only. The
+vendored manifests were independently confirmed byte for byte against that
+same clone before the run. The evidence records the run as
 `operator_image_official_published_release: false` with the build provenance
 attached; it is not evidence that the published `linux/amd64` artifact was
 executed, and nothing about the production pin was relaxed to obtain it.
+
+`Dockerfile.meta` cannot be built for `linux/arm64` unmodified: its builder
+stage installs the Go 1.27.0 `linux-amd64` tarball and asserts that GOARCH.
+The failing unmodified build is retained in the evidence directory, and the
+`linux/arm64` Meta image above was produced from a build-time copy of
+`Dockerfile.meta` held outside the repository whose only difference is those
+three Go-toolchain lines; every other line, including both base-image index
+digests and the `cargo build ... --features "rhiza-backend" --locked`
+invocation, is unchanged, and the diff is retained alongside the run. The
+committed Dockerfile and the CI `linux/amd64` path are untouched.
 
 What this run does not establish is unchanged: it is a single-namespace fixture
 whose only writer is the operator, so the fence attestation is harness ownership
