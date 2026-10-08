@@ -43,6 +43,7 @@ jobs:
           bash -n scripts/check-rustfs-s3-gate-contract.sh
           bash -n scripts/check-no-external-runtime-artifacts.sh
           sh -n scripts/check-rust-toolchain-contract.sh
+          sh -n scripts/check-rhiza-operator-manifests-contract.sh
           python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
 
       - name: Check first-E2E readiness contract
@@ -54,6 +55,7 @@ jobs:
           scripts/check-rustfs-s3-gate-contract.sh
           scripts/check-no-external-runtime-artifacts.sh
           sh scripts/check-rust-toolchain-contract.sh
+          scripts/check-rhiza-operator-manifests-contract.sh
 
   msrv:
     name: MSRV check
@@ -136,9 +138,9 @@ jobs:
           timeout 120s sudo apt-get install -y --no-install-recommends libxml2-utils
 
       - name: Test Rhiza backend
-        run: cargo test -p velorix-meta --features 'hiqlite-backend rhiza-backend' --tests
+        run: cargo test -p velorix-meta --features 'rhiza-backend' --tests
 
-      - name: Verify three-node KV cold recovery without local state
+      - name: Verify three-node KV WAL continuity and retained-state recovery
         run: sh scripts/check-rhiza-recovery.sh
 
       - name: Retain Rhiza recovery evidence
@@ -152,7 +154,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Lint Rhiza backend
-        run: cargo clippy -p velorix-meta --features 'hiqlite-backend rhiza-backend' --all-targets -- -D warnings
+        run: cargo clippy -p velorix-meta --features 'rhiza-backend' --all-targets -- -D warnings
 
   deny:
     name: cargo deny

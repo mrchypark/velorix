@@ -148,7 +148,7 @@ For each committed ingest epoch:
 7. Write operator state checkpoint objects when checkpointing.
 8. Write output delta/page manifests.
 9. Verify content hashes.
-10. Atomically advance metadata pointers in hiqlite.
+10. Atomically advance metadata pointers in the metadata service.
 
 The query path must read the materialized output table/page index. It must not
 reconstruct query results by scanning source relation batches or by rebuilding
@@ -162,7 +162,7 @@ not sufficient completion evidence for concurrent view creation and ingest.
 
 ## Durable State Model
 
-Hiqlite should store small metadata:
+The metadata service stores small metadata:
 
 - relation definitions
 - view specs
@@ -675,7 +675,7 @@ state.
 
 These fields are diagnostic evidence, not correctness authority. Durable
 correctness still comes from the ingest log, signed output deltas, checkpoint
-state records, and Hiqlite checkpoint pointer authority.
+state records, and metadata-service checkpoint pointer authority.
 
 ## Incremental View Dependencies
 

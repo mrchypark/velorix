@@ -37,7 +37,7 @@ use crate::{
 
 const MAX_CAS_ATTEMPTS: usize = 8;
 
-/// A metadata store using only Rhiza 0.12's linearizable KV operations.
+/// A metadata store using only Rhiza 0.19.0's linearizable KV operations.
 #[derive(Clone)]
 pub struct RhizaKvMetaStore {
     snapshot: RhizaKvSnapshot,
@@ -175,6 +175,32 @@ fn snapshot_error(error: SnapshotError) -> MetaStoreError {
     match error {
         SnapshotError::Kv(error) => rhiza_error(error),
         other => MetaStoreError::Serialization(other.to_string()),
+    }
+}
+
+impl RhizaKvMetaStore {
+    /// Open the store from the canonical `RHIZA_*` process environment with the
+    /// private recovery listener already bound. Metadata operations and the
+    /// Operator's recovery endpoints then share one native handle, so the
+    /// listener is closed by the same `close` that shuts the store down.
+    pub async fn open_operator_managed(
+        recovery_bind: impl Into<String> + Send + 'static,
+    ) -> Result<Self, MetaStoreError> {
+        Ok(Self::new(
+            RhizaKvStore::open_operator_managed(recovery_bind)
+                .await
+                .map_err(rhiza_error)?,
+        ))
+    }
+
+    /// The bound recovery address, if this store started the listener.
+    pub fn recovery_address(&self) -> Option<&str> {
+        self.snapshot.recovery_address()
+    }
+
+    /// Native local readiness, which a learner reports before it has a quorum.
+    pub async fn ready(&self) -> Result<bool, MetaStoreError> {
+        self.snapshot.ready().await.map_err(snapshot_error)
     }
 }
 

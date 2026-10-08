@@ -140,12 +140,6 @@ late, so this path must not claim bounded wall-clock failover. This is a
 different limitation from the atomic root-CAS safety guarantee and is not an
 upstream API blocker.
 
-The analogous Hiqlite primitive samples wall-clock time at command admission
-and persists that value in the replicated command. It is likewise not a
-monotonic or skew-safe clock; its safety comes from serialized command ordering
-and persisted epoch/token predicates, while TTL liveness remains clock
-dependent.
-
 ## Recovery and migration scope
 
 No-PVC object-store recovery behavior for this SDK was not established by the

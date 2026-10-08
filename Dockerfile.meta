@@ -25,11 +25,10 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY --from=velorix-hiqlite-source . /hiqlite
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    RUSTFLAGS="-C strip=symbols" GOTOOLCHAIN=local cargo build --release -p velorix-meta --features "hiqlite-backend rhiza-backend" --locked \
+    RUSTFLAGS="-C strip=symbols" GOTOOLCHAIN=local cargo build --release -p velorix-meta --features "rhiza-backend" --locked \
     && cp /workspace/target/release/velorix-meta /workspace/velorix-meta
 
 FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS runtime

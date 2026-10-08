@@ -63,10 +63,6 @@ query_policy_files = {
 
 for filename in {
     "no-pvc-namespace.json",
-    "hiqlite-authority-attestation.json",
-    "hiqlite-backend-time-attestation.json",
-    "no-pvc-hiqlite-statefulset.json",
-    "velorix-hiqlite.yaml",
     "ingress-tls-auth-attestation.json",
     "openapi.json",
     "tls-auth-smoke.json",
@@ -111,20 +107,7 @@ product = {
         },
     },
     "no_pvc": {"evidence": "no-pvc-namespace.json"},
-    "metadata_store": {
-        "hiqlite_authority_attestation": {
-            "evidence": "hiqlite-authority-attestation.json",
-            "authority_kind": "velorix_managed_hiqlite",
-            "no_pvc_evidence_files": {
-                "namespace_pvc_list": "no-pvc-namespace.json",
-                "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",
-                "manifest": "velorix-hiqlite.yaml",
-            },
-        },
-        "hiqlite_backend_time_attestation": {
-            "evidence": "hiqlite-backend-time-attestation.json",
-        },
-    },
+    "metadata_store": {},
     "object_store": {
         "external_s3_validation_evidence": {
             "job": "external-s3-validate-job.json",
@@ -263,10 +246,6 @@ required = [
     out / "product" / "velorix-meta.yaml",
     out / "product" / "velorix-meta-deployment-observed.json",
     out / "product" / "velorix-meta-pods.json",
-    out / "product" / "hiqlite-authority-attestation.json",
-    out / "product" / "hiqlite-backend-time-attestation.json",
-    out / "product" / "no-pvc-hiqlite-statefulset.json",
-    out / "product" / "velorix-hiqlite.yaml",
     out / "product" / "ingress-tls-auth-attestation.json",
     out / "product" / "openapi.json",
     out / "product" / "tls-auth-smoke.json",
@@ -318,46 +297,6 @@ run_helper_expect_fail(
         "standing-runtime-product-evidence.json",
     ],
     "no-pvc-namespace.json",
-)
-
-missing_hiqlite_src = scratch_dir / "missing-hiqlite-src"
-missing_hiqlite_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (missing_hiqlite_src / path.name).write_bytes(path.read_bytes())
-(missing_hiqlite_src / "hiqlite-authority-attestation.json").unlink()
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(missing_hiqlite_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "missing-hiqlite-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "hiqlite-authority-attestation.json",
-)
-
-missing_hiqlite_backend_time_src = scratch_dir / "missing-hiqlite-backend-time-src"
-missing_hiqlite_backend_time_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (missing_hiqlite_backend_time_src / path.name).write_bytes(path.read_bytes())
-(missing_hiqlite_backend_time_src / "hiqlite-backend-time-attestation.json").unlink()
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(missing_hiqlite_backend_time_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "missing-hiqlite-backend-time-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "hiqlite-backend-time-attestation.json",
 )
 
 missing_ingress_src = scratch_dir / "missing-ingress-src"
@@ -528,84 +467,6 @@ run_helper_expect_fail(
     "product local_tls_auth_smoke.evidence must be tls-auth-smoke.json",
 )
 
-invalid_hiqlite_src = scratch_dir / "invalid-hiqlite-src"
-invalid_hiqlite_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (invalid_hiqlite_src / path.name).write_bytes(path.read_bytes())
-invalid_product = json.loads((invalid_hiqlite_src / "product.json").read_text(encoding="utf-8"))
-invalid_product["metadata_store"]["hiqlite_authority_attestation"]["evidence"] = "../hiqlite.json"
-(invalid_hiqlite_src / "product.json").write_text(json.dumps(invalid_product), encoding="utf-8")
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(invalid_hiqlite_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "invalid-hiqlite-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "product hiqlite_authority_attestation.evidence must be hiqlite-authority-attestation.json",
-)
-
-invalid_hiqlite_no_pvc_src = scratch_dir / "invalid-hiqlite-no-pvc-src"
-invalid_hiqlite_no_pvc_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (invalid_hiqlite_no_pvc_src / path.name).write_bytes(path.read_bytes())
-invalid_product = json.loads(
-    (invalid_hiqlite_no_pvc_src / "product.json").read_text(encoding="utf-8")
-)
-invalid_product["metadata_store"]["hiqlite_authority_attestation"][
-    "no_pvc_evidence_files"
-]["namespace_pvc_list"] = "../pvc.json"
-(invalid_hiqlite_no_pvc_src / "product.json").write_text(
-    json.dumps(invalid_product), encoding="utf-8"
-)
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(invalid_hiqlite_no_pvc_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "invalid-hiqlite-no-pvc-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "product hiqlite_authority_attestation.no_pvc_evidence_files.namespace_pvc_list must be no-pvc-namespace.json",
-)
-
-invalid_hiqlite_backend_time_src = scratch_dir / "invalid-hiqlite-backend-time-src"
-invalid_hiqlite_backend_time_src.mkdir()
-for path in src.iterdir():
-    if path.is_file():
-        (invalid_hiqlite_backend_time_src / path.name).write_bytes(path.read_bytes())
-invalid_product = json.loads(
-    (invalid_hiqlite_backend_time_src / "product.json").read_text(encoding="utf-8")
-)
-invalid_product["metadata_store"]["hiqlite_backend_time_attestation"][
-    "evidence"
-] = "../backend-time.json"
-(invalid_hiqlite_backend_time_src / "product.json").write_text(
-    json.dumps(invalid_product), encoding="utf-8"
-)
-run_helper_expect_fail(
-    [
-        "--kind",
-        "product",
-        "--artifact",
-        str(invalid_hiqlite_backend_time_src / "product.json"),
-        "--out-dir",
-        str(scratch_dir / "invalid-hiqlite-backend-time-out"),
-        "--artifact-name",
-        "standing-runtime-product-evidence.json",
-    ],
-    "product hiqlite_backend_time_attestation.evidence must be hiqlite-backend-time-attestation.json",
-)
-
 invalid_ingress_src = scratch_dir / "invalid-ingress-src"
 invalid_ingress_src.mkdir()
 for path in src.iterdir():
@@ -662,35 +523,22 @@ workflow_checks = {
         and "release gate requires inputs.rustfs-production-gc-validation-evidence-path"
         in workflow
     ),
-    "workflow requires image subject digests for trusted backend-time provenance": (
+    "workflow requires image subject digests for trusted release provenance": (
         "velorix-api-image-digest" in workflow
         and "velorix-meta-image-digest" in workflow
-        and "hiqlite-image-digest" in workflow
         and "release gate requires inputs.velorix-api-image-digest" in workflow
         and "release gate requires inputs.velorix-meta-image-digest" in workflow
-        and "release gate requires inputs.hiqlite-image-digest" in workflow
     ),
     "workflow trusted provenance requires protected release ref": (
         'refs/heads/main | refs/tags/v*)' in workflow
         and "release gate trusted provenance requires refs/heads/main or refs/tags/v*" in workflow
     ),
-    "workflow can mint Sigstore bundle with GitHub OIDC": (
-        "id-token: write" in workflow
-        and "sigstore/cosign-installer" in workflow
-        and "cosign sign-blob" in workflow
-        and "--bundle \"$HIQLITE_BACKEND_TIME_SIGSTORE_BUNDLE_PATH\"" in workflow
-        and "VELORIX_CI_SIGSTORE_BUNDLE_BASE64" in workflow
-        and "VELORIX_CI_SIGSTORE_BUNDLE_SHA256" in workflow
-    ),
-    "workflow regenerates trusted backend-time attestation before release readiness": (
-        "HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_PATH" in workflow
-        and "VELORIX_HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_FILE" in workflow
-        and "HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_SHA256" in workflow
-        and "VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE=1" in workflow
-        and "VELORIX_CI_SIGSTORE_CERTIFICATE_IDENTITY" in workflow
-        and "--update-product-evidence" in workflow
-        and 'test "$HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_SHA256" = "$(sha256sum "$HIQLITE_BACKEND_TIME_CANONICAL_BUNDLE_PATH" | awk \'{print $1}\')"' in workflow
-        and "--standing-runtime-product-evidence \"$STANDING_RUNTIME_PRODUCT_RELEASE_PATH\""
+    "release gate has no removed Hiqlite attestation or Sigstore path": (
+        "HIQLITE" not in workflow
+        and "hiqlite" not in workflow
+        and "cosign" not in workflow
+        and "sigstore" not in workflow
+        and '--standing-runtime-product-evidence "$STANDING_RUNTIME_PRODUCT_RELEASE_PATH"'
         in workflow
     ),
     "workflow copies RustFS production GC family": (

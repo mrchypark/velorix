@@ -12,21 +12,14 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bytes::Bytes;
 use clap::{CommandFactory, Parser, Subcommand};
 use object_store::{
     aws::AmazonS3Builder, local::LocalFileSystem, path::Path as ObjectStorePath,
     prefix::PrefixStore, ObjectStore,
 };
-use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sigstore_trust_root::{TrustedRoot, SIGSTORE_PRODUCTION_TRUSTED_ROOT};
-use sigstore_types::{Bundle as SigstoreBundle, Sha256Hash as SigstoreSha256Hash};
-use sigstore_verify::{
-    verify as verify_sigstore_bundle, VerificationPolicy as SigstoreVerificationPolicy,
-};
 use velorix_control::readiness::{ProductionReadinessEvidenceV1, ProductionReadinessReportV1};
 use velorix_control::storage_admin::{
     probe_authoritative_object_store_capabilities, AppendValidatedEnvelopeOutcome,
@@ -91,29 +84,6 @@ const INGEST_WRITER_LIFECYCLE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const INGEST_WRITER_LIFECYCLE_FUTURE_SKEW_SECS: u64 = 15 * 60;
 const INGRESS_TLS_AUTH_ATTESTATION_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 const INGRESS_TLS_AUTH_ATTESTATION_FUTURE_SKEW_SECS: u64 = 15 * 60;
-const HIQLITE_BACKEND_TIME_ATTESTATION_MAX_AGE_SECS: u64 = 24 * 60 * 60;
-const HIQLITE_BACKEND_TIME_ATTESTATION_FUTURE_SKEW_SECS: u64 = 15 * 60;
-const HIQLITE_BACKEND_TIME_ALLOWED_ATTESTERS: &[&str] = &[
-    "scripts/run-vind-product.sh",
-    "velorix-release-operator",
-    "velorix-ci",
-];
-const HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE_KIND: &str = "velorix_ci_evidence_bundle_provenance";
-const HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE_ATTESTERS: &[&str] =
-    &["velorix-release-operator", "velorix-ci"];
-const HIQLITE_BACKEND_TIME_REQUIRED_SUBJECT_IMAGE_ROLES: &[&str] =
-    &["velorix-api", "velorix-meta", "hiqlite-authority"];
-const HIQLITE_BACKEND_TIME_TRUSTED_SOURCE_REPOSITORY: &str = "github.com/mrchypark/velorix";
-const HIQLITE_BACKEND_TIME_TRUSTED_GITHUB_REPOSITORY: &str = "mrchypark/velorix";
-const HIQLITE_BACKEND_TIME_TRUSTED_OIDC_ISSUER: &str =
-    "https://token.actions.githubusercontent.com";
-const HIQLITE_BACKEND_TIME_TRUSTED_OIDC_AUDIENCE: &str = "sigstore";
-const HIQLITE_BACKEND_TIME_TRUSTED_WORKFLOW_REF_PREFIX: &str =
-    "mrchypark/velorix/.github/workflows/release-gate.yml@";
-const HIQLITE_BACKEND_TIME_TRUSTED_SIGSTORE_CERTIFICATE_IDENTITY_PREFIX: &str =
-    "https://github.com/mrchypark/velorix/.github/workflows/release-gate.yml@";
-const HIQLITE_BACKEND_TIME_TRUSTED_RELEASE_BRANCH_REF: &str = "refs/heads/main";
-const HIQLITE_BACKEND_TIME_TRUSTED_RELEASE_TAG_REF_PREFIX: &str = "refs/tags/v";
 const REQUIRED_INGEST_WRITER_LIFECYCLE_EVIDENCE_FILES: &[(&str, &str)] = &[
     ("pod_internal_job", "velorix-ingest-writer-smoke-log.json"),
     ("overlap_job", "velorix-ingest-lifecycle-overlap-log.json"),
@@ -129,12 +99,6 @@ const REQUIRED_INGEST_WRITER_LIFECYCLE_EVIDENCE_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HiqliteBackendTimeTrustStatus {
-    Diagnostic,
-    TrustedWithoutSigstoreBundle,
-    SigstoreVerified,
-}
 const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
     "ingest",
     "relation catalog",
@@ -307,8 +271,6 @@ enum Command {
         standing_runtime_product_evidence: Option<PathBuf>,
         #[arg(long)]
         s3_checkpoint_fault_matrix_evidence: Option<PathBuf>,
-        #[arg(long)]
-        hiqlite_restore_drill_evidence: Option<PathBuf>,
         #[arg(long)]
         upgrade_rollback_repair_gc_fault_matrix_evidence: Option<PathBuf>,
         #[arg(long)]
@@ -588,7 +550,6 @@ async fn main() -> anyhow::Result<()> {
             ingest_writer_lifecycle_evidence,
             standing_runtime_product_evidence,
             s3_checkpoint_fault_matrix_evidence,
-            hiqlite_restore_drill_evidence,
             upgrade_rollback_repair_gc_fault_matrix_evidence,
             query_output_isolation_evidence,
             security_release_provenance_evidence,
@@ -607,7 +568,6 @@ async fn main() -> anyhow::Result<()> {
                 ingest_writer_lifecycle_evidence,
                 standing_runtime_product_evidence,
                 s3_checkpoint_fault_matrix_evidence,
-                hiqlite_restore_drill_evidence,
                 upgrade_rollback_repair_gc_fault_matrix_evidence,
                 query_output_isolation_evidence,
                 security_release_provenance_evidence,
@@ -689,7 +649,6 @@ struct ReadinessReleaseArtifactPaths {
     ingest_writer_lifecycle_evidence: Option<PathBuf>,
     standing_runtime_product_evidence: Option<PathBuf>,
     s3_checkpoint_fault_matrix_evidence: Option<PathBuf>,
-    hiqlite_restore_drill_evidence: Option<PathBuf>,
     upgrade_rollback_repair_gc_fault_matrix_evidence: Option<PathBuf>,
     query_output_isolation_evidence: Option<PathBuf>,
     security_release_provenance_evidence: Option<PathBuf>,
@@ -755,10 +714,6 @@ fn validate_readiness_release_artifacts(
         require_artifact_path(
             "s3-checkpoint-fault-matrix-evidence",
             &artifacts.s3_checkpoint_fault_matrix_evidence,
-        )?;
-        require_artifact_path(
-            "hiqlite-restore-drill-evidence",
-            &artifacts.hiqlite_restore_drill_evidence,
         )?;
         require_artifact_path(
             "upgrade-rollback-repair-gc-fault-matrix-evidence",
@@ -830,7 +785,6 @@ fn validate_readiness_release_artifacts(
             deployment_id,
             authority_store_id,
             mode,
-            artifacts.release_commit.as_deref(),
         )?;
     }
     if release_artifacts_required {
@@ -877,39 +831,6 @@ fn validate_readiness_release_artifacts(
                 "delayed_visibility",
                 "retry_after_failure",
             ],
-        )?;
-    }
-    if let Some(path) = &artifacts.hiqlite_restore_drill_evidence {
-        validate_critique_release_evidence_artifact(
-            path,
-            &[
-                "hiqlite_total_voter_loss_restore_drill",
-                "hiqlite_no_pvc_three_voter_backup_restore",
-            ],
-            deployment_id,
-            authority_store_id,
-            artifacts.release_commit.as_deref(),
-            release_artifacts_required,
-            &[
-                "no_pvc",
-                "total_voter_loss_exercised",
-                "restored_from_object_store_backup",
-                "acknowledged_metadata_writes_survived",
-                "catalog_verified",
-                "owner_epoch_verified",
-                "checkpoint_pointer_verified",
-                "post_restore_ingest_query_verified",
-                "restore_drill_verified",
-            ],
-            &[],
-            &[
-                "object_store_backup",
-                "total_voter_loss_log",
-                "restore_log",
-                "metadata_write_survival",
-                "post_restore_ingest_query",
-            ],
-            &[],
         )?;
     }
     if let Some(path) = &artifacts.upgrade_rollback_repair_gc_fault_matrix_evidence {
@@ -1258,14 +1179,6 @@ fn validate_critique_release_evidence_kind_specific_fields(
                 );
             }
         }
-        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore"
-            if require_json_u64(path, artifact, "/voter_count")? != 3 =>
-        {
-            bail!(
-                "{} Hiqlite restore drill requires voter_count=3",
-                path.display()
-            );
-        }
         "query_output_isolation"
             if require_json_str(path, artifact, "/query_authority")?
                 != "published_materialized_output" =>
@@ -1316,13 +1229,6 @@ fn reject_critique_release_forbidden_tokens(
             "localhost",
             "127.0.0.1",
         ][..],
-        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore" => {
-            &[
-                "persistentvolumeclaim",
-                "volumeclaimtemplates",
-                "volumeclaim",
-            ]
-        }
         "security_release_provenance" => &[
             "127.0.0.1",
             "::1",
@@ -1352,27 +1258,7 @@ fn reject_critique_release_forbidden_tokens(
         }
     }
 
-    if matches!(
-        evidence_kind,
-        "hiqlite_total_voter_loss_restore_drill" | "hiqlite_no_pvc_three_voter_backup_restore"
-    ) && contains_json_word_token(text, "pvc")
-    {
-        bail!(
-            "{} critique release evidence must not contain pvc",
-            path.display()
-        );
-    }
-
     Ok(())
-}
-
-fn contains_json_word_token(text: &str, token: &str) -> bool {
-    text.match_indices(token).any(|(index, _)| {
-        let before = text[..index].chars().next_back();
-        let after = text[index + token.len()..].chars().next();
-        !matches!(before, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
-            && !matches!(after, Some(ch) if ch.is_ascii_alphanumeric() || ch == '_')
-    })
 }
 
 fn validate_release_evidence_ref(path: &Path, reference: &str, label: &str) -> anyhow::Result<()> {
@@ -1700,32 +1586,6 @@ mod tests {
         })
     }
 
-    fn valid_hiqlite_restore_drill() -> serde_json::Value {
-        json!({
-            "evidence_kind": "hiqlite_total_voter_loss_restore_drill",
-            "status": "pass",
-            "deployment_id": "release-prod",
-            "authority_store_id": "s3://velorix-release/checkpoints",
-            "no_pvc": true,
-            "voter_count": 3,
-            "total_voter_loss_exercised": true,
-            "restored_from_object_store_backup": true,
-            "acknowledged_metadata_writes_survived": true,
-            "catalog_verified": true,
-            "owner_epoch_verified": true,
-            "checkpoint_pointer_verified": true,
-            "post_restore_ingest_query_verified": true,
-            "restore_drill_verified": true,
-            "evidence_refs": {
-                "object_store_backup": evidence_uri("object-store-backup.json"),
-                "total_voter_loss_log": evidence_uri("total-voter-loss.log"),
-                "restore_log": evidence_uri("restore.log"),
-                "metadata_write_survival": evidence_uri("metadata-write-survival.json"),
-                "post_restore_ingest_query": evidence_uri("post-restore-ingest-query.json")
-            }
-        })
-    }
-
     fn valid_upgrade_rollback_repair_gc_matrix() -> serde_json::Value {
         json!({
             "evidence_kind": "upgrade_rollback_repair_gc_fault_matrix",
@@ -2023,48 +1883,6 @@ mod tests {
             .expect_err("uppercase release digest should fail")
             .to_string()
             .contains("lowercase hex"));
-    }
-
-    #[test]
-    fn hiqlite_restore_drill_requires_three_voters() {
-        let mut artifact = valid_hiqlite_restore_drill();
-        artifact["voter_count"] = json!(1);
-        let path = write_artifact("hiqlite-restore-drill", artifact);
-
-        let result = validate_critique_release_evidence_artifact(
-            &path,
-            &[
-                "hiqlite_total_voter_loss_restore_drill",
-                "hiqlite_no_pvc_three_voter_backup_restore",
-            ],
-            "release-prod",
-            "s3://velorix-release/checkpoints",
-            None,
-            false,
-            &[
-                "no_pvc",
-                "total_voter_loss_exercised",
-                "restored_from_object_store_backup",
-                "acknowledged_metadata_writes_survived",
-                "catalog_verified",
-                "owner_epoch_verified",
-                "checkpoint_pointer_verified",
-                "post_restore_ingest_query_verified",
-                "restore_drill_verified",
-            ],
-            &[],
-            &[
-                "object_store_backup",
-                "total_voter_loss_log",
-                "restore_log",
-                "metadata_write_survival",
-                "post_restore_ingest_query",
-            ],
-            &[],
-        );
-
-        fs::remove_file(path).ok();
-        assert!(result.is_err());
     }
 
     #[test]
@@ -2580,6 +2398,70 @@ mod tests {
                 BenchmarkBackend::Local
             ))
             .is_err());
+    }
+
+    /// A manually authored capability document that claims every release-safe
+    /// property about itself, for any backend name at all.
+    fn all_true_standing_runtime_capability(backend: &str) -> serde_json::Value {
+        json!({
+            "capability_schema_version": STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
+            "backend_name": backend,
+            "owner_scope_kind": STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
+            "linearizable_owner_lease": true,
+            "durable_monotonic_owner_epoch": true,
+            "authoritative_backend_time": true,
+            "owner_validated_checkpoint_publish": true,
+            "publish_checks_owner_and_latest_atomically": true,
+            "publish_rejects_expired_owner": true,
+            "latest_read_linearizable": true,
+            "publish_rejects_scope_mismatch": true,
+            "max_owner_ttl_ms": 30_000,
+            "control_plane_auth_enforced": true,
+            "production_multi_writer_safe": true,
+            "backend_time_source_kind": STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
+            "backend_time_blocked_reason": "",
+            "lease_authority_kind": STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
+            "lease_expiry_semantics": STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
+            "bounded_wall_clock_failover": true,
+            "failover_time_bound_ms": 5_000,
+            "multi_writer_fencing_safe": true,
+            "production_bounded_failover_safe": true
+        })
+    }
+
+    #[test]
+    fn release_metadata_authority_rejects_a_self_declared_all_true_capability() {
+        let path = Path::new("standing-runtime-product-evidence.json").to_path_buf();
+        let mut artifact = json!({"standing_runtime_fencing": {"capability": null}});
+        // Rhiza is the supported production metadata backend, and naming it does
+        // not turn a self-declared claim into evidence. An unknown backend name
+        // is not a way around the gate either.
+        for backend in ["rhiza-kv", "totally-unknown-backend"] {
+            artifact["standing_runtime_fencing"]["capability"] =
+                all_true_standing_runtime_capability(backend);
+            let capability = parse_product_standing_runtime_fencing_capability(&path, &artifact)
+                .expect("an all-true claim still has the typed capability schema");
+            let error = validate_release_standing_runtime_fencing_capability(&path, &capability)
+                .expect_err("a self-declared capability must not pass the release gate");
+            assert!(
+                format!("{error:#}").contains("self-declared"),
+                "the rejection must name the claim for backend {backend}: {error:#}"
+            );
+        }
+
+        // A document that does not even claim everything reports its own missing
+        // properties first, so the earlier validation error stays intact.
+        let mut incomplete = all_true_standing_runtime_capability("rhiza-kv");
+        incomplete["authoritative_backend_time"] = json!(false);
+        artifact["standing_runtime_fencing"]["capability"] = incomplete;
+        let capability = parse_product_standing_runtime_fencing_capability(&path, &artifact)
+            .expect("an incomplete claim still has the typed capability schema");
+        let error = validate_release_standing_runtime_fencing_capability(&path, &capability)
+            .expect_err("an incomplete capability is not release-safe");
+        assert!(
+            format!("{error:#}").contains("missing authoritative_backend_time"),
+            "the earlier missing-property error must stay intact: {error:#}"
+        );
     }
 }
 
@@ -3151,7 +3033,6 @@ fn validate_standing_runtime_product_evidence_artifact(
     deployment_id: &str,
     authority_store_id: &str,
     mode: StandingRuntimeProductEvidenceMode,
-    release_commit: Option<&str>,
 ) -> anyhow::Result<()> {
     let artifact: serde_json::Value = read_json_artifact(path)?;
 
@@ -3527,7 +3408,7 @@ fn validate_standing_runtime_product_evidence_artifact(
         )?;
         validate_product_ingress_tls_auth_attestation(path, &artifact)?;
         validate_product_deployed_image_evidence(path, &artifact)?;
-        validate_product_metadata_authority(path, &artifact, release_commit)?;
+        validate_product_metadata_authority(path, &artifact)?;
         require_json_true(path, &artifact, "/standing_runtime_fencing/required_mode")?;
         require_json_true(
             path,
@@ -3592,9 +3473,6 @@ fn validate_release_standing_runtime_fencing_capability(
     let mut missing = Vec::new();
     if capability.capability_schema_version != STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION {
         missing.push("supported_capability_schema_version");
-    }
-    if capability.backend_name != "hiqlite" {
-        missing.push("hiqlite_backend_name");
     }
     if capability.owner_scope_kind != STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW {
         missing.push("tenant_program_view_owner_scope");
@@ -3663,21 +3541,31 @@ fn validate_release_standing_runtime_fencing_capability(
         missing.push("production_bounded_failover_safe");
     }
 
-    if missing.is_empty() {
-        Ok(())
-    } else {
+    if !missing.is_empty() {
         bail!(
             "{} standing-runtime capability schema is typed but not release-safe for product_complete; missing {}",
             path.display(),
             missing.join(", ")
         );
     }
+
+    // Everything the release gate asks for is a boolean the evidence document
+    // declares about itself, so an all-true document says nothing that has
+    // been independently observed. No supported metadata backend in this
+    // repository proves authoritative backend time together with bounded
+    // production multi-writer fencing, and the capability document is not a
+    // proof of either, so this gate fails closed on the claim itself instead of
+    // admitting a forged one. It can be reopened only when a supported backend
+    // actually verifies those properties through a real check.
+    bail!(
+        "{} standing-runtime fencing capability is a self-declared claim; no supported metadata backend independently proves authoritative backend time with bounded production multi-writer fencing",
+        path.display()
+    )
 }
 
 fn validate_product_metadata_authority(
     path: &Path,
     artifact: &serde_json::Value,
-    release_commit: Option<&str>,
 ) -> anyhow::Result<()> {
     require_json_true(path, artifact, "/metadata_store/enabled")?;
     let backend = require_json_str(path, artifact, "/metadata_store/backend")?;
@@ -3693,12 +3581,6 @@ fn validate_product_metadata_authority(
             path.display()
         );
     }
-    if normalized_backend != "hiqlite" {
-        bail!(
-            "{} release product evidence supports metadata_store.backend=hiqlite with release attestation; backend {backend:?} is unsupported",
-            path.display()
-        );
-    }
     let capability_backend = require_json_str(
         path,
         artifact,
@@ -3710,1385 +3592,15 @@ fn validate_product_metadata_authority(
             path.display()
         );
     }
+    // No backend passes this gate: the release check below rejects every
+    // capability document, including an all-true one, because no supported
+    // metadata authority can prove an authoritative backend clock and bounded
+    // production multi-writer fencing to it. A backend that cannot prove them
+    // stays fail-closed here.
     let capability = parse_product_standing_runtime_fencing_capability(path, artifact)?;
     validate_release_standing_runtime_fencing_capability(path, &capability)?;
-    validate_product_hiqlite_authority_attestation(path, artifact)?;
-    validate_product_hiqlite_backend_time_claim(path, artifact, release_commit)?;
 
     Ok(())
-}
-
-fn validate_product_hiqlite_backend_time_claim(
-    path: &Path,
-    artifact: &serde_json::Value,
-    release_commit: Option<&str>,
-) -> anyhow::Result<()> {
-    let backend_time_kind = require_json_str(
-        path,
-        artifact,
-        "/standing_runtime_fencing/capability/backend_time_source_kind",
-    )?;
-    if backend_time_kind == "raft_replicated_authority_time" {
-        if artifact
-            .pointer("/metadata_store/hiqlite_backend_time_attestation")
-            .is_none()
-        {
-            bail!(
-                "{} Hiqlite authority attestation proves topology/no-PVC only; product_complete requires a separate backend-authoritative raft-time attestation",
-                path.display()
-            );
-        }
-        let trust_status =
-            validate_product_hiqlite_backend_time_attestation(path, artifact, release_commit)?;
-        match trust_status {
-            HiqliteBackendTimeTrustStatus::Diagnostic => {
-                bail!(
-                    "{} Hiqlite backend-time attestation is diagnostic; product_complete requires trusted CI provenance over the canonical backend-time evidence bundle",
-                    path.display()
-                );
-            }
-            HiqliteBackendTimeTrustStatus::TrustedWithoutSigstoreBundle => {
-                bail!(
-                    "{} Hiqlite backend-time trusted provenance Ed25519 signature is verified, but product_complete remains fail-closed until full Sigstore certificate-chain and transparency-log verification is implemented",
-                    path.display()
-                );
-            }
-            HiqliteBackendTimeTrustStatus::SigstoreVerified => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_product_hiqlite_backend_time_attestation(
-    path: &Path,
-    artifact: &serde_json::Value,
-    release_commit: Option<&str>,
-) -> anyhow::Result<HiqliteBackendTimeTrustStatus> {
-    let prefix = "/metadata_store/hiqlite_backend_time_attestation";
-    require_json_true(path, artifact, &format!("{prefix}/validated"))?;
-    if require_json_str(path, artifact, &format!("{prefix}/evidence"))?
-        != "hiqlite-backend-time-attestation.json"
-    {
-        bail!(
-            "{} product evidence must attach Hiqlite backend-time evidence",
-            path.display()
-        );
-    }
-    let sibling = read_sibling_json_artifact(
-        path,
-        "hiqlite-backend-time-attestation.json",
-        "product Hiqlite backend-time evidence",
-    )?;
-    if require_json_u64(path, artifact, &format!("{prefix}/schema_version"))? != 1 {
-        bail!(
-            "{} Hiqlite backend-time attestation has unsupported schema_version",
-            path.display()
-        );
-    }
-    if require_json_str(path, artifact, &format!("{prefix}/evidence_kind"))?
-        != "velorix_hiqlite_backend_time_attestation"
-    {
-        bail!(
-            "{} Hiqlite backend-time attestation has unsupported evidence_kind",
-            path.display()
-        );
-    }
-    if require_json_str(path, artifact, &format!("{prefix}/backend_name"))? != "hiqlite" {
-        bail!(
-            "{} Hiqlite backend-time attestation must target backend_name=hiqlite",
-            path.display()
-        );
-    }
-    if require_json_str(path, artifact, &format!("{prefix}/time_source_kind"))?
-        != "raft_replicated_authority_time"
-    {
-        bail!(
-            "{} Hiqlite backend-time attestation time_source_kind must be raft_replicated_authority_time",
-            path.display()
-        );
-    }
-    if require_json_str(path, artifact, &format!("{prefix}/lease_authority_kind"))?
-        != "raft_replicated_time"
-    {
-        bail!(
-            "{} Hiqlite backend-time attestation lease_authority_kind must be raft_replicated_time",
-            path.display()
-        );
-    }
-    if require_json_str(path, artifact, &format!("{prefix}/lease_expiry_semantics"))?
-        != "backend_wall_clock_ttl"
-    {
-        bail!(
-            "{} Hiqlite backend-time attestation lease_expiry_semantics must be backend_wall_clock_ttl",
-            path.display()
-        );
-    }
-    for field in [
-        "authoritative_backend_time",
-        "bounded_wall_clock_failover",
-        "production_bounded_failover_safe",
-        "authority_sampled_unix_time_ms_in_raft_operation",
-        "owner_expiry_bound_to_authority_time",
-        "checkpoint_publish_rejects_expired_owner_with_authority_time",
-        "bounded_failover_probe_passed",
-        "metrics_time_source_rejected",
-        "raft_log_index_time_source_rejected",
-        "distributed_lock_ttl_source_rejected",
-    ] {
-        require_json_true(path, artifact, &format!("{prefix}/{field}"))?;
-    }
-    let capability_failover_bound = require_json_u64(
-        path,
-        artifact,
-        "/standing_runtime_fencing/capability/failover_time_bound_ms",
-    )?;
-    let attested_failover_bound =
-        require_json_u64(path, artifact, &format!("{prefix}/failover_time_bound_ms"))?;
-    if attested_failover_bound == 0 || attested_failover_bound != capability_failover_bound {
-        bail!(
-            "{} Hiqlite backend-time attestation failover_time_bound_ms must match the advertised capability",
-            path.display()
-        );
-    }
-    let observed_failover = require_json_u64(
-        path,
-        artifact,
-        &format!("{prefix}/observed_max_failover_ms"),
-    )?;
-    if observed_failover > attested_failover_bound {
-        bail!(
-            "{} Hiqlite backend-time attestation observed_max_failover_ms exceeds failover_time_bound_ms",
-            path.display()
-        );
-    }
-    let attested_at = require_json_str(path, artifact, &format!("{prefix}/attested_at"))?;
-    parse_rfc3339_utc_epoch_seconds(attested_at).with_context(|| {
-        format!(
-            "{} Hiqlite backend-time attestation has invalid attested_at",
-            path.display()
-        )
-    })?;
-    validate_recent_hiqlite_backend_time_attested_at(path, attested_at)?;
-    let attester = require_json_str(path, artifact, &format!("{prefix}/attester"))?;
-    validate_hiqlite_backend_time_attester(path, attester)?;
-    for pointer in [
-        "/schema_version",
-        "/evidence_kind",
-        "/backend_name",
-        "/time_source_kind",
-        "/lease_authority_kind",
-        "/lease_expiry_semantics",
-        "/authoritative_backend_time",
-        "/bounded_wall_clock_failover",
-        "/production_bounded_failover_safe",
-        "/authority_sampled_unix_time_ms_in_raft_operation",
-        "/owner_expiry_bound_to_authority_time",
-        "/checkpoint_publish_rejects_expired_owner_with_authority_time",
-        "/bounded_failover_probe_passed",
-        "/failover_time_bound_ms",
-        "/observed_max_failover_ms",
-        "/metrics_time_source_rejected",
-        "/raft_log_index_time_source_rejected",
-        "/distributed_lock_ttl_source_rejected",
-        "/attested_at",
-        "/attester",
-        "/trusted_for_product_complete",
-        "/trusted_for_release_validator",
-        "/release_validator_fail_closed",
-    ] {
-        let summary_pointer = format!("{prefix}{pointer}");
-        let summary_value = artifact.pointer(&summary_pointer).with_context(|| {
-            format!(
-                "{} Hiqlite backend-time attestation missing {summary_pointer}",
-                path.display()
-            )
-        })?;
-        let sibling_value = sibling.pointer(pointer).with_context(|| {
-            format!(
-                "{} product Hiqlite backend-time evidence sibling hiqlite-backend-time-attestation.json missing {pointer}",
-                path.display()
-            )
-        })?;
-        if summary_value != sibling_value {
-            bail!(
-                "{} product Hiqlite backend-time evidence sibling hiqlite-backend-time-attestation.json {pointer} does not match {summary_pointer}",
-                path.display()
-            );
-        }
-    }
-    validate_product_hiqlite_backend_time_evidence_files(
-        path,
-        artifact,
-        &sibling,
-        observed_failover,
-        release_commit,
-    )
-}
-
-fn validate_product_hiqlite_backend_time_evidence_files(
-    path: &Path,
-    artifact: &serde_json::Value,
-    sibling: &serde_json::Value,
-    observed_failover: u64,
-    release_commit: Option<&str>,
-) -> anyhow::Result<HiqliteBackendTimeTrustStatus> {
-    let evidence_files = sibling
-        .pointer("/evidence_files")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} product Hiqlite backend-time evidence sibling hiqlite-backend-time-attestation.json missing array /evidence_files",
-                path.display()
-            )
-        })?;
-    let mut by_kind = BTreeMap::new();
-    for file in evidence_files {
-        let kind = file
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "{} product Hiqlite backend-time evidence /evidence_files entry missing kind",
-                    path.display()
-                )
-            })?;
-        if by_kind.insert(kind, file).is_some() {
-            bail!(
-                "{} product Hiqlite backend-time evidence /evidence_files has duplicate kind {kind}",
-                path.display()
-            );
-        }
-    }
-
-    let require_evidence_file = |kind: &str| -> anyhow::Result<(PathBuf, &serde_json::Value)> {
-        let entry = by_kind.get(kind).copied().with_context(|| {
-            format!(
-                "{} product Hiqlite backend-time evidence /evidence_files missing kind {kind}",
-                path.display()
-            )
-        })?;
-        let evidence_path = entry
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "{} product Hiqlite backend-time evidence /evidence_files {kind} missing path",
-                    path.display()
-                )
-            })?;
-        let sibling_path = if kind == "product_evidence" {
-            let product_filename = path.file_name().and_then(|value| value.to_str());
-            if product_filename != Some(evidence_path) {
-                bail!(
-                    "{} product Hiqlite backend-time evidence /evidence_files product_evidence path must match the validated product evidence filename",
-                    path.display()
-                );
-            }
-            path.to_path_buf()
-        } else {
-            sibling_evidence_path(path, evidence_path, "product Hiqlite backend-time evidence")?
-        };
-        let expected_size = entry
-            .get("size_bytes")
-            .and_then(serde_json::Value::as_u64)
-            .with_context(|| {
-                format!(
-                    "{} product Hiqlite backend-time evidence /evidence_files {kind} missing size_bytes",
-                    path.display()
-                )
-            })?;
-        let canonicalization = entry
-            .get("canonicalization")
-            .and_then(serde_json::Value::as_str);
-        let canonicalized_bytes = if canonicalization
-            == Some("without_metadata_store_hiqlite_backend_time_attestation")
-        {
-            if kind != "product_evidence" {
-                bail!(
-                    "{} product Hiqlite backend-time evidence /evidence_files {kind} cannot use product_evidence canonicalization",
-                    path.display()
-                );
-            }
-            Some(canonical_product_evidence_without_backend_time_attestation_bytes(&sibling_path)?)
-        } else {
-            if kind == "product_evidence" {
-                bail!(
-                    "{} product Hiqlite backend-time evidence /evidence_files product_evidence must use canonicalization=without_metadata_store_hiqlite_backend_time_attestation",
-                    path.display()
-                );
-            }
-            if canonicalization.is_some() {
-                bail!(
-                    "{} product Hiqlite backend-time evidence /evidence_files {kind} has unsupported canonicalization",
-                    path.display()
-                );
-            }
-            None
-        };
-        let actual_size = if let Some(bytes) = &canonicalized_bytes {
-            bytes.len() as u64
-        } else {
-            fs::metadata(&sibling_path)
-                .with_context(|| {
-                    format!(
-                        "{} product Hiqlite backend-time evidence failed to stat {}",
-                        path.display(),
-                        sibling_path.display()
-                    )
-                })?
-                .len()
-        };
-        if actual_size != expected_size {
-            bail!(
-                "{} product Hiqlite backend-time evidence /evidence_files {kind} size_bytes mismatch",
-                path.display()
-            );
-        }
-        let expected_sha256 = entry
-            .get("sha256")
-            .and_then(serde_json::Value::as_str)
-            .with_context(|| {
-                format!(
-                    "{} product Hiqlite backend-time evidence /evidence_files {kind} missing sha256",
-                    path.display()
-                )
-            })?;
-        let actual_sha256 = if let Some(bytes) = &canonicalized_bytes {
-            sha256_hex_of_bytes(bytes)
-        } else {
-            sha256_hex_of_file(&sibling_path)?
-        };
-        if expected_sha256 != actual_sha256 {
-            bail!(
-                "{} product Hiqlite backend-time evidence /evidence_files {kind} sha256 mismatch",
-                path.display()
-            );
-        }
-        Ok((sibling_path, entry))
-    };
-
-    let (_product_evidence, _entry) = require_evidence_file("product_evidence")?;
-    let (assessment_path, _entry) = require_evidence_file("hiqlite_backend_time_assessment")?;
-    let (readyz_path, _entry) = require_evidence_file("readyz")?;
-    let (multi_replica_path, _entry) = require_evidence_file("multi_replica_fencing_smoke")?;
-    let (failover_path, _entry) = require_evidence_file("standing_runtime_failover_smoke")?;
-    let (meta_smoke_log_path, _entry) = require_evidence_file("metadata_adversarial_smoke_log")?;
-
-    let assessment: serde_json::Value = read_json_artifact(&assessment_path)?;
-    if require_json_str(&assessment_path, &assessment, "/evidence_kind")?
-        != "velorix_hiqlite_backend_time_assessment"
-    {
-        bail!(
-            "{} Hiqlite backend-time assessment evidence has unsupported evidence_kind",
-            assessment_path.display()
-        );
-    }
-    require_json_true(&assessment_path, &assessment, "/required_mode_supported")?;
-    require_json_true(
-        &assessment_path,
-        &assessment,
-        "/can_generate_product_complete_backend_time_attestation",
-    )?;
-    if require_json_str(&assessment_path, &assessment, "/backend_time_source_kind")?
-        != "raft_replicated_authority_time"
-    {
-        bail!(
-            "{} Hiqlite backend-time assessment must use raft_replicated_authority_time",
-            assessment_path.display()
-        );
-    }
-    let missing_capabilities = assessment
-        .pointer("/missing_capabilities")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} Hiqlite backend-time assessment missing /missing_capabilities",
-                assessment_path.display()
-            )
-        })?;
-    if !missing_capabilities.is_empty() {
-        bail!(
-            "{} Hiqlite backend-time assessment still reports missing capabilities",
-            assessment_path.display()
-        );
-    }
-    if assessment.pointer("/product_capability")
-        != artifact.pointer("/standing_runtime_fencing/capability")
-    {
-        bail!(
-            "{} Hiqlite backend-time assessment product_capability does not match product evidence",
-            assessment_path.display()
-        );
-    }
-    for pointer in [
-        "/velorix_meta_runtime/owner_acquire_uses_authority_time",
-        "/velorix_meta_runtime/owner_read_uses_authority_time",
-        "/velorix_meta_runtime/checkpoint_publish_update_uses_authority_time",
-        "/velorix_meta_runtime/checkpoint_publish_insert_uses_authority_time",
-        "/velorix_meta_runtime/checkpoint_publish_rejects_scope_mismatch",
-        "/velorix_meta_runtime/unsafe_runtime_time_sources_absent",
-    ] {
-        require_json_true(&assessment_path, &assessment, pointer)?;
-    }
-
-    let readyz: serde_json::Value = read_json_artifact(&readyz_path)?;
-    if readyz.pointer("/metadata_store/standing_runtime_fencing")
-        != artifact.pointer("/standing_runtime_fencing/capability")
-    {
-        bail!(
-            "{} readyz standing_runtime_fencing does not match product evidence capability",
-            readyz_path.display()
-        );
-    }
-
-    let multi_replica: serde_json::Value = read_json_artifact(&multi_replica_path)?;
-    if require_json_str(&multi_replica_path, &multi_replica, "/evidence_kind")?
-        != "velorix_deployed_multi_replica_fencing_smoke"
-    {
-        bail!(
-            "{} multi-replica fencing smoke has unsupported evidence_kind",
-            multi_replica_path.display()
-        );
-    }
-    if require_json_str(&multi_replica_path, &multi_replica, "/status")? != "pass" {
-        bail!(
-            "{} multi-replica fencing smoke must have status=pass",
-            multi_replica_path.display()
-        );
-    }
-    for pointer in [
-        "/assertions/distinct_api_pods",
-        "/assertions/non_owner_ingest_rejected",
-        "/assertions/owner_retry_converged",
-        "/assertions/read_replica_served_query",
-    ] {
-        require_json_true(&multi_replica_path, &multi_replica, pointer)?;
-    }
-
-    let failover: serde_json::Value = read_json_artifact(&failover_path)?;
-    let trusted_for_release_validator =
-        require_json_bool(path, sibling, "/trusted_for_release_validator")?;
-    let capability_owner_ttl_ms = require_json_u64(
-        path,
-        artifact,
-        "/standing_runtime_fencing/capability/max_owner_ttl_ms",
-    )?;
-    let capability_failover_bound_ms = require_json_u64(
-        path,
-        artifact,
-        "/standing_runtime_fencing/capability/failover_time_bound_ms",
-    )?;
-    if require_json_str(&failover_path, &failover, "/evidence_kind")?
-        != "velorix_standing_runtime_failover_smoke"
-    {
-        bail!(
-            "{} standing-runtime failover smoke has unsupported evidence_kind",
-            failover_path.display()
-        );
-    }
-    if require_json_str(&failover_path, &failover, "/status")? != "pass" {
-        bail!(
-            "{} standing-runtime failover smoke must have status=pass",
-            failover_path.display()
-        );
-    }
-    validate_hiqlite_backend_time_failover_evidence(
-        &failover_path,
-        &failover,
-        observed_failover,
-        trusted_for_release_validator,
-        capability_failover_bound_ms,
-        capability_owner_ttl_ms,
-    )?;
-
-    let meta_smoke_log = fs::read_to_string(&meta_smoke_log_path).with_context(|| {
-        format!(
-            "{} failed to read metadata adversarial smoke log",
-            meta_smoke_log_path.display()
-        )
-    })?;
-    for fragment in [
-        "standing runtime adversarial smoke ok",
-        "owner_a_epoch=",
-        "owner_b_epoch=",
-        "latest_epoch=",
-        "backend_time_source_kind=raft_replicated_authority_time",
-    ] {
-        if !meta_smoke_log.contains(fragment) {
-            bail!(
-                "{} metadata adversarial smoke log missing {fragment}",
-                meta_smoke_log_path.display()
-            );
-        }
-    }
-
-    validate_product_hiqlite_backend_time_trusted_provenance(
-        path,
-        artifact,
-        sibling,
-        &by_kind,
-        release_commit,
-    )
-}
-
-fn validate_hiqlite_backend_time_failover_evidence(
-    failover_path: &Path,
-    failover: &serde_json::Value,
-    observed_failover: u64,
-    trusted_for_release_validator: bool,
-    capability_failover_bound_ms: u64,
-    capability_owner_ttl_ms: u64,
-) -> anyhow::Result<()> {
-    if trusted_for_release_validator {
-        require_json_true(failover_path, failover, "/trusted_for_product_complete")?;
-        require_json_true(
-            failover_path,
-            failover,
-            "/production_wall_clock_failover_attestation",
-        )?;
-        if require_json_str(failover_path, failover, "/evidence_scope")?
-            != "release_ci_deployed_product"
-        {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence requires evidence_scope=release_ci_deployed_product",
-                failover_path.display()
-            );
-        }
-        if require_json_str(failover_path, failover, "/failover_probe_kind")?
-            != "release_bounded_wall_clock_failover"
-        {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence requires failover_probe_kind=release_bounded_wall_clock_failover",
-                failover_path.display()
-            );
-        }
-        if require_json_str(failover_path, failover, "/backend_time_source_kind")?
-            != "raft_replicated_authority_time"
-        {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence requires raft_replicated_authority_time",
-                failover_path.display()
-            );
-        }
-        require_json_true(failover_path, failover, "/authority_time_observed")?;
-        let owner_ttl = require_json_u64(failover_path, failover, "/owner_ttl_ms")?;
-        if owner_ttl != capability_owner_ttl_ms {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence owner_ttl_ms does not match capability",
-                failover_path.display()
-            );
-        }
-        let failover_bound = require_json_u64(failover_path, failover, "/failover_time_bound_ms")?;
-        if failover_bound != capability_failover_bound_ms {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence failover_time_bound_ms does not match capability",
-                failover_path.display()
-            );
-        }
-        let pre_epoch = require_json_u64(failover_path, failover, "/pre_failover_owner_epoch")?;
-        let post_epoch = require_json_u64(failover_path, failover, "/post_failover_owner_epoch")?;
-        if post_epoch <= pre_epoch {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence post_failover_owner_epoch must advance",
-                failover_path.display()
-            );
-        }
-        let affected_pods =
-            require_json_string_array(failover_path, failover, "/affected_api_pods")?;
-        if affected_pods.is_empty() {
-            bail!(
-                "{} release Hiqlite backend-time failover evidence requires affected_api_pods",
-                failover_path.display()
-            );
-        }
-    } else {
-        require_json_false(failover_path, failover, "/trusted_for_product_complete")?;
-        require_json_false(
-            failover_path,
-            failover,
-            "/production_wall_clock_failover_attestation",
-        )?;
-    }
-    let smoke_observed_failover =
-        require_json_u64(failover_path, failover, "/observed_failover_ms")?;
-    if smoke_observed_failover != observed_failover {
-        bail!(
-            "{} standing-runtime failover smoke observed_failover_ms does not match backend-time attestation",
-            failover_path.display()
-        );
-    }
-
-    Ok(())
-}
-
-fn validate_product_hiqlite_backend_time_trusted_provenance(
-    path: &Path,
-    artifact: &serde_json::Value,
-    sibling: &serde_json::Value,
-    evidence_files: &BTreeMap<&str, &serde_json::Value>,
-    release_commit: Option<&str>,
-) -> anyhow::Result<HiqliteBackendTimeTrustStatus> {
-    let prefix = "/metadata_store/hiqlite_backend_time_attestation";
-    let trusted_for_release_validator = require_json_bool(
-        path,
-        artifact,
-        &format!("{prefix}/trusted_for_release_validator"),
-    )?;
-    let trusted_for_product_complete = require_json_bool(
-        path,
-        artifact,
-        &format!("{prefix}/trusted_for_product_complete"),
-    )?;
-    let release_validator_fail_closed = require_json_bool(
-        path,
-        artifact,
-        &format!("{prefix}/release_validator_fail_closed"),
-    )?;
-
-    if !trusted_for_release_validator {
-        if trusted_for_product_complete || !release_validator_fail_closed {
-            bail!(
-                "{} diagnostic Hiqlite backend-time attestation must keep product-complete trust disabled",
-                path.display()
-            );
-        }
-        return Ok(HiqliteBackendTimeTrustStatus::Diagnostic);
-    }
-    if !trusted_for_product_complete || release_validator_fail_closed {
-        bail!(
-            "{} trusted Hiqlite backend-time attestation must clear release fail-closed flags",
-            path.display()
-        );
-    }
-
-    let sibling_provenance = sibling.pointer("/trusted_provenance").with_context(|| {
-        format!(
-            "{} product Hiqlite backend-time evidence sibling hiqlite-backend-time-attestation.json missing /trusted_provenance",
-            path.display()
-        )
-    })?;
-
-    if require_json_u64(path, sibling_provenance, "/schema_version")? != 1 {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance has unsupported schema_version",
-            path.display()
-        );
-    }
-    if require_json_str(path, sibling_provenance, "/source_repository")?
-        != HIQLITE_BACKEND_TIME_TRUSTED_SOURCE_REPOSITORY
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance source_repository is not trusted",
-            path.display()
-        );
-    }
-    if require_json_str(path, sibling_provenance, "/provenance_kind")?
-        != HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE_KIND
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance has unsupported provenance_kind",
-            path.display()
-        );
-    }
-    let provenance_attester = require_json_str(path, sibling_provenance, "/attester")?;
-    if !HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE_ATTESTERS.contains(&provenance_attester) {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance attester is not trusted: {provenance_attester}",
-            path.display()
-        );
-    }
-    let top_level_attester = require_json_str(path, artifact, &format!("{prefix}/attester"))?;
-    if provenance_attester != top_level_attester {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance attester does not match attestation attester",
-            path.display()
-        );
-    }
-
-    for pointer in [
-        "/source_repository",
-        "/source_revision",
-        "/workflow_name",
-        "/workflow_run_id",
-        "/job_name",
-        "/subject_image_digest",
-        "/generated_at",
-        "/canonical_bundle_sha256",
-    ] {
-        require_nonempty_json_str(path, sibling_provenance, pointer)?;
-    }
-    let source_revision = require_json_str(path, sibling_provenance, "/source_revision")?;
-    if is_placeholder_commit(source_revision) {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance uses placeholder source_revision",
-            path.display()
-        );
-    }
-    validate_full_git_commit_sha(path, source_revision, "source_revision")?;
-    let Some(release_commit) = release_commit else {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance requires --release-commit",
-            path.display()
-        );
-    };
-    validate_full_git_commit_sha(path, release_commit, "release_commit")?;
-    if source_revision != release_commit {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance source_revision does not match release_commit",
-            path.display()
-        );
-    }
-    let subject_image_digest = require_json_str(path, sibling_provenance, "/subject_image_digest")?;
-    validate_sha256_digest(path, subject_image_digest, "subject_image_digest")?;
-    validate_hiqlite_backend_time_subject_images(
-        path,
-        artifact,
-        sibling_provenance,
-        subject_image_digest,
-    )?;
-    validate_hiqlite_backend_time_ci_identity(path, sibling_provenance, release_commit)?;
-    let sigstore_verified =
-        validate_hiqlite_backend_time_signature_bundle(path, sibling_provenance)?;
-    if let Some(authority_image_digest) = artifact
-        .pointer("/metadata_store/hiqlite_authority_attestation/image_digest")
-        .and_then(serde_json::Value::as_str)
-    {
-        if subject_image_digest != authority_image_digest {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance subject_image_digest does not match Hiqlite authority attestation",
-                path.display()
-            );
-        }
-    }
-    let generated_at = require_json_str(path, sibling_provenance, "/generated_at")?;
-    validate_recent_hiqlite_backend_time_attested_at(path, generated_at)?;
-
-    validate_hiqlite_backend_time_canonical_bundle_entries(
-        path,
-        sibling_provenance,
-        evidence_files,
-    )?;
-
-    if sigstore_verified {
-        Ok(HiqliteBackendTimeTrustStatus::SigstoreVerified)
-    } else {
-        Ok(HiqliteBackendTimeTrustStatus::TrustedWithoutSigstoreBundle)
-    }
-}
-
-fn validate_hiqlite_backend_time_ci_identity(
-    path: &Path,
-    provenance: &serde_json::Value,
-    release_commit: &str,
-) -> anyhow::Result<()> {
-    let identity = provenance.pointer("/ci_identity").with_context(|| {
-        format!(
-            "{} Hiqlite backend-time trusted provenance missing /ci_identity",
-            path.display()
-        )
-    })?;
-    if require_json_str(path, identity, "/identity_kind")? != "github_actions_oidc" {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity must be github_actions_oidc",
-            path.display()
-        );
-    }
-    if require_json_str(path, identity, "/issuer")? != HIQLITE_BACKEND_TIME_TRUSTED_OIDC_ISSUER {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity issuer is not trusted",
-            path.display()
-        );
-    }
-    if require_json_str(path, identity, "/audience")? != HIQLITE_BACKEND_TIME_TRUSTED_OIDC_AUDIENCE
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity audience is not trusted",
-            path.display()
-        );
-    }
-    if require_json_str(path, identity, "/repository")?
-        != HIQLITE_BACKEND_TIME_TRUSTED_GITHUB_REPOSITORY
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity repository is not trusted",
-            path.display()
-        );
-    }
-    let subject = require_json_str(path, identity, "/subject")?;
-    if !subject.starts_with("repo:mrchypark/velorix:") {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity subject is not trusted",
-            path.display()
-        );
-    }
-    let workflow_ref = require_json_str(path, identity, "/workflow_ref")?;
-    let Some(workflow_release_ref) =
-        workflow_ref.strip_prefix(HIQLITE_BACKEND_TIME_TRUSTED_WORKFLOW_REF_PREFIX)
-    else {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity workflow_ref is not trusted",
-            path.display()
-        );
-    };
-    validate_hiqlite_backend_time_trusted_release_ref(
-        path,
-        workflow_release_ref,
-        "ci_identity.workflow_ref",
-    )?;
-    if subject != format!("repo:mrchypark/velorix:ref:{workflow_release_ref}") {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity subject does not match trusted release workflow_ref",
-            path.display()
-        );
-    }
-    let workflow_sha = require_json_str(path, identity, "/workflow_sha")?;
-    validate_full_git_commit_sha(path, workflow_sha, "ci_identity.workflow_sha")?;
-    if workflow_sha != release_commit {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity workflow_sha does not match release_commit",
-            path.display()
-        );
-    }
-    for pointer in ["/run_id", "/run_attempt", "/job_workflow_ref"] {
-        require_nonempty_json_str(path, identity, pointer)?;
-    }
-    if require_json_str(path, identity, "/job_workflow_ref")?
-        != format!(
-            "{}{}",
-            HIQLITE_BACKEND_TIME_TRUSTED_WORKFLOW_REF_PREFIX, release_commit
-        )
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance ci_identity job_workflow_ref does not match release_commit",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_hiqlite_backend_time_trusted_release_ref(
-    path: &Path,
-    release_ref: &str,
-    field: &str,
-) -> anyhow::Result<()> {
-    if release_ref == HIQLITE_BACKEND_TIME_TRUSTED_RELEASE_BRANCH_REF
-        || release_ref
-            .strip_prefix(HIQLITE_BACKEND_TIME_TRUSTED_RELEASE_TAG_REF_PREFIX)
-            .is_some_and(|suffix| !suffix.trim().is_empty())
-    {
-        return Ok(());
-    }
-    bail!(
-        "{} Hiqlite backend-time trusted provenance {field} must use refs/heads/main or refs/tags/v*",
-        path.display()
-    );
-}
-
-fn validate_hiqlite_backend_time_signature_bundle(
-    path: &Path,
-    provenance: &serde_json::Value,
-) -> anyhow::Result<bool> {
-    let signature_bundle = provenance.pointer("/signature_bundle").with_context(|| {
-        format!(
-            "{} Hiqlite backend-time trusted provenance missing /signature_bundle",
-            path.display()
-        )
-    })?;
-    if require_json_str(path, signature_bundle, "/bundle_kind")? != "sigstore_rekor_dsse" {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle bundle_kind is unsupported",
-            path.display()
-        );
-    }
-    let signed_payload_sha256 = require_json_str(path, signature_bundle, "/signed_payload_sha256")?;
-    validate_sha256_digest(
-        path,
-        signed_payload_sha256,
-        "signature_bundle.signed_payload_sha256",
-    )?;
-    if signed_payload_sha256 != require_json_str(path, provenance, "/canonical_bundle_sha256")? {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle signed_payload_sha256 does not match canonical_bundle_sha256",
-            path.display()
-        );
-    }
-    for (pointer, label) in [
-        (
-            "/signing_certificate_sha256",
-            "signature_bundle.signing_certificate_sha256",
-        ),
-        (
-            "/transparency_log_id",
-            "signature_bundle.transparency_log_id",
-        ),
-        (
-            "/inclusion_proof_sha256",
-            "signature_bundle.inclusion_proof_sha256",
-        ),
-    ] {
-        validate_sha256_digest(
-            path,
-            require_json_str(path, signature_bundle, pointer)?,
-            label,
-        )?;
-    }
-    let sigstore_bundle_present = signature_bundle
-        .pointer("/sigstore_bundle_base64")
-        .is_some();
-    if require_json_str(path, signature_bundle, "/oidc_issuer")?
-        != HIQLITE_BACKEND_TIME_TRUSTED_OIDC_ISSUER
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle oidc_issuer is not trusted",
-            path.display()
-        );
-    }
-    let certificate_identity = require_json_str(path, signature_bundle, "/certificate_identity")?;
-    if sigstore_bundle_present {
-        let Some(certificate_release_ref) = certificate_identity
-            .strip_prefix(HIQLITE_BACKEND_TIME_TRUSTED_SIGSTORE_CERTIFICATE_IDENTITY_PREFIX)
-        else {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance signature_bundle certificate_identity is not trusted",
-                path.display()
-            );
-        };
-        validate_hiqlite_backend_time_trusted_release_ref(
-            path,
-            certificate_release_ref,
-            "signature_bundle.certificate_identity",
-        )?;
-        let workflow_ref = require_json_str(path, provenance, "/ci_identity/workflow_ref")?;
-        let workflow_release_ref = workflow_ref
-            .strip_prefix(HIQLITE_BACKEND_TIME_TRUSTED_WORKFLOW_REF_PREFIX)
-            .unwrap_or_default();
-        if certificate_release_ref != workflow_release_ref {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance signature_bundle certificate_identity does not match ci_identity workflow_ref",
-                path.display()
-            );
-        }
-    } else if certificate_identity != require_json_str(path, provenance, "/ci_identity/subject")? {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle certificate_identity does not match ci_identity subject",
-            path.display()
-        );
-    }
-    let transparency_log_index =
-        require_json_u64(path, signature_bundle, "/transparency_log_index")?;
-    if !sigstore_bundle_present && transparency_log_index == 0 {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle transparency_log_index must be nonzero",
-            path.display()
-        );
-    }
-    if require_json_u64(path, signature_bundle, "/integrated_time_unix")? == 0 {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle integrated_time_unix must be nonzero",
-            path.display()
-        );
-    }
-    if sigstore_bundle_present {
-        return validate_hiqlite_backend_time_sigstore_bundle(
-            path,
-            signature_bundle,
-            signed_payload_sha256,
-        );
-    }
-
-    validate_hiqlite_backend_time_legacy_ed25519_signature(
-        path,
-        signature_bundle,
-        signed_payload_sha256,
-    )?;
-    Ok(false)
-}
-
-fn validate_hiqlite_backend_time_legacy_ed25519_signature(
-    path: &Path,
-    signature_bundle: &serde_json::Value,
-    signed_payload_sha256: &str,
-) -> anyhow::Result<()> {
-    if require_json_str(path, signature_bundle, "/signature_algorithm")? != "ed25519" {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle signature_algorithm is unsupported",
-            path.display()
-        );
-    }
-    let public_key_base64 = require_json_str(path, signature_bundle, "/public_key_base64")?;
-    let public_key = decode_base64_field(
-        path,
-        public_key_base64,
-        "signature_bundle.public_key_base64",
-    )?;
-    if public_key.len() != 32 {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle public_key_base64 must decode to a 32-byte Ed25519 public key",
-            path.display()
-        );
-    }
-    let public_key_sha256 = require_json_str(path, signature_bundle, "/public_key_sha256")?;
-    validate_sha256_digest(
-        path,
-        public_key_sha256,
-        "signature_bundle.public_key_sha256",
-    )?;
-    if public_key_sha256 != sha256_digest_of_bytes(&public_key) {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle public_key_sha256 does not match public_key_base64",
-            path.display()
-        );
-    }
-    let signature = decode_base64_field(
-        path,
-        require_json_str(path, signature_bundle, "/signature_base64")?,
-        "signature_bundle.signature_base64",
-    )?;
-    if signature.len() != 64 {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle signature_base64 must decode to a 64-byte Ed25519 signature",
-            path.display()
-        );
-    }
-    UnparsedPublicKey::new(&ED25519, &public_key)
-        .verify(signed_payload_sha256.as_bytes(), &signature)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "{} Hiqlite backend-time trusted provenance signature_bundle Ed25519 signature verification failed",
-                path.display()
-            )
-        })?;
-    Ok(())
-}
-
-fn validate_hiqlite_backend_time_sigstore_bundle(
-    path: &Path,
-    signature_bundle: &serde_json::Value,
-    signed_payload_sha256: &str,
-) -> anyhow::Result<bool> {
-    let Some(sigstore_bundle_base64) = signature_bundle
-        .pointer("/sigstore_bundle_base64")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(false);
-    };
-
-    let sigstore_bundle_bytes = decode_base64_field(
-        path,
-        sigstore_bundle_base64,
-        "signature_bundle.sigstore_bundle_base64",
-    )?;
-    let sigstore_bundle_sha256 =
-        require_json_str(path, signature_bundle, "/sigstore_bundle_sha256")?;
-    validate_sha256_digest(
-        path,
-        sigstore_bundle_sha256,
-        "signature_bundle.sigstore_bundle_sha256",
-    )?;
-    if sigstore_bundle_sha256 != sha256_digest_of_bytes(&sigstore_bundle_bytes) {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle sigstore_bundle_sha256 does not match sigstore_bundle_base64",
-            path.display()
-        );
-    }
-    let sigstore_bundle_json = std::str::from_utf8(&sigstore_bundle_bytes).with_context(|| {
-        format!(
-            "{} Hiqlite backend-time trusted provenance signature_bundle sigstore_bundle_base64 must decode to UTF-8 JSON",
-            path.display()
-        )
-    })?;
-    let bundle = SigstoreBundle::from_json(sigstore_bundle_json).with_context(|| {
-        format!(
-            "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed while parsing bundle JSON",
-            path.display()
-        )
-    })?;
-    if !bundle.has_inclusion_proof() {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed: bundle is missing Rekor inclusion proof",
-            path.display()
-        );
-    }
-    let Some(signing_certificate) = bundle.signing_certificate() else {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed: bundle is missing Fulcio signing certificate",
-            path.display()
-        );
-    };
-    if require_json_str(path, signature_bundle, "/signing_certificate_sha256")?
-        != sha256_digest_of_bytes(signing_certificate.as_bytes())
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore signing certificate digest does not match signature_bundle signing_certificate_sha256",
-            path.display()
-        );
-    }
-    let Some(tlog_entry) = bundle.verification_material.tlog_entries.first() else {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed: bundle is missing Rekor transparency log entry",
-            path.display()
-        );
-    };
-    if tlog_entry.log_index.as_u64()
-        != Some(require_json_u64(
-            path,
-            signature_bundle,
-            "/transparency_log_index",
-        )?)
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore transparency log index does not match signature_bundle transparency_log_index",
-            path.display()
-        );
-    }
-    let log_key_id = tlog_entry.log_id.key_id.decode().with_context(|| {
-        format!(
-            "{} Hiqlite backend-time trusted provenance Sigstore transparency log id is not valid base64",
-            path.display()
-        )
-    })?;
-    if sha256_digest_of_bytes(&log_key_id)
-        != require_json_str(path, signature_bundle, "/transparency_log_id")?
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore transparency log id does not match signature_bundle transparency_log_id",
-            path.display()
-        );
-    }
-
-    let trusted_root = TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT).with_context(|| {
-        format!(
-            "{} Hiqlite backend-time trusted provenance failed to load Sigstore production trusted root",
-            path.display()
-        )
-    })?;
-    let artifact_digest = sigstore_sha256_hash_from_prefixed_digest(
-        path,
-        signed_payload_sha256,
-        "signature_bundle.signed_payload_sha256",
-    )?;
-    let certificate_identity = require_json_str(path, signature_bundle, "/certificate_identity")?;
-    let policy = SigstoreVerificationPolicy::default()
-        .require_identity(certificate_identity)
-        .require_issuer(HIQLITE_BACKEND_TIME_TRUSTED_OIDC_ISSUER);
-    let result = verify_sigstore_bundle(artifact_digest, &bundle, &policy, &trusted_root)
-        .with_context(|| {
-            format!(
-                "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed",
-                path.display()
-            )
-        })?;
-    if result.identity.as_deref() != Some(certificate_identity) {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore verified identity does not match signature_bundle certificate_identity",
-            path.display()
-        );
-    }
-    if result.issuer.as_deref() != Some(HIQLITE_BACKEND_TIME_TRUSTED_OIDC_ISSUER) {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore verified issuer is not trusted",
-            path.display()
-        );
-    }
-    let Some(integrated_time) = result.integrated_time else {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore bundle verification failed: verified Rekor integrated time is missing",
-            path.display()
-        );
-    };
-    if integrated_time < 0
-        || integrated_time as u64
-            != require_json_u64(path, signature_bundle, "/integrated_time_unix")?
-    {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance Sigstore verified integrated time does not match signature_bundle integrated_time_unix",
-            path.display()
-        );
-    }
-
-    Ok(true)
-}
-
-fn validate_hiqlite_backend_time_subject_images(
-    path: &Path,
-    artifact: &serde_json::Value,
-    provenance: &serde_json::Value,
-    legacy_subject_image_digest: &str,
-) -> anyhow::Result<()> {
-    let images = provenance
-        .pointer("/subject_images")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} Hiqlite backend-time trusted provenance missing array /subject_images",
-                path.display()
-            )
-        })?;
-    let mut by_role = BTreeMap::new();
-    for image in images {
-        let role = require_json_str(path, image, "/role")?;
-        if !HIQLITE_BACKEND_TIME_REQUIRED_SUBJECT_IMAGE_ROLES.contains(&role) {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance subject_images has unsupported role {role}",
-                path.display()
-            );
-        }
-        let image_digest = require_json_str(path, image, "/image_digest")?;
-        validate_sha256_digest(
-            path,
-            image_digest,
-            &format!("subject_images[{role}].image_digest"),
-        )?;
-        if by_role.insert(role, image_digest).is_some() {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance subject_images has duplicate role {role}",
-                path.display()
-            );
-        }
-    }
-    for required_role in HIQLITE_BACKEND_TIME_REQUIRED_SUBJECT_IMAGE_ROLES {
-        if !by_role.contains_key(required_role) {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance subject_images missing required role {required_role}",
-                path.display()
-            );
-        }
-    }
-
-    let hiqlite_subject_digest = by_role["hiqlite-authority"];
-    if legacy_subject_image_digest != hiqlite_subject_digest {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance subject_image_digest does not match subject_images hiqlite-authority",
-            path.display()
-        );
-    }
-    if let Some(authority_image_digest) = artifact
-        .pointer("/metadata_store/hiqlite_authority_attestation/image_digest")
-        .and_then(serde_json::Value::as_str)
-    {
-        if hiqlite_subject_digest != authority_image_digest {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance subject_images hiqlite-authority image_digest does not match Hiqlite authority attestation",
-                path.display()
-            );
-        }
-    }
-    for role in ["velorix-api", "velorix-meta"] {
-        let Some(product_image_digest) = product_deployed_image_digest(artifact, role) else {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance cannot bind subject_images {role} without product deployed image evidence",
-                path.display()
-            );
-        };
-        if by_role[role] != product_image_digest {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance subject_images {role} image_digest does not match product deployed image evidence",
-                path.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_hiqlite_backend_time_canonical_bundle_entries(
-    path: &Path,
-    provenance: &serde_json::Value,
-    evidence_files: &BTreeMap<&str, &serde_json::Value>,
-) -> anyhow::Result<()> {
-    let entries = provenance
-        .pointer("/canonical_bundle_entries")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} Hiqlite backend-time trusted provenance missing array /canonical_bundle_entries",
-                path.display()
-            )
-        })?;
-    if entries.len() != evidence_files.len() {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance canonical_bundle_entries length mismatch",
-            path.display()
-        );
-    }
-    let mut provenance_entries = BTreeMap::new();
-    for entry in entries {
-        let kind = require_json_str(path, entry, "/kind")?;
-        if provenance_entries.insert(kind, entry).is_some() {
-            bail!(
-                "{} Hiqlite backend-time trusted provenance has duplicate canonical bundle kind {kind}",
-                path.display()
-            );
-        }
-    }
-    for (kind, evidence_file) in evidence_files {
-        let provenance_entry = provenance_entries.get(kind).copied().with_context(|| {
-            format!(
-                "{} Hiqlite backend-time trusted provenance missing canonical bundle kind {kind}",
-                path.display()
-            )
-        })?;
-        for pointer in ["/path", "/sha256", "/size_bytes", "/canonicalization"] {
-            if provenance_entry.pointer(pointer) != evidence_file.pointer(pointer) {
-                bail!(
-                    "{} Hiqlite backend-time trusted provenance canonical bundle {kind} {pointer} does not match evidence_files",
-                    path.display()
-                );
-            }
-        }
-    }
-
-    let expected_digest = require_json_str(path, provenance, "/canonical_bundle_sha256")?;
-    validate_sha256_digest(path, expected_digest, "canonical_bundle_sha256")?;
-    let actual_digest = hiqlite_backend_time_canonical_bundle_sha256(evidence_files)?;
-    if expected_digest != actual_digest {
-        bail!(
-            "{} Hiqlite backend-time trusted provenance canonical_bundle_sha256 mismatch",
-            path.display()
-        );
-    }
-
-    Ok(())
-}
-
-fn hiqlite_backend_time_canonical_bundle_sha256(
-    evidence_files: &BTreeMap<&str, &serde_json::Value>,
-) -> anyhow::Result<String> {
-    let mut canonical = String::new();
-    for (kind, entry) in evidence_files {
-        let path = entry
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .with_context(|| format!("Hiqlite backend-time evidence file {kind} missing path"))?;
-        let sha256 = entry
-            .get("sha256")
-            .and_then(serde_json::Value::as_str)
-            .with_context(|| format!("Hiqlite backend-time evidence file {kind} missing sha256"))?;
-        let size_bytes = entry
-            .get("size_bytes")
-            .and_then(serde_json::Value::as_u64)
-            .with_context(|| {
-                format!("Hiqlite backend-time evidence file {kind} missing size_bytes")
-            })?;
-        canonical.push_str(kind);
-        canonical.push('\t');
-        canonical.push_str(path);
-        canonical.push('\t');
-        canonical.push_str(sha256);
-        canonical.push('\t');
-        canonical.push_str(&size_bytes.to_string());
-        canonical.push('\n');
-    }
-    let digest = Sha256::digest(canonical.as_bytes());
-    let mut output = String::with_capacity("sha256:".len() + digest.len() * 2);
-    output.push_str("sha256:");
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    Ok(output)
 }
 
 fn validate_product_object_store_durability_policy_attestation(
@@ -5722,441 +4234,6 @@ fn validate_product_no_pvc_namespace_sibling(path: &Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn validate_product_hiqlite_authority_attestation(
-    path: &Path,
-    artifact: &serde_json::Value,
-) -> anyhow::Result<()> {
-    let prefix = "/metadata_store/hiqlite_authority_attestation";
-    require_json_true(path, artifact, &format!("{prefix}/validated"))?;
-    if require_json_str(path, artifact, &format!("{prefix}/evidence"))?
-        != "hiqlite-authority-attestation.json"
-    {
-        bail!(
-            "{} product evidence must attach Hiqlite authority evidence",
-            path.display()
-        );
-    }
-    require_sibling_evidence_file(
-        path,
-        "hiqlite-authority-attestation.json",
-        "product Hiqlite authority evidence",
-    )?;
-    let sibling = read_sibling_json_artifact(
-        path,
-        "hiqlite-authority-attestation.json",
-        "product Hiqlite authority evidence",
-    )?;
-    if require_json_u64(path, artifact, &format!("{prefix}/schema_version"))? != 1 {
-        bail!(
-            "{} Hiqlite authority attestation has unsupported schema_version",
-            path.display()
-        );
-    }
-    let authority_kind = require_json_str(path, artifact, &format!("{prefix}/authority_kind"))?;
-    if !matches!(
-        authority_kind,
-        "external_hiqlite" | "velorix_managed_hiqlite"
-    ) {
-        bail!(
-            "{} Hiqlite authority attestation has unsupported authority_kind",
-            path.display()
-        );
-    }
-    let nodes = require_json_string_array(path, artifact, &format!("{prefix}/nodes"))?;
-    if nodes.len() != 3 {
-        bail!(
-            "{} Hiqlite authority attestation requires exactly 3 voter nodes",
-            path.display()
-        );
-    }
-    let unique_nodes = nodes.iter().collect::<BTreeSet<_>>();
-    if unique_nodes.len() != nodes.len() {
-        bail!(
-            "{} Hiqlite authority attestation requires unique voter nodes",
-            path.display()
-        );
-    }
-    if require_json_u64(path, artifact, &format!("{prefix}/expected_voter_count"))? != 3 {
-        bail!(
-            "{} Hiqlite authority attestation requires expected_voter_count=3",
-            path.display()
-        );
-    }
-    for field in [
-        "no_pvc_created_by_vind",
-        "metadata_authority_no_pvc_used",
-        "voters_learner_only_disabled",
-        "api_auth_configured",
-        "raft_auth_configured",
-        "backup_restore_configured",
-    ] {
-        require_json_true(path, artifact, &format!("{prefix}/{field}"))?;
-    }
-    let storage_mode = require_json_str(
-        path,
-        artifact,
-        &format!("{prefix}/metadata_authority_storage_mode"),
-    )?;
-    if storage_mode != "object-store-backup-restore-with-ephemeral-node-disk" {
-        bail!(
-            "{} Hiqlite authority attestation requires object-store backup/restore with ephemeral node disk",
-            path.display()
-        );
-    }
-    let transport_security =
-        require_json_str(path, artifact, &format!("{prefix}/transport_security"))?;
-    if transport_security.trim().is_empty()
-        || matches!(
-            transport_security.trim().to_ascii_lowercase().as_str(),
-            "none" | "plaintext" | "local-only" | "generated-local-self-signed"
-        )
-    {
-        bail!(
-            "{} Hiqlite authority attestation requires non-local transport security",
-            path.display()
-        );
-    }
-    let attested_at = require_json_str(path, artifact, &format!("{prefix}/attested_at"))?;
-    parse_rfc3339_utc_epoch_seconds(attested_at).with_context(|| {
-        format!(
-            "{} Hiqlite authority attestation has invalid attested_at",
-            path.display()
-        )
-    })?;
-    require_nonempty_json_str(path, artifact, &format!("{prefix}/attester"))?;
-    let has_image_digest = artifact
-        .pointer(&format!("{prefix}/image_digest"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value.trim().starts_with("sha256:"));
-    let has_source_revision = artifact
-        .pointer(&format!("{prefix}/source_revision"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty());
-    if !has_image_digest && !has_source_revision {
-        bail!(
-            "{} Hiqlite authority attestation requires image_digest or source_revision",
-            path.display()
-        );
-    }
-    if authority_kind == "velorix_managed_hiqlite" {
-        if !has_image_digest {
-            bail!(
-                "{} managed Hiqlite authority attestation requires sha256 image_digest",
-                path.display()
-            );
-        }
-        require_json_true(
-            path,
-            artifact,
-            "/no_pvc/managed_hiqlite_authority_validated",
-        )?;
-        for (pointer, expected) in [
-            ("namespace_pvc_list", "no-pvc-namespace.json"),
-            ("hiqlite_statefulset", "no-pvc-hiqlite-statefulset.json"),
-            ("manifest", "velorix-hiqlite.yaml"),
-        ] {
-            let evidence_pointer = format!("{prefix}/no_pvc_evidence_files/{pointer}");
-            if require_json_str(path, artifact, &evidence_pointer)? != expected {
-                bail!(
-                    "{} managed Hiqlite authority attestation must attach {expected}",
-                    path.display()
-                );
-            }
-            require_sibling_evidence_file(path, expected, "product Hiqlite no-PVC evidence")?;
-        }
-    }
-    validate_product_hiqlite_authority_sibling(path, artifact, &sibling, prefix)?;
-
-    Ok(())
-}
-
-fn validate_product_hiqlite_authority_sibling(
-    path: &Path,
-    artifact: &serde_json::Value,
-    sibling: &serde_json::Value,
-    product_prefix: &str,
-) -> anyhow::Result<()> {
-    let filename = "hiqlite-authority-attestation.json";
-    let label = "product Hiqlite authority evidence";
-    require_sibling_json_u64(path, filename, sibling, "/schema_version", label)?;
-    for field in [
-        "schema_version",
-        "authority_kind",
-        "nodes",
-        "expected_voter_count",
-        "no_pvc_created_by_vind",
-        "metadata_authority_no_pvc_used",
-        "metadata_authority_storage_mode",
-        "voters_learner_only_disabled",
-        "api_auth_configured",
-        "raft_auth_configured",
-        "transport_security",
-        "backup_restore_configured",
-        "attested_at",
-        "attester",
-    ] {
-        require_sibling_json_matches_product(
-            path,
-            filename,
-            sibling,
-            &format!("/{field}"),
-            artifact,
-            &format!("{product_prefix}/{field}"),
-            label,
-        )?;
-    }
-    for field in [
-        "authority_kind",
-        "metadata_authority_storage_mode",
-        "transport_security",
-        "attested_at",
-        "attester",
-    ] {
-        require_sibling_json_str(path, filename, sibling, &format!("/{field}"), label)?;
-    }
-    for field in [
-        "no_pvc_created_by_vind",
-        "metadata_authority_no_pvc_used",
-        "voters_learner_only_disabled",
-        "api_auth_configured",
-        "raft_auth_configured",
-        "backup_restore_configured",
-    ] {
-        require_sibling_json_true(path, filename, sibling, &format!("/{field}"), label)?;
-    }
-    let nodes = sibling
-        .pointer("/nodes")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} {label} sibling {filename} missing array /nodes",
-                path.display()
-            )
-        })?;
-    if nodes.len() != 3 {
-        bail!(
-            "{} {label} sibling {filename} requires exactly 3 voter nodes",
-            path.display()
-        );
-    }
-    let mut unique_nodes = BTreeSet::new();
-    for node in nodes {
-        let Some(node) = node.as_str().filter(|value| !value.trim().is_empty()) else {
-            bail!(
-                "{} {label} sibling {filename} requires /nodes to contain nonempty strings",
-                path.display()
-            );
-        };
-        unique_nodes.insert(node);
-    }
-    if unique_nodes.len() != nodes.len() {
-        bail!(
-            "{} {label} sibling {filename} requires unique voter nodes",
-            path.display()
-        );
-    }
-    if require_sibling_json_u64(path, filename, sibling, "/expected_voter_count", label)? != 3 {
-        bail!(
-            "{} {label} sibling {filename} requires /expected_voter_count=3",
-            path.display()
-        );
-    }
-    let storage_mode = require_sibling_json_str(
-        path,
-        filename,
-        sibling,
-        "/metadata_authority_storage_mode",
-        label,
-    )?;
-    if storage_mode != "object-store-backup-restore-with-ephemeral-node-disk" {
-        bail!(
-            "{} {label} sibling {filename} requires object-store backup/restore with ephemeral node disk",
-            path.display()
-        );
-    }
-    let transport_security =
-        require_sibling_json_str(path, filename, sibling, "/transport_security", label)?;
-    if transport_security.trim().is_empty()
-        || matches!(
-            transport_security.trim().to_ascii_lowercase().as_str(),
-            "none" | "plaintext" | "local-only" | "generated-local-self-signed"
-        )
-    {
-        bail!(
-            "{} {label} sibling {filename} requires non-local transport security",
-            path.display()
-        );
-    }
-    let attested_at = require_sibling_json_str(path, filename, sibling, "/attested_at", label)?;
-    parse_rfc3339_utc_epoch_seconds(attested_at).with_context(|| {
-        format!(
-            "{} {label} sibling {filename} has invalid attested_at",
-            path.display()
-        )
-    })?;
-    for field in ["image_digest", "source_revision"] {
-        if artifact
-            .pointer(&format!("{product_prefix}/{field}"))
-            .is_some_and(|value| !value.is_null())
-        {
-            require_sibling_json_matches_product(
-                path,
-                filename,
-                sibling,
-                &format!("/{field}"),
-                artifact,
-                &format!("{product_prefix}/{field}"),
-                label,
-            )?;
-        }
-    }
-    if require_json_str(path, artifact, &format!("{product_prefix}/authority_kind"))?
-        == "velorix_managed_hiqlite"
-    {
-        require_sibling_json_str(path, filename, sibling, "/image_digest", label)?;
-        validate_product_managed_hiqlite_no_pvc_siblings(path)?;
-        require_sibling_json_matches_product(
-            path,
-            filename,
-            sibling,
-            "/no_pvc_evidence_files",
-            artifact,
-            &format!("{product_prefix}/no_pvc_evidence_files"),
-            label,
-        )?;
-    }
-
-    Ok(())
-}
-
-fn validate_product_managed_hiqlite_no_pvc_siblings(path: &Path) -> anyhow::Result<()> {
-    let filename = "no-pvc-hiqlite-statefulset.json";
-    let label = "product Hiqlite no-PVC StatefulSet evidence";
-    let statefulset = read_sibling_json_artifact(path, filename, label)?;
-    require_sibling_json_str_eq(path, filename, &statefulset, "/kind", "StatefulSet", label)?;
-    require_sibling_json_str_eq(
-        path,
-        filename,
-        &statefulset,
-        "/metadata/name",
-        "velorix-hiqlite",
-        label,
-    )?;
-    if require_sibling_json_u64(path, filename, &statefulset, "/spec/replicas", label)? != 3 {
-        bail!(
-            "{} {label} sibling {filename} requires /spec/replicas=3",
-            path.display()
-        );
-    }
-    match statefulset.pointer("/spec/volumeClaimTemplates") {
-        Some(serde_json::Value::Array(items)) if items.is_empty() => {}
-        None => {}
-        Some(_) => bail!(
-            "{} {label} sibling {filename} must not define volumeClaimTemplates",
-            path.display()
-        ),
-    }
-    require_sibling_json_str_eq(
-        path,
-        filename,
-        &statefulset,
-        "/spec/template/spec/serviceAccountName",
-        "velorix-hiqlite",
-        label,
-    )?;
-    let volumes = statefulset
-        .pointer("/spec/template/spec/volumes")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} {label} sibling {filename} missing array /spec/template/spec/volumes",
-                path.display()
-            )
-        })?;
-    let mut data_empty_dir = false;
-    for volume in volumes {
-        let name = volume.get("name").and_then(serde_json::Value::as_str);
-        if volume.get("persistentVolumeClaim").is_some() {
-            bail!(
-                "{} {label} sibling {filename} must not mount persistentVolumeClaim volumes",
-                path.display()
-            );
-        }
-        if name == Some("data") && volume.get("emptyDir").is_some() {
-            data_empty_dir = true;
-        }
-    }
-    if !data_empty_dir {
-        bail!(
-            "{} {label} sibling {filename} requires data emptyDir volume",
-            path.display()
-        );
-    }
-    let containers = statefulset
-        .pointer("/spec/template/spec/containers")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} {label} sibling {filename} missing array /spec/template/spec/containers",
-                path.display()
-            )
-        })?;
-    if containers.len() != 1 {
-        bail!(
-            "{} {label} sibling {filename} requires a single hiqlite container",
-            path.display()
-        );
-    }
-    let container = &containers[0];
-    if container.get("name").and_then(serde_json::Value::as_str) != Some("hiqlite") {
-        bail!(
-            "{} {label} sibling {filename} requires a single hiqlite container",
-            path.display()
-        );
-    }
-    let env = container
-        .get("env")
-        .and_then(serde_json::Value::as_array)
-        .with_context(|| {
-            format!(
-                "{} {label} sibling {filename} missing hiqlite container env",
-                path.display()
-            )
-        })?;
-    let env_names = env
-        .iter()
-        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
-        .collect::<BTreeSet<_>>();
-    for required in [
-        "HQL_SECRET_API",
-        "HQL_SECRET_RAFT",
-        "ENC_KEY_ACTIVE",
-        "ENC_KEYS",
-    ] {
-        if !env_names.contains(required) {
-            bail!(
-                "{} {label} sibling {filename} missing required env {required}",
-                path.display()
-            );
-        }
-    }
-    for item in env {
-        if item.get("name").and_then(serde_json::Value::as_str) == Some("HQL_LEARNER_ONLY")
-            && item
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        {
-            bail!(
-                "{} {label} sibling {filename} must not set HQL_LEARNER_ONLY=true",
-                path.display()
-            );
-        }
-    }
-
-    Ok(())
-}
-
 fn validate_product_api_auth_evidence(
     path: &Path,
     artifact: &serde_json::Value,
@@ -6236,15 +4313,6 @@ fn validate_product_deployed_image_evidence(
         )?;
     }
     Ok(())
-}
-
-fn product_deployed_image_digest<'a>(
-    artifact: &'a serde_json::Value,
-    role: &str,
-) -> Option<&'a str> {
-    artifact
-        .pointer(&format!("/deployed_images/{role}/image_digest"))
-        .and_then(serde_json::Value::as_str)
 }
 
 fn validate_product_deployed_role_image_evidence(
@@ -7373,55 +5441,6 @@ fn validate_recent_ingress_tls_auth_attested_at(
     Ok(())
 }
 
-fn validate_recent_hiqlite_backend_time_attested_at(
-    path: &Path,
-    attested_at: &str,
-) -> anyhow::Result<()> {
-    let attested_at_epoch = parse_rfc3339_utc_epoch_seconds(attested_at).with_context(|| {
-        format!(
-            "{} Hiqlite backend-time attestation has invalid attested_at",
-            path.display()
-        )
-    })?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system time is before Unix epoch")?
-        .as_secs();
-    if attested_at_epoch > now + HIQLITE_BACKEND_TIME_ATTESTATION_FUTURE_SKEW_SECS {
-        bail!(
-            "{} Hiqlite backend-time attestation attested_at is too far in the future",
-            path.display()
-        );
-    }
-    if now.saturating_sub(attested_at_epoch) > HIQLITE_BACKEND_TIME_ATTESTATION_MAX_AGE_SECS {
-        bail!(
-            "{} Hiqlite backend-time attestation attested_at is older than {} seconds",
-            path.display(),
-            HIQLITE_BACKEND_TIME_ATTESTATION_MAX_AGE_SECS
-        );
-    }
-
-    Ok(())
-}
-
-fn validate_hiqlite_backend_time_attester(path: &Path, attester: &str) -> anyhow::Result<()> {
-    let attester = attester.trim();
-    if attester.is_empty() {
-        bail!(
-            "{} Hiqlite backend-time attestation is missing attester",
-            path.display()
-        );
-    }
-    if !HIQLITE_BACKEND_TIME_ALLOWED_ATTESTERS.contains(&attester) {
-        bail!(
-            "{} Hiqlite backend-time attestation attester is not allowlisted: {attester}",
-            path.display()
-        );
-    }
-
-    Ok(())
-}
-
 fn parse_rfc3339_utc_epoch_seconds(value: &str) -> anyhow::Result<u64> {
     let value = value.trim();
     let Some(value) = value.strip_suffix('Z') else {
@@ -7662,37 +5681,6 @@ fn validate_full_git_commit_sha(path: &Path, value: &str, label: &str) -> anyhow
     Ok(())
 }
 
-fn decode_base64_field(path: &Path, value: &str, label: &str) -> anyhow::Result<Vec<u8>> {
-    BASE64_STANDARD
-        .decode(value.trim())
-        .with_context(|| format!("{} {label} must be base64", path.display()))
-}
-
-fn sigstore_sha256_hash_from_prefixed_digest(
-    path: &Path,
-    value: &str,
-    label: &str,
-) -> anyhow::Result<SigstoreSha256Hash> {
-    validate_sha256_digest(path, value, label)?;
-    let hex = value.trim().trim_start_matches("sha256:");
-    SigstoreSha256Hash::from_hex(hex).with_context(|| {
-        format!(
-            "{} {label} is not a valid Sigstore SHA-256 hash",
-            path.display()
-        )
-    })
-}
-
-fn sha256_digest_of_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity("sha256:".len() + digest.len() * 2);
-    output.push_str("sha256:");
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
-}
-
 fn is_local_dev_authority_store_id(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     [
@@ -7853,39 +5841,6 @@ fn garbage_collection_run_digest(run: &GarbageCollectionRunV1) -> anyhow::Result
         output.push_str(&format!("{byte:02x}"));
     }
     Ok(output)
-}
-
-fn sha256_hex_of_file(path: &Path) -> anyhow::Result<String> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read {} for sha256 digest", path.display()))?;
-    Ok(sha256_hex_of_bytes(&bytes))
-}
-
-fn sha256_hex_of_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
-}
-
-fn canonical_product_evidence_without_backend_time_attestation_bytes(
-    path: &Path,
-) -> anyhow::Result<Vec<u8>> {
-    let mut value: serde_json::Value = read_json_artifact(path)?;
-    if let Some(metadata_store) = value
-        .get_mut("metadata_store")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        metadata_store.remove("hiqlite_backend_time_attestation");
-    }
-    serde_json::to_vec(&value).with_context(|| {
-        format!(
-            "failed to canonicalize {} without metadata_store.hiqlite_backend_time_attestation",
-            path.display()
-        )
-    })
 }
 
 fn sorted_u64s(values: &[u64]) -> Vec<u64> {
@@ -9173,7 +7128,7 @@ const REQUIRED_PACKAGE_REVIEW_SUBJECTS: &[&str] = &[
     "k8s-openapi",
     "slatedb",
     "foyer",
-    "hiqlite",
+    "rhizadb",
     "materialized_view_runtime",
 ];
 

@@ -606,7 +606,6 @@ def main() -> int:
     parser.add_argument("--external-s3-mode", choices=["auto", "0", "1"], required=True)
     parser.add_argument("--ingress-mode", choices=["auto", "0", "1"], required=True)
     parser.add_argument("--durability-mode", choices=["auto", "0", "1"], required=True)
-    parser.add_argument("--hiqlite-mode", choices=["auto", "0", "1"], required=True)
     parser.add_argument("durability_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -628,14 +627,6 @@ def main() -> int:
         "durability": validate_durability(args.durability_mode, durability_args, product)
         if args.durability_mode != "0"
         else {"mode": "0", "required": False, "ready": False, "status": "disabled"},
-        "hiqlite_backend_time": {
-            "mode": args.hiqlite_mode,
-            "required": args.hiqlite_mode == "1",
-            "ready": None,
-            "status": "disabled" if args.hiqlite_mode == "0" else "deferred_to_release_preflight",
-            "release_failover_requested": env("VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST") == "1",
-            "trusted_provenance_requested": env("VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE") == "1",
-        },
     }
     forced_blockers = [
         {"step": name, "missing": step.get("missing") or [], "invalid": step.get("invalid") or []}

@@ -43,10 +43,7 @@ local_min_free_disk_gib="${VELORIX_FIRST_E2E_MIN_FREE_DISK_GIB:-${VELORIX_LOCAL_
 
 api_image="${VELORIX_API_IMAGE:-}"
 meta_image="${VELORIX_META_IMAGE:-}"
-hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"
-hiqlite_image="${VELORIX_HIQLITE_IMAGE:-velorix-hiqlite:e2e}"
 ingest_writer_image="${VELORIX_INGEST_WRITER_IMAGE:-velorix-ingest-writer:e2e}"
-hiqlite_local_source_dir="${VELORIX_HIQLITE_LOCAL_SOURCE_DIR:-${repo_root}/../hiqlite}"
 max_regression_fraction="${VELORIX_FIRST_E2E_MAX_REGRESSION_FRACTION:-0.35}"
 
 skip_rustfs="${VELORIX_FIRST_E2E_SKIP_RUSTFS:-0}"
@@ -87,8 +84,6 @@ Main environment overrides:
   VELORIX_FIRST_E2E_MAX_REGRESSION_FRACTION=0.35
   VELORIX_API_IMAGE=<required with RUN_PRODUCT=1 and SKIP_DOCKER_BUILD=1>
   VELORIX_META_IMAGE=<required with RUN_PRODUCT=1 and SKIP_DOCKER_BUILD=1>
-  VELORIX_HIQLITE_DEPLOY=0  # set 1 to let the product slice deploy managed no-PVC Hiqlite
-  VELORIX_HIQLITE_IMAGE=velorix-hiqlite:e2e
   VELORIX_INGEST_WRITER_IMAGE=velorix-ingest-writer:e2e
   VELORIX_FIRST_E2E_SKIP_RUSTFS=1
   VELORIX_FIRST_E2E_SKIP_DOCKER_BUILD=1
@@ -284,13 +279,6 @@ case "$rustfs_cleanup_requested" in
     exit 64
     ;;
 esac
-case "$hiqlite_deploy" in
-  0 | 1) ;;
-  *)
-    echo "VELORIX_HIQLITE_DEPLOY must be 0 or 1" >&2
-    exit 64
-    ;;
-esac
 if [ "$rustfs_credentials_explicit" = "1" ]; then
   if [ -z "${VELORIX_RUSTFS_ACCESS_KEY:-}" ] || [ -z "${VELORIX_RUSTFS_SECRET_KEY:-}" ]; then
     echo "VELORIX_RUSTFS_ACCESS_KEY and VELORIX_RUSTFS_SECRET_KEY must be set together" >&2
@@ -319,9 +307,6 @@ if [ "$skip_docker_build" = "1" ]; then
     fi
     require_local_docker_image "$api_image"
     require_local_docker_image "$meta_image"
-    if [ "$hiqlite_deploy" = "1" ]; then
-      require_local_docker_image "$hiqlite_image"
-    fi
   fi
 fi
 
@@ -379,12 +364,7 @@ if [ "$skip_docker_build" = "1" ]; then
   step "Skipping ingest-writer image build"
 else
   step "Building ingest-writer image ${ingest_writer_image}"
-  if [ ! -f "${hiqlite_local_source_dir}/hiqlite/Cargo.toml" ]; then
-    echo "VELORIX_HIQLITE_LOCAL_SOURCE_DIR must point to a hiqlite checkout containing hiqlite/Cargo.toml: ${hiqlite_local_source_dir}" >&2
-    exit 64
-  fi
   DOCKER_BUILDKIT=1 docker build \
-    --build-context "velorix-hiqlite-source=${hiqlite_local_source_dir}" \
     -f Dockerfile.ingest-writer \
     -t "$ingest_writer_image" \
     .
@@ -526,12 +506,6 @@ EOF
   if [ -n "$product_ingress_tls_auth_auto" ]; then
     product_env+=("VELORIX_INGRESS_TLS_AUTH_AUTO=$product_ingress_tls_auth_auto")
   fi
-  if [ "$hiqlite_deploy" = "1" ]; then
-    product_env+=(
-      "VELORIX_HIQLITE_DEPLOY=1"
-      "VELORIX_HIQLITE_IMAGE=$hiqlite_image"
-    )
-  fi
   if [ -n "$api_image" ]; then
     product_env+=("VELORIX_API_IMAGE=$api_image")
   fi
@@ -543,9 +517,6 @@ EOF
       "VELORIX_BUILD_API_IMAGE=0"
       "VELORIX_BUILD_META_IMAGE=0"
     )
-    if [ "$hiqlite_deploy" = "1" ]; then
-      product_env+=("VELORIX_BUILD_HIQLITE_IMAGE=0")
-    fi
   fi
   if [ "$product_authority_kind" = "external" ]; then
     require_env AWS_ENDPOINT_URL
@@ -557,28 +528,19 @@ EOF
 	    default)
 	      ;;
 	    logical-fencing)
-	      if [ "$hiqlite_deploy" != "1" ]; then
-        require_env VELORIX_HIQLITE_NODES
-        require_env VELORIX_HIQLITE_API_SECRET
-      fi
       product_env+=(
         "VELORIX_STANDING_RUNTIME_FENCING=logical-fencing"
         "VELORIX_API_REPLICA_COUNT=2"
         "VELORIX_META_ENABLED=1"
-	        "VELORIX_META_BACKEND=hiqlite"
-	      )
+        "VELORIX_META_BACKEND=oss"
+      )
 	      ;;
 	    required)
-	      if [ "$hiqlite_deploy" != "1" ]; then
-	        require_env VELORIX_HIQLITE_NODES
-	        require_env VELORIX_HIQLITE_API_SECRET
-	      fi
 	      product_env+=(
 	        "VELORIX_STANDING_RUNTIME_FENCING=required"
 	        "VELORIX_API_REPLICA_COUNT=2"
 	        "VELORIX_META_ENABLED=1"
-	        "VELORIX_META_BACKEND=hiqlite"
-	        "VELORIX_REQUIRE_HIQLITE_BACKEND_TIME=1"
+	        "VELORIX_META_BACKEND=oss"
 	      )
 	      ;;
 	  esac

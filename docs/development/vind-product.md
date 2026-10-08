@@ -65,13 +65,6 @@ The local product path is no-PVC and jarless. Evidence is written under
 
 - `no-pvc-namespace.json`: proves no `PersistentVolumeClaim` objects exist in
   the product namespace.
-- `hiqlite-authority-attestation.json`: records the managed or external
-  Hiqlite authority shape and source revision.
-- `hiqlite-backend-time-assessment.json`: local diagnostic assessment for
-  backend-time lease semantics. Set `VELORIX_REQUIRE_HIQLITE_BACKEND_TIME=1`
-  when this diagnostic must pass.
-- `hiqlite-backend-time-attestation.json`: diagnostic backend-time attestation;
-  release/Sigstore provenance is tracked separately.
 - `tls-auth-smoke.json`: local TLS/auth smoke evidence.
 - `ingress-tls-auth-attestation.json`: public ingress/TLS/auth product
   attestation.
@@ -133,6 +126,18 @@ service-connection and pod-replacement recovery check, use
 `VELORIX_RHIZA_EXECUTE=1` is explicitly set and records production trust as
 false.
 
+That harness targets the Rhiza 0.19.0 peer-identity contract: the membership
+document carries `node_id`, `url`, `peer_url`, and `public_key` — standard
+padded base64 of each node's 32-byte Ed25519 public key — and rejects the
+legacy per-member `token` as an unknown field. Private peer tokens are supplied
+separately as one node-keyed shared map: the harness passes
+`VELORIX_RHIZA_PEER_TOKENS`, which the gate materializes as the native
+`RHIZA_PEER_TOKENS` Secret, and every Pod selects only its own entry by
+`RHIZA_NODE_ID` rather than reading a per-Pod
+`VELORIX_RHIZA_PEER_TOKEN_FILE`. It is greenfield: it provisions a fresh
+namespace, object-store prefix, cluster identity, and empty node directories,
+and it has no migration path from a pre-0.19.0 membership document.
+
 Refresh deployed image digest evidence with:
 
 ```bash
@@ -172,8 +177,7 @@ The same gate data is exposed as `completion_plan`; each in-scope gate is
 classified as `input_required`, `waiting_on_prerequisite`, `runnable`, or
 `blocked_without_action`. Input-related plan steps include `input_summary`,
 including `secret_placeholders`, `missing_subjects`, `invalid_subjects`, and
-redacted release preflight details such as
-`hiqlite-backend-time-release-preflight.json`.
+redacted release preflight details.
 
 `VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3=0` is the current default.
 Therefore `object_store_external_authority` and

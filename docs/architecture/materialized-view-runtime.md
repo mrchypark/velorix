@@ -68,7 +68,7 @@ published join output must state the exact input frontiers it has applied.
 
 ## Metadata, Cache, and Checkpoints
 
-Hiqlite stores small metadata:
+The metadata service stores small metadata:
 
 - relation definitions
 - view definitions
@@ -92,13 +92,13 @@ The runtime should use cache layers to reduce repeated durable storage reads:
 - durable object or local storage as the source of truth
 
 Cache state is never the only correctness boundary. Recovery must be possible
-from hiqlite metadata plus durable storage checkpoints and replay data.
+from metadata-service state plus durable storage checkpoints and replay data.
 
 ## Recovery Model
 
-On restart, Velorix loads relation and view metadata from hiqlite, restores view
-runtime state from the latest durable checkpoint, and replays only committed
-epochs after that checkpoint.
+On restart, Velorix loads relation and view metadata from the metadata service,
+restores view runtime state from the latest durable checkpoint, and replays only
+committed epochs after that checkpoint.
 
 Recovery must not require source full recomputation when a valid checkpoint and
 replay range exist. If a checkpoint is missing or invalid, recovery must fail
@@ -123,7 +123,7 @@ closed or use an explicitly accepted repair path.
 - Unsupported views fail during admission with a clear error.
 - Ingest automatically updates materialized output tables.
 - Query reads materialized output rather than recomputing from source relations.
-- Restart recovers from hiqlite metadata and durable checkpoints.
+- Restart recovers from metadata-service state and durable checkpoints.
 - Replay after restart applies only epochs after the restored checkpoint.
 - Two-relation join views publish checkpoint-bound per-relation frontier
   vectors.

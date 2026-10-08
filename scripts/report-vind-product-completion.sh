@@ -290,12 +290,6 @@ def subjects_from_issues(items):
 product = load_json(product_path)
 rest_smoke = load_json(rest_smoke_path) if os.path.exists(rest_smoke_path) else None
 deployed_images = product.get("deployed_images") or {}
-release_preflight_path = os.path.join(
-    product_dir, "hiqlite-backend-time-release-preflight.json"
-)
-release_env_report_path = os.path.join(
-    product_dir, "hiqlite-backend-time-release-env.json"
-)
 input_preflight_path = os.path.join(
     product_dir, "complete-vind-product-input-preflight.json"
 )
@@ -315,10 +309,6 @@ s3_checkpoint_fault_matrix_path = os.environ.get(
     "VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH",
     os.path.join(product_dir, "s3-checkpoint-fault-matrix.json"),
 )
-hiqlite_restore_drill_path = os.environ.get(
-    "VELORIX_HIQLITE_RESTORE_DRILL_EVIDENCE_PATH",
-    os.path.join(product_dir, "hiqlite-restore-drill.json"),
-)
 upgrade_repair_gc_fault_matrix_path = os.environ.get(
     "VELORIX_UPGRADE_ROLLBACK_REPAIR_GC_FAULT_MATRIX_EVIDENCE_PATH",
     os.path.join(product_dir, "upgrade-rollback-repair-gc-fault-matrix.json"),
@@ -336,8 +326,6 @@ remaining_release_readiness_path = os.environ.get(
     "VELORIX_REMAINING_RELEASE_READINESS_EVIDENCE_PATH",
     os.path.join(product_dir, "remaining-release-readiness.json"),
 )
-release_preflight = load_optional_json(release_preflight_path)
-release_env_report = load_optional_json(release_env_report_path)
 input_preflight = load_optional_json(input_preflight_path)
 complete_env_report = load_optional_json(complete_env_report_path)
 complete_execution_plan = load_optional_json(complete_execution_plan_path)
@@ -347,7 +335,6 @@ product_evidence_blockers = product.get("product_complete_blockers") or []
 product_evidence_product_complete = product.get("product_complete") is True
 external_s3_required = os.environ.get("VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3", "0") == "1"
 public_ingress_required = os.environ.get("VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS", "0") == "1"
-hiqlite_release_required = os.environ.get("VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE", "0") == "1"
 completion_scope_warnings = []
 if not public_ingress_required:
     completion_scope_warnings.append(
@@ -356,10 +343,6 @@ if not public_ingress_required:
 if not external_s3_required:
     completion_scope_warnings.append(
         "object_store_external_authority_out_of_scope_does_not_prove_object_store_durability"
-    )
-if not hiqlite_release_required:
-    completion_scope_warnings.append(
-        "hiqlite_backend_time_release_out_of_scope_does_not_prove_sigstore_ci_release_provenance"
     )
 gates = []
 next_actions = []
@@ -887,178 +870,6 @@ gates.append(
 if not s3_fault_matrix_pass and object_store_real_authority:
     next_actions.append(s3_fault_matrix_action)
 
-backend_time = pointer(product, "/metadata_store/hiqlite_backend_time_attestation")
-backend_assessment = pointer(product, "/metadata_store/hiqlite_backend_time_assessment") or {}
-backend_time_boundary_pass = (
-    backend_assessment.get("validated") is True
-    and backend_assessment.get("backend_time_source_kind")
-    == "raft_replicated_authority_time"
-    and backend_assessment.get("bounded_wall_clock_failover") is True
-    and backend_assessment.get("can_generate_product_complete_backend_time_attestation")
-    is True
-    and isinstance(backend_time, dict)
-    and backend_time.get("validated") is True
-    and backend_time.get("authoritative_backend_time") is True
-    and backend_time.get("time_source_kind") == "raft_replicated_authority_time"
-    and backend_time.get("bounded_wall_clock_failover") is True
-    and backend_time.get("release_validator_fail_closed") is True
-    and backend_time.get("trusted_for_release_validator") is False
-    and backend_time.get("trusted_for_product_complete") is False
-)
-gates.append(
-    gate(
-        "hiqlite_backend_time_boundary",
-        "pass" if backend_time_boundary_pass else "blocked",
-        "Local Hiqlite replicated backend-time boundary for owner TTL and failover",
-        evidence={
-            "assessment": backend_assessment.get("evidence"),
-            "attestation": None if backend_time is None else backend_time.get("evidence"),
-            "backend_time_source_kind": backend_assessment.get(
-                "backend_time_source_kind"
-            ),
-            "attestation_origin": None
-            if backend_time is None
-            else backend_time.get("attestation_origin"),
-            "source_kind": None if backend_time is None else backend_time.get("source_kind"),
-            "release_validator_fail_closed": None
-            if backend_time is None
-            else backend_time.get("release_validator_fail_closed"),
-            "trusted_for_release_validator": None
-            if backend_time is None
-            else backend_time.get("trusted_for_release_validator"),
-        },
-        next_action=None
-        if backend_time_boundary_pass
-        else command(
-            "scripts/attest-hiqlite-backend-time.sh "
-            "--product-evidence target/velorix-product/product-evidence.json "
-            "--output target/velorix-product/hiqlite-backend-time-attestation.json "
-            "--update-product-evidence"
-        ),
-    )
-)
-if not hiqlite_release_required:
-    action = command(
-        "scripts/write-hiqlite-backend-time-release-env.sh "
-        "--product-evidence target/velorix-product/product-evidence.json && "
-        "Replace every REPLACE_WITH_* value in "
-        "target/velorix-product/hiqlite-backend-time-release.env, then "
-        "scripts/check-hiqlite-backend-time-release-inputs.sh "
-        "--env-file target/velorix-product/hiqlite-backend-time-release.env "
-        "--product-evidence target/velorix-product/product-evidence.json && "
-        "Regenerate Hiqlite backend-time attestation in release CI with "
-        "VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE=1"
-    )
-    gates.append(
-        gate(
-            "hiqlite_backend_time_release",
-            "out_of_scope",
-            "Trusted Hiqlite backend-time release CI/Sigstore provenance is excluded from the current product-complete goal",
-            evidence={
-                "hiqlite_release_required": hiqlite_release_required,
-                "diagnostic_attestation": None
-                if backend_time is None
-                else backend_time.get("evidence"),
-                "release_validator_fail_closed": None
-                if backend_time is None
-                else backend_time.get("release_validator_fail_closed"),
-            },
-            next_action=action,
-        )
-    )
-elif backend_time and backend_time.get("trusted_for_product_complete") is True:
-    gates.append(
-        gate(
-            "hiqlite_backend_time_release",
-            "pass",
-            "Trusted Hiqlite backend-time release attestation is attached",
-            evidence={"hiqlite_backend_time_attestation": backend_time.get("evidence")},
-        )
-    )
-else:
-    if backend_time:
-        action = command(
-            "scripts/write-hiqlite-backend-time-release-env.sh "
-            "--product-evidence target/velorix-product/product-evidence.json && "
-            "Replace every REPLACE_WITH_* value in "
-            "target/velorix-product/hiqlite-backend-time-release.env, then "
-            "scripts/check-hiqlite-backend-time-release-inputs.sh "
-            "--env-file target/velorix-product/hiqlite-backend-time-release.env "
-            "--product-evidence target/velorix-product/product-evidence.json && "
-            "Regenerate Hiqlite backend-time attestation in release CI with "
-            "VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE=1, trusted "
-            "release wall-clock failover evidence, deployed image digests, "
-            "clean source revision, and signing/sigstore provenance; the "
-            "current local diagnostic attestation cannot pass release validation"
-        )
-    else:
-        action = command(
-            "scripts/attest-hiqlite-backend-time.sh "
-            "--product-evidence target/velorix-product/product-evidence.json "
-            "--output target/velorix-product/hiqlite-backend-time-attestation.json "
-            "--update-product-evidence"
-        )
-    status = (
-        "diagnostic"
-        if backend_assessment.get("can_generate_product_complete_backend_time_attestation")
-        is True
-        else "blocked"
-    )
-    release_evidence = {}
-    if release_preflight:
-        missing = release_preflight.get("missing") or []
-        invalid = release_preflight.get("invalid") or []
-        release_evidence["preflight"] = {
-            "evidence": "hiqlite-backend-time-release-preflight.json",
-            "status": release_preflight.get("status"),
-            "missing_count": len(missing),
-            "invalid_count": len(invalid),
-            "missing_subjects": [
-                item.get("subject") for item in missing if isinstance(item, dict)
-            ],
-            "invalid_subjects": [
-                item.get("subject") for item in invalid if isinstance(item, dict)
-            ],
-        }
-    if release_env_report:
-        release_evidence["env_template"] = {
-            "evidence": "hiqlite-backend-time-release-env.json",
-            "placeholder_count": len(release_env_report.get("placeholders") or []),
-            "placeholders": release_env_report.get("placeholders") or [],
-            "derived_from_product_evidence": release_env_report.get(
-                "derived_from_product_evidence"
-            )
-            or [],
-        }
-    gates.append(
-        gate(
-            "hiqlite_backend_time_release",
-            status,
-            "Hiqlite backend-time capability is diagnostic until trusted release provenance and product-complete failover evidence are attached",
-            evidence={
-                "assessment": backend_assessment.get("evidence"),
-                "assessment_can_generate": backend_assessment.get(
-                    "can_generate_product_complete_backend_time_attestation"
-                ),
-                "attestation": None
-                if backend_time is None
-                else backend_time.get("evidence"),
-                "trusted_for_product_complete": None
-                if backend_time is None
-                else backend_time.get("trusted_for_product_complete"),
-                "trusted_for_release_validator": None
-                if backend_time is None
-                else backend_time.get("trusted_for_release_validator"),
-                "release_validator_fail_closed": None
-                if backend_time is None
-                else backend_time.get("release_validator_fail_closed"),
-                **release_evidence,
-            },
-            next_action=action,
-        )
-    )
-    next_actions.append(action)
-
 standing = product.get("standing_runtime_fencing") or {}
 standing_pass = (
     standing.get("required_mode") is True
@@ -1091,41 +902,6 @@ gates.append(
         evidence={"no_pvc": pointer(product, "/no_pvc/evidence")},
     )
 )
-
-hiqlite_restore_drill = validator_summary(
-    "check-hiqlite-restore-drill-evidence.sh",
-    hiqlite_restore_drill_path,
-)
-hiqlite_restore_drill_pass = bind_release_identity(
-    hiqlite_restore_drill,
-    hiqlite_restore_drill_path,
-    "hiqlite_total_voter_loss_restore_drill",
-)
-hiqlite_restore_drill_action = command(
-    "Destroy every Hiqlite voter and node-local disk after an acknowledged "
-    "materialized ingest, restore only from object-store backup, write "
-    "target/velorix-product/hiqlite-restore-drill.json with deployment_id, "
-    "s3:// authority_store_id, evidence_kind=hiqlite_total_voter_loss_restore_drill, "
-    "source_revision, deployed_image_digests, "
-    "and evidence_refs for object_store_backup, total_voter_loss_log, restore_log, "
-    "metadata_write_survival, and post_restore_ingest_query; then validate with "
-    "scripts/check-hiqlite-restore-drill-evidence.sh "
-    "target/velorix-product/hiqlite-restore-drill.json"
-)
-gates.append(
-    gate(
-        "hiqlite_total_voter_loss_restore_drill",
-        "pass"
-        if hiqlite_restore_drill_pass
-        else hiqlite_restore_drill.get("status", "blocked"),
-        "Live no-PVC Hiqlite total-voter-loss restore drill preserving acknowledged metadata writes",
-        evidence=hiqlite_restore_drill,
-        next_action=None if hiqlite_restore_drill_pass else hiqlite_restore_drill_action,
-        blocked_by=None if no_pvc_pass else ["no_pvc"],
-    )
-)
-if not hiqlite_restore_drill_pass and no_pvc_pass:
-    next_actions.append(hiqlite_restore_drill_action)
 
 upgrade_repair_gc_fault_matrix = validator_summary(
     "check-upgrade-rollback-repair-gc-fault-matrix-evidence.sh",
@@ -1367,10 +1143,6 @@ GATE_INPUT_MAP = {
         "preflight_steps": ["durability"],
         "placeholder_groups": ["object_store_durability_review"],
     },
-    "hiqlite_backend_time_release": {
-        "preflight_steps": ["hiqlite_backend_time"],
-        "placeholder_groups": ["release_identity", "sigstore_provenance"],
-    },
 }
 
 
@@ -1423,23 +1195,6 @@ def integer_or_zero(value):
     return value if isinstance(value, int) else 0
 
 
-def release_preflight_summary():
-    if not isinstance(release_preflight, dict):
-        return None
-    missing = redacted_issues(release_preflight.get("missing") or [])
-    invalid = redacted_issues(release_preflight.get("invalid") or [])
-    return {
-        "evidence": "hiqlite-backend-time-release-preflight.json",
-        "status": release_preflight.get("status"),
-        "missing_count": len(missing),
-        "invalid_count": len(invalid),
-        "missing": missing,
-        "invalid": invalid,
-        "missing_subjects": issue_subjects(missing),
-        "invalid_subjects": issue_subjects(invalid),
-    }
-
-
 def completion_execution_plan_summary():
     if not isinstance(complete_execution_plan, dict):
         return None
@@ -1460,13 +1215,6 @@ def completion_execution_plan_summary():
             "missing_subjects": step.get("missing_subjects") or [],
             "invalid_subjects": step.get("invalid_subjects") or [],
         }
-        if name == "hiqlite_backend_time":
-            release_summary = release_preflight_summary()
-            if release_summary:
-                step_summary["release_preflight"] = release_summary
-                step_summary["release_preflight_status"] = release_summary.get("status")
-                step_summary["release_preflight_missing_subjects"] = release_summary.get("missing_subjects") or []
-                step_summary["release_preflight_invalid_subjects"] = release_summary.get("invalid_subjects") or []
         steps[name] = step_summary
     return {
         "evidence": "complete-vind-product-plan.json",
@@ -1568,10 +1316,6 @@ def input_summary_for_gate(gate_id):
         ],
         "creates_product_complete_evidence": False,
     }
-    if gate_id == "hiqlite_backend_time_release":
-        release_summary = release_preflight_summary()
-        if release_summary:
-            payload["release_preflight"] = release_summary
     if gate_id == "object_store_durability_policy":
         if staged_attestation:
             payload["staged_attestation"] = staged_attestation
@@ -1626,11 +1370,6 @@ def input_summary_requires_input(summary):
             return True
         if step.get("ready") is False:
             return True
-    release = summary.get("release_preflight") or {}
-    if isinstance(release, dict) and (
-        release.get("missing_count", 0) > 0 or release.get("invalid_count", 0) > 0
-    ):
-        return True
     return False
 
 
@@ -1792,7 +1531,6 @@ payload = {
     "completion_scope": {
         "external_s3_required": external_s3_required,
         "public_ingress_required": public_ingress_required,
-        "hiqlite_release_required": hiqlite_release_required,
         "excluded_gates": [
             item.get("id") for item in gates if item.get("status") == "out_of_scope"
         ],

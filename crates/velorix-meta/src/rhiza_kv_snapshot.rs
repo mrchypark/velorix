@@ -179,7 +179,18 @@ impl RhizaKvSnapshot {
         })
     }
 
-    /// Close the native node owned by this snapshot facade.
+    /// The bound recovery address, if the underlying store started one.
+    pub fn recovery_address(&self) -> Option<&str> {
+        self.kv.recovery_address()
+    }
+
+    /// Native local readiness. See [`super::rhiza_kv::RhizaKvStore::ready`].
+    pub async fn ready(&self) -> Result<bool, SnapshotError> {
+        self.kv.ready().await.map_err(SnapshotError::Kv)
+    }
+
+    /// Close the native node owned by this snapshot facade. Closing also closes
+    /// the recovery listener, which native ties to the same handle.
     pub async fn close(self) -> Result<(), SnapshotError> {
         self.kv.close().await.map_err(SnapshotError::Kv)
     }

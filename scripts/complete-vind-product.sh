@@ -50,7 +50,6 @@ Step modes, each auto|0|1:
   VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3=auto
   VELORIX_COMPLETE_PRODUCT_INGRESS=auto
   VELORIX_COMPLETE_PRODUCT_DURABILITY=auto
-  VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME=auto
   VELORIX_COMPLETE_PRODUCT_LOCAL_EVIDENCE=auto
 
 Other:
@@ -160,13 +159,11 @@ if [ -n "$env_file" ]; then
     VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3 \
     VELORIX_COMPLETE_PRODUCT_INGRESS \
     VELORIX_COMPLETE_PRODUCT_DURABILITY \
-    VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME \
     VELORIX_COMPLETE_PRODUCT_LOCAL_EVIDENCE \
     VELORIX_COMPLETE_PRODUCT_REPORT \
     VELORIX_COMPLETE_PRODUCT_DRY_RUN \
     VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3 \
     VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS \
-    VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE \
     AWS_ENDPOINT_URL \
     AWS_ACCESS_KEY_ID \
     AWS_SECRET_ACCESS_KEY \
@@ -206,24 +203,8 @@ if [ -n "$env_file" ]; then
     VELORIX_OBJECT_STORE_DESTRUCTIVE_DELETE_PROTECTION_REVIEWED \
     VELORIX_OBJECT_STORE_COST_CONTROLS_REVIEWED \
     VELORIX_PRODUCT_EVIDENCE_PATH \
-    VELORIX_HIQLITE_BACKEND_TIME_RELEASE_ENV_FORCE \
-    VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE \
-    VELORIX_SOURCE_REPOSITORY \
-    VELORIX_SOURCE_REVISION \
-    VELORIX_RELEASE_COMMIT \
     VELORIX_API_IMAGE_DIGEST \
-    VELORIX_META_IMAGE_DIGEST \
-    VELORIX_HIQLITE_IMAGE_DIGEST \
-    VELORIX_CI_WORKFLOW_NAME \
-    VELORIX_CI_WORKFLOW_RUN_ID \
-    VELORIX_CI_JOB_NAME \
-    VELORIX_CI_OIDC_SUBJECT \
-    VELORIX_CI_WORKFLOW_REF \
-    VELORIX_CI_JOB_WORKFLOW_REF \
-    VELORIX_CI_SIGSTORE_BUNDLE_BASE64 \
-    VELORIX_CI_SIGSTORE_CERTIFICATE_IDENTITY \
-    VELORIX_CI_SIGSTORE_BUNDLE_SHA256 \
-    VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST
+    VELORIX_META_IMAGE_DIGEST
 fi
 
 product_dir="${VELORIX_VIND_PRODUCT_DIR:-target/velorix-product}"
@@ -232,27 +213,21 @@ report_file="${VELORIX_PRODUCT_COMPLETION_REPORT:-${product_dir}/product-complet
 input_preflight_file="${VELORIX_COMPLETE_PRODUCT_INPUT_PREFLIGHT:-${product_dir}/complete-vind-product-input-preflight.json}"
 external_s3_required="${VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3:-0}"
 public_ingress_required="${VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS:-0}"
-hiqlite_release_required="${VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE:-0}"
 external_s3_step="${VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3:-auto}"
 ingress_step="${VELORIX_COMPLETE_PRODUCT_INGRESS:-auto}"
 durability_step="${VELORIX_COMPLETE_PRODUCT_DURABILITY:-auto}"
-hiqlite_backend_time_step="${VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME:-auto}"
 local_evidence_step="${VELORIX_COMPLETE_PRODUCT_LOCAL_EVIDENCE:-auto}"
 final_report="${VELORIX_COMPLETE_PRODUCT_REPORT:-1}"
 dry_run="${VELORIX_COMPLETE_PRODUCT_DRY_RUN:-0}"
-hiqlite_release_env_force="${VELORIX_HIQLITE_BACKEND_TIME_RELEASE_ENV_FORCE:-0}"
 
 valid_step_mode VELORIX_COMPLETE_PRODUCT_EXTERNAL_S3 "$external_s3_step"
 valid_step_mode VELORIX_COMPLETE_PRODUCT_INGRESS "$ingress_step"
 valid_step_mode VELORIX_COMPLETE_PRODUCT_DURABILITY "$durability_step"
-valid_step_mode VELORIX_COMPLETE_PRODUCT_HIQLITE_BACKEND_TIME "$hiqlite_backend_time_step"
 valid_step_mode VELORIX_COMPLETE_PRODUCT_LOCAL_EVIDENCE "$local_evidence_step"
 valid_bool VELORIX_PRODUCT_COMPLETE_REQUIRE_EXTERNAL_S3 "$external_s3_required"
 valid_bool VELORIX_PRODUCT_COMPLETE_REQUIRE_PUBLIC_INGRESS "$public_ingress_required"
-valid_bool VELORIX_PRODUCT_COMPLETE_REQUIRE_HIQLITE_RELEASE "$hiqlite_release_required"
 valid_bool VELORIX_COMPLETE_PRODUCT_DRY_RUN "$dry_run"
 valid_bool VELORIX_COMPLETE_PRODUCT_REPORT "$final_report"
-valid_bool VELORIX_HIQLITE_BACKEND_TIME_RELEASE_ENV_FORCE "$hiqlite_release_env_force"
 
 if [ "$external_s3_required" != "1" ]; then
   external_s3_step="0"
@@ -288,7 +263,6 @@ run_completion_input_preflight() {
     --external-s3-mode "$external_s3_step" \
     --ingress-mode "$ingress_step" \
     --durability-mode "$durability_step" \
-    --hiqlite-mode "$hiqlite_backend_time_step" \
     -- "$@"
 }
 
@@ -319,24 +293,6 @@ run_local_evidence_refresh() {
     VELORIX_REST_API_SMOKE_EVIDENCE="${product_dir}/rest-api-smoke.json" \
     VELORIX_REST_API_SMOKE_ATTACH=auto \
     scripts/smoke-vind-rest-api.sh
-}
-
-run_hiqlite_backend_time_release_preflight() {
-  local release_env="${product_dir}/hiqlite-backend-time-release.env"
-  local release_env_report="${product_dir}/hiqlite-backend-time-release-env.json"
-
-  if [ "$hiqlite_release_env_force" = "1" ] || [ ! -f "$release_env" ]; then
-    scripts/write-hiqlite-backend-time-release-env.sh \
-      --product-evidence "$product_evidence" \
-      --output "$release_env" \
-      --report "$release_env_report" >/dev/null
-  else
-    echo "hiqlite_backend_time=using_existing_release_env"
-  fi
-
-  scripts/check-hiqlite-backend-time-release-inputs.sh \
-    --env-file "$release_env" \
-    --product-evidence "$product_evidence"
 }
 
 product_external_s3_ready() {
@@ -390,7 +346,7 @@ run_completion_report() {
 }
 
 write_plan() {
-  python3 - "$product_evidence" "$report_file" "$input_preflight_file" "${env_file:-}" "$external_s3_step" "$ingress_step" "$durability_step" "$hiqlite_backend_time_step" "$local_evidence_step" "$dry_run" "$hiqlite_release_required" "$@" <<'PY'
+  python3 - "$product_evidence" "$report_file" "$input_preflight_file" "${env_file:-}" "$external_s3_step" "$ingress_step" "$durability_step" "$local_evidence_step" "$dry_run" "$@" <<'PY'
 import json
 import os
 import sys
@@ -405,10 +361,8 @@ from pathlib import Path
     external_mode,
     ingress_mode,
     durability_mode,
-    hiqlite_mode,
     local_evidence_mode,
     dry_run,
-    hiqlite_release_required,
     *durability_args,
 ) = sys.argv[1:]
 env = os.environ
@@ -537,7 +491,6 @@ payload = {
         "external_s3",
         "ingress",
         "durability",
-        "hiqlite_backend_time",
         "final_report",
     ],
     "steps": {
@@ -569,23 +522,6 @@ payload = {
             preflight=preflight,
             waiting_on=durability_waiting_on,
         ),
-        "hiqlite_backend_time": {
-            "step": "hiqlite_backend_time",
-            "mode": hiqlite_mode,
-            "helper": "scripts/check-hiqlite-backend-time-release-inputs.sh + scripts/attest-hiqlite-backend-time.sh",
-            "state": "disabled"
-            if hiqlite_mode == "0"
-            else (
-                "release_preflight_required"
-                if hiqlite_release_required == "1"
-                else "diagnostic_attestation_only"
-            ),
-            "will_run": external_execution_allowed and hiqlite_mode != "0" and Path(product_evidence).is_file(),
-            "release_preflight_required": hiqlite_release_required == "1",
-            "trusted_provenance_requested": env.get("VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE") == "1",
-            "release_failover_requested": env.get("VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST") == "1",
-            **redacted_step_summary(preflight_step(preflight, "hiqlite_backend_time")),
-        },
         "final_report": {
             "step": "final_report",
             "mode": env.get("VELORIX_COMPLETE_PRODUCT_REPORT", "1"),
@@ -608,15 +544,6 @@ PY
 if [ "$dry_run" = "1" ]; then
   run_completion_input_preflight "$@" >/dev/null || true
   write_plan "$@"
-  if [ -f "$product_evidence" ] && [ "$hiqlite_backend_time_step" != "0" ] && [ "$hiqlite_release_required" = "1" ]; then
-    release_env="${product_dir}/hiqlite-backend-time-release.env"
-    if [ "$hiqlite_release_env_force" = "1" ] || [ ! -f "$release_env" ]; then
-      scripts/write-hiqlite-backend-time-release-env.sh \
-        --product-evidence "$product_evidence" \
-        --output "$release_env" \
-        --report "${product_dir}/hiqlite-backend-time-release-env.json" >/dev/null
-    fi
-  fi
   if [ "$final_report" = "1" ]; then
     run_completion_report >/dev/null || true
     echo "product_completion_report=${report_file}"
@@ -691,40 +618,6 @@ if [ "$durability_step" != "0" ]; then
     exit 64
   else
     echo "durability=skipped_missing_external_authority_or_review"
-  fi
-fi
-
-if [ "$hiqlite_backend_time_step" != "0" ] && [ -f "$product_evidence" ]; then
-  if [ "$hiqlite_release_required" = "1" ] && [ "${VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST:-0}" = "1" ]; then
-    echo "hiqlite_backend_time=release_failover_smoke"
-    VELORIX_VIND_PRODUCT_DIR="$product_dir" \
-      VELORIX_VIND_PRODUCT_EVIDENCE="$product_evidence" \
-      VELORIX_STANDING_RUNTIME_FAILOVER_RELEASE_ATTEST=1 \
-      VELORIX_STANDING_RUNTIME_FAILOVER_UPDATE_PRODUCT_EVIDENCE=1 \
-      scripts/smoke-vind-standing-runtime-failover.sh
-  fi
-  echo "hiqlite_backend_time=diagnostic_attestation"
-  VELORIX_PRODUCT_EVIDENCE_PATH="$product_evidence" \
-    scripts/attest-hiqlite-backend-time.sh \
-      --product-evidence "$product_evidence" \
-      --output "${product_dir}/hiqlite-backend-time-attestation.json" \
-      --attester complete-vind-product \
-      --update-product-evidence
-  echo "hiqlite_backend_time=preflight"
-  if [ "$hiqlite_release_required" = "1" ]; then
-    if run_hiqlite_backend_time_release_preflight; then
-      if [ "${VELORIX_HIQLITE_BACKEND_TIME_TRUSTED_PROVENANCE:-}" = "1" ]; then
-        VELORIX_PRODUCT_EVIDENCE_PATH="$product_evidence" \
-          scripts/attest-hiqlite-backend-time.sh \
-            --product-evidence "$product_evidence" \
-            --output "${product_dir}/hiqlite-backend-time-attestation.json" \
-            --update-product-evidence
-      fi
-    elif [ "$hiqlite_backend_time_step" = "1" ]; then
-      exit 65
-    fi
-  else
-    echo "hiqlite_backend_time=release_preflight_out_of_scope"
   fi
 fi
 

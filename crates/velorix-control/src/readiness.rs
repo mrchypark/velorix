@@ -70,7 +70,7 @@ pub enum ReadinessEvidenceKind {
     GcRunEvidence,
     ProductionGcRunEvidence,
     RustfsProductionGcEvidenceFamilyValidated,
-    HiqliteNoPvcThreeVoterBackupRestore,
+    MetadataAuthorityNoPvcRecovery,
     CheckpointRetentionRecord,
     UpgradeRollbackRepairGcFaultMatrix,
     QueryOutputIsolation,
@@ -240,11 +240,10 @@ impl ProductionReadinessEvidenceV1 {
         if require_release_evidence
             && !self
                 .kubernetes_status
-                .has_evidence(ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore)
+                .has_evidence(ReadinessEvidenceKind::MetadataAuthorityNoPvcRecovery)
         {
             blocking_reasons.push(
-                "kubernetes_status missing hiqlite_no_pvc_three_voter_backup_restore evidence"
-                    .to_string(),
+                "kubernetes_status missing metadata_authority_no_pvc_recovery evidence".to_string(),
             );
         }
         if !self
@@ -651,7 +650,7 @@ mod tests {
             ]),
             kubernetes_status: passing_check(vec![
                 ReadinessEvidenceKind::KubernetesLeaseClient,
-                ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore,
+                ReadinessEvidenceKind::MetadataAuthorityNoPvcRecovery,
             ]),
         }
     }
@@ -689,18 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn release_readiness_requires_hiqlite_no_pvc_backup_restore_evidence() {
+    fn release_readiness_requires_metadata_authority_no_pvc_recovery() {
         let mut evidence = release_ready_evidence();
         evidence
             .kubernetes_status
             .evidence_kind
-            .retain(|kind| *kind != ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore);
+            .retain(|kind| *kind != ReadinessEvidenceKind::MetadataAuthorityNoPvcRecovery);
 
         let report = evidence.try_into_report().unwrap();
-
         assert!(!report.production_ready);
         assert!(report.blocking_reasons.iter().any(|reason| {
-            reason == "kubernetes_status missing hiqlite_no_pvc_three_voter_backup_restore evidence"
+            reason == "kubernetes_status missing metadata_authority_no_pvc_recovery evidence"
         }));
     }
 
@@ -756,6 +754,10 @@ mod tests {
     fn first_e2e_readiness_does_not_require_release_fault_matrices() {
         let mut evidence = release_ready_evidence();
         evidence
+            .kubernetes_status
+            .evidence_kind
+            .retain(|kind| *kind != ReadinessEvidenceKind::MetadataAuthorityNoPvcRecovery);
+        evidence
             .gc_status
             .evidence_kind
             .retain(|kind| *kind != ReadinessEvidenceKind::UpgradeRollbackRepairGcFaultMatrix);
@@ -763,10 +765,6 @@ mod tests {
             .s3_compatible_test_status
             .evidence_kind
             .retain(|kind| *kind != ReadinessEvidenceKind::S3CompatibleCheckpointFaultMatrix);
-        evidence
-            .kubernetes_status
-            .evidence_kind
-            .retain(|kind| *kind != ReadinessEvidenceKind::HiqliteNoPvcThreeVoterBackupRestore);
         evidence
             .query_policy_status
             .evidence_kind

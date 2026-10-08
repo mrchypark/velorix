@@ -47,21 +47,15 @@ meta_mode="${VELORIX_META_MODE:-development}"
 meta_backend="${VELORIX_META_BACKEND:-memory}"
 meta_development_allow_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK:-0}"
 meta_development_allow_remote_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK:-0}"
-hiqlite_deploy="${VELORIX_HIQLITE_DEPLOY:-0}"
-hiqlite_image="${VELORIX_HIQLITE_IMAGE:-velorix-hiqlite:product-${run_id}}"
-hiqlite_image_digest="${VELORIX_HIQLITE_IMAGE_DIGEST:-}"
-build_hiqlite_image="${VELORIX_BUILD_HIQLITE_IMAGE:-1}"
 ingest_writer_image="${VELORIX_INGEST_WRITER_IMAGE:-velorix-ingest-writer:product-${run_id}}"
 ingest_writer_image_digest="${VELORIX_INGEST_WRITER_IMAGE_DIGEST:-}"
 build_ingest_writer_image="${VELORIX_BUILD_INGEST_WRITER_IMAGE:-1}"
 image_pull_secret="${VELORIX_IMAGE_PULL_SECRET:-}"
 docker_build_no_cache="${VELORIX_DOCKER_BUILD_NO_CACHE:-0}"
-hiqlite_local_source_dir="${VELORIX_HIQLITE_LOCAL_SOURCE_DIR:-${repo_root}/../hiqlite}"
 load_existing_images="${VELORIX_LOAD_EXISTING_IMAGES:-0}"
 ingest_writer_smoke="${VELORIX_INGEST_WRITER_SMOKE:-1}"
 multi_replica_fencing_smoke="${VELORIX_MULTI_REPLICA_FENCING_SMOKE:-1}"
 standing_runtime_failover_smoke="${VELORIX_STANDING_RUNTIME_FAILOVER_SMOKE:-auto}"
-hiqlite_backend_time_assess="${VELORIX_HIQLITE_BACKEND_TIME_ASSESS:-auto}"
 object_store_mode="${VELORIX_OBJECT_STORE_MODE:-rustfs}"
 object_store_local_development_authority="${VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY:-0}"
 external_s3_validate="${VELORIX_EXTERNAL_S3_VALIDATE:-1}"
@@ -173,27 +167,9 @@ multi_replica_fencing_smoke_passed=0
 multi_replica_fencing_smoke_evidence_file=""
 standing_runtime_failover_smoke_passed=0
 standing_runtime_failover_smoke_evidence_file=""
-hiqlite_backend_time_assessment_file="${VELORIX_HIQLITE_BACKEND_TIME_ASSESSMENT_PATH:-${output_dir}/hiqlite-backend-time-assessment.json}"
-hiqlite_backend_time_assessment_validated=0
-hiqlite_backend_time_attest="${VELORIX_HIQLITE_BACKEND_TIME_ATTEST:-auto}"
-hiqlite_backend_time_attestation_file="${output_dir}/hiqlite-backend-time-attestation.json"
-hiqlite_backend_time_attestation_validated=0
 meta_bearer_token="${VELORIX_META_BEARER_TOKEN:-}"
 meta_bind="127.0.0.1:9090"
 meta_development_insecure_transport=0
-hiqlite_nodes="${VELORIX_HIQLITE_NODES:-}"
-hiqlite_api_secret="${VELORIX_HIQLITE_API_SECRET:-}"
-hiqlite_raft_secret="${VELORIX_HIQLITE_RAFT_SECRET:-}"
-hiqlite_enc_key_active="${VELORIX_HIQLITE_ENC_KEY_ACTIVE:-}"
-hiqlite_enc_keys="${VELORIX_HIQLITE_ENC_KEYS:-}"
-hiqlite_backup_cron="${VELORIX_HIQLITE_BACKUP_CRON:-0 30 2 * * * *}"
-hiqlite_backup_keep_days="${VELORIX_HIQLITE_BACKUP_KEEP_DAYS:-30}"
-hiqlite_backup_keep_days_local="${VELORIX_HIQLITE_BACKUP_KEEP_DAYS_LOCAL:-3}"
-hiqlite_with_proxy="${VELORIX_HIQLITE_WITH_PROXY:-0}"
-hiqlite_authority_attestation_file="${VELORIX_HIQLITE_AUTHORITY_ATTESTATION_FILE:-}"
-generated_hiqlite_authority_attestation="${VELORIX_HIQLITE_AUTHORITY_GENERATED_ATTESTATION:-${output_dir}/hiqlite-authority-attestation.json}"
-hiqlite_authority_sibling_attestation="${output_dir}/hiqlite-authority-attestation.json"
-hiqlite_authority_attestation_validated=0
 created_cluster=0
 created_namespace=0
 previous_context=""
@@ -268,11 +244,6 @@ Main overrides:
   VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=0  # set 1 only for ephemeral local-development RustFS + durable authenticated Meta
   VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK=0  # set 1 only for a restricted existing remote context ephemeral test
   VELORIX_META_BACKEND=memory
-  VELORIX_HIQLITE_DEPLOY=0  # set 1 with VELORIX_META_BACKEND=hiqlite to deploy a no-PVC 3-voter authority
-  VELORIX_HIQLITE_IMAGE=velorix-hiqlite:product
-  VELORIX_HIQLITE_IMAGE_DIGEST=<optional sha256 digest for managed hiqlite attestation>
-  VELORIX_BUILD_HIQLITE_IMAGE=1
-  VELORIX_HIQLITE_AUTHORITY_ATTESTATION_FILE=<optional JSON for external hiqlite authority evidence>
   VELORIX_INGEST_WRITER_IMAGE=velorix-ingest-writer:product
   VELORIX_INGEST_WRITER_IMAGE_DIGEST=<required sha256 digest when externally pulling the ingest-writer image>
   VELORIX_BUILD_INGEST_WRITER_IMAGE=1
@@ -423,7 +394,6 @@ sensitive_keys = {
 }
 redacted_paths = []
 
-
 def redact(value, path_parts=()):
     if isinstance(value, dict):
         output = {}
@@ -438,7 +408,6 @@ def redact(value, path_parts=()):
     if isinstance(value, list):
         return [redact(child, (*path_parts, str(index))) for index, child in enumerate(value)]
     return value
-
 
 with private_path.open(encoding="utf-8") as stream:
     payload = json.load(stream)
@@ -626,82 +595,6 @@ sha256_value() {
   python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read().rstrip(b"\n")).hexdigest())' <<<"$1"
 }
 
-random_token() {
-  python3 - <<'PY'
-import secrets
-
-print(secrets.token_urlsafe(32))
-PY
-}
-
-random_alnum() {
-  python3 - <<'PY'
-import secrets
-import string
-
-alphabet = string.ascii_letters + string.digits
-print("".join(secrets.choice(alphabet) for _ in range(12)))
-PY
-}
-
-random_base64_key() {
-  python3 - <<'PY'
-import base64
-import secrets
-
-print(base64.b64encode(secrets.token_bytes(32)).decode("ascii"))
-PY
-}
-
-validate_hiqlite_enc_keys() {
-  local active="$1"
-  local keys="$2"
-  python3 - "$active" "$keys" <<'PY'
-import base64
-import re
-import sys
-
-active = sys.argv[1]
-raw_keys = sys.argv[2]
-key_ids = []
-for line in raw_keys.splitlines():
-    line = line.strip()
-    if not line:
-        continue
-    if "/" not in line:
-        continue
-    key_id, encoded = line.split("/", 1)
-    key_id = key_id.strip()
-    encoded = encoded.strip()
-    if not key_id or not encoded:
-        raise SystemExit("VELORIX_HIQLITE_ENC_KEYS entries must use <id>/<base64-key>")
-    if not re.fullmatch(r"[a-zA-Z0-9:_-]{2,20}", key_id):
-        raise SystemExit("VELORIX_HIQLITE_ENC_KEYS key IDs must match ^[a-zA-Z0-9:_-]{2,20}$")
-    try:
-        key = base64.b64decode(encoded, validate=True)
-    except Exception as exc:
-        raise SystemExit(f"VELORIX_HIQLITE_ENC_KEYS key {key_id} is not valid base64: {exc}")
-    if len(key) != 32:
-        raise SystemExit(
-            f"VELORIX_HIQLITE_ENC_KEYS key {key_id} must decode to exactly 32 bytes, got {len(key)}"
-        )
-    key_ids.append(key_id)
-
-if not key_ids:
-    raise SystemExit("VELORIX_HIQLITE_ENC_KEYS must contain at least one <id>/<base64-key> entry")
-if active not in key_ids:
-    raise SystemExit("VELORIX_HIQLITE_ENC_KEY_ACTIVE must match one VELORIX_HIQLITE_ENC_KEYS key ID")
-PY
-}
-
-validate_hiqlite_nodes_for_remote_client() {
-  local nodes="$1"
-  if [[ "$nodes" == *"://"* ]]; then
-    echo "VELORIX_HIQLITE_NODES must use Hiqlite remote client addresses without URL schemes, for example host:8200,host2:8200" >&2
-    exit 64
-  fi
-}
-
 sha256_file() {
   python3 - "$1" <<'PY'
 import hashlib
@@ -710,90 +603,6 @@ import sys
 with open(sys.argv[1], "rb") as f:
     print("sha256:" + hashlib.sha256(f.read()).hexdigest())
 PY
-}
-
-validate_hiqlite_authority_attestation() {
-  if [ -z "$hiqlite_authority_attestation_file" ]; then
-    return 0
-  fi
-  if [ "$meta_backend" != "hiqlite" ]; then
-    echo "VELORIX_HIQLITE_AUTHORITY_ATTESTATION_FILE requires VELORIX_META_BACKEND=hiqlite" >&2
-    exit 64
-  fi
-  if ! python3 - "$hiqlite_authority_attestation_file" "$hiqlite_nodes" <<'PY'
-import json
-import sys
-from datetime import datetime
-
-path, configured_nodes = sys.argv[1:]
-with open(path, "r", encoding="utf-8") as f:
-    attestation = json.load(f)
-
-errors = []
-if attestation.get("schema_version") != 1:
-    errors.append("schema_version must be 1")
-if attestation.get("authority_kind") not in {"external_hiqlite", "velorix_managed_hiqlite"}:
-    errors.append("authority_kind must be external_hiqlite or velorix_managed_hiqlite")
-nodes = attestation.get("nodes")
-if not isinstance(nodes, list) or not nodes or not all(isinstance(node, str) and node for node in nodes):
-    errors.append("nodes must be a nonempty string array")
-else:
-    if len(nodes) != 3:
-        errors.append("nodes must contain exactly three Hiqlite voter endpoints")
-    if len(set(nodes)) != len(nodes):
-        errors.append("nodes must contain unique Hiqlite voter endpoints")
-    expected_nodes = [node for node in configured_nodes.split(",") if node]
-    if expected_nodes and sorted(nodes) != sorted(expected_nodes):
-        errors.append("nodes must match VELORIX_HIQLITE_NODES")
-if attestation.get("expected_voter_count") != 3:
-    errors.append("expected_voter_count must be 3")
-for field in [
-    "no_pvc_created_by_vind",
-    "metadata_authority_no_pvc_used",
-    "voters_learner_only_disabled",
-    "api_auth_configured",
-    "raft_auth_configured",
-    "backup_restore_configured",
-]:
-    if attestation.get(field) is not True:
-        errors.append(f"{field} must be true")
-if attestation.get("metadata_authority_storage_mode") != "object-store-backup-restore-with-ephemeral-node-disk":
-    errors.append("metadata_authority_storage_mode must be object-store-backup-restore-with-ephemeral-node-disk")
-transport_security = attestation.get("transport_security")
-if not isinstance(transport_security, str) or transport_security.strip().lower() in {"", "none", "plaintext", "local-only", "generated-local-self-signed"}:
-    errors.append("transport_security must describe non-local TLS, service mesh, or equivalent boundary")
-image_digest = attestation.get("image_digest")
-if not (image_digest or attestation.get("source_revision")):
-    errors.append("image_digest or source_revision is required")
-if image_digest and (not isinstance(image_digest, str) or not image_digest.startswith("sha256:")):
-    errors.append("image_digest must be a sha256 digest")
-if attestation.get("authority_kind") == "velorix_managed_hiqlite" and not image_digest:
-    errors.append("managed Hiqlite authority requires image_digest")
-attested_at = attestation.get("attested_at")
-if not isinstance(attested_at, str):
-    errors.append("attested_at must be an RFC3339 UTC timestamp")
-else:
-    try:
-        if not attested_at.endswith("Z"):
-            raise ValueError("timestamp must use UTC Z suffix")
-        datetime.fromisoformat(attested_at.replace("Z", "+00:00"))
-    except ValueError:
-        errors.append("attested_at must be an RFC3339 UTC timestamp")
-if errors:
-    raise SystemExit(
-        "invalid VELORIX_HIQLITE_AUTHORITY_ATTESTATION_FILE:\n- " + "\n- ".join(errors)
-    )
-PY
-  then
-    exit 64
-  fi
-  mkdir -p "$output_dir"
-  if [ "$hiqlite_authority_attestation_file" != "$hiqlite_authority_sibling_attestation" ]; then
-    cp "$hiqlite_authority_attestation_file" "$hiqlite_authority_sibling_attestation"
-    chmod 600 "$hiqlite_authority_sibling_attestation"
-    hiqlite_authority_attestation_file="$hiqlite_authority_sibling_attestation"
-  fi
-  hiqlite_authority_attestation_validated=1
 }
 
 validate_ingress_tls_auth_attestation() {
@@ -1134,7 +943,6 @@ normalized_meta_backend() {
   case "$1" in
     memory | in-memory) printf '%s\n' "in-memory" ;;
     oss | object-store) printf '%s\n' "oss" ;;
-    hiqlite) printf '%s\n' "hiqlite" ;;
     *) return 1 ;;
   esac
 }
@@ -1273,7 +1081,6 @@ fi
 
 api_image_pull_policy="Never"
 meta_image_pull_policy="Never"
-hiqlite_image_pull_policy="Never"
 ingest_writer_image_pull_policy="Never"
 if [ "$image_load_mode" = "none" ]; then
   if [ "$build_api_image" = "0" ]; then
@@ -1289,13 +1096,6 @@ if [ "$image_load_mode" = "none" ]; then
     fi
     meta_image="$(immutable_image_reference "$meta_image" "$meta_image_digest")"
     meta_image_pull_policy="IfNotPresent"
-  fi
-  if [ "$hiqlite_deploy" = "1" ] && [ "$build_hiqlite_image" = "0" ]; then
-    if [ -z "$hiqlite_image_digest" ] && [[ "$hiqlite_image" == *@sha256:* ]]; then
-      hiqlite_image_digest="${hiqlite_image##*@}"
-    fi
-    hiqlite_image="$(immutable_image_reference "$hiqlite_image" "$hiqlite_image_digest")"
-    hiqlite_image_pull_policy="IfNotPresent"
   fi
   if [ "$ingest_writer_smoke" = "1" ] && [ "$build_ingest_writer_image" = "0" ]; then
     if [ -z "$ingest_writer_image_digest" ] && [[ "$ingest_writer_image" == *@sha256:* ]]; then
@@ -1470,11 +1270,6 @@ name = sys.argv[1]
 if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", name):
     raise SystemExit("VELORIX_S3_CREDENTIALS_SECRET_NAME must be a valid Kubernetes Secret name")
 PY
-if [ "$s3_force_path_style" = "1" ]; then
-  s3_force_path_style_bool="true"
-else
-  s3_force_path_style_bool="false"
-fi
 case "$object_store_local_development_authority" in
   0 | 1) ;;
   *)
@@ -1515,14 +1310,6 @@ case "$standing_runtime_failover_smoke" in
     ;;
 esac
 
-case "$hiqlite_backend_time_assess" in
-  auto | 0 | 1) ;;
-  *)
-    echo "VELORIX_HIQLITE_BACKEND_TIME_ASSESS must be auto, 0, or 1" >&2
-    exit 64
-    ;;
-esac
-
 case "$ingress_tls_auth_auto" in
   0 | 1) ;;
   *)
@@ -1552,9 +1339,6 @@ case "$product_evidence_level" in
     fi
     if [ -n "$ingest_writer_lifecycle_attestation_file" ]; then
       validate_ingest_writer_lifecycle_attestation
-    fi
-    if [ -n "$hiqlite_authority_attestation_file" ]; then
-      validate_hiqlite_authority_attestation
     fi
     ;;
   *)
@@ -1706,9 +1490,13 @@ if [ "$api_tls_enabled" = "1" ] && [ "$api_tls_local_port" = "$api_local_port" ]
 fi
 
 case "$meta_backend" in
-  memory | in-memory | oss | object-store | hiqlite) ;;
+  memory | in-memory | oss | object-store) ;;
+  hiqlite)
+    echo "VELORIX_META_BACKEND=hiqlite was removed; Velorix deployments use the Rhiza KV metadata authority (scripts/run-rhiza-kv-k8s-gate.sh) or the durable object-store authority (oss)" >&2
+    exit 64
+    ;;
   *)
-    echo "VELORIX_META_BACKEND must be memory, oss, or hiqlite" >&2
+    echo "VELORIX_META_BACKEND must be memory or oss" >&2
     exit 64
     ;;
 esac
@@ -1743,37 +1531,10 @@ if [ "$meta_mode" = "production" ] || [ "$meta_mode" = "prod" ]; then
   echo "VELORIX_META_MODE=production is unsupported by this local runner until validated transport configuration exists" >&2
   exit 64
 fi
-case "$hiqlite_deploy" in
-  0 | 1) ;;
-  *)
-    echo "VELORIX_HIQLITE_DEPLOY must be 0 or 1" >&2
-    exit 64
-    ;;
-esac
-if [ "$hiqlite_deploy" = "1" ] && { [ "$meta_enabled" != "1" ] || [ "$meta_backend" != "hiqlite" ]; }; then
-  echo "VELORIX_HIQLITE_DEPLOY=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite" >&2
+if [ "$ingest_writer_smoke" = "1" ] \
+  && { [ "$meta_enabled" != "1" ] || [ "$meta_backend" = "memory" ] || [ "$meta_backend" = "in-memory" ]; }; then
+  echo "VELORIX_INGEST_WRITER_SMOKE=1 requires VELORIX_META_ENABLED=1 and a durable metadata backend with production-safe partition authority; deploy the Rhiza KV metadata authority (scripts/run-rhiza-kv-k8s-gate.sh) or set VELORIX_INGEST_WRITER_SMOKE=0" >&2
   exit 64
-fi
-if [ "$ingest_writer_smoke" = "1" ] && { [ "$meta_enabled" != "1" ] || [ "$meta_backend" != "hiqlite" ]; }; then
-  echo "VELORIX_INGEST_WRITER_SMOKE=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite for production-safe partition authority" >&2
-  exit 64
-fi
-if [ "$hiqlite_deploy" = "1" ]; then
-  if [ -z "$hiqlite_nodes" ]; then
-    hiqlite_nodes="velorix-hiqlite-0.velorix-hiqlite-headless:8200,velorix-hiqlite-1.velorix-hiqlite-headless:8200,velorix-hiqlite-2.velorix-hiqlite-headless:8200"
-  fi
-  if [ -z "$hiqlite_api_secret" ]; then
-    hiqlite_api_secret="$(random_token)"
-  fi
-  if [ -z "$hiqlite_raft_secret" ]; then
-    hiqlite_raft_secret="$(random_token)"
-  fi
-  if [ -z "$hiqlite_enc_key_active" ]; then
-    hiqlite_enc_key_active="$(random_alnum)"
-  fi
-  if [ -z "$hiqlite_enc_keys" ]; then
-    hiqlite_enc_keys="${hiqlite_enc_key_active}/$(random_base64_key)"
-  fi
 fi
 
 case "$standing_runtime_fencing" in
@@ -1949,30 +1710,6 @@ if [ "$s3_credentials_secret_managed" = "1" ]; then
 else
   s3_credentials_hash="$(sha256_value "existing-kubernetes-secret:${s3_credentials_secret_name}")"
 fi
-hiqlite_api_secret_hash="disabled"
-if [ -n "$hiqlite_api_secret" ]; then
-  hiqlite_api_secret_hash="$(sha256_value "$hiqlite_api_secret")"
-fi
-hiqlite_raft_secret_hash="disabled"
-if [ -n "$hiqlite_raft_secret" ]; then
-  hiqlite_raft_secret_hash="$(sha256_value "$hiqlite_raft_secret")"
-fi
-
-if [ "$meta_enabled" = "1" ] && [ "$meta_backend" = "hiqlite" ]; then
-  if [ -z "$hiqlite_nodes" ] || [ -z "$hiqlite_api_secret" ]; then
-    echo "VELORIX_META_BACKEND=hiqlite requires VELORIX_HIQLITE_NODES and VELORIX_HIQLITE_API_SECRET" >&2
-    exit 64
-  fi
-  validate_hiqlite_nodes_for_remote_client "$hiqlite_nodes"
-fi
-if [ "$hiqlite_deploy" = "1" ]; then
-  if [ -z "$hiqlite_raft_secret" ] || [ -z "$hiqlite_enc_key_active" ] || [ -z "$hiqlite_enc_keys" ]; then
-    echo "VELORIX_HIQLITE_DEPLOY=1 requires generated or supplied raft secret and encryption keys" >&2
-    exit 64
-  fi
-  validate_hiqlite_enc_keys "$hiqlite_enc_key_active" "$hiqlite_enc_keys"
-fi
-validate_hiqlite_authority_attestation
 
 if [ "$standing_runtime_fencing" = "unsafe-dev-only" ] && [ "$api_replica_count" -gt 1 ]; then
   echo "VELORIX_API_REPLICA_COUNT>1 requires VELORIX_STANDING_RUNTIME_FENCING=logical-fencing or required" >&2
@@ -2011,7 +1748,6 @@ write_diagnostics() {
     echo "object_store_mode=${object_store_mode}"
     echo "external_s3_validate=${external_s3_validate}"
     echo "external_s3_bucket_validated=${external_s3_bucket_validated}"
-    echo "hiqlite_authority_attestation_validated=${hiqlite_authority_attestation_validated}"
     echo "ingress_tls_auth_attestation_validated=${ingress_tls_auth_attestation_validated}"
     echo "ingest_writer_lifecycle_attestation_validated=${ingest_writer_lifecycle_attestation_validated}"
     if kubectl --context "$context" get --raw=/readyz >/dev/null 2>&1; then
@@ -2485,22 +2221,6 @@ remove_service_run_id_selector() {
     >/dev/null 2>&1 || true
 }
 
-wait_for_statefulset_rollout() {
-  local statefulset="$1"
-  local deadline=$((SECONDS + 240))
-  while true; do
-    if kubectl --context "$context" -n "$namespace" rollout status "statefulset/${statefulset}" --timeout=5s >/dev/null 2>&1; then
-      return 0
-    fi
-    check_kubernetes_scheduling_health "rollout-${statefulset}"
-    if [ "$SECONDS" -ge "$deadline" ]; then
-      kubectl --context "$context" -n "$namespace" rollout status "statefulset/${statefulset}" --timeout=1s >&2 || true
-      echo "statefulset did not roll out" >&2
-      exit 1
-    fi
-  done
-}
-
 validate_rendered_no_pvc_manifest() {
   local manifest="$1"
   if [ ! -r "$manifest" ]; then
@@ -2531,13 +2251,6 @@ validate_rendered_no_pvc_manifests() {
       validate_rendered_no_pvc_manifest "$manifest"
     done <<< "$manifests"
   fi
-}
-
-wait_for_hiqlite_ready() {
-  kubectl --context "$context" -n "$namespace" wait \
-    --for=condition=ready pod \
-    -l 'app=velorix-hiqlite' \
-    --timeout=240s >/dev/null
 }
 
 wait_for_job_complete() {
@@ -2994,52 +2707,6 @@ PY
           --namespace "$namespace" \
           --as "system:serviceaccount:${namespace}:${service_account}"
       done
-    done
-  fi
-  if [ "$hiqlite_deploy" = "1" ]; then
-    local hiqlite_statefulset_json="${output_dir}/no-pvc-hiqlite-statefulset.json"
-    kubectl --context "$context" -n "$namespace" get statefulset velorix-hiqlite -o json >"$hiqlite_statefulset_json"
-    python3 - "$hiqlite_statefulset_json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    statefulset = json.load(f)
-spec = statefulset.get("spec") or {}
-if spec.get("replicas") != 3:
-    raise SystemExit("managed Hiqlite authority must run exactly three voters")
-if spec.get("volumeClaimTemplates"):
-    raise SystemExit("managed Hiqlite authority must not define StatefulSet volumeClaimTemplates")
-template_spec = ((spec.get("template") or {}).get("spec") or {})
-if template_spec.get("serviceAccountName") != "velorix-hiqlite":
-    raise SystemExit("managed Hiqlite authority must use the locked-down velorix-hiqlite service account")
-volumes = {volume.get("name"): volume for volume in template_spec.get("volumes") or []}
-data_volume = volumes.get("data") or {}
-if "emptyDir" not in data_volume:
-    raise SystemExit("managed Hiqlite authority data volume must be emptyDir, not PVC-backed")
-for volume in volumes.values():
-    if "persistentVolumeClaim" in volume:
-        raise SystemExit("managed Hiqlite authority pod template must not mount persistentVolumeClaim volumes")
-containers = template_spec.get("containers") or []
-if len(containers) != 1 or containers[0].get("name") != "hiqlite":
-    raise SystemExit("managed Hiqlite authority must run a single hiqlite container per voter pod")
-env = {item.get("name"): item for item in containers[0].get("env") or []}
-if str(env.get("HQL_LEARNER_ONLY", {}).get("value", "")).lower() == "true":
-    raise SystemExit("managed Hiqlite voter StatefulSet must not set HQL_LEARNER_ONLY=true")
-if "HQL_SECRET_API" not in env or "HQL_SECRET_RAFT" not in env:
-    raise SystemExit("managed Hiqlite authority must configure both API and Raft authentication secrets")
-if "ENC_KEY_ACTIVE" not in env or "ENC_KEYS" not in env:
-    raise SystemExit("managed Hiqlite authority must configure backup encryption keys")
-PY
-    assert_kubectl_auth_can_i_denied "hiqlite-pvc" \
-      --context "$context" auth can-i create persistentvolumeclaims \
-      --namespace "$namespace" \
-      --as "system:serviceaccount:${namespace}:velorix-hiqlite"
-    for verb in get list watch; do
-      assert_kubectl_auth_can_i_denied "hiqlite-secret-${verb}" \
-        --context "$context" auth can-i "$verb" secrets \
-        --namespace "$namespace" \
-        --as "system:serviceaccount:${namespace}:velorix-hiqlite"
     done
   fi
   no_pvc_namespace_validated=1
@@ -5247,10 +4914,7 @@ if mode == "required":
 elif mode == "logical-fencing":
     if capability.get("multi_writer_fencing_safe") is not True:
         raise SystemExit(1)
-    if capability.get("lease_authority_kind") not in {
-        "hiqlite_raft_serialized",
-        "raft_replicated_time",
-    }:
+    if capability.get("lease_authority_kind") != "raft_replicated_time":
         raise SystemExit(1)
     if capability.get("lease_expiry_semantics") not in {
         "operation_driven_logical",
@@ -5787,95 +5451,6 @@ run_standing_runtime_failover_smoke() {
   standing_runtime_failover_smoke_evidence_file="${output_dir}/standing-runtime-failover-smoke.json"
 }
 
-run_hiqlite_backend_time_assessment() {
-  local should_run=0
-  case "$hiqlite_backend_time_assess" in
-    0)
-      return 0
-      ;;
-    1)
-      if [ "$meta_enabled" != "1" ] || [ "$meta_backend" != "hiqlite" ]; then
-        echo "VELORIX_HIQLITE_BACKEND_TIME_ASSESS=1 requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=hiqlite" >&2
-        exit 64
-      fi
-      should_run=1
-      ;;
-    auto)
-      if [ "$meta_enabled" = "1" ] && [ "$meta_backend" = "hiqlite" ]; then
-        should_run=1
-      fi
-      ;;
-  esac
-  if [ "$should_run" != "1" ]; then
-    return 0
-  fi
-  if [ ! -f "${output_dir}/product-evidence.json" ]; then
-    echo "Hiqlite backend-time assessment requires ${output_dir}/product-evidence.json" >&2
-    exit 66
-  fi
-
-  local require_backend_time=0
-  if [ "$product_evidence_level" = "product-complete" ]; then
-    require_backend_time=1
-  fi
-
-  VELORIX_PRODUCT_EVIDENCE_PATH="${output_dir}/product-evidence.json" \
-    VELORIX_HIQLITE_BACKEND_TIME_ASSESSMENT_PATH="$hiqlite_backend_time_assessment_file" \
-    VELORIX_HIQLITE_BACKEND_TIME_UPDATE_PRODUCT_EVIDENCE=1 \
-    VELORIX_REQUIRE_HIQLITE_BACKEND_TIME="${VELORIX_REQUIRE_HIQLITE_BACKEND_TIME:-${require_backend_time}}" \
-    bash "${repo_root}/scripts/assess-hiqlite-backend-time.sh" "$output_dir" \
-    | tee "${output_dir}/hiqlite-backend-time-assessment.out" >/dev/null
-
-  hiqlite_backend_time_assessment_validated=1
-}
-
-run_hiqlite_backend_time_attestation() {
-  local should_run=0
-  case "$hiqlite_backend_time_attest" in
-    0)
-      return 0
-      ;;
-    1)
-      if [ "$meta_enabled" != "1" ] || [ "$meta_backend" != "hiqlite" ] || [ "$standing_runtime_fencing" != "required" ]; then
-        echo "VELORIX_HIQLITE_BACKEND_TIME_ATTEST=1 requires VELORIX_META_ENABLED=1, VELORIX_META_BACKEND=hiqlite, and VELORIX_STANDING_RUNTIME_FENCING=required" >&2
-        exit 64
-      fi
-      should_run=1
-      ;;
-    auto)
-      if [ "$meta_enabled" = "1" ] \
-        && [ "$meta_backend" = "hiqlite" ] \
-        && [ "$standing_runtime_fencing" = "required" ] \
-        && [ "$hiqlite_backend_time_assessment_validated" = "1" ] \
-        && [ "$meta_fencing_adversarial_smoke_passed" = "1" ] \
-        && [ "$multi_replica_fencing_smoke_passed" = "1" ] \
-        && [ "$standing_runtime_failover_smoke_passed" = "1" ]; then
-        should_run=1
-      fi
-      ;;
-    *)
-      echo "VELORIX_HIQLITE_BACKEND_TIME_ATTEST must be 0, 1, or auto" >&2
-      exit 64
-      ;;
-  esac
-  if [ "$should_run" != "1" ]; then
-    return 0
-  fi
-  if [ ! -f "${output_dir}/product-evidence.json" ]; then
-    echo "Hiqlite backend-time attestation requires ${output_dir}/product-evidence.json" >&2
-    exit 66
-  fi
-
-  VELORIX_PRODUCT_EVIDENCE_PATH="${output_dir}/product-evidence.json" \
-    VELORIX_HIQLITE_BACKEND_TIME_ATTESTATION_FILE="$hiqlite_backend_time_attestation_file" \
-    VELORIX_HIQLITE_BACKEND_TIME_ATTESTATION_UPDATE_PRODUCT_EVIDENCE=1 \
-    VELORIX_ATTESTER="scripts/run-vind-product.sh" \
-    bash "${repo_root}/scripts/attest-hiqlite-backend-time.sh" \
-    | tee "${output_dir}/hiqlite-backend-time-attestation.out" >/dev/null
-
-  hiqlite_backend_time_attestation_validated=1
-}
-
 start_api_tls_port_forward() {
   if [ "$api_tls_enabled" != "1" ]; then
     return 0
@@ -6045,11 +5620,6 @@ write_product_evidence() {
     "$no_pvc_namespace_validate" \
     "$no_pvc_namespace_validated" \
     "${output_dir}/readyz.json" \
-    "$hiqlite_authority_attestation_file" \
-    "$hiqlite_authority_attestation_validated" \
-    "$hiqlite_backend_time_assessment_file" \
-    "$hiqlite_backend_time_attestation_file" \
-    "$hiqlite_backend_time_attestation_validated" \
     "$api_tls_enabled" \
     "$api_tls_auth_smoke_passed" \
     "$api_tls_certificate_sha256" \
@@ -6151,11 +5721,6 @@ from datetime import datetime, timezone
     no_pvc_namespace_validate,
     no_pvc_namespace_validated,
     readyz_path,
-    hiqlite_authority_attestation_file,
-    hiqlite_authority_attestation_validated,
-    hiqlite_backend_time_assessment_file,
-    hiqlite_backend_time_attestation_file,
-    hiqlite_backend_time_attestation_validated,
     api_tls_enabled,
     api_tls_auth_smoke_passed,
     api_tls_certificate_sha256,
@@ -6224,116 +5789,12 @@ if isinstance(standing_capability, dict):
     )
     if not production_multi_writer_safe:
         blocked_reason = standing_capability.get("backend_time_blocked_reason")
-        if not blocked_reason and metadata_store_readyz.get("standing_runtime_fencing", {}).get("backend_name") == "hiqlite" and not authoritative_backend_time:
-            blocked_reason = "hiqlite_authoritative_backend_time_false"
-        elif not blocked_reason:
+        if not blocked_reason:
             blocked_reason = "metadata_backend_not_production_multi_writer_safe"
 elif meta_enabled == "1":
     blocked_reason = "metadata_capability_missing_from_readyz"
 else:
     blocked_reason = "metadata_store_disabled"
-
-hiqlite_authority_attestation = None
-if hiqlite_authority_attestation_file:
-    with open(hiqlite_authority_attestation_file, "r", encoding="utf-8") as f:
-        raw_attestation = json.load(f)
-    hiqlite_authority_attestation = {
-        "validated": hiqlite_authority_attestation_validated == "1",
-        "evidence": "hiqlite-authority-attestation.json"
-        if hiqlite_authority_attestation_validated == "1"
-        else None,
-        "authority_kind": raw_attestation.get("authority_kind"),
-        "schema_version": raw_attestation.get("schema_version"),
-        "nodes": raw_attestation.get("nodes"),
-        "expected_voter_count": raw_attestation.get("expected_voter_count"),
-        "no_pvc_created_by_vind": raw_attestation.get("no_pvc_created_by_vind"),
-        "metadata_authority_no_pvc_used": raw_attestation.get("metadata_authority_no_pvc_used"),
-        "metadata_authority_storage_mode": raw_attestation.get("metadata_authority_storage_mode"),
-        "voters_learner_only_disabled": raw_attestation.get("voters_learner_only_disabled"),
-        "api_auth_configured": raw_attestation.get("api_auth_configured"),
-        "raft_auth_configured": raw_attestation.get("raft_auth_configured"),
-        "transport_security": raw_attestation.get("transport_security"),
-        "backup_restore_configured": raw_attestation.get("backup_restore_configured"),
-        "image_digest": raw_attestation.get("image_digest"),
-        "source_revision": raw_attestation.get("source_revision"),
-        "raft_secret_sha256": raw_attestation.get("raft_secret_sha256"),
-        "no_pvc_evidence_files": raw_attestation.get("no_pvc_evidence_files"),
-        "attested_at": raw_attestation.get("attested_at"),
-        "attester": raw_attestation.get("attester"),
-    }
-
-hiqlite_backend_time_assessment = None
-if hiqlite_backend_time_assessment_file:
-    try:
-        with open(hiqlite_backend_time_assessment_file, "r", encoding="utf-8") as f:
-            raw_assessment = json.load(f)
-    except FileNotFoundError:
-        raw_assessment = None
-    if raw_assessment:
-        hiqlite_backend_time_assessment = {
-            "validated": True,
-            "evidence": "hiqlite-backend-time-assessment.json",
-            "schema_version": raw_assessment.get("schema_version"),
-            "evidence_kind": raw_assessment.get("evidence_kind"),
-            "required_mode_supported": raw_assessment.get("required_mode_supported"),
-            "can_generate_product_complete_backend_time_attestation": raw_assessment.get(
-                "can_generate_product_complete_backend_time_attestation"
-            ),
-            "backend_time_source_kind": raw_assessment.get("backend_time_source_kind"),
-            "backend_time_blocked_reason": raw_assessment.get("backend_time_blocked_reason"),
-            "lease_authority_kind": raw_assessment.get("lease_authority_kind"),
-            "lease_expiry_semantics": raw_assessment.get("lease_expiry_semantics"),
-            "bounded_wall_clock_failover": raw_assessment.get("bounded_wall_clock_failover"),
-            "trusted_for_product_complete": False,
-        }
-
-hiqlite_backend_time_attestation = None
-if hiqlite_backend_time_attestation_file and hiqlite_backend_time_attestation_validated == "1":
-    try:
-        with open(hiqlite_backend_time_attestation_file, "r", encoding="utf-8") as f:
-            raw_attestation = json.load(f)
-    except FileNotFoundError:
-        raw_attestation = None
-    if raw_attestation:
-        hiqlite_backend_time_attestation = {
-            "validated": hiqlite_backend_time_attestation_validated == "1",
-            "evidence": "hiqlite-backend-time-attestation.json"
-            if hiqlite_backend_time_attestation_validated == "1"
-            else None,
-            "schema_version": raw_attestation.get("schema_version"),
-            "evidence_kind": raw_attestation.get("evidence_kind"),
-            "backend_name": raw_attestation.get("backend_name"),
-            "time_source_kind": raw_attestation.get("time_source_kind"),
-            "lease_authority_kind": raw_attestation.get("lease_authority_kind"),
-            "lease_expiry_semantics": raw_attestation.get("lease_expiry_semantics"),
-            "authoritative_backend_time": raw_attestation.get("authoritative_backend_time"),
-            "bounded_wall_clock_failover": raw_attestation.get("bounded_wall_clock_failover"),
-            "production_bounded_failover_safe": raw_attestation.get("production_bounded_failover_safe"),
-            "authority_sampled_unix_time_ms_in_raft_operation": raw_attestation.get(
-                "authority_sampled_unix_time_ms_in_raft_operation"
-            ),
-            "owner_expiry_bound_to_authority_time": raw_attestation.get(
-                "owner_expiry_bound_to_authority_time"
-            ),
-            "checkpoint_publish_rejects_expired_owner_with_authority_time": raw_attestation.get(
-                "checkpoint_publish_rejects_expired_owner_with_authority_time"
-            ),
-            "bounded_failover_probe_passed": raw_attestation.get("bounded_failover_probe_passed"),
-            "failover_time_bound_ms": raw_attestation.get("failover_time_bound_ms"),
-            "observed_max_failover_ms": raw_attestation.get("observed_max_failover_ms"),
-            "metrics_time_source_rejected": raw_attestation.get("metrics_time_source_rejected"),
-            "raft_log_index_time_source_rejected": raw_attestation.get(
-                "raft_log_index_time_source_rejected"
-            ),
-            "distributed_lock_ttl_source_rejected": raw_attestation.get(
-                "distributed_lock_ttl_source_rejected"
-            ),
-            "trusted_for_product_complete": raw_attestation.get("trusted_for_product_complete"),
-            "trusted_for_release_validator": raw_attestation.get("trusted_for_release_validator"),
-            "release_validator_fail_closed": raw_attestation.get("release_validator_fail_closed"),
-            "attested_at": raw_attestation.get("attested_at"),
-            "attester": raw_attestation.get("attester"),
-        }
 
 local_tls_auth_smoke = None
 if api_tls_enabled == "1":
@@ -6470,30 +5931,9 @@ if not production_multi_writer_safe:
         product_complete_blockers.append(
             "metadata backend proves multi-writer fencing, but bounded wall-clock failover is not proven"
         )
-    elif blocked_reason in {
-        "hiqlite_authoritative_backend_time_false",
-        "hiqlite_raft_replicated_authority_time_primitive_missing",
-    }:
-        product_complete_blockers.append(
-            "Hiqlite metadata authority shape may be attested, but backend-time lease semantics are not proven"
-        )
     else:
         product_complete_blockers.append(
             f"metadata backend is not production multi-writer safe: {blocked_reason or 'unknown'}"
-        )
-if (
-    meta_enabled == "1"
-    and meta_backend == "hiqlite"
-    and standing_runtime_fencing == "required"
-    and backend_time_source == "raft_replicated_authority_time"
-):
-    if not hiqlite_backend_time_attestation:
-        product_complete_blockers.append(
-            "Hiqlite backend-time attestation was not generated from deployed product smoke"
-        )
-    elif hiqlite_backend_time_attestation.get("trusted_for_release_validator") is not True:
-        product_complete_blockers.append(
-            "Hiqlite backend-time attestation is diagnostic and release validator remains fail-closed"
         )
 if standing_runtime_fencing != "unsafe-dev-only" and meta_fencing_adversarial_smoke_passed != "1":
     product_complete_blockers.append(
@@ -6633,12 +6073,6 @@ evidence = {
         "namespace_validated": no_pvc_namespace_validated == "1",
         "evidence": "no-pvc-namespace.json" if no_pvc_namespace_validated == "1" else None,
         "contract": "no PersistentVolumeClaim objects in the Velorix product namespace",
-        "managed_hiqlite_authority_validated": bool(
-            hiqlite_authority_attestation
-            and hiqlite_authority_attestation.get("authority_kind") == "velorix_managed_hiqlite"
-            and hiqlite_authority_attestation.get("no_pvc_created_by_vind") is True
-            and hiqlite_authority_attestation.get("metadata_authority_no_pvc_used") is True
-        ),
     },
     "metadata_store": {
         "enabled": meta_enabled == "1",
@@ -6668,9 +6102,6 @@ evidence = {
             else None,
         },
         "meta_s3_prefix": meta_s3_prefix if meta_enabled == "1" else None,
-        "hiqlite_authority_attestation": hiqlite_authority_attestation,
-        "hiqlite_backend_time_assessment": hiqlite_backend_time_assessment,
-        "hiqlite_backend_time_attestation": hiqlite_backend_time_attestation,
         "standing_runtime_adversarial_smoke": {
             "status": "pass" if meta_fencing_adversarial_smoke_passed == "1" else (
                 "not_required" if standing_runtime_fencing == "unsafe-dev-only" else "not_run"
@@ -6881,17 +6312,6 @@ docker_build_args=()
 if [ "$docker_build_no_cache" = "1" ]; then
   docker_build_args+=(--no-cache)
 fi
-if [ "$build_api_image" = "1" ] || \
-  { [ "$meta_enabled" = "1" ] && [ "$build_meta_image" = "1" ]; } || \
-  { [ "$hiqlite_deploy" = "1" ] && [ "$build_hiqlite_image" = "1" ]; } || \
-  { [ "$ingest_writer_smoke" = "1" ] && [ "$build_ingest_writer_image" = "1" ]; }; then
-  if [ ! -f "${hiqlite_local_source_dir}/hiqlite/Cargo.toml" ]; then
-    echo "VELORIX_HIQLITE_LOCAL_SOURCE_DIR must point to a hiqlite checkout containing hiqlite/Cargo.toml: ${hiqlite_local_source_dir}" >&2
-    exit 64
-  fi
-  docker_build_args+=(--build-context "velorix-hiqlite-source=${hiqlite_local_source_dir}")
-fi
-
 if [ "$build_api_image" = "1" ]; then
   echo "building ${api_image}"
   DOCKER_BUILDKIT=1 docker build "${docker_build_args[@]}" -f Dockerfile.api -t "$api_image" .
@@ -6925,21 +6345,6 @@ if [ -z "$api_image_digest" ]; then
 fi
 if [ "$meta_enabled" = "1" ] && [ -z "$meta_image_digest" ]; then
   meta_image_digest="$(resolve_local_image_digest "$meta_image")"
-fi
-
-if [ "$hiqlite_deploy" = "1" ]; then
-  if [ "$build_hiqlite_image" = "1" ]; then
-    echo "building ${hiqlite_image}"
-    DOCKER_BUILDKIT=1 docker build "${docker_build_args[@]}" -f Dockerfile.hiqlite -t "$hiqlite_image" .
-    load_image_into_product_cluster "$hiqlite_image"
-  else
-    if [ "$load_existing_images" = "1" ]; then
-      echo "skipping hiqlite image build for ${hiqlite_image}; loading existing local image into the selected product cluster"
-      load_existing_image_into_product_cluster "$hiqlite_image"
-    else
-      echo "skipping hiqlite image build/load for ${hiqlite_image}; assuming it is already available in the selected product cluster"
-    fi
-  fi
 fi
 
 if [ "$ingest_writer_smoke" = "1" ]; then
@@ -7125,311 +6530,6 @@ else
               value: "1"'
 fi
 
-hiqlite_api_secret_ref_name="velorix-hiqlite-auth"
-if [ "$meta_enabled" = "1" ] && [ -n "$hiqlite_api_secret" ]; then
-  hiqlite_api_secret_b64="$(base64_value "$hiqlite_api_secret")"
-  if [ "$hiqlite_deploy" = "1" ]; then
-    hiqlite_raft_secret_b64="$(base64_value "$hiqlite_raft_secret")"
-    hiqlite_enc_key_active_b64="$(base64_value "$hiqlite_enc_key_active")"
-    hiqlite_enc_keys_b64="$(base64_value "$hiqlite_enc_keys")"
-    cat <<EOF | kubectl --context "$context" apply -f -
-apiVersion: v1
-kind: Secret
-metadata:
-  name: velorix-hiqlite-auth
-  namespace: ${namespace}
-type: Opaque
-data:
-  api-secret: ${hiqlite_api_secret_b64}
-  raft-secret: ${hiqlite_raft_secret_b64}
-  enc-key-active: ${hiqlite_enc_key_active_b64}
-  enc-keys: ${hiqlite_enc_keys_b64}
-EOF
-  else
-    hiqlite_api_secret_ref_name="velorix-meta-hiqlite-auth"
-    cat <<EOF | kubectl --context "$context" apply -f -
-apiVersion: v1
-kind: Secret
-metadata:
-  name: velorix-meta-hiqlite-auth
-  namespace: ${namespace}
-type: Opaque
-data:
-  api-secret: ${hiqlite_api_secret_b64}
-EOF
-  fi
-fi
-
-deploy_hiqlite_authority() {
-cat >"${output_dir}/velorix-hiqlite.yaml" <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: velorix-hiqlite
-  namespace: ${namespace}
-  labels:
-    app: velorix-hiqlite
-    velorix.dev/run-id: "${run_id}"
-automountServiceAccountToken: false
-$(service_account_image_pull_secrets_yaml)
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: velorix-hiqlite-config
-  namespace: ${namespace}
-  labels:
-    app: velorix-hiqlite
-    velorix.dev/run-id: "${run_id}"
-data:
-  hiqlite.toml: |
-    [hiqlite]
-    node_id_from = "k8s"
-    nodes = [
-      "1 velorix-hiqlite-0.velorix-hiqlite-headless:8100 velorix-hiqlite-0.velorix-hiqlite-headless:8200",
-      "2 velorix-hiqlite-1.velorix-hiqlite-headless:8100 velorix-hiqlite-1.velorix-hiqlite-headless:8200",
-      "3 velorix-hiqlite-2.velorix-hiqlite-headless:8100 velorix-hiqlite-2.velorix-hiqlite-headless:8200",
-    ]
-    listen_addr_api = "0.0.0.0"
-    listen_addr_raft = "0.0.0.0"
-    data_dir = "/data"
-    filename_db = "velorix-hiqlite.db"
-    log_statements = false
-    read_pool_size = 4
-    log_sync = "interval_200"
-    wal_size = 2097152
-    cache_storage_disk = true
-    logs_until_snapshot = 10000
-    health_check_delay_secs = 30
-    backup_cron = "${hiqlite_backup_cron}"
-    backup_keep_days = ${hiqlite_backup_keep_days}
-    backup_keep_days_local = ${hiqlite_backup_keep_days_local}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: velorix-hiqlite-headless
-  namespace: ${namespace}
-  labels:
-    app: velorix-hiqlite
-    velorix.dev/run-id: "${run_id}"
-spec:
-  clusterIP: None
-  selector:
-    app: velorix-hiqlite
-  ports:
-    - name: raft
-      port: 8100
-      targetPort: 8100
-    - name: api
-      port: 8200
-      targetPort: 8200
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: velorix-hiqlite
-  namespace: ${namespace}
-  labels:
-    app: velorix-hiqlite
-    velorix.dev/run-id: "${run_id}"
-spec:
-  selector:
-    app: velorix-hiqlite
-  ports:
-    - name: api
-      port: 8200
-      targetPort: 8200
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: velorix-hiqlite
-  namespace: ${namespace}
-  labels:
-    app: velorix-hiqlite
-    velorix.dev/run-id: "${run_id}"
-spec:
-  serviceName: velorix-hiqlite-headless
-  replicas: 3
-  selector:
-    matchLabels:
-      app: velorix-hiqlite
-  template:
-    metadata:
-      labels:
-        app: velorix-hiqlite
-        velorix.dev/run-id: "${run_id}"
-      annotations:
-        velorix.dev/run-id: "${run_id}"
-        velorix.dev/image-tag: "${hiqlite_image}"
-        velorix.dev/hiqlite-api-secret-sha256: "${hiqlite_api_secret_hash}"
-        velorix.dev/hiqlite-raft-secret-sha256: "${hiqlite_raft_secret_hash}"
-        velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
-        velorix.dev/no-pvc: "true"
-    spec:
-      serviceAccountName: velorix-hiqlite
-      automountServiceAccountToken: false
-$(image_pull_secrets_yaml)
-      securityContext:
-        seccompProfile:
-          type: RuntimeDefault
-        fsGroup: 65532
-        fsGroupChangePolicy: OnRootMismatch
-      containers:
-        - name: hiqlite
-          image: ${hiqlite_image}
-          imagePullPolicy: ${hiqlite_image_pull_policy}
-          args: ["serve", "-c", "/etc/hiqlite/hiqlite.toml"]
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-            capabilities:
-              drop:
-                - ALL
-          env:
-            - name: HQL_SECRET_API
-              valueFrom:
-                secretKeyRef:
-                  name: velorix-hiqlite-auth
-                  key: api-secret
-            - name: HQL_SECRET_RAFT
-              valueFrom:
-                secretKeyRef:
-                  name: velorix-hiqlite-auth
-                  key: raft-secret
-            - name: ENC_KEY_ACTIVE
-              valueFrom:
-                secretKeyRef:
-                  name: velorix-hiqlite-auth
-                  key: enc-key-active
-            - name: ENC_KEYS
-              valueFrom:
-                secretKeyRef:
-                  name: velorix-hiqlite-auth
-                  key: enc-keys
-            - name: HQL_S3_URL
-              value: "${s3_endpoint}"
-            - name: HQL_S3_BUCKET
-              value: "${bucket}"
-            - name: HQL_S3_REGION
-              value: "${aws_region}"
-            - name: HQL_S3_PATH_STYLE
-              value: "${s3_force_path_style_bool}"
-            - name: HQL_S3_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: ${s3_credentials_secret_name}
-                  key: access-key-id
-            - name: HQL_S3_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ${s3_credentials_secret_name}
-                  key: secret-access-key
-          ports:
-            - name: raft
-              containerPort: 8100
-            - name: api
-              containerPort: 8200
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8200
-            periodSeconds: 2
-            failureThreshold: 60
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8200
-            periodSeconds: 10
-            failureThreshold: 12
-          volumeMounts:
-            - name: config
-              mountPath: /etc/hiqlite
-              readOnly: true
-            - name: data
-              mountPath: /data
-      volumes:
-        - name: config
-          configMap:
-            name: velorix-hiqlite-config
-        - name: data
-          emptyDir: {}
-EOF
-
-  validate_rendered_no_pvc_manifest "${output_dir}/velorix-hiqlite.yaml"
-  kubectl --context "$context" apply -f "${output_dir}/velorix-hiqlite.yaml"
-  remove_service_run_id_selector velorix-hiqlite-headless
-  remove_service_run_id_selector velorix-hiqlite
-  wait_for_statefulset_rollout velorix-hiqlite
-  wait_for_hiqlite_ready
-  if [ -z "$hiqlite_image_digest" ]; then
-    hiqlite_image_digest="$(docker image inspect "$hiqlite_image" --format '{{.Id}}' 2>/dev/null || true)"
-  fi
-  if [ -z "$hiqlite_image_digest" ]; then
-    echo "managed Hiqlite authority attestation requires VELORIX_HIQLITE_IMAGE_DIGEST or a locally inspectable image" >&2
-    exit 64
-  fi
-  hiqlite_source_revision="local-source-no-git"
-  if git -C "$hiqlite_local_source_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    hiqlite_source_head="$(git -C "$hiqlite_local_source_dir" rev-parse --short HEAD)"
-    hiqlite_source_remote="$(git -C "$hiqlite_local_source_dir" config --get remote.origin.url || true)"
-    if [ -z "$hiqlite_source_remote" ]; then
-      hiqlite_source_remote="local"
-    fi
-    hiqlite_source_dirty=""
-    if [ -n "$(git -C "$hiqlite_local_source_dir" status --porcelain)" ]; then
-      hiqlite_source_dirty="+dirty"
-    fi
-    hiqlite_source_revision="${hiqlite_source_remote}@${hiqlite_source_head}${hiqlite_source_dirty}"
-  fi
-  python3 - \
-    "$generated_hiqlite_authority_attestation" \
-    "$hiqlite_nodes" \
-    "$hiqlite_image_digest" \
-    "$hiqlite_raft_secret_hash" \
-    "$hiqlite_source_revision" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-
-path, nodes_csv, image_digest, raft_secret_hash, source_revision = sys.argv[1:]
-nodes = [node for node in nodes_csv.split(",") if node]
-attestation = {
-    "schema_version": 1,
-    "authority_kind": "velorix_managed_hiqlite",
-    "nodes": nodes,
-    "expected_voter_count": 3,
-    "no_pvc_created_by_vind": True,
-    "metadata_authority_no_pvc_used": True,
-    "metadata_authority_storage_mode": "object-store-backup-restore-with-ephemeral-node-disk",
-    "voters_learner_only_disabled": True,
-    "api_auth_configured": True,
-    "raft_auth_configured": True,
-    "transport_security": "cluster-internal-authenticated-plaintext",
-    "backup_restore_configured": True,
-    "image_digest": image_digest,
-    "source_revision": source_revision,
-    "raft_secret_sha256": raft_secret_hash,
-    "no_pvc_evidence_files": {
-        "namespace_pvc_list": "no-pvc-namespace.json",
-        "hiqlite_statefulset": "no-pvc-hiqlite-statefulset.json",
-        "manifest": "velorix-hiqlite.yaml",
-    },
-    "attested_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "attester": "scripts/run-vind-product.sh",
-}
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(attestation, f, indent=2, sort_keys=True)
-    f.write("\n")
-PY
-  hiqlite_authority_attestation_file="$generated_hiqlite_authority_attestation"
-  validate_hiqlite_authority_attestation
-}
-
 if [ "$object_store_mode" = "rustfs" ]; then
 cat >"${output_dir}/rustfs.yaml" <<EOF
 apiVersion: apps/v1
@@ -7557,10 +6657,6 @@ else
   echo "using external S3-compatible object store endpoint ${s3_endpoint}; skipping RustFS deployment and bucket creation"
 fi
 run_external_s3_validation_job
-if [ "$hiqlite_deploy" = "1" ]; then
-  deploy_hiqlite_authority
-fi
-
 api_meta_env=""
 if [ "$meta_enabled" = "1" ]; then
   meta_bearer_token_b64="$(base64_value "$meta_bearer_token")"
@@ -7599,7 +6695,7 @@ spec:
         velorix.dev/image-digest: "${meta_image_digest:-unknown}"
         velorix.dev/meta-token-sha256: "${meta_bearer_token_hash}"
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
-        velorix.dev/hiqlite-secret-sha256: "${hiqlite_api_secret_hash}"
+        velorix.dev/no-pvc: "true"
         velorix.dev/authority-namespace: "${authority_namespace}"
         velorix.dev/authority-store-id: "${s3_authority_store_id}"
         velorix.dev/object-store-backend: "${s3_backend_name}"
@@ -7664,16 +6760,6 @@ $(image_pull_secrets_yaml)
               value: "${bucket}"
             - name: VELORIX_S3_PREFIX
               value: "${meta_s3_prefix}"
-            - name: VELORIX_HIQLITE_NODES
-              value: "${hiqlite_nodes}"
-            - name: VELORIX_HIQLITE_API_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: ${hiqlite_api_secret_ref_name}
-                  key: api-secret
-                  optional: true
-            - name: VELORIX_HIQLITE_WITH_PROXY
-              value: "${hiqlite_with_proxy}"
           ports:
             - containerPort: 9090
           readinessProbe:
@@ -8013,7 +7099,6 @@ if meta_enabled == "1":
         "in-memory": "in-memory",
         "oss": "oss",
         "object-store": "oss",
-        "hiqlite": "hiqlite",
     }[meta_backend]
     if capability.get("backend_name") != expected_backend:
         raise SystemExit(f"metadata backend mismatch: expected {expected_backend}, got {capability}")
@@ -8039,12 +7124,9 @@ if meta_enabled == "1":
             raise SystemExit(
                 f"metadata backend does not satisfy logical fencing fields {missing}: {capability}"
             )
-        if capability.get("lease_authority_kind") not in {
-            "hiqlite_raft_serialized",
-            "raft_replicated_time",
-        }:
+        if capability.get("lease_authority_kind") != "raft_replicated_time":
             raise SystemExit(
-                f"metadata backend does not report a recognized lease authority: {capability}"
+                f"metadata backend does not report a Raft-replicated lease authority: {capability}"
             )
         if capability.get("lease_expiry_semantics") not in {
             "operation_driven_logical",
@@ -8295,7 +7377,7 @@ if (actual.get("u1") or {}).get("sum", 0) < 12 or (actual.get("u1") or {}).get("
 PY
   if [ "$meta_enabled" = "1" ]; then
     case "$meta_backend" in
-      oss | object-store | hiqlite)
+      oss | object-store)
         kubectl --context "$context" -n "$namespace" rollout restart deployment/velorix-meta >/dev/null
         wait_for_rollout velorix-meta
         run_meta_smoke_job
@@ -8345,8 +7427,6 @@ run_standing_runtime_failover_smoke
 if [ "$standing_runtime_failover_smoke_passed" = "1" ]; then
   write_product_evidence
 fi
-run_hiqlite_backend_time_assessment
-run_hiqlite_backend_time_attestation
 write_product_evidence
 if [ "$product_evidence_level" = "product-complete" ]; then
   assert_product_complete_evidence
@@ -8369,9 +7449,6 @@ echo "product_evidence_public=${output_dir}/product-evidence.public.json"
 echo "meta_enabled=${meta_enabled}"
 if [ "$meta_enabled" = "1" ]; then
   echo "meta_backend=${meta_backend}"
-  if [ "$meta_backend" = "hiqlite" ]; then
-    echo "hiqlite_authority_attestation_validated=${hiqlite_authority_attestation_validated}"
-  fi
 fi
 echo "product_smoke=${product_smoke}"
 echo "rest_api_smoke=${rest_api_smoke}"
@@ -8390,10 +7467,6 @@ echo "multi_replica_fencing_smoke=${multi_replica_fencing_smoke}"
 echo "multi_replica_fencing_smoke_passed=${multi_replica_fencing_smoke_passed}"
 echo "standing_runtime_failover_smoke=${standing_runtime_failover_smoke}"
 echo "standing_runtime_failover_smoke_passed=${standing_runtime_failover_smoke_passed}"
-echo "hiqlite_backend_time_assess=${hiqlite_backend_time_assess}"
-echo "hiqlite_backend_time_assessment_validated=${hiqlite_backend_time_assessment_validated}"
-echo "hiqlite_backend_time_attest=${hiqlite_backend_time_attest}"
-echo "hiqlite_backend_time_attestation_validated=${hiqlite_backend_time_attestation_validated}"
 if [ "$ingest_writer_smoke" = "1" ]; then
   echo "ingest_writer_job_completed=${ingest_writer_job_completed}"
 fi

@@ -1,0 +1,11 @@
+# sha256 of the byte-for-byte upstream files vendored from
+# github.com/mrchypark/rhiza tag v0.19.0, path deploy/operator/.
+#
+# release commit: abb87a0336cba8fee3fd1d9e5a0bf797de5b25b8
+#
+# scripts/run-rhiza-kv-k8s-gate.sh verifies these before it renders or applies
+# anything. A mismatch aborts the gate: an unverified operator manifest is not a
+# basis for a recovery claim.
+b3e6744a8542e3804e9fa1a315aade37bbb6446b399fdeafae85a1ea80b25b22  crd.yaml
+54972983941ed36d72f1918569b0fffbec6ab34535dbf6aa1337fc3289c9e379  rbac.yaml
+d57ce9551830e1fb519ee50f28da381857494f60452a247975e72640067587bf  deployment.yaml

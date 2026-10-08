@@ -8,13 +8,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # The authority path uses object_store 0.14 / quick-xml 0.41. The remaining
-  # quick-xml 0.39 path is pinned Hiqlite -> cryptr -> s3-simple and has
-  # owner/expiry records in dependency-governance.json.
-  "RUSTSEC-2026-0194",
-  "RUSTSEC-2026-0195",
-]
+# No advisory is suppressed. The quick-xml 0.39 Hiqlite -> cryptr -> s3-simple
+# path left the graph when Hiqlite was removed, so the authority path's only
+# quick-xml line is 0.41 and needs no exception.
+ignore = []
 
 [licenses]
 version = 2
@@ -24,8 +21,13 @@ allow = [
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
-  "bzip2-1.0.6",
   "CC0-1.0",
+  # Kept although cargo-deny 0.20.2 also reports it as not encountered:
+  # webpki-root-certs 1.0.9 (rustls-platform-verifier 0.7.0, via kube-client
+  # 4.2.0 and reqwest 0.13.5) requires it, and dropping it fails `check
+  # licenses`. CDLA-Permissive-2.0 moved here with kube 4.x; the bzip2-1.0.6
+  # allowance was removed with the Hiqlite -> cryptr -> s3-simple line, which
+  # was the graph's only bzip2 consumer.
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
@@ -49,4 +51,6 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/mrchypark/hiqlite.git"]
+# No git source is allowed. Hiqlite was the only git dependency; the metadata
+# authority is the embedded Rhiza KV backend from crates.io.
+allow-git = []

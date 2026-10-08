@@ -41,10 +41,11 @@ checks = {
             script,
         )
     ),
-    "first-E2E Docker build includes local Hiqlite source context": (
-        "VELORIX_HIQLITE_LOCAL_SOURCE_DIR" in script
-        and "velorix-hiqlite-source=${hiqlite_local_source_dir}" in script
-        and "DOCKER_BUILDKIT=1 docker build" in script
+    "first-E2E Docker build has no removed Hiqlite source build context": (
+        "DOCKER_BUILDKIT=1 docker build" in script
+        and "velorix-hiqlite-source" not in script
+        and "VELORIX_HIQLITE" not in script
+        and "Dockerfile.hiqlite" not in script
     ),
     "switches default lifecycle evidence to product output after product run": (
         'ingest_writer_lifecycle_evidence="${product_output_dir}/ingest-writer-lifecycle-attestation.json"'
@@ -69,14 +70,14 @@ checks = {
         and "local_api_pod_failover_smoke" in doc
         and "standing-runtime-failover-smoke.json" in doc
     ),
-    "first-E2E required product profile is enabled for Hiqlite authority time": (
+    "first-E2E required product profile stays fail-closed without Raft authority time": (
         'default | logical-fencing | required)' in script
         and 'VELORIX_FIRST_E2E_PRODUCT_PROFILE=required is not supported' not in script
         and 'VELORIX_STANDING_RUNTIME_FENCING=required' in script
-        and 'VELORIX_REQUIRE_HIQLITE_BACKEND_TIME=1' in script
-        and 'VELORIX_FIRST_E2E_PRODUCT_PROFILE=required' in doc
-        and 'backend_time_source_kind=raft_replicated_authority_time' in doc
-        and 'production_bounded_failover_safe=true' in doc
+        and 'VELORIX_META_ENABLED=1' in script
+        and 'VELORIX_REQUIRE_HIQLITE_BACKEND_TIME' not in script
+        and 'backend_time_source_kind=process_clock' in doc
+        and 'production_bounded_failover_safe=false' in doc
     ),
     "first-E2E can pass external object-store durability attestation but rejects local RustFS attestation": (
         "VELORIX_FIRST_E2E_PRODUCT_OBJECT_STORE_DURABILITY_ATTESTATION_FILE" in script

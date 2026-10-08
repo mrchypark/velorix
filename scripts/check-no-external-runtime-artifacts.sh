@@ -32,7 +32,6 @@ dockerfiles = [
     "Dockerfile.api",
     "Dockerfile.meta",
     "Dockerfile.ingest-writer",
-    "Dockerfile.hiqlite",
     "Dockerfile.all-in-one",
 ]
 runtime_source_dirs = [

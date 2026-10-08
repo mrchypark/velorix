@@ -57,12 +57,12 @@ Main overrides:
   VELORIX_EXTERNAL_RUSTFS_CLEANUP=0
   VELORIX_S3_BUCKET=velorix-product
   VELORIX_S3_PREFIX=product/<run-id>
-  VELORIX_META_BACKEND=hiqlite
+  VELORIX_META_BACKEND=oss
   VELORIX_STANDING_RUNTIME_FENCING=logical-fencing
   VELORIX_API_REPLICA_COUNT=2
 
 The external RustFS container is local development infrastructure, not public
-ingress/TLS/auth evidence and not Hiqlite backend-time proof.
+ingress/TLS/auth evidence and not metadata-authority failover proof.
 EOF
 }
 
@@ -284,7 +284,7 @@ payload = {
     "trusted_scope": "local Docker RustFS authority for manual vind product execution",
     "remaining_product_complete_gates": [
         "public ingress/TLS/auth attestation",
-        "Hiqlite backend-authoritative bounded wall-clock failover",
+        "metadata-authority bounded wall-clock failover",
         "operator-reviewed external object-store durability policy",
     ],
 }
