@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     env, fmt,
     future::Future,
-    net::SocketAddr,
+    net::{SocketAddr, SocketAddrV4},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -391,7 +391,7 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
             // rewrites it between generations. In this mode the native engine
             // reads that environment itself, so this process must not also hold
             // a parsed Velorix copy that could shadow it.
-            true => rhiza_operator_managed_config(vars)?,
+            true => rhiza_operator_managed_config(vars, bind)?,
             false => RhizaServeConfig::Explicit(Box::new(parse_rhiza_config(vars, &mode)?)),
         })
     } else {
@@ -582,6 +582,7 @@ const VELORIX_RHIZA_SHADOW_VARS: &[&str] = &[
 /// to read them afresh.
 fn rhiza_operator_managed_config(
     vars: &HashMap<String, String>,
+    meta_bind: SocketAddr,
 ) -> anyhow::Result<RhizaServeConfig> {
     let conflicts = VELORIX_RHIZA_SHADOW_VARS
         .iter()
@@ -655,20 +656,31 @@ fn rhiza_operator_managed_config(
             "RHIZA_PEER_TOKENS and RHIZA_PEER_TOKEN are mutually exclusive; set exactly one so native can select this node's private peer token"
         );
     }
-    if let Some(map) = &peer_tokens {
-        let entries = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(map)
-            .map_err(|error| anyhow::anyhow!("invalid RHIZA_PEER_TOKENS JSON: {error}"))?;
-        let own = entries
-            .get(&node_id)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|token| !token.is_empty());
-        if own.is_none() {
-            anyhow::bail!(
-                "RHIZA_PEER_TOKENS must map this node's RHIZA_NODE_ID `{node_id}` to a nonempty private peer token"
-            );
+    // Native selects this node's own entry from the map, so the selected value
+    // is the peer identity the admin token must differ from. Keep the selection
+    // after the shape check instead of dropping it.
+    let mapped_peer_token = match &peer_tokens {
+        Some(map) => {
+            let entries =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(map)
+                    .map_err(|error| anyhow::anyhow!("invalid RHIZA_PEER_TOKENS JSON: {error}"))?;
+            // Native selects this entry verbatim: `configEnvPeerToken` returns
+            // `tokens[nodeID]` raw, and the admin token comes from `os.Getenv`
+            // untrimmed as well. Trim only to reject an all-whitespace value;
+            // the byte-for-byte token is what the equality check below must see.
+            let own = entries
+                .get(&node_id)
+                .and_then(serde_json::Value::as_str)
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RHIZA_PEER_TOKENS must map this node's RHIZA_NODE_ID `{node_id}` to a nonempty private peer token"
+                    )
+                })?;
+            Some(own.to_string())
         }
-    }
+        None => None,
+    };
     // An empty admin token disables archive publication, which the Operator
     // needs for a before-ack source generation. Refuse it here rather than
     // letting recovery fail later with no archive to certify.
@@ -678,7 +690,10 @@ fn rhiza_operator_managed_config(
             "VELORIX_RHIZA_OPERATOR_MANAGED=true requires a nonempty RHIZA_ADMIN_TOKEN; an empty token disables the archive publication the Operator recovers from"
         );
     }
-    if admin_token == peer_token {
+    // The admin token guards archive publication while the peer token derives
+    // this node's wire identity, so they must differ whichever form supplied
+    // the peer token. Neither value is echoed.
+    if admin_token == peer_token || admin_token.as_deref() == mapped_peer_token.as_deref() {
         anyhow::bail!("RHIZA_ADMIN_TOKEN must differ from this node's peer identity token");
     }
 
@@ -705,13 +720,18 @@ fn rhiza_operator_managed_config(
     // `recovery` or `http` and falls back to 8080. A Velorix-chosen default would
     // bind a port the Operator never probes, so the Operator must declare the
     // bind address, and it must equal the `recovery`/`http` container port.
+    //
+    // The comparison uses the parsed Meta bind rather than the raw strings:
+    // equal listeners can be spelled differently (`[::1]` vs `[0:0:0:0:0:0:0:1]`),
+    // and a wildcard collides with every specific address in its family.
     let recovery_bind = required_nonempty_config(vars, "RHIZA_BIND_ADDR")?;
-    recovery_bind
+    let recovery_bind_addr = recovery_bind
         .parse::<SocketAddr>()
         .map_err(|error| anyhow::anyhow!("invalid RHIZA_BIND_ADDR `{recovery_bind}`: {error}"))?;
-    if Some(recovery_bind.as_str()) == optional_config(vars, "VELORIX_META_BIND").as_deref() {
+    if socket_addrs_share_listener(recovery_bind_addr, meta_bind) {
         anyhow::bail!(
-            "RHIZA_BIND_ADDR and VELORIX_META_BIND both request `{recovery_bind}`; the recovery listener and the Velorix gRPC listener need separate addresses"
+            "RHIZA_BIND_ADDR `{recovery_bind_addr}` and VELORIX_META_BIND `{meta_bind}` share port {}; the recovery listener and the Velorix gRPC listener need separate addresses",
+            recovery_bind_addr.port()
         );
     }
 
@@ -719,6 +739,50 @@ fn rhiza_operator_managed_config(
         recovery_bind,
         learner: learner.is_some(),
     })
+}
+
+/// An IPv4-mapped IPv6 address normalized to its IPv4 form: binding the
+/// mapped address binds the IPv4 address on every supported platform. Only
+/// mapped addresses convert; IPv4-compatible forms (`::`, `::1`) keep their
+/// IPv6 identity so wildcard and loopback semantics survive.
+fn normalize_mapped(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::V4(SocketAddrV4::new(ip, v6.port())),
+            None => SocketAddr::V6(v6),
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+/// True when two listeners cannot both bind on this platform: same port and
+/// overlapping IP coverage.
+///
+/// A wildcard covers every specific address in its family, and an IPv6 wildcard
+/// additionally covers IPv4 through the dual-stack socket that Linux and macOS
+/// create by default, so an IPv6 wildcard collides with any same-port IPv4
+/// listener. IPv4-mapped IPv6 addresses normalize to their IPv4 form because
+/// binding one binds the IPv4 address. Distinct specific addresses in different
+/// families never collide.
+fn socket_addrs_share_listener(left: SocketAddr, right: SocketAddr) -> bool {
+    if left.port() != right.port() {
+        return false;
+    }
+    let left = normalize_mapped(left);
+    let right = normalize_mapped(right);
+    match (left, right) {
+        (SocketAddr::V4(left), SocketAddr::V4(right)) => {
+            left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified()
+        }
+        (SocketAddr::V6(left), SocketAddr::V6(right)) => {
+            left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified()
+        }
+        // Different address families. Only an IPv6 wildcard reaches across
+        // families, via the dual-stack default; a specific IPv6 address
+        // coexists with any IPv4 address.
+        (SocketAddr::V6(left), _) => left.ip().is_unspecified(),
+        (_, SocketAddr::V6(right)) => right.ip().is_unspecified(),
+    }
 }
 
 /// Parse fixed Rhiza membership from JSON or a secret-mounted file. Membership
@@ -1925,6 +1989,31 @@ async fn rhiza_meta_store_from_config(
     ))
 }
 
+/// Serialize one member into the exact `quepaxa.Member` shape native decodes
+/// with unknown fields disallowed. Only non-default native fields are emitted:
+/// `public_key` stays absent for an unauthenticated single-node cluster, and
+/// `log_url`/`wal_identity` are published only when set. No legacy or private
+/// token field is ever emitted.
+#[cfg(feature = "rhiza-backend")]
+fn rhiza_native_member_json(member: &RhizaMemberConfig) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("node_id".to_string(), json!(member.node_id));
+    entry.insert("url".to_string(), json!(member.url));
+    entry.insert("peer_url".to_string(), json!(member.peer_url));
+    // A single-node cluster publishes no key at all; native derives the zero
+    // key from its absent peer token and accepts it.
+    if !member.public_key.is_empty() {
+        entry.insert("public_key".to_string(), json!(member.public_key));
+    }
+    if !member.log_url.is_empty() {
+        entry.insert("log_url".to_string(), json!(member.log_url));
+    }
+    if let Some(wal_identity) = &member.wal_identity {
+        entry.insert("wal_identity".to_string(), json!(wal_identity));
+    }
+    serde_json::Value::Object(entry)
+}
+
 #[cfg(feature = "rhiza-backend")]
 async fn rhiza_explicit_meta_store_from_config(
     config: &RhizaServeConfig,
@@ -1956,20 +2045,7 @@ async fn rhiza_explicit_meta_store_from_config(
     };
     let members = members
         .iter()
-        .map(|member| {
-            let mut entry = serde_json::Map::new();
-            entry.insert("node_id".to_string(), json!(member.node_id));
-            entry.insert("url".to_string(), json!(member.url));
-            entry.insert("peer_url".to_string(), json!(member.peer_url));
-            // Native decodes the members array rejecting unknown fields, so the
-            // private peer token is never emitted. A single-node cluster
-            // publishes no key at all; native derives the zero key from its
-            // absent peer token and accepts it.
-            if !member.public_key.is_empty() {
-                entry.insert("public_key".to_string(), json!(member.public_key));
-            }
-            serde_json::Value::Object(entry)
-        })
+        .map(rhiza_native_member_json)
         .collect::<Vec<_>>();
     let mut native = rhizadb::Config::new(data_dir)
         .node_id(node_id.clone())
@@ -2793,6 +2869,68 @@ mod tests {
     }
 
     #[test]
+    fn operator_managed_rhiza_rejects_admin_token_equal_to_either_peer_token_form() {
+        // Direct form: the admin token must differ from RHIZA_PEER_TOKEN.
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[(
+            "RHIZA_ADMIN_TOKEN",
+            NODE_A_PEER_TOKEN,
+        )]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("must differ"),
+            "direct peer token duplication must be rejected: {error}"
+        );
+
+        // Map form: the admin token must also differ from this node's own mapped
+        // entry, which is the peer identity native actually selects.
+        let map = r#"{"node-a":"velorix-peer-token-a","node-b":"velorix-peer-token-b"}"#;
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("RHIZA_PEER_TOKEN", ""),
+            ("RHIZA_PEER_TOKENS", map),
+            ("RHIZA_ADMIN_TOKEN", "velorix-peer-token-a"),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("must differ"),
+            "mapped own token duplication must be rejected: {error}"
+        );
+
+        // Another node's mapped token is not this node's peer identity, so it may
+        // equal the admin token.
+        parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("RHIZA_PEER_TOKEN", ""),
+            ("RHIZA_PEER_TOKENS", map),
+            ("RHIZA_ADMIN_TOKEN", "velorix-peer-token-b"),
+        ]))
+        .expect("another node's mapped token is not this node's peer identity");
+
+        // Native selects the mapped entry raw and reads the admin token raw, so
+        // a pair that is byte-identical apart from surrounding whitespace is the
+        // same identity and must still be refused. Neither value may appear in
+        // the error.
+        let padded_map = serde_json::json!({
+            "node-a": "  velorix-peer-token-a  ",
+            "node-b": "velorix-peer-token-b",
+        })
+        .to_string();
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("RHIZA_PEER_TOKEN", ""),
+            ("RHIZA_PEER_TOKENS", padded_map.as_str()),
+            ("RHIZA_ADMIN_TOKEN", "  velorix-peer-token-a  "),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("must differ"),
+            "byte-identical whitespace-padded mapped and admin tokens must be rejected: {error}"
+        );
+        assert!(
+            !error.contains("velorix-peer-token-a"),
+            "the rejection must not echo a peer or admin token: {error}"
+        );
+    }
+
+    #[test]
     fn operator_managed_rhiza_rejects_a_shared_recovery_and_grpc_address() {
         let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[(
             "RHIZA_BIND_ADDR",
@@ -2807,6 +2945,138 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(error.to_string().contains("invalid RHIZA_BIND_ADDR"));
+    }
+
+    #[test]
+    fn operator_managed_rhiza_rejects_overlapping_recovery_and_grpc_binds() {
+        // Equal IPv6 addresses in different spellings are the same listener.
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "[::1]:9090"),
+            ("RHIZA_BIND_ADDR", "[0:0:0:0:0:0:0:1]:9090"),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("separate addresses"),
+            "equal IPv6 spellings must collide: {error}"
+        );
+
+        // A wildcard covers every specific address in its family.
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "127.0.0.1:9090"),
+            ("RHIZA_BIND_ADDR", "0.0.0.0:9090"),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("separate addresses"),
+            "IPv4 wildcard must cover a specific address: {error}"
+        );
+
+        // An IPv6 wildcard is dual-stack by default on Linux and macOS, so it
+        // also covers every IPv4 listener on the same port.
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("RHIZA_BIND_ADDR", "[::]:9090"),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("separate addresses"),
+            "IPv6 wildcard must cover an IPv4 wildcard: {error}"
+        );
+
+        let error = parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "[::1]:9090"),
+            ("RHIZA_BIND_ADDR", "[::]:9090"),
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("separate addresses"),
+            "IPv6 wildcard must cover a specific IPv6 address: {error}"
+        );
+
+        // Different ports never collide, and neither do genuinely distinct
+        // specific addresses.
+        parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "0.0.0.0:9090"),
+            ("RHIZA_BIND_ADDR", "0.0.0.0:9091"),
+        ]))
+        .expect("different ports must not collide");
+        parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "127.0.0.1:9090"),
+            ("RHIZA_BIND_ADDR", "127.0.0.2:9090"),
+        ]))
+        .expect("distinct specific addresses in one family must not collide");
+        parse_meta_serve_config(&operator_managed_rhiza_vars(&[
+            ("VELORIX_META_BIND", "127.0.0.1:9090"),
+            ("RHIZA_BIND_ADDR", "[::1]:9090"),
+        ]))
+        .expect("distinct address families must not collide");
+    }
+
+    #[test]
+    fn socket_listener_overlap_follows_platform_wildcard_semantics() {
+        let addr = |value: &str| value.parse::<SocketAddr>().unwrap();
+        // Same port, same address in either spelling.
+        assert!(socket_addrs_share_listener(
+            addr("[::1]:9090"),
+            addr("[0:0:0:0:0:0:0:1]:9090")
+        ));
+        // A wildcard covers specific addresses in its family.
+        assert!(socket_addrs_share_listener(
+            addr("0.0.0.0:9090"),
+            addr("127.0.0.1:9090")
+        ));
+        assert!(socket_addrs_share_listener(
+            addr("[::]:9090"),
+            addr("[::1]:9090")
+        ));
+        // An IPv6 wildcard is dual-stack by default and covers IPv4 too.
+        assert!(socket_addrs_share_listener(
+            addr("[::]:9090"),
+            addr("0.0.0.0:9090")
+        ));
+        assert!(socket_addrs_share_listener(
+            addr("[::]:9090"),
+            addr("127.0.0.1:9090")
+        ));
+        // An IPv4-mapped IPv6 address binds the IPv4 address.
+        assert!(socket_addrs_share_listener(
+            addr("[::ffff:127.0.0.1]:9090"),
+            addr("127.0.0.1:9090")
+        ));
+        // Different ports never collide.
+        assert!(!socket_addrs_share_listener(
+            addr("0.0.0.0:9090"),
+            addr("0.0.0.0:9091")
+        ));
+        // Distinct specific addresses in one family do not collide.
+        assert!(!socket_addrs_share_listener(
+            addr("127.0.0.1:9090"),
+            addr("127.0.0.2:9090")
+        ));
+        assert!(!socket_addrs_share_listener(
+            addr("[::1]:9090"),
+            addr("[::2]:9090")
+        ));
+        // A specific IPv6 address coexists with any IPv4 address.
+        assert!(!socket_addrs_share_listener(
+            addr("127.0.0.1:9090"),
+            addr("[::1]:9090")
+        ));
+        assert!(!socket_addrs_share_listener(
+            addr("0.0.0.0:9090"),
+            addr("[::1]:9090")
+        ));
+        // IPv4-compatible IPv6 addresses are not IPv4 addresses: `::1` and
+        // `0.0.0.1` are distinct loopbacks in distinct families.
+        assert!(!socket_addrs_share_listener(
+            addr("[::1]:9090"),
+            addr("0.0.0.1:9090")
+        ));
+        // The IPv6 wildcard covers every specific IPv6 address.
+        assert!(socket_addrs_share_listener(
+            addr("[::]:9090"),
+            addr("[2001:db8::1]:9090")
+        ));
     }
 
     #[test]
@@ -3107,6 +3377,51 @@ mod tests {
             .expect("upstream fixture must decode to 32 bytes");
         assert_eq!(decoded.len(), 32);
         assert_ne!(decoded, [0_u8; 32]);
+    }
+
+    /// The serializer `Config::set_option("Members", ...)` feeds native must
+    /// publish every native public field and no private one, since native
+    /// decodes the array with unknown fields disallowed.
+    #[cfg(feature = "rhiza-backend")]
+    #[test]
+    fn rhiza_native_member_json_serializes_the_native_member_shape() {
+        let members = parse_rhiza_members_json(
+            r#"[{"node_id":"node-a","url":"http://a","peer_url":"quic://a","log_url":"http://a:8080/log","public_key":"p1Pr7TD2f8ccrYFAHg9m+fGpIwTJLXq9TeL1Q2st72k=","wal_identity":"deadbeef"}]"#,
+        )
+        .expect("the native member schema must decode");
+        let serialized = rhiza_native_member_json(&members[0]);
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "node_id": "node-a",
+                "url": "http://a",
+                "peer_url": "quic://a",
+                "public_key": "p1Pr7TD2f8ccrYFAHg9m+fGpIwTJLXq9TeL1Q2st72k=",
+                "log_url": "http://a:8080/log",
+                "wal_identity": "deadbeef",
+            }),
+            "every native public field must round-trip exactly"
+        );
+        assert!(
+            !serialized.to_string().contains("token"),
+            "no token field may be serialized: {serialized}"
+        );
+
+        // The default unauthenticated single member omits the absent key and
+        // log_url entirely, and publishes no wal_identity.
+        let single = parse_rhiza_members_json(
+            r#"[{"node_id":"node-a","url":"http://a","peer_url":"quic://a"}]"#,
+        )
+        .expect("the native member schema must decode");
+        assert_eq!(
+            rhiza_native_member_json(&single[0]),
+            serde_json::json!({
+                "node_id": "node-a",
+                "url": "http://a",
+                "peer_url": "quic://a",
+            }),
+            "an unauthenticated single member must omit empty key, log_url, and wal_identity"
+        );
     }
 
     /// The decoder must not accept a second spelling of an otherwise valid key.
