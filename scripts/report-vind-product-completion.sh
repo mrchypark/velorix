@@ -765,7 +765,7 @@ elif not object_store_real_authority:
         gate(
             "object_store_external_authority",
             "blocked",
-            "External S3-compatible shape is validated, but the authority is local development RustFS",
+            "External S3-compatible shape is validated, but the authority is local development storage",
             evidence={"authority_store_id": store.get("authority_store_id")},
             next_action=action,
         )

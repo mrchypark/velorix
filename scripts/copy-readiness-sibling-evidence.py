@@ -161,33 +161,33 @@ def lifecycle_siblings(artifact: Path, doc: dict, label: str) -> list[Path]:
     return result
 
 
-def rustfs_production_gc_siblings(artifact: Path, doc: dict) -> list[Path]:
-    if doc.get("evidence_kind") != "rustfs_production_gc_evidence_family_validated":
+def versitygw_production_gc_siblings(artifact: Path, doc: dict) -> list[Path]:
+    if doc.get("evidence_kind") != "versitygw_production_gc_evidence_family_validated":
         raise SystemExit(
-            "RustFS production GC validation evidence_kind must be rustfs_production_gc_evidence_family_validated"
+            "Versity Gateway production GC validation evidence_kind must be versitygw_production_gc_evidence_family_validated"
         )
     if doc.get("status") != "pass":
-        raise SystemExit("RustFS production GC validation evidence must be pass")
+        raise SystemExit("Versity Gateway production GC validation evidence must be pass")
 
     result = []
     for key, expected in {
-        "gate_evidence_path": "rustfs-s3-gate-evidence.json",
-        "seed_evidence_path": "rustfs-production-gc-seed.json",
-        "execute_evidence_path": "rustfs-production-gc-run.json",
-        "production_evidence_path": "rustfs-production-gc.json",
+        "gate_evidence_path": "versitygw-s3-gate-evidence.json",
+        "seed_evidence_path": "versitygw-production-gc-seed.json",
+        "execute_evidence_path": "versitygw-production-gc-run.json",
+        "production_evidence_path": "versitygw-production-gc.json",
     }.items():
         result.append(
             related_artifact(
                 artifact,
                 doc.get(key),
                 expected,
-                f"RustFS production GC validation {key}",
+                f"Versity Gateway production GC validation {key}",
             )
         )
 
     checks = set(doc.get("checks") or [])
     for required_check in {
-        "rustfs_s3_compatible_gate_present",
+        "versitygw_s3_compatible_gate_present",
         "seed_fixture_created_retired_checkpoint_state",
         "s3_gc_execute_deleted_seeded_candidate",
         "production_gc_evidence_verified_listing_retention_and_transition",
@@ -195,7 +195,7 @@ def rustfs_production_gc_siblings(artifact: Path, doc: dict) -> list[Path]:
     }:
         if required_check not in checks:
             raise SystemExit(
-                f"RustFS production GC validation evidence missing check {required_check}"
+                f"Versity Gateway production GC validation evidence missing check {required_check}"
             )
     return unique_paths(result)
 
@@ -242,7 +242,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--kind",
-        choices=["product", "ingest-writer-lifecycle", "rustfs-production-gc", "critique"],
+        choices=["product", "ingest-writer-lifecycle", "versitygw-production-gc", "critique"],
         required=True,
     )
     parser.add_argument("--artifact", required=True)
@@ -263,8 +263,8 @@ def main() -> None:
         siblings = product_siblings(artifact, doc)
     elif args.kind == "ingest-writer-lifecycle":
         siblings = lifecycle_siblings(artifact, doc, "ingest-writer lifecycle evidence")
-    elif args.kind == "rustfs-production-gc":
-        siblings = rustfs_production_gc_siblings(artifact, doc)
+    elif args.kind == "versitygw-production-gc":
+        siblings = versitygw_production_gc_siblings(artifact, doc)
     elif args.kind == "critique":
         siblings = critique_siblings(artifact, doc)
     else:

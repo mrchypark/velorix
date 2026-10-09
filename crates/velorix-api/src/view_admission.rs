@@ -12,12 +12,30 @@ pub(super) async fn create_view(
         .map(|input| input.catalog())
         .collect::<Result<Vec<_>, ApiError>>()?;
     let spec = view_spec_from_request(&state, &request, &catalogs)?;
+    let relations = spec
+        .input_relations
+        .iter()
+        .map(|input| (input.relation_id.as_str(), input.relation_version.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut _relation_guards = Vec::new();
+    for (relation_id, relation_version) in relations {
+        _relation_guards.push(
+            state
+                .relation_operation_lock(relation_id, relation_version)?
+                .lock_owned()
+                .await,
+        );
+    }
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
     let input_bindings =
         input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs).await?;
-    let mut runtime_binding =
-        materialized_view_runtime_binding_for_spec(&catalogs, &spec, &input_bindings)?;
+    let mut runtime_binding = materialized_view_runtime_binding_for_spec(
+        &catalogs,
+        &spec,
+        &input_bindings,
+        request.correction_horizon_ns,
+    )?;
     validate_public_runtime_plan_admission(
         &state,
         runtime_binding.logical_plan.as_ref().ok_or_else(|| {
@@ -386,6 +404,14 @@ pub(super) fn validate_public_view_feature_admission(
     state: &ApiState,
     request: &CreateViewRequest,
 ) -> Result<(), ApiError> {
+    if request
+        .correction_horizon_ns
+        .is_some_and(|horizon| horizon <= 0)
+    {
+        return Err(ApiError::bad_request(
+            "correction_horizon_ns must be positive",
+        ));
+    }
     let policy = state.public_view_feature_policy;
     let sql = request.sql.to_ascii_lowercase();
     let event_time_enabled = policy.event_time_windows == FeatureAdmissionModeV1::Enabled;
@@ -525,15 +551,42 @@ pub(super) fn materialized_view_runtime_binding_for_spec(
     catalogs: &[VelorixRelationCatalogV1],
     spec: &StandingViewSpec,
     input_bindings: &[StandingInputBindingV1],
+    correction_horizon_ns: Option<i64>,
 ) -> Result<MaterializedViewRuntimeBinding, ApiError> {
-    let identity =
+    let mut identity =
         standing_program_identity_from_materialized_view_runtime(catalogs, spec, input_bindings)?;
     let output_schema = only_output_relation_for_runtime_binding(spec)?;
-    let logical_plan = lower_materialized_view_runtime_sql_to_logical_plan(
-        spec.sql.as_str(),
-        catalogs,
-        output_schema,
-    )?;
+    let correction_horizon_ns = correction_horizon_ns.or_else(|| {
+        let [catalog] = catalogs else { return None };
+        let plan = validate_supported_tumbling_window_sql(&spec.sql, catalog).ok()?;
+        (plan.window_kind != velorix_core::view_plan::SupportedEventTimeWindowKind::Session
+            && plan.top_k.is_none())
+        .then_some(plan.window_size_ns)
+    });
+    let logical_plan = if let Some(horizon_ns) = correction_horizon_ns {
+        let [catalog] = catalogs else {
+            return Err(ApiError::bad_request(
+                "correction_horizon_ns requires a single-input TUMBLE or HOP aggregate",
+            ));
+        };
+        let plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+            &spec.sql, catalog, output_schema,
+            Some(LateRowPolicy::CorrectWithinHorizon { horizon_ns }),
+        ).map_err(|error| ApiError::bad_request(format!("correction_horizon_ns requires a supported TUMBLE or HOP aggregate without TopK: {error}")))?;
+        // Bind configured execution semantics without changing the raw SQL hash.
+        let plan_hash = plan
+            .plan_hash
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("correction logical plan is missing plan_hash"))?;
+        identity.runtime_compatibility = format!("{}:{plan_hash}", identity.runtime_compatibility);
+        plan
+    } else {
+        lower_materialized_view_runtime_sql_to_logical_plan(
+            spec.sql.as_str(),
+            catalogs,
+            output_schema,
+        )?
+    };
     Ok(MaterializedViewRuntimeBinding {
         runtime_kind: MATERIALIZED_VIEW_RUNTIME_NAME.to_string(),
         runtime_version: "builtin-v1".to_string(),

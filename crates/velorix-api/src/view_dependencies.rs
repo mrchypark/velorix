@@ -917,6 +917,7 @@ pub(super) async fn apply_validated_producer_commit_to_consumer(
     )
     .map_err(ApiError::bad_request)?;
     let apply_result = match apply_standing_runtime_changes_and_checkpoint(
+        state,
         Arc::clone(&runtime),
         commit.logical_epoch,
         idempotency_key,
@@ -937,6 +938,7 @@ pub(super) async fn apply_validated_producer_commit_to_consumer(
         &apply_result.checkpoint,
         &apply_result.output_deltas,
         StandingRuntimeCheckpointPersistContext::new(previous_checkpoint, Vec::new(), owner)
+            .with_event_time_state(apply_result.staged_event_time_state.clone())
             .with_published_relation(published_relation_binding_for_active_view(active)?)
             .with_direct_view_inputs(vec![StandingRuntimeDirectViewInputV1 {
                 published_relation: binding.clone(),
@@ -1160,6 +1162,7 @@ pub(super) async fn bootstrap_consumer_from_published_snapshot(
     )
     .map_err(ApiError::bad_request)?;
     let apply_result = match apply_standing_runtime_changes_and_checkpoint(
+        state,
         Arc::clone(&runtime),
         input.bootstrap_cursor.output_epoch,
         idempotency_key,
@@ -1180,6 +1183,7 @@ pub(super) async fn bootstrap_consumer_from_published_snapshot(
         &apply_result.checkpoint,
         &apply_result.output_deltas,
         StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), owner)
+            .with_event_time_state(apply_result.staged_event_time_state.clone())
             .with_published_relation(published_relation_binding_for_active_view(active)?)
             .with_direct_view_inputs(vec![StandingRuntimeDirectViewInputV1 {
                 published_relation: input.binding.clone(),

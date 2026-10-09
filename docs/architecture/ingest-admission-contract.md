@@ -144,7 +144,7 @@ orphan as non-active. The vind run counts as live Kubernetes evidence for the
 operator path it exercises, while the run-local authority store portion remains
 object-store-local. Row-closing writer evidence still requires a deployed
 writer/coordinator path running on vind that calls the preflight before serving
-writers, plus RustFS/S3-compatible crash/retry and restart reconstruction
+writers, plus Versity Gateway/S3-compatible crash/retry and restart reconstruction
 evidence and vind multi-pod overlap races, adjacent range races, crash/retry
 windows, restart reconstruction, and leader handoff before this contract can
 close.
@@ -156,7 +156,7 @@ atomically reject different-key overlapping ranges such as `[0, 100)` and
 `[50, 150)`. Checked catalog-aware coordinator admission now uses
 `RangeAdmissionIndexV1` for that storage-level partition fence, but production
 multi-writer ingest must not advertise the guarantee until the deployed
-writer/operator path routes through the checked coordinator and has RustFS plus
+writer/operator path routes through the checked coordinator and has Versity Gateway plus
 vind live evidence for the exercised deployment topology.
 
 Conflict reasons must be explicit:
@@ -172,7 +172,7 @@ Conflict reasons must be explicit:
 ## Verification
 
 - Concurrent `[0,100)` and `[50,150)` admission rejects one request in the
-  checked coordinator through `RangeAdmissionIndexV1`; the local and RustFS
+  checked coordinator through `RangeAdmissionIndexV1`; the local and Versity Gateway
   S3-compatible multi-process harnesses mark child processes ready only after
   store/coordinator/payload setup, then release them together into append with
   zero artificial post-release delay.

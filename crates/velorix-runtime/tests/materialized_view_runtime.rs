@@ -15807,10 +15807,17 @@ fn runtime_rejects_late_rows_for_already_closed_tumbling_window() {
     let output_schema = purchases_window_output_schema();
     let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
     let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::Reject),
+    )
+    .unwrap();
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
-        sql,
+        logical_plan,
         &[input_schema],
         std::slice::from_ref(&output_schema),
     )
@@ -20988,16 +20995,22 @@ fn multi_input_watermark_combination_is_min_across_partitions_and_rejects_regres
 }
 
 #[test]
-fn late_row_policy_default_strict_reject_fails_closed_on_late_row() {
+fn late_row_policy_explicit_strict_reject_fails_closed_on_late_row() {
     let catalog = purchases_event_time_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
     let output_schema = purchases_window_output_schema();
     let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
-    // No policy on the plan: the legacy strict contract must be preserved.
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::Reject),
+    )
+    .unwrap();
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
         &standing_identity_with_view(sql, "purchases_by_user_minute"),
         std::slice::from_ref(&catalog),
-        sql,
+        logical_plan,
         &[input_schema],
         std::slice::from_ref(&output_schema),
     )
@@ -21066,7 +21079,7 @@ fn late_row_policy_default_strict_reject_fails_closed_on_late_row() {
         error
             .to_string()
             .contains("tumbling_event_time_input_batch"),
-        "strict default must fail closed on late rows: {error}"
+        "explicit strict policy must fail closed on late rows: {error}"
     );
     assert_window_page(runtime.as_ref(), 1, &[("alice", 0, 60_000_000_000, 10, 1)]);
 }
@@ -21215,10 +21228,17 @@ fn session_window_failed_epoch_rolls_back_rebuild_and_allows_same_key_retry() {
     let output_schema = purchases_window_output_schema();
     let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from purchases group by user_id, session(interval '10 seconds')";
     let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::Reject),
+    )
+    .unwrap();
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
-        sql,
+        logical_plan,
         &[input_schema],
         std::slice::from_ref(&output_schema),
     )
@@ -21366,10 +21386,17 @@ fn tumbling_window_retraction_before_closure_is_exact_and_after_closure_fails_cl
     let output_schema = purchases_window_output_schema();
     let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
     let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
-    let mut runtime = create_standing_runtime_with_sql_and_catalogs(
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::Reject),
+    )
+    .unwrap();
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
-        sql,
+        logical_plan,
         &[input_schema],
         std::slice::from_ref(&output_schema),
     )
@@ -21465,7 +21492,7 @@ fn tumbling_window_retraction_before_closure_is_exact_and_after_closure_fails_cl
         .unwrap();
     assert_window_page(runtime.as_ref(), 3, &[("alice", 0, 60_000_000_000, 7, 1)]);
 
-    // A retraction of a finalized-window row is late and the strict default
+    // A retraction of a finalized-window row is late and the explicit strict policy
     // fails the epoch closed.
     let error = runtime
         .apply_changes(
@@ -27022,4 +27049,1216 @@ fn temporal_join_boundary_equal_event_times() {
             .value(0),
         1000
     );
+}
+
+fn correction_input(
+    catalog: &VelorixRelationCatalogV1,
+    epoch: u64,
+    watermark_ns: i64,
+    rows: &[(&str, i64, i64, i64)],
+) -> RelationInputBatch {
+    RelationInputBatch {
+        encoding: RelationInputEncodingV1::SourceRelationV1,
+        relation_id: catalog.relation_schema.relation_id.clone(),
+        relation_version: catalog.relation_schema.relation_version.clone(),
+        stream_id: "test-stream".to_string(),
+        partition_id: 0,
+        schema_fingerprint: catalog.schema_fingerprint.to_string(),
+        start_offset_inclusive: epoch - 1,
+        end_offset_exclusive: epoch,
+        event_time_watermark: Some(InputEventTimeWatermark {
+            stream_id: "purchases-stream".to_string(),
+            partition_id: 0,
+            event_time_column_id: "event_time".to_string(),
+            max_observed_event_time_ns: watermark_ns,
+            watermark_ns,
+        }),
+        batches: vec![purchases_event_time_batch(rows)],
+    }
+}
+
+fn archive_window_state(
+    runtime: &mut dyn StandingProgramRuntime,
+    objects: &mut std::collections::BTreeMap<String, String>,
+) {
+    loop {
+        let exported = runtime.export_event_time_state().unwrap();
+        if exported.is_empty() {
+            break;
+        }
+        let refs: Vec<_> = exported
+            .iter()
+            .map(|object| object.reference.clone())
+            .collect();
+        for object in exported {
+            objects.insert(object.reference.state_root.object_key, object.payload);
+        }
+        runtime.stage_event_time_state(&refs).unwrap();
+        // Model object persistence followed by checkpoint publication, then eviction.
+        restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+        runtime.acknowledge_event_time_state(&refs).unwrap();
+    }
+}
+
+fn hydrate_window_state(
+    runtime: &mut dyn StandingProgramRuntime,
+    inputs: &[RelationInputBatch],
+    objects: &std::collections::BTreeMap<String, String>,
+) -> usize {
+    let requests = runtime.event_time_state_requests(inputs).unwrap();
+    for request in &requests {
+        let reference = request.reference.as_ref().expect("durable cold reference");
+        runtime
+            .hydrate_event_time_state(
+                request,
+                objects.get(&reference.state_root.object_key).unwrap(),
+            )
+            .unwrap();
+    }
+    requests.len()
+}
+
+#[test]
+fn late_correction_publishes_retracts_expires_and_restores_retained_output() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_stats_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 120_000_000_000,
+        }),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute_stats");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let commit = runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("correction-1").unwrap(),
+            vec![correction_input(
+                &catalog,
+                1,
+                60_000_000_000,
+                &[
+                    ("alice", 10, 30_000_000_000, 1),
+                    ("bob", 20, 40_000_000_000, 1),
+                ],
+            )],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 2);
+    assert_window_stats_page(
+        runtime.as_ref(),
+        1,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1, 10, 10, 10.0),
+            ("bob", 0, 60_000_000_000, 20, 1, 20, 20, 20.0),
+        ],
+    );
+    let commit = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("correction-2").unwrap(),
+            vec![correction_input(
+                &catalog,
+                2,
+                60_000_000_000,
+                &[("alice", 5, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 2);
+    assert!(commit.output_deltas[0]
+        .delta
+        .records()
+        .iter()
+        .all(|record| record.key.as_json()[0] == "alice"));
+    assert_eq!(commit.output_batches[0].batches[0].num_rows(), 2);
+    assert_window_stats_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", 0, 60_000_000_000, 15, 2, 5, 10, 7.5),
+            ("bob", 0, 60_000_000_000, 20, 1, 20, 20, 20.0),
+        ],
+    );
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    // Data is evaluated at old W=60, then this epoch advances W to the expiry boundary.
+    let before_preflight = runtime.checkpoint().unwrap();
+    runtime
+        .validate_event_time_corrections(&[correction_input(
+            &catalog,
+            3,
+            180_000_000_000,
+            &[("alice", 5, 30_000_000_000, -1)],
+        )])
+        .unwrap();
+    assert_eq!(runtime.checkpoint().unwrap(), before_preflight);
+    let commit = runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("correction-3").unwrap(),
+            vec![correction_input(
+                &catalog,
+                3,
+                180_000_000_000,
+                &[("alice", 5, 30_000_000_000, -1)],
+            )],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 2);
+    let mut objects = std::collections::BTreeMap::new();
+    archive_window_state(runtime.as_mut(), &mut objects);
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["state"]["rows"].as_object().unwrap().len(), 0);
+    assert_eq!(
+        payload["published_output"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    runtime = restore_standing_runtime(checkpoint).unwrap();
+    let before_preflight = runtime.checkpoint().unwrap();
+    runtime
+        .validate_event_time_corrections(&[correction_input(
+            &catalog,
+            2,
+            60_000_000_000,
+            &[("alice", 5, 30_000_000_000, 1)],
+        )])
+        .unwrap();
+    assert_eq!(runtime.checkpoint().unwrap(), before_preflight);
+    let mut partial = correction_input(
+        &catalog,
+        4,
+        180_000_000_000,
+        &[("alice", 5, 30_000_000_000, 1)],
+    );
+    partial.start_offset_inclusive = 2;
+    runtime.validate_event_time_corrections(&[partial]).unwrap();
+    let mut other_partition = correction_input(
+        &catalog,
+        2,
+        60_000_000_000,
+        &[("alice", 5, 30_000_000_000, 1)],
+    );
+    other_partition.partition_id = 1;
+    assert!(runtime
+        .validate_event_time_corrections(&[other_partition])
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before_preflight);
+    assert_window_stats_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1, 10, 10, 10.0),
+            ("bob", 0, 60_000_000_000, 20, 1, 20, 20, 20.0),
+        ],
+    );
+    let before = runtime.checkpoint().unwrap();
+    let error = runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("correction-4").unwrap(),
+            vec![correction_input(
+                &catalog,
+                4,
+                180_000_000_000,
+                &[
+                    ("alice", 9, 190_000_000_000, 1),
+                    ("alice", 5, 30_000_000_000, 1),
+                ],
+            )],
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("event_time_state_hydration_required"));
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let inputs = vec![correction_input(
+        &catalog,
+        4,
+        180_000_000_000,
+        &[("alice", 5, 30_000_000_000, 1)],
+    )];
+    assert_eq!(hydrate_window_state(runtime.as_mut(), &inputs, &objects), 1);
+    let commit = runtime
+        .apply_changes(4, EpochIdempotencyKey::new("correction-4").unwrap(), inputs)
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 2);
+    assert_window_stats_page(
+        runtime.as_ref(),
+        4,
+        &[
+            ("alice", 0, 60_000_000_000, 15, 2, 5, 10, 7.5),
+            ("bob", 0, 60_000_000_000, 20, 1, 20, 20, 20.0),
+        ],
+    );
+}
+
+#[test]
+fn late_correction_hop_hydrates_only_expired_fanout_atomically() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from hop(purchases, event_time, interval '30 seconds', interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 120_000_000_000,
+        }),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("hop-1").unwrap(),
+            vec![correction_input(
+                &catalog,
+                1,
+                60_000_000_000,
+                &[("alice", 10, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("hop-2").unwrap(),
+            vec![correction_input(
+                &catalog,
+                2,
+                60_000_000_000,
+                &[("alice", 5, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("hop-3").unwrap(),
+            vec![correction_input(&catalog, 3, 180_000_000_000, &[])],
+        )
+        .unwrap();
+    assert_window_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 0, 60_000_000_000, 15, 2),
+            ("alice", 30_000_000_000, 90_000_000_000, 15, 2),
+        ],
+    );
+    let mut objects = std::collections::BTreeMap::new();
+    archive_window_state(runtime.as_mut(), &mut objects);
+    let before = runtime.checkpoint().unwrap();
+    for weight in [1, -1] {
+        runtime
+            .validate_event_time_corrections(&[correction_input(
+                &catalog,
+                4,
+                180_000_000_000,
+                &[
+                    ("alice", 7, 190_000_000_000, 1),
+                    ("alice", 5, 30_000_000_000, weight),
+                ],
+            )])
+            .unwrap();
+        assert_eq!(runtime.checkpoint().unwrap(), before);
+        let error = runtime
+            .apply_changes(
+                4,
+                EpochIdempotencyKey::new("hop-4").unwrap(),
+                vec![correction_input(
+                    &catalog,
+                    4,
+                    180_000_000_000,
+                    &[
+                        ("alice", 7, 190_000_000_000, 1),
+                        ("alice", 5, 30_000_000_000, weight),
+                    ],
+                )],
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("event_time_state_hydration_required"));
+        assert_eq!(runtime.checkpoint().unwrap(), before);
+    }
+    let inputs = vec![correction_input(
+        &catalog,
+        4,
+        180_000_000_000,
+        &[("alice", 5, 30_000_000_000, -1)],
+    )];
+    assert_eq!(hydrate_window_state(runtime.as_mut(), &inputs, &objects), 1);
+    let commit = runtime
+        .apply_changes(4, EpochIdempotencyKey::new("hop-4").unwrap(), inputs)
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 4);
+    assert_window_page(
+        runtime.as_ref(),
+        4,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1),
+            ("alice", 30_000_000_000, 90_000_000_000, 10, 1),
+        ],
+    );
+}
+
+#[test]
+fn late_correction_boundary_noop_last_retraction_and_checkpoint_validation() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 120_000_000_000,
+        }),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("boundary-1").unwrap(),
+            vec![correction_input(
+                &catalog,
+                1,
+                179_999_999_999,
+                &[("alice", 10, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    let commit = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("boundary-2").unwrap(),
+            vec![correction_input(
+                &catalog,
+                2,
+                179_999_999_999,
+                &[
+                    ("alice", 5, 30_000_000_000, 1),
+                    ("alice", 5, 30_000_000_000, -1),
+                ],
+            )],
+        )
+        .unwrap();
+    assert!(commit.output_deltas[0].delta.records().is_empty());
+    let replay = runtime
+        .apply_changes(2, EpochIdempotencyKey::new("boundary-2").unwrap(), vec![])
+        .unwrap();
+    assert!(replay.output_deltas.is_empty());
+    assert_eq!(replay.output_batches[0].batches[0].num_rows(), 1);
+
+    // A missing partition watermark fails the whole epoch, rather than advancing from peers.
+    let before = runtime.checkpoint().unwrap();
+    let mut missing = correction_input(&catalog, 3, 179_999_999_999, &[]);
+    missing.partition_id = 1;
+    missing.event_time_watermark = None;
+    assert!(runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("missing-watermark").unwrap(),
+            vec![missing]
+        )
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+
+    // Restore must reject a tampered active output even if the payload hash is recomputed.
+    for damage in [
+        "missing-output",
+        "missing-state",
+        "wrong-value",
+        "duplicate-key",
+    ] {
+        let mut damaged = before.clone();
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&damaged.state_payload.as_ref().unwrap().payload).unwrap();
+        match damage {
+            "missing-output" => payload["published_output"]["records"] = serde_json::json!([]),
+            "missing-state" => payload["state"]["rows"] = serde_json::json!({}),
+            "wrong-value" => {
+                payload["published_output"]["records"][0]["value"]["total_amount"] =
+                    serde_json::json!(999)
+            }
+            "duplicate-key" => {
+                let duplicate = payload["published_output"]["records"][0].clone();
+                payload["published_output"]["records"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            _ => unreachable!(),
+        }
+        let text = serde_json::to_string(&payload).unwrap();
+        damaged.state_root.content_hash = stable_bytes_hash(text.as_bytes());
+        damaged.state_payload.as_mut().unwrap().payload = text;
+        assert!(
+            restore_standing_runtime(damaged).is_err(),
+            "accepted {damage}"
+        );
+    }
+
+    // The final row retracts before expiry; an empty published group stays absent after restart.
+    let commit = runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("boundary-3").unwrap(),
+            vec![correction_input(
+                &catalog,
+                3,
+                179_999_999_999,
+                &[("alice", 10, 30_000_000_000, -1)],
+            )],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 1);
+    assert_eq!(commit.output_deltas[0].delta.records()[0].weight, -1);
+    assert_window_page(runtime.as_ref(), 3, &[]);
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("boundary-4").unwrap(),
+            vec![correction_input(
+                &catalog,
+                4,
+                180_000_000_000,
+                &[("alice", 3, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 4, &[("alice", 0, 60_000_000_000, 3, 1)]);
+    let mut objects = std::collections::BTreeMap::new();
+    archive_window_state(runtime.as_mut(), &mut objects);
+    let before = runtime.checkpoint().unwrap();
+    let error = runtime
+        .apply_changes(
+            5,
+            EpochIdempotencyKey::new("boundary-5").unwrap(),
+            vec![correction_input(
+                &catalog,
+                5,
+                180_000_000_000,
+                &[("alice", 3, 30_000_000_000, -1)],
+            )],
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("event_time_state_hydration_required"));
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let inputs = vec![correction_input(
+        &catalog,
+        5,
+        180_000_000_000,
+        &[("alice", 3, 30_000_000_000, -1)],
+    )];
+    assert_eq!(hydrate_window_state(runtime.as_mut(), &inputs, &objects), 1);
+    runtime
+        .apply_changes(5, EpochIdempotencyKey::new("boundary-5").unwrap(), inputs)
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 5, &[]);
+}
+
+#[test]
+fn late_correction_runtime_rejects_crafted_session_and_top_k_plans() {
+    use velorix_core::view_plan::validate_supported_tumbling_window_sql_with_policy;
+    use velorix_runtime::materialized_view_runtime::TumblingEventTimeAggregateRuntime;
+
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    for sql in [
+        "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from session(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end",
+        "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end order by total_amount desc limit 1",
+    ] {
+        let mut plan = validate_supported_tumbling_window_sql_with_policy(sql, &catalog, None).unwrap();
+        let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+            sql, &catalog, &output_schema, None,
+        ).unwrap();
+        plan.late_row_policy = Some(LateRowPolicy::CorrectWithinHorizon { horizon_ns: 120_000_000_000 });
+        let result = TumblingEventTimeAggregateRuntime::new_with_logical_plan(
+            standing_identity_with_view(sql, "purchases_by_user_minute"),
+            catalog.clone(), input_schema.clone(), output_schema.clone(), sql.to_string(), plan, logical_plan,
+        );
+        assert!(matches!(result, Err(StandingProgramRuntimeError::InvalidProgramIdentity { field: "window_correction_policy" })));
+    }
+}
+
+#[test]
+fn late_correction_waits_for_all_observed_partition_watermarks() {
+    let catalog = purchases_event_time_catalog();
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let output_schema = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql,
+        &catalog,
+        &output_schema,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 120_000_000_000,
+        }),
+    )
+    .unwrap();
+    let identity = standing_identity_with_view(sql, "purchases_by_user_minute");
+    let mut runtime = create_standing_runtime_with_logical_plan_and_catalogs(
+        &identity,
+        std::slice::from_ref(&catalog),
+        logical_plan,
+        &[input_schema],
+        std::slice::from_ref(&output_schema),
+    )
+    .unwrap();
+    let mut slow = correction_input(&catalog, 1, 0, &[]);
+    slow.partition_id = 1;
+    slow.event_time_watermark.as_mut().unwrap().partition_id = 1;
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("partitions-1").unwrap(),
+            vec![
+                correction_input(
+                    &catalog,
+                    1,
+                    180_000_000_000,
+                    &[("alice", 10, 30_000_000_000, 1)],
+                ),
+                slow,
+            ],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[]);
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    let mut slow = correction_input(&catalog, 2, 60_000_000_000, &[]);
+    slow.partition_id = 1;
+    slow.event_time_watermark.as_mut().unwrap().partition_id = 1;
+    let commit = runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("partitions-2").unwrap(),
+            vec![slow],
+        )
+        .unwrap();
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 1);
+    assert_window_page(runtime.as_ref(), 2, &[("alice", 0, 60_000_000_000, 10, 1)]);
+    // A fast partition cannot expire shared state while the slower one is at W=60.
+    runtime
+        .apply_changes(
+            3,
+            EpochIdempotencyKey::new("partitions-3").unwrap(),
+            vec![correction_input(
+                &catalog,
+                2,
+                180_000_000_000,
+                &[("alice", 5, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 3, &[("alice", 0, 60_000_000_000, 15, 2)]);
+    let before = runtime.checkpoint().unwrap();
+    let mut new_partition = correction_input(
+        &catalog,
+        1,
+        30_000_000_000,
+        &[("bob", 7, 90_000_000_000, 1)],
+    );
+    new_partition.partition_id = 2;
+    new_partition
+        .event_time_watermark
+        .as_mut()
+        .unwrap()
+        .partition_id = 2;
+    let inputs = vec![
+        correction_input(
+            &catalog,
+            3,
+            180_000_000_000,
+            &[("alice", 5, 30_000_000_000, 1)],
+        ),
+        new_partition,
+    ];
+    let preflight_error = runtime
+        .validate_event_time_corrections(&inputs)
+        .unwrap_err();
+    assert!(preflight_error
+        .to_string()
+        .contains("window_correction_watermark_regression"));
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let error = runtime
+        .apply_changes(4, EpochIdempotencyKey::new("partitions-4").unwrap(), inputs)
+        .unwrap_err();
+    assert_eq!(error, preflight_error);
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let mut new_partition = correction_input(&catalog, 1, 60_000_000_000, &[]);
+    new_partition.partition_id = 2;
+    new_partition
+        .event_time_watermark
+        .as_mut()
+        .unwrap()
+        .partition_id = 2;
+    runtime
+        .apply_changes(
+            4,
+            EpochIdempotencyKey::new("partitions-4").unwrap(),
+            vec![new_partition],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 4, &[("alice", 0, 60_000_000_000, 15, 2)]);
+}
+
+fn window_runtime_with_policy(
+    catalog: &VelorixRelationCatalogV1,
+    sql: &str,
+    output: &RelationSchema,
+    policy: Option<LateRowPolicy>,
+) -> Box<dyn StandingProgramRuntime + Send> {
+    let logical_plan = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+        sql, catalog, output, policy,
+    )
+    .unwrap();
+    create_standing_runtime_with_logical_plan_and_catalogs(
+        &standing_identity_with_view(sql, &output.relation_id),
+        std::slice::from_ref(catalog),
+        logical_plan,
+        &[catalog_input_relation_schema(catalog).unwrap()],
+        std::slice::from_ref(output),
+    )
+    .unwrap()
+}
+
+#[test]
+fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
+    let catalog = purchases_event_time_catalog();
+    let output = purchases_window_stats_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let mut runtime = window_runtime_with_policy(
+        &catalog,
+        sql,
+        &output,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 60_000_000_000,
+        }),
+    );
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("cold-1").unwrap(),
+            vec![correction_input(
+                &catalog,
+                1,
+                600_000_000_000,
+                &[
+                    ("alice", 5, 10_000_000_000, 1),
+                    ("alice", 10, 20_000_000_000, 1),
+                    ("alice", 30, 30_000_000_000, 1),
+                    ("bob", 100, 10_000_000_000, 1),
+                ],
+            )],
+        )
+        .unwrap();
+    let objects = runtime.export_event_time_state().unwrap();
+    let references: Vec<_> = objects
+        .iter()
+        .map(|object| object.reference.clone())
+        .collect();
+    let before = runtime.checkpoint().unwrap();
+    // A failed persistence call cannot discard hot rows; acknowledgement needs staging.
+    assert!(runtime.acknowledge_event_time_state(&references).is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let mut bad_references = references.clone();
+    bad_references[1].logical_epoch += 1;
+    assert!(runtime.stage_event_time_state(&bad_references).is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let mut durable = std::collections::BTreeMap::new();
+    archive_window_state(runtime.as_mut(), &mut durable);
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert!(payload["state"]["rows"].as_object().unwrap().is_empty());
+    assert_eq!(payload["cold_state_refs"].as_object().unwrap().len(), 2);
+    runtime = restore_standing_runtime(checkpoint.clone()).unwrap();
+    let inputs = vec![correction_input(
+        &catalog,
+        2,
+        600_000_000_000,
+        &[
+            ("alice", 5, 10_000_000_000, -1),
+            ("alice", 30, 30_000_000_000, -1),
+        ],
+    )];
+    runtime.validate_event_time_corrections(&inputs).unwrap();
+    let requests = runtime.event_time_state_requests(&inputs).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].window_key.contains("alice"));
+    // An unavailable object fails before apply; published output is never a zero baseline.
+    assert!(runtime
+        .apply_changes(
+            2,
+            EpochIdempotencyKey::new("cold-2").unwrap(),
+            inputs.clone()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("hydration_required"));
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
+    let request = &requests[0];
+    let payload = durable
+        .get(&request.reference.as_ref().unwrap().state_root.object_key)
+        .unwrap();
+    // Rehashed but misbound objects still fail the key/epoch/plan checks.
+    for field in ["window_key", "logical_epoch", "runtime_binding"] {
+        let mut object: Value = serde_json::from_str(payload).unwrap();
+        object[field] = if field == "logical_epoch" {
+            json!(0)
+        } else {
+            json!("wrong")
+        };
+        let object = serde_json::to_string(&object).unwrap();
+        let hash = stable_bytes_hash(object.as_bytes());
+        let mut altered = checkpoint.clone();
+        let mut checkpoint_payload: Value =
+            serde_json::from_str(&altered.state_payload.as_ref().unwrap().payload).unwrap();
+        let reference = &mut checkpoint_payload["cold_state_refs"][&request.window_key];
+        let prefix = reference["state_root"]["object_key"]
+            .as_str()
+            .unwrap()
+            .rsplit_once('/')
+            .unwrap()
+            .0
+            .to_string();
+        reference["state_root"]["content_hash"] = json!(hash);
+        reference["state_root"]["object_key"] = json!(format!("{prefix}/{hash}"));
+        let text = serde_json::to_string(&checkpoint_payload).unwrap();
+        altered.state_root.content_hash = stable_bytes_hash(text.as_bytes());
+        altered.state_payload.as_mut().unwrap().payload = text;
+        let mut altered_runtime = restore_standing_runtime(altered.clone()).unwrap();
+        let altered_request = altered_runtime
+            .event_time_state_requests(&inputs)
+            .unwrap()
+            .remove(0);
+        assert!(altered_runtime
+            .hydrate_event_time_state(&altered_request, &object)
+            .unwrap_err()
+            .to_string()
+            .contains("event_time_state_identity"));
+        assert_eq!(altered_runtime.checkpoint().unwrap(), altered);
+    }
+    assert!(runtime.hydrate_event_time_state(request, "{}").is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
+    let mut stale = request.clone();
+    stale.logical_epoch += 1;
+    assert!(runtime.hydrate_event_time_state(&stale, payload).is_err());
+    runtime.hydrate_event_time_state(request, payload).unwrap();
+    // Retraction mutates the loaded multiset before a SUM overflow; undo restores all fields.
+    let before = runtime.checkpoint().unwrap();
+    let failure = vec![correction_input(
+        &catalog,
+        2,
+        600_000_000_000,
+        &[
+            ("alice", 5, 10_000_000_000, -1),
+            ("alice", i64::MAX, 30_000_000_000, 1),
+        ],
+    )];
+    assert!(runtime
+        .apply_changes(2, EpochIdempotencyKey::new("cold-2").unwrap(), failure)
+        .is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    let commit = runtime
+        .apply_changes_delta_only(2, EpochIdempotencyKey::new("cold-2").unwrap(), inputs)
+        .unwrap();
+    assert!(commit.output_batches.is_empty());
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 2);
+    assert!(commit.output_deltas[0]
+        .delta
+        .records()
+        .iter()
+        .all(|record| record.key.as_json()[0] == "alice"));
+    assert_window_stats_page(
+        runtime.as_ref(),
+        2,
+        &[
+            ("alice", 0, 60_000_000_000, 10, 1, 10, 10, 10.0),
+            ("bob", 0, 60_000_000_000, 100, 1, 100, 100, 100.0),
+        ],
+    );
+    assert!(runtime.acknowledge_event_time_state(&references).is_err());
+    archive_window_state(runtime.as_mut(), &mut durable);
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    // A previously unseen timestamp far behind W creates a new historical window.
+    let inputs = vec![correction_input(
+        &catalog,
+        3,
+        600_000_000_000,
+        &[
+            ("alice", 5, 10_000_000_000, 1),
+            ("new", 7, -600_000_000_000, 1),
+        ],
+    )];
+    assert_eq!(hydrate_window_state(runtime.as_mut(), &inputs, &durable), 1);
+    runtime
+        .apply_changes(3, EpochIdempotencyKey::new("cold-3").unwrap(), inputs)
+        .unwrap();
+    assert_window_stats_page(
+        runtime.as_ref(),
+        3,
+        &[
+            ("alice", 0, 60_000_000_000, 15, 2, 5, 10, 7.5),
+            ("bob", 0, 60_000_000_000, 100, 1, 100, 100, 100.0),
+            ("new", -600_000_000_000, -540_000_000_000, 7, 1, 7, 7, 7.0),
+        ],
+    );
+    assert_eq!(
+        runtime.checkpoint().unwrap().input_event_time_frontiers[0].watermark_ns,
+        600_000_000_000
+    );
+    for damage in [
+        "missing-ref",
+        "wrong-key",
+        "future-epoch",
+        "wrong-hash",
+        "wrong-version",
+    ] {
+        let mut checkpoint = checkpoint.clone();
+        let mut payload: Value =
+            serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        let key = payload["cold_state_refs"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        match damage {
+            "missing-ref" => {
+                payload["cold_state_refs"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(&key);
+            }
+            "wrong-key" => {
+                payload["cold_state_refs"][&key]["window_key"] = json!("[\"wrong\",0,60000000000]")
+            }
+            "future-epoch" => payload["cold_state_refs"][&key]["logical_epoch"] = json!(999),
+            "wrong-hash" => {
+                payload["cold_state_refs"][&key]["state_root"]["content_hash"] = json!("sha256:bad")
+            }
+            "wrong-version" => payload["cold_state_version"] = json!(99),
+            _ => unreachable!(),
+        }
+        let text = serde_json::to_string(&payload).unwrap();
+        checkpoint.state_root.content_hash = stable_bytes_hash(text.as_bytes());
+        checkpoint.state_payload.as_mut().unwrap().payload = text;
+        assert!(
+            restore_standing_runtime(checkpoint).is_err(),
+            "accepted {damage}"
+        );
+    }
+}
+
+#[test]
+fn cold_correction_legacy_expired_auxiliary_state_replays_only_requested_window() {
+    let catalog = purchases_event_time_catalog();
+    let output = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end having sum(amount) > 10";
+    let mut runtime = window_runtime_with_policy(
+        &catalog,
+        sql,
+        &output,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 60_000_000_000,
+        }),
+    );
+    let original = correction_input(
+        &catalog,
+        1,
+        600_000_000_000,
+        &[
+            ("alice", 15, 10_000_000_000, 1),
+            ("bob", 5, 20_000_000_000, 1),
+        ],
+    );
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("legacy-1").unwrap(),
+            vec![original.clone()],
+        )
+        .unwrap();
+    let mut checkpoint = runtime.checkpoint().unwrap();
+    let mut payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    payload["state"]["rows"] = json!({});
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("cold_state_version");
+    payload.as_object_mut().unwrap().remove("cold_state_refs");
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("legacy_replay_before_ns");
+    let text = serde_json::to_string(&payload).unwrap();
+    checkpoint.state_root.content_hash = stable_bytes_hash(text.as_bytes());
+    checkpoint.state_payload.as_mut().unwrap().payload = text;
+    runtime = restore_standing_runtime(checkpoint).unwrap();
+    let inputs = vec![correction_input(
+        &catalog,
+        2,
+        600_000_000_000,
+        &[("alice", 15, 10_000_000_000, -1)],
+    )];
+    let request = runtime
+        .event_time_state_requests(&inputs)
+        .unwrap()
+        .remove(0);
+    assert!(request.reference.is_none());
+    let before = runtime.checkpoint().unwrap();
+    assert!(runtime.reconstruct_event_time_state(&request, &[]).is_err());
+    assert_eq!(runtime.checkpoint().unwrap(), before);
+    runtime
+        .reconstruct_event_time_state(&request, std::slice::from_ref(&original))
+        .unwrap();
+    let payload: Value =
+        serde_json::from_str(&runtime.checkpoint().unwrap().state_payload.unwrap().payload)
+            .unwrap();
+    assert_eq!(payload["state"]["rows"].as_object().unwrap().len(), 1);
+    assert!(payload["state"]["rows"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .contains("alice"));
+    let suffix = inputs[0].clone();
+    runtime
+        .apply_changes(2, EpochIdempotencyKey::new("legacy-2").unwrap(), inputs)
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 2, &[]);
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    // HAVING hid bob's old output; it still needs original history, not a zero baseline.
+    let inputs = vec![correction_input(
+        &catalog,
+        3,
+        600_000_000_000,
+        &[("bob", 7, 30_000_000_000, 1)],
+    )];
+    let request = runtime
+        .event_time_state_requests(&inputs)
+        .unwrap()
+        .remove(0);
+    assert!(runtime.reconstruct_event_time_state(&request, &[]).is_err());
+    runtime
+        .reconstruct_event_time_state(&request, &[original, suffix])
+        .unwrap();
+    runtime
+        .apply_changes(3, EpochIdempotencyKey::new("legacy-3").unwrap(), inputs)
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 3, &[("bob", 0, 60_000_000_000, 12, 2)]);
+}
+
+#[test]
+fn cold_correction_exports_bounded_chunks_and_keeps_pending_rows_in_rollback_checkpoint() {
+    let catalog = purchases_event_time_catalog();
+    let output = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let mut runtime = window_runtime_with_policy(
+        &catalog,
+        sql,
+        &output,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 60_000_000_000,
+        }),
+    );
+    let names: Vec<_> = (0..150).map(|index| format!("user-{index:03}")).collect();
+    let rows: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_str(), 10, 10_000_000_000, 1))
+        .collect();
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("chunks-1").unwrap(),
+            vec![correction_input(&catalog, 1, 600_000_000_000, &rows)],
+        )
+        .unwrap();
+    let objects = runtime.export_event_time_state().unwrap();
+    assert_eq!(objects.len(), 64);
+    let refs: Vec<_> = objects
+        .iter()
+        .map(|object| object.reference.clone())
+        .collect();
+    runtime.stage_event_time_state(&refs).unwrap();
+    let checkpoint = runtime.checkpoint().unwrap();
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    assert_eq!(payload["state"]["rows"].as_object().unwrap().len(), 86);
+    assert_eq!(payload["cold_state_refs"].as_object().unwrap().len(), 64);
+    assert_eq!(runtime.export_event_time_state().unwrap().len(), 64);
+    runtime.acknowledge_event_time_state(&refs).unwrap();
+    runtime = restore_standing_runtime(checkpoint).unwrap();
+    let inputs = vec![correction_input(
+        &catalog,
+        2,
+        600_000_000_000,
+        &[(names[0].as_str(), 5, 20_000_000_000, 1)],
+    )];
+    assert_eq!(runtime.event_time_state_requests(&inputs).unwrap().len(), 1);
+}
+
+#[test]
+fn cold_correction_nullable_count_and_signed_retractions_from_published_input() {
+    let catalog = purchases_event_time_catalog_with_nullable_amount();
+    let output = purchases_window_output_schema();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total_amount, count(amount) as event_count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let mut runtime = window_runtime_with_policy(
+        &catalog,
+        sql,
+        &output,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 60_000_000_000,
+        }),
+    );
+    let mut initial = correction_input(&catalog, 1, 600_000_000_000, &[]);
+    initial.batches = vec![purchases_event_time_nullable_amount_batch(&[
+        ("alice", Some(10), 10_000_000_000, 1),
+        ("alice", None, 20_000_000_000, 1),
+    ])];
+    initial.encoding = RelationInputEncodingV1::PublishedRelationDeltaV1 {
+        output_schema_hash: stable_bytes_hash(b"published-purchases"),
+        delta_codec_identity: PUBLISHED_RELATION_DELTA_CODEC_V1.to_string(),
+        weight_field_name: catalog.relation_schema.weight_column_id.clone(),
+        weight_field_index: 3,
+    };
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("null-1").unwrap(),
+            vec![initial],
+        )
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 1, &[("alice", 0, 60_000_000_000, 10, 1)]);
+    let mut objects = std::collections::BTreeMap::new();
+    archive_window_state(runtime.as_mut(), &mut objects);
+    runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    let mut input = correction_input(&catalog, 2, 600_000_000_000, &[]);
+    input.batches = vec![purchases_event_time_nullable_amount_batch(&[
+        ("alice", None, 20_000_000_000, -1),
+        ("alice", Some(5), 30_000_000_000, 1),
+    ])];
+    assert_eq!(
+        hydrate_window_state(runtime.as_mut(), std::slice::from_ref(&input), &objects),
+        1
+    );
+    runtime
+        .apply_changes(2, EpochIdempotencyKey::new("null-2").unwrap(), vec![input])
+        .unwrap();
+    assert_window_page(runtime.as_ref(), 2, &[("alice", 0, 60_000_000_000, 15, 2)]);
+}
+
+#[test]
+fn legacy_none_accepts_unlimited_late_tumble_hop_session_and_top_k() {
+    let catalog = purchases_event_time_catalog();
+    let output = purchases_window_output_schema();
+    for source in [
+        "tumble(purchases, event_time, interval '60 seconds')",
+        "hop(purchases, event_time, interval '30 seconds', interval '60 seconds')",
+        "session(purchases, event_time, interval '60 seconds')",
+    ] {
+        for top_k in ["", " order by total_amount desc limit 1"] {
+            let sql = format!("select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count from {source} group by user_id, window_start, window_end{top_k}");
+            let mut runtime = window_runtime_with_policy(&catalog, &sql, &output, None);
+            runtime
+                .apply_changes(
+                    1,
+                    EpochIdempotencyKey::new("none-1").unwrap(),
+                    vec![correction_input(
+                        &catalog,
+                        1,
+                        600_000_000_000,
+                        &[("alice", 10, 10_000_000_000, 1)],
+                    )],
+                )
+                .unwrap();
+            runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+            let commit = runtime
+                .apply_changes(
+                    2,
+                    EpochIdempotencyKey::new("none-2").unwrap(),
+                    vec![correction_input(
+                        &catalog,
+                        2,
+                        600_000_000_000,
+                        &[("alice", 5, 10_000_000_000, 1)],
+                    )],
+                )
+                .unwrap();
+            assert!(!commit.output_deltas[0].delta.records().is_empty(), "{sql}");
+            assert!(commit.output_deltas[0]
+                .delta
+                .records()
+                .iter()
+                .filter(|record| record.weight > 0)
+                .all(|record| record.value.as_json()["total_amount"] == 15));
+            runtime = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+            let commit = runtime
+                .apply_changes(
+                    3,
+                    EpochIdempotencyKey::new("none-3").unwrap(),
+                    vec![correction_input(
+                        &catalog,
+                        3,
+                        600_000_000_000,
+                        &[("alice", 5, 10_000_000_000, -1)],
+                    )],
+                )
+                .unwrap();
+            assert!(commit.output_deltas[0]
+                .delta
+                .records()
+                .iter()
+                .filter(|record| record.weight > 0)
+                .all(|record| record.value.as_json()["total_amount"] == 10));
+            assert!(runtime.export_event_time_state().unwrap().is_empty());
+        }
+    }
 }

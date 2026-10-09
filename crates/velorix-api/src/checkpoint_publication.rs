@@ -17,6 +17,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         input_coverage,
         replace_replay_coverage,
         expected_relation_source_cuts,
+        staged_event_time_state,
     } = context;
     let checkpoint = match input_coverage {
         Some(input_coverage) => {
@@ -193,6 +194,16 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         expected_relation_source_cuts,
     )
     .await?;
+    if let Some(runtime) = state.standing_runtime(&checkpoint.identity, view_id)? {
+        let mut runtime = runtime
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?;
+        if runtime.logical_epoch() == checkpoint.logical_epoch {
+            runtime
+                .acknowledge_event_time_state(&staged_event_time_state)
+                .map_err(ApiError::bad_request)?;
+        }
+    }
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_pointer");
     }

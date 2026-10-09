@@ -56,6 +56,11 @@ RustFS-backed live S3 API gate on 2026-05-18 at commit
 artifacts both compare the generated result against the matching committed
 baseline with `backend_evidence_scope=live_or_native`.
 
+These historical measurements remain RustFS results. The Versity Gateway
+replacement does not establish a new benchmark baseline: fresh measurements
+against `versity/versitygw:v1.8.0` are required before claiming Versity Gateway
+performance or release-quality benchmark evidence.
+
 `local_incremental` is a production-runtime smoke harness, not full product-path
 readiness evidence. It emits real local workload details for the authoritative
 object-store capability probe, catalog-aware ingest envelope admission, SQL

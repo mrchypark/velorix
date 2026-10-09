@@ -18,6 +18,7 @@ PLACEHOLDER_PREFIXES = (
     "S3_OR_OSS_ENDPOINT",
 )
 DEFAULT_SECRET_VALUES = {
+    "admin",
     "rustfsadmin",
     "minioadmin",
     "changeme",
@@ -251,7 +252,7 @@ def validate_endpoint(endpoint: str, allow_local: bool, missing: list, invalid: 
         add_issue(
             invalid,
             "AWS_ENDPOINT_URL",
-            "AWS_ENDPOINT_URL looks local; use run-vind-product-external-rustfs.sh for local RustFS or set VELORIX_EXTERNAL_S3_ALLOW_LOCAL_ENDPOINT=1 only for diagnostics",
+            "AWS_ENDPOINT_URL looks local; use run-vind-product-external-versitygw.sh for local Versity Gateway or set VELORIX_EXTERNAL_S3_ALLOW_LOCAL_ENDPOINT=1 only for diagnostics",
         )
     return details
 

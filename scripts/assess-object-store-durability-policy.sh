@@ -6,7 +6,7 @@ repo_root="$(git rev-parse --show-toplevel)"
 product_dir="${VELORIX_VIND_PRODUCT_DIR:-target/velorix-product}"
 product_evidence="${VELORIX_VIND_PRODUCT_EVIDENCE:-${product_dir}/product-evidence.json}"
 output_file="${VELORIX_OBJECT_STORE_DURABILITY_ASSESSMENT_FILE:-${product_dir}/object-store-durability-assessment.json}"
-external_rustfs_env="${VELORIX_EXTERNAL_RUSTFS_ENV:-${product_dir}/external-rustfs.env}"
+external_versitygw_env="${VELORIX_EXTERNAL_VERSITYGW_ENV:-${product_dir}/external-versitygw.env}"
 aws_cli_image="${VELORIX_AWS_CLI_IMAGE:-amazon/aws-cli:2.17.36}"
 probe="${VELORIX_OBJECT_STORE_DURABILITY_ASSESS_PROBE:-1}"
 
@@ -22,7 +22,7 @@ Main overrides:
   VELORIX_VIND_PRODUCT_DIR=target/velorix-product
   VELORIX_VIND_PRODUCT_EVIDENCE=target/velorix-product/product-evidence.json
   VELORIX_OBJECT_STORE_DURABILITY_ASSESSMENT_FILE=target/velorix-product/object-store-durability-assessment.json
-  VELORIX_EXTERNAL_RUSTFS_ENV=target/velorix-product/external-rustfs.env
+  VELORIX_EXTERNAL_VERSITYGW_ENV=target/velorix-product/external-versitygw.env
   VELORIX_OBJECT_STORE_DURABILITY_ASSESS_PROBE=1
 
 This writes an assessment artifact. It deliberately does not write
@@ -55,9 +55,9 @@ if [ ! -f "$product_evidence" ]; then
   exit 66
 fi
 
-if [ -f "$external_rustfs_env" ]; then
+if [ -f "$external_versitygw_env" ]; then
   # shellcheck disable=SC1090
-  source "$external_rustfs_env"
+  source "$external_versitygw_env"
 fi
 
 IFS=$'\t' read -r mode endpoint bucket s3_prefix authority_store_id region < <(
@@ -114,9 +114,9 @@ printf '{}\n' >"$lifecycle_json"
 
 probe_endpoint="${VELORIX_OBJECT_STORE_DURABILITY_ASSESS_ENDPOINT:-${AWS_ENDPOINT_URL:-$endpoint}}"
 docker_network="${VELORIX_OBJECT_STORE_DURABILITY_ASSESS_DOCKER_NETWORK:-}"
-if [ -z "$docker_network" ] && [ -n "${VELORIX_EXTERNAL_RUSTFS_CONTAINER:-}" ]; then
-  docker_network="$VELORIX_EXTERNAL_RUSTFS_CONTAINER"
-  probe_endpoint="http://${VELORIX_EXTERNAL_RUSTFS_CONTAINER}:9000"
+if [ -z "$docker_network" ] && [ -n "${VELORIX_EXTERNAL_VERSITYGW_CONTAINER:-}" ]; then
+  docker_network="$VELORIX_EXTERNAL_VERSITYGW_CONTAINER"
+  probe_endpoint="http://${VELORIX_EXTERNAL_VERSITYGW_CONTAINER}:9000"
 fi
 
 run_aws_s3api() {
@@ -254,11 +254,11 @@ payload = {
     "probe_endpoint": probe_endpoint,
     "object_store_mode": mode,
     "authority_class": "local_single_node_docker_volume"
-    if "rustfs" in probe_endpoint.lower()
+    if "versitygw" in probe_endpoint.lower()
     or "127.0.0.1" in probe_endpoint
     or "192.168." in probe_endpoint
     else "external_s3_compatible",
-    "reason": "local Docker-volume RustFS is useful for API compatibility smoke tests but is not an externally durable production object-store authority",
+    "reason": "local Docker-volume storage is useful for API compatibility smoke tests but is not an externally durable production object-store authority",
     "trusted_for_product_complete": False,
     "can_generate_product_complete_attestation": not missing,
     "required_truths": required_truths,

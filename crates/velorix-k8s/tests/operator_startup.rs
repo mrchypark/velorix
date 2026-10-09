@@ -527,7 +527,7 @@ fn deployed_ingest_writer_pod_template_can_run_checked_append_entrypoint() {
         .with_checked_append_entrypoint("/var/run/velorix/payload.vlxingest")
         .unwrap()
         .with_env_var(env_var("VELORIX_S3_COMPAT", "1"))
-        .with_env_var(env_var("AWS_ENDPOINT_URL", "http://rustfs:9000"))
+        .with_env_var(env_var("AWS_ENDPOINT_URL", "http://versitygw:9000"))
         .with_env_var(env_var("AWS_REGION", "us-east-1"))
         .with_volume_mount(VolumeMount {
             name: "ingest-payload".to_string(),
@@ -579,7 +579,7 @@ fn deployed_ingest_writer_pod_template_can_run_checked_append_entrypoint() {
                 "/var/run/velorix/payload.vlxingest",
             ),
             env_var("VELORIX_S3_COMPAT", "1"),
-            env_var("AWS_ENDPOINT_URL", "http://rustfs:9000"),
+            env_var("AWS_ENDPOINT_URL", "http://versitygw:9000"),
             env_var("AWS_REGION", "us-east-1"),
         ]
     );

@@ -36,11 +36,12 @@ use velorix_core::{
         RelationColumnV1, RelationSemanticRoleV1, VelorixRelationCatalogV1,
     },
     standing_program::{
-        DurableStateRoot, EpochCommit, EpochIdempotencyKey, InputEventTimeFrontier,
-        MaterializedViewPage, RelationFrontier, RelationInputBatch, RelationInputEncodingV1,
-        RuntimeCheckpoint, RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest,
-        StandingProgramIdentity, StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier,
-        ViewOutputBatch, ViewOutputDelta,
+        DurableStateRoot, EpochCommit, EpochIdempotencyKey, EventTimeStateObject,
+        EventTimeStateRef, EventTimeStateRequest, InputEventTimeFrontier, MaterializedViewPage,
+        RelationFrontier, RelationInputBatch, RelationInputEncodingV1, RuntimeCheckpoint,
+        RuntimeCheckpointStatePayload, ScopedViewId, SnapshotPageRequest, StandingProgramIdentity,
+        StandingProgramRuntime, StandingProgramRuntimeError, ViewFrontier, ViewOutputBatch,
+        ViewOutputDelta,
     },
     view_contract::{
         catalog_input_relation_schema, stable_bytes_hash, RelationSchema, SqlDataType,
@@ -939,6 +940,12 @@ struct TumblingWindowCheckpointPayload {
     #[serde(default)]
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     state: TumblingWindowState,
+    #[serde(default)]
+    cold_state_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    cold_state_refs: BTreeMap<String, EventTimeStateRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_replay_before_ns: Option<i64>,
     published_output: DeltaBatch,
     applied_epochs: Vec<GenericAppliedEpoch>,
     logical_epoch: LogicalEpoch,
@@ -3495,6 +3502,17 @@ fn validate_tumbling_supported_schemas(
     output: &RelationSchema,
     plan: &SupportedTumblingWindowPlan,
 ) -> Result<(), StandingProgramRuntimeError> {
+    if let Some(LateRowPolicy::CorrectWithinHorizon { horizon_ns }) = plan.late_row_policy {
+        if horizon_ns <= 0
+            || plan.window_kind == SupportedEventTimeWindowKind::Session
+            || plan.top_k.is_some()
+            || plan.retention_contract.is_some()
+        {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "window_correction_policy",
+            });
+        }
+    }
     catalog
         .validate()
         .map_err(|_| StandingProgramRuntimeError::InvalidProgramIdentity { field: "catalog" })?;
@@ -7262,13 +7280,17 @@ fn apply_tumbling_input(
     plan: &SupportedTumblingWindowPlan,
     current_event_time_frontiers: &[InputEventTimeFrontier],
     input: &RelationInputBatch,
+    selected_windows: Option<&BTreeSet<String>>,
 ) -> Result<(), StandingProgramRuntimeError> {
-    let Some(watermark) = &input.event_time_watermark else {
-        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "tumbling_event_time_input_batch",
-        });
-    };
-    if watermark.event_time_column_id != plan.event_time_column_id {
+    if published_input_empty_delta(input, catalog)?.is_some() {
+        return Ok(());
+    }
+    if selected_windows.is_none()
+        && input
+            .event_time_watermark
+            .as_ref()
+            .is_none_or(|watermark| watermark.event_time_column_id != plan.event_time_column_id)
+    {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "tumbling_event_time_input_batch",
         });
@@ -7292,9 +7314,15 @@ fn apply_tumbling_input(
                 row_index,
             )?;
             let is_late = current_watermark.is_some_and(|watermark| event_time_ns < watermark);
+            // Batch watermarks follow their data; expiration uses the committed frontier.
+            validate_window_correction_horizon(
+                plan,
+                min_event_time_watermark(current_event_time_frontiers),
+                event_time_ns,
+            )?;
             if is_late {
                 match plan.late_row_policy {
-                    None | Some(LateRowPolicy::Reject) => {
+                    Some(LateRowPolicy::Reject) => {
                         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                             field: "tumbling_event_time_input_batch",
                         });
@@ -7320,12 +7348,16 @@ fn apply_tumbling_input(
                             continue;
                         }
                     }
+                    None | Some(LateRowPolicy::CorrectWithinHorizon { .. }) => {}
                 }
             }
             let group_key =
                 batch_key_value(batch, key_index, &key_column.physical_arrow_type, row_index)?;
             let amount = batch_nullable_int64_value(batch, value_index, row_index)?;
             let weight = batch_int64_value(batch, weight_index, row_index)?;
+            if weight == 0 {
+                continue;
+            }
             if !tumbling_predicate_matches_row(
                 &plan.predicate_expr,
                 catalog,
@@ -7352,6 +7384,9 @@ fn apply_tumbling_input(
                     {
                         let state_key =
                             window_state_key(&group_key, window_start_ns, window_end_ns);
+                        if selected_windows.is_some_and(|keys| !keys.contains(&state_key)) {
+                            continue;
+                        }
                         undo.touch_row(state, &state_key);
                         let row = window_state_row_mut(
                             state,
@@ -7388,14 +7423,40 @@ fn apply_tumbling_input(
     Ok(())
 }
 
+/// The correction horizon controls hot retention, never admission by age.
+fn validate_window_correction_horizon(
+    plan: &SupportedTumblingWindowPlan,
+    _committed_watermark: Option<i64>,
+    event_time_ns: i64,
+) -> Result<(), StandingProgramRuntimeError> {
+    let Some(LateRowPolicy::CorrectWithinHorizon { horizon_ns }) = plan.late_row_policy else {
+        return Ok(());
+    };
+    if horizon_ns <= 0
+        || plan.window_kind == SupportedEventTimeWindowKind::Session
+        || plan.top_k.is_some()
+    {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "window_correction_policy",
+        });
+    }
+    fixed_window_assignments(plan, event_time_ns)?;
+    Ok(())
+}
+
 fn fixed_window_assignments(
     plan: &SupportedTumblingWindowPlan,
     event_time_ns: i64,
 ) -> Result<Vec<(i64, i64)>, StandingProgramRuntimeError> {
+    if plan.window_size_ns <= 0 {
+        return Err(invalid_runtime_state());
+    }
     match plan.window_kind {
         SupportedEventTimeWindowKind::Tumbling => {
-            let window_start_ns =
-                event_time_ns.div_euclid(plan.window_size_ns) * plan.window_size_ns;
+            let window_start_ns = event_time_ns
+                .div_euclid(plan.window_size_ns)
+                .checked_mul(plan.window_size_ns)
+                .ok_or_else(invalid_runtime_state)?;
             let window_end_ns = window_start_ns
                 .checked_add(plan.window_size_ns)
                 .ok_or_else(invalid_runtime_state)?;
@@ -7403,7 +7464,16 @@ fn fixed_window_assignments(
         }
         SupportedEventTimeWindowKind::Hopping => {
             let slide_ns = plan.hop_slide_ns.ok_or_else(invalid_runtime_state)?;
-            let last_start = event_time_ns.div_euclid(slide_ns) * slide_ns;
+            if slide_ns <= 0
+                || plan.window_size_ns < slide_ns
+                || plan.window_size_ns % slide_ns != 0
+            {
+                return Err(invalid_runtime_state());
+            }
+            let last_start = event_time_ns
+                .div_euclid(slide_ns)
+                .checked_mul(slide_ns)
+                .ok_or_else(invalid_runtime_state)?;
             let window_count = plan.window_size_ns / slide_ns;
             let mut windows = Vec::with_capacity(window_count as usize);
             for index in 0..window_count {

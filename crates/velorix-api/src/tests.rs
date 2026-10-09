@@ -2084,6 +2084,7 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -3171,9 +3172,13 @@ fn materialized_runtime_binding_persists_admitted_logical_plan() {
         },
     };
 
-    let binding =
-        materialized_view_runtime_binding_for_spec(std::slice::from_ref(&catalog), &spec, &[])
-            .unwrap();
+    let binding = materialized_view_runtime_binding_for_spec(
+        std::slice::from_ref(&catalog),
+        &spec,
+        &[],
+        None,
+    )
+    .unwrap();
     let logical_plan = binding.logical_plan.unwrap();
 
     assert_eq!(logical_plan.view_sql, spec.sql);
@@ -3541,6 +3546,7 @@ async fn rest_latest_by_key_cte_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -3829,6 +3835,7 @@ async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_re
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -3978,6 +3985,7 @@ async fn rest_latest_by_key_order_by_limit_top_k_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4070,6 +4078,7 @@ async fn rest_latest_by_key_order_by_limit_offset_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4257,6 +4266,7 @@ async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_afte
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -4406,6 +4416,7 @@ async fn rest_tumbling_window_cte_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4499,6 +4510,7 @@ async fn rest_tumbling_window_order_by_limit_top_k_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4590,6 +4602,7 @@ async fn rest_tumbling_window_order_by_sum_function_top_k_view_materializes_outp
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4682,6 +4695,7 @@ async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4796,6 +4810,7 @@ async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs(
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -4926,6 +4941,7 @@ async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() 
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -5051,6 +5067,7 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -5535,6 +5552,7 @@ async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -5663,6 +5681,7 @@ async fn rest_hopping_and_session_window_views_materialize_outputs() {
                 response_schema: None,
                 response_formats: vec!["json".to_string()],
                 query_policy_id: None,
+                correction_horizon_ns: None,
             };
             let view_response =
                 call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
@@ -5779,6 +5798,7 @@ async fn rest_session_window_view_materialized_output_survives_api_restart() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -5919,6 +5939,7 @@ async fn rest_late_tumbling_window_view_reports_materialization_lag_on_first_que
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -6090,6 +6111,7 @@ async fn rest_late_hopping_and_session_window_views_report_materialization_lag_o
                 response_schema: None,
                 response_formats: vec!["json".to_string()],
                 query_policy_id: None,
+                correction_horizon_ns: None,
             };
             let view_response =
                 call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
@@ -6216,6 +6238,7 @@ async fn rest_unsupported_single_input_sql_admission_fails_closed_without_creati
                 response_schema: None,
                 response_formats: vec!["json".to_string()],
                 query_policy_id: None,
+                correction_horizon_ns: None,
             };
             let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
             assert!(
@@ -6293,6 +6316,7 @@ async fn rest_unsupported_join_sql_admission_fails_closed_without_creating_view(
                 response_schema: None,
                 response_formats: vec!["json".to_string()],
                 query_policy_id: None,
+                correction_horizon_ns: None,
             };
             let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
             assert!(
@@ -6365,6 +6389,7 @@ async fn rest_unsupported_three_table_join_admission_fails_closed_without_active
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
 
     let create_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
@@ -6548,6 +6573,7 @@ async fn rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_bind
                 response_schema: None,
                 response_formats: vec!["json".to_string()],
                 query_policy_id: None,
+                correction_horizon_ns: None,
             };
 
             let create_response =
@@ -6694,6 +6720,7 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -6715,9 +6742,10 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
     .unwrap();
 
     object_access_counts.clear();
-    let summary = apply_standing_runtime_prepared_ingests(&state, None, &[prepared], None)
-        .await
-        .unwrap();
+    let summary =
+        apply_standing_runtime_prepared_ingests(&state, None, &[prepared], None, &BTreeSet::new())
+            .await
+            .unwrap();
 
     assert_eq!(summary.active_views, 1);
     assert_eq!(summary.applied_batches, 1);
@@ -6749,10 +6777,15 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
     .unwrap();
 
     object_access_counts.clear();
-    let second_summary =
-        apply_standing_runtime_prepared_ingests(&state, None, &[next_prepared], None)
-            .await
-            .unwrap();
+    let second_summary = apply_standing_runtime_prepared_ingests(
+        &state,
+        None,
+        &[next_prepared],
+        None,
+        &BTreeSet::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(second_summary.applied_batches, 1);
     let checkpoint_get_paths = object_access_counts
         .get_paths()
@@ -6866,6 +6899,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -7098,6 +7132,7 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -7385,6 +7420,7 @@ async fn rest_relation_scoped_ingest_materializes_views_automatically() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -7718,6 +7754,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -7847,6 +7884,7 @@ async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_r
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -7974,6 +8012,7 @@ async fn rest_late_filter_project_view_reports_materialization_lag_on_first_quer
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -8033,6 +8072,7 @@ async fn rest_between_predicate_aggregate_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -8116,6 +8156,7 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -8352,6 +8393,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -8691,6 +8733,7 @@ async fn rest_materialization_rejects_output_delta_over_runtime_budget() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -8856,6 +8899,7 @@ async fn rest_sum_arithmetic_expression_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -8947,6 +8991,7 @@ async fn rest_cast_int64_aggregate_expression_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9032,6 +9077,7 @@ async fn rest_nested_double_colon_cast_int64_aggregate_expression_view_materiali
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9120,6 +9166,7 @@ async fn rest_try_and_safe_cast_int64_aggregate_expression_view_materializes_out
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9208,6 +9255,7 @@ async fn rest_abs_int64_aggregate_expression_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9298,6 +9346,7 @@ async fn rest_greatest_least_int64_aggregate_expression_view_materializes_output
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9389,6 +9438,7 @@ async fn rest_coalesce_nullable_int64_aggregate_expression_view_materializes_out
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9480,6 +9530,7 @@ async fn rest_is_not_distinct_from_null_predicate_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9568,6 +9619,7 @@ async fn rest_case_when_distinct_from_null_predicate_view_materializes_outputs()
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9658,6 +9710,7 @@ async fn rest_case_when_is_null_predicate_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9748,6 +9801,7 @@ async fn rest_case_when_int64_aggregate_expression_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9839,6 +9893,7 @@ async fn rest_case_when_between_and_in_predicate_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -9931,6 +9986,7 @@ async fn rest_if_int64_aggregate_expression_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10022,6 +10078,7 @@ async fn rest_multi_branch_case_when_int64_aggregate_expression_view_materialize
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10112,6 +10169,7 @@ async fn rest_simple_case_when_int64_aggregate_expression_view_materializes_outp
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10202,6 +10260,7 @@ async fn rest_min_max_arithmetic_expression_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10293,6 +10352,7 @@ async fn rest_avg_arithmetic_expression_view_materializes_outputs() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10381,6 +10441,7 @@ async fn rest_filter_project_view_materializes_outputs() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10458,6 +10519,7 @@ async fn rest_filter_project_union_distinct_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10540,6 +10602,7 @@ async fn rest_filter_project_order_by_limit_view_materializes_top_k_outputs() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10655,6 +10718,7 @@ async fn rest_filter_project_case_over_bool_predicate_materializes_relation_scop
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10735,6 +10799,7 @@ async fn rest_filter_project_cte_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10813,6 +10878,7 @@ async fn rest_filter_project_derived_table_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10891,6 +10957,7 @@ async fn rest_filter_project_view_materializes_nullable_value_outputs() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -10975,6 +11042,7 @@ async fn rest_computed_filter_project_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -11051,6 +11119,7 @@ async fn rest_aggregate_having_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -11129,6 +11198,7 @@ async fn rest_count_distinct_view_materializes_outputs() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -11270,6 +11340,7 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
         let view_response =
             call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
@@ -11304,6 +11375,7 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
         let view_response =
             call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
@@ -11328,6 +11400,7 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let key_only_response = call_json(
         &router,
@@ -11385,6 +11458,7 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
         let response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
         assert_eq!(response.0, StatusCode::BAD_REQUEST, "{response:?}");
@@ -11943,6 +12017,7 @@ async fn rest_having_count_distinct_function_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -12022,6 +12097,7 @@ async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -12101,6 +12177,7 @@ async fn rest_order_by_limit_top_k_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -12203,6 +12280,7 @@ async fn rest_order_by_limit_offset_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -12282,6 +12360,7 @@ async fn rest_order_by_function_top_k_view_materializes_relation_scoped_ingest()
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -12437,6 +12516,7 @@ struct GuardRaceHook {
     reached: Notify,
     release: Notify,
     fire_once: AtomicBool,
+    all_checkpoints: bool,
 }
 
 impl DurableCapabilityMetaStore {
@@ -12509,7 +12589,12 @@ impl MetaStore for DurableCapabilityMetaStore {
         &self,
         request: PublishStandingRuntimeCheckpointRequest,
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
-        if request.expected_relation_source_cuts.is_some() {
+        if request.expected_relation_source_cuts.is_some()
+            || self
+                .guard_race
+                .as_ref()
+                .is_some_and(|hook| hook.all_checkpoints)
+        {
             if let Some(guard_race) = &self.guard_race {
                 if guard_race.fire_once.swap(false, Ordering::SeqCst) {
                     guard_race.reached.notify_one();
@@ -12815,6 +12900,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
         reached: Notify::new(),
         release: Notify::new(),
         fire_once: AtomicBool::new(true),
+        all_checkpoints: false,
     });
     let meta: Arc<dyn MetaStore> = Arc::new(
         DurableCapabilityMetaStore::new(InMemoryMetaStore::default())
@@ -13291,6 +13377,7 @@ async fn rest_late_view_query_reports_materialization_lag_without_blocking_later
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -13443,6 +13530,7 @@ async fn rest_late_view_backfill_api_reports_coverage_and_runs_limited_steps() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -13601,6 +13689,7 @@ async fn rest_late_single_relation_stats_having_top_k_backfill_api_runs_limited_
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -13736,6 +13825,7 @@ async fn rest_late_view_backfill_rejects_offset_range_scope() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -13861,6 +13951,7 @@ async fn rest_late_view_backfill_rejects_predicate_request_scope() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -13980,6 +14071,7 @@ async fn rest_late_view_background_backfill_request_fails_closed() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -14066,6 +14158,7 @@ async fn rest_view_query_fails_closed_without_published_checkpoint_output() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -14134,6 +14227,7 @@ async fn rest_select_star_backfill_activates_authoritative_bootstrap_when_ingest
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -14254,6 +14348,7 @@ async fn rest_standing_runtime_output_query_without_sql_reads_materialized_rows_
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: Some("no-sql-output-read".to_string()),
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -14344,6 +14439,7 @@ async fn rest_view_compaction_and_openapi_paths_are_available_after_materializat
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED);
@@ -14491,6 +14587,7 @@ async fn raw_sql_count_and_sum_fail_closed_when_the_materialized_input_is_paged(
                     response_schema: None,
                     response_formats: vec!["json".to_string()],
                     query_policy_id: query_policy_id.map(str::to_string),
+                    correction_horizon_ns: None,
                 }),
             )
             .await;
@@ -14635,6 +14732,7 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
         let response = call_json(&router, Method::POST, "/v1/views", json!(request)).await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -14797,6 +14895,7 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(
@@ -16094,6 +16193,7 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -16224,6 +16324,7 @@ async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -16330,6 +16431,7 @@ async fn rest_right_join_swaps_operands_and_materializes_unmatched_right_rows() 
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         }),
     )
     .await;
@@ -16429,6 +16531,7 @@ async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -16536,6 +16639,7 @@ async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -16677,6 +16781,7 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -16785,6 +16890,7 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -16913,6 +17019,7 @@ async fn rest_two_relation_join_having_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17020,6 +17127,7 @@ async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17127,6 +17235,7 @@ async fn rest_two_relation_join_filtered_count_distinct_view_materializes_output
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17238,6 +17347,7 @@ async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outp
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17343,6 +17453,7 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17467,6 +17578,7 @@ async fn rest_two_relation_join_alias_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17567,6 +17679,7 @@ async fn rest_two_relation_join_where_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17671,6 +17784,7 @@ async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17774,6 +17888,7 @@ async fn rest_two_relation_join_right_cte_source_filter_view_materializes_output
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17876,6 +17991,7 @@ async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs(
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -17982,6 +18098,7 @@ async fn rest_two_relation_join_derived_table_source_filter_view_materializes_ou
             response_schema: None,
             response_formats: vec!["json".to_string()],
             query_policy_id: None,
+            correction_horizon_ns: None,
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -18250,6 +18367,7 @@ async fn standing_runtime_state_quota_rejection_rolls_back_before_publication() 
     };
 
     let error = apply_standing_runtime_changes_and_checkpoint(
+        &test_api_state().await,
         runtime.clone(),
         1,
         EpochIdempotencyKey::new("quota-epoch").unwrap(),
@@ -18265,6 +18383,7 @@ async fn standing_runtime_state_quota_rejection_rolls_back_before_publication() 
     assert_eq!(runtime.lock().unwrap().checkpoint().unwrap(), before);
 
     let applied = apply_standing_runtime_changes_and_checkpoint(
+        &test_api_state().await,
         runtime.clone(),
         1,
         EpochIdempotencyKey::new("quota-epoch").unwrap(),
@@ -20295,6 +20414,7 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(filter_view)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -20355,6 +20475,7 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(aggregate_view)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -20393,6 +20514,7 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(topk_view)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
@@ -20995,5 +21117,1143 @@ fn experimental_advanced_view_features_explicit_false_wires_policy() {
         state.public_view_feature_policy.analytic_windows,
         FeatureAdmissionModeV1::Experimental,
         "explicit false must keep analytic windows experimental"
+    );
+}
+
+#[test]
+fn correction_configuration_defaults_and_binds_runtime_identity() {
+    let catalog = test_purchases_event_time_catalog();
+    let sql = "select user_id, window_start, window_end, sum(amount) as total, count(*) as count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let request: CreateViewRequest =
+        serde_json::from_value(json!({"view_id": "correctable", "sql": sql})).unwrap();
+    assert_eq!(request.correction_horizon_ns, None);
+    assert!(serde_json::to_value(&request)
+        .unwrap()
+        .get("correction_horizon_ns")
+        .is_none());
+    let aliased: CreateViewRequest = serde_json::from_value(
+        json!({"view_id": "correctable", "sql": sql, "correctionHorizonNs": 120}),
+    )
+    .unwrap();
+    assert_eq!(aliased.correction_horizon_ns, Some(120));
+    let supported = validate_supported_tumbling_window_sql(sql, &catalog).unwrap();
+    let spec = StandingViewSpec {
+        view_id: request.view_id,
+        sql: sql.to_string(),
+        dialect: SqlDialect::VelorixSql,
+        source_kind: SqlSourceKind::StandingView,
+        input_relations: vec![catalog_input_relation_schema(&catalog).unwrap()],
+        output_relations: vec![
+            tumbling_window_output_schema("correctable", &catalog, &supported).unwrap(),
+        ],
+        shape: StandingViewShape {
+            is_materialized: true,
+            multi_input: false,
+            multi_output: false,
+        },
+    };
+    let binding = |horizon| {
+        materialized_view_runtime_binding_for_spec(
+            std::slice::from_ref(&catalog),
+            &spec,
+            &[],
+            horizon,
+        )
+        .unwrap()
+    };
+    let default = binding(None);
+    let legacy_identity = standing_program_identity_from_materialized_view_runtime(
+        std::slice::from_ref(&catalog),
+        &spec,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        default.standing_program_identity.sql_hash,
+        legacy_identity.sql_hash
+    );
+    assert_eq!(default, binding(Some(60_000_000_000)));
+    assert_ne!(default.standing_program_identity, legacy_identity);
+    let corrected = binding(Some(120));
+    let other = binding(Some(121));
+    assert_eq!(
+        corrected.standing_program_identity.sql_hash,
+        default.standing_program_identity.sql_hash
+    );
+    assert_ne!(
+        default.logical_plan.as_ref().unwrap().plan_hash,
+        corrected.logical_plan.as_ref().unwrap().plan_hash
+    );
+    assert_ne!(
+        corrected.logical_plan.as_ref().unwrap().plan_hash,
+        other.logical_plan.as_ref().unwrap().plan_hash
+    );
+    assert_ne!(
+        stable_bytes_hash(&serde_json::to_vec(&default.standing_program_identity).unwrap()),
+        stable_bytes_hash(&serde_json::to_vec(&corrected.standing_program_identity).unwrap())
+    );
+    assert_ne!(
+        stable_bytes_hash(&serde_json::to_vec(&corrected.standing_program_identity).unwrap()),
+        stable_bytes_hash(&serde_json::to_vec(&other.standing_program_identity).unwrap())
+    );
+    let restored: MaterializedViewRuntimeBinding =
+        serde_json::from_value(serde_json::to_value(&corrected).unwrap()).unwrap();
+    assert_eq!(restored, corrected);
+    let VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan } =
+        &restored.logical_plan.unwrap().execution
+    else {
+        panic!("expected window plan")
+    };
+    assert_eq!(
+        plan.late_row_policy,
+        Some(LateRowPolicy::CorrectWithinHorizon { horizon_ns: 120 })
+    );
+}
+
+#[tokio::test]
+async fn rest_correction_configuration_rejects_invalid_horizons_and_shapes() {
+    let state =
+        test_api_state_with_store(Arc::new(InMemory::new()), "api-correction-admission", false)
+            .await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let tumble = "select user_id, window_start, window_end, sum(amount) as total from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    for (id, sql, horizon) in [
+        ("zero", tumble, 0),
+        ("negative", tumble, -1),
+        ("plain", "select user_id, sum(amount) as total from purchases group by user_id", 120),
+        ("session", "select user_id, window_start, window_end, sum(amount) as total from session(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end", 120),
+        ("topk", "select user_id, window_start, window_end, sum(amount) as total from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end order by total desc limit 1", 120),
+    ] {
+        let response = call_json(&router, Method::POST, "/v1/views", json!({"view_id": id, "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": sql, "correction_horizon_ns": horizon})).await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST, "{id}: {response:?}");
+        assert!(response.1["error"].as_str().unwrap().contains("correction_horizon_ns"), "{response:?}");
+        assert!(state.view_registry().unwrap().read_active(id).await.is_err());
+    }
+    for (id, sql) in [("default_window", tumble), ("corrected_hop", "select user_id, window_start, window_end, sum(amount) as total from hop(purchases, event_time, interval '30 seconds', interval '60 seconds') group by user_id, window_start, window_end")] {
+        let mut request = json!({"view_id": id, "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": sql});
+        if id == "corrected_hop" { request["correctionHorizonNs"] = json!(120); }
+        let response = call_json(&router, Method::POST, "/v1/views", request).await;
+        assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
+        let active = state.view_registry().unwrap().read_active(id).await.unwrap();
+        let VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan } = &active.runtime.unwrap().logical_plan.unwrap().execution else { panic!("expected window plan") };
+        assert_eq!(plan.late_row_policy, Some(LateRowPolicy::CorrectWithinHorizon { horizon_ns: if id == "corrected_hop" { 120 } else { 60_000_000_000 } }));
+    }
+}
+
+#[tokio::test]
+async fn rest_correction_configuration_survives_activation_and_checkpoint_restart() {
+    correction_restart_regression(false).await;
+}
+
+#[tokio::test]
+async fn authoritative_correction_configuration_survives_activation_and_checkpoint_restart() {
+    correction_restart_regression(true).await;
+}
+
+#[tokio::test]
+async fn rest_default_window_far_late_extrema_and_avg_load_only_affected_state() {
+    far_late_window_regression(false, false).await;
+}
+
+#[tokio::test]
+async fn authoritative_default_window_far_late_extrema_and_avg_load_only_affected_state() {
+    far_late_window_regression(true, false).await;
+}
+
+#[tokio::test]
+async fn rest_far_late_legacy_checkpoint_reconstructs_affected_window() {
+    far_late_window_regression(false, true).await;
+}
+
+#[tokio::test]
+async fn authoritative_far_late_legacy_checkpoint_reconstructs_affected_window() {
+    far_late_window_regression(true, true).await;
+}
+
+async fn far_late_window_regression(authoritative: bool, migrate: bool) {
+    let counts = ObjectStoreAccessCounts::default();
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let failing = Arc::new(ArmedPrefixFailingObjectStore::new(inner));
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(CountingObjectStore::new(failing.clone(), counts.clone()));
+    let meta = authoritative
+        .then(|| Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default())));
+    let authority_clock = Arc::new(std::sync::atomic::AtomicU64::new(100_000));
+    let new_state = |reconstruct| {
+        let store = store.clone();
+        let meta = meta.clone();
+        let authority_clock = authority_clock.clone();
+        async move {
+            match meta {
+                Some(meta) => {
+                    meta.inner
+                        .set_partition_authority_clock_for_test(
+                            authority_clock.fetch_add(100_000, Ordering::SeqCst),
+                        )
+                        .await;
+                    let mut state =
+                        test_authoritative_api_state_with_store(store, "far-late-owner", meta)
+                            .await;
+                    state.owner_id = "far-late-runtime-owner".to_string();
+                    state
+                }
+                None => test_api_state_with_store(store, "far-late-owner", reconstruct).await,
+            }
+        }
+    };
+    let state = new_state(false).await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let created = call_json(&router, Method::POST, "/v1/views", json!({
+        "view_id": "cold_aggregates", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1",
+        "sql": "select user_id, window_start, window_end, sum(amount) as total, count(*) as count, min(amount) as minimum, max(amount) as maximum, avg(amount) as average from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end"
+    })).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    let batch = |offset, rows: Value, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "cold-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": rows});
+    let first = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(
+            0,
+            json!([
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
+                {"user_id": "alice", "amount": 4, "event_time": 20_000_000_000i64, "delta": 1},
+                {"user_id": "bob", "amount": 20, "event_time": 10_000_000_000i64, "delta": 1}
+            ]),
+            60_000_000_000i64,
+        ),
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::CREATED, "{first:?}");
+    let advanced = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(
+            3,
+            json!([
+                {"user_id": "charlie", "amount": 3, "event_time": 10_000_000_000_000i64, "delta": 1}
+            ]),
+            10_080_000_000_000i64,
+        ),
+    )
+    .await;
+    assert_eq!(advanced.0, StatusCode::CREATED, "{advanced:?}");
+    let restarted = new_state(true).await;
+    assert_eq!(
+        restarted
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let active = restarted
+        .view_registry()
+        .unwrap()
+        .read_active("cold_aggregates")
+        .await
+        .unwrap();
+    let identity = active.runtime.unwrap().standing_program_identity;
+    let checkpoint =
+        read_latest_standing_runtime_checkpoint(&restarted, &identity, "cold_aggregates")
+            .await
+            .unwrap()
+            .unwrap();
+    let payload: Value = serde_json::from_str(
+        &checkpoint
+            .checkpoint
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(
+        payload["state"]["rows"].as_object().unwrap().is_empty(),
+        "expired accumulators must not remain hot"
+    );
+    let references = payload["cold_state_refs"].as_object().unwrap();
+    let alice_ref = references
+        .iter()
+        .find(|(key, _)| key.contains("alice"))
+        .unwrap()
+        .1;
+    let alice_path = Path::from(alice_ref["state_root"]["object_key"].as_str().unwrap());
+    let saved = store.get(&alice_path).await.unwrap().bytes().await.unwrap();
+    let router = app(restarted.clone());
+    let late = batch(
+        4,
+        json!([{"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": -1}]),
+        10_080_000_000_000i64,
+    );
+    let before_objects = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len();
+    store.delete(&alice_path).await.unwrap();
+    let missing = call_json(&router, Method::POST, "/v1/ingest", late.clone()).await;
+    assert_eq!(missing.0, StatusCode::SERVICE_UNAVAILABLE, "{missing:?}");
+    assert!(missing.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("retained window state unavailable"));
+    assert_eq!(
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        before_objects - 1,
+        "cold load failure must precede source publication"
+    );
+    store
+        .put(&alice_path, bytes::Bytes::from_static(b"corrupt").into())
+        .await
+        .unwrap();
+    let corrupt = call_json(&router, Method::POST, "/v1/ingest", late.clone()).await;
+    assert_eq!(corrupt.0, StatusCode::BAD_REQUEST, "{corrupt:?}");
+    assert!(corrupt.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("digest mismatch"));
+    store.put(&alice_path, saved.into()).await.unwrap();
+    if migrate {
+        let mut old = checkpoint.checkpoint.clone();
+        let mut legacy = payload.clone();
+        for field in [
+            "cold_state_version",
+            "cold_state_refs",
+            "legacy_replay_before_ns",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        old.state_payload.as_mut().unwrap().payload = serde_json::to_string(&legacy).unwrap();
+        old.state_root.content_hash =
+            stable_bytes_hash(old.state_payload.as_ref().unwrap().payload.as_bytes());
+        let runtime =
+            velorix_runtime::materialized_view_runtime::restore_standing_runtime(old).unwrap();
+        insert_standing_runtime(&restarted, "cold_aggregates", runtime).unwrap();
+    }
+    counts.clear();
+    let corrected = call_json(&router, Method::POST, "/v1/ingest", late.clone()).await;
+    assert_eq!(corrected.0, StatusCode::CREATED, "{corrected:?}");
+    let cold_reads = counts
+        .get_paths()
+        .into_iter()
+        .filter(|path| path.contains("/windows/"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cold_reads,
+        if migrate {
+            Vec::new()
+        } else {
+            vec![alice_path.to_string()]
+        },
+        "only the affected accumulator should be loaded"
+    );
+    let objects = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len();
+    counts.clear();
+    let duplicate = call_json(&router, Method::POST, "/v1/ingest", late).await;
+    assert_eq!(duplicate.0, StatusCode::OK, "{duplicate:?}");
+    assert_eq!(
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        objects
+    );
+    assert!(
+        counts
+            .get_paths()
+            .iter()
+            .all(|path| !path.contains("/windows/")),
+        "idempotent retry should not reload cold state"
+    );
+    let final_state = new_state(true).await;
+    assert_eq!(
+        final_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let query = call_json(
+        &app(final_state.clone()),
+        Method::POST,
+        "/v1/views/cold_aggregates/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    let alice = query.1["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["user_id"] == "alice")
+        .unwrap();
+    assert_eq!(alice["total"], 4);
+    assert_eq!(alice["count"], 1);
+    assert_eq!(alice["minimum"], 4);
+    assert_eq!(alice["maximum"], 4);
+    assert_eq!(alice["average"].as_f64(), Some(4.0));
+    assert_eq!(query.1["rows"].as_array().unwrap().len(), 3);
+    if !migrate {
+        let committed =
+            read_latest_standing_runtime_checkpoint(&final_state, &identity, "cold_aggregates")
+                .await
+                .unwrap()
+                .unwrap();
+        let old_bob_archive = references
+            .iter()
+            .find(|(key, _)| key.contains("bob"))
+            .unwrap()
+            .1["state_root"]["object_key"]
+            .as_str()
+            .unwrap();
+        failing.arm("v1/state/materialized-view-runtime/");
+        let failing_ingest = batch(
+            5,
+            json!([
+                {"user_id": "bob", "amount": 5, "event_time": 20_000_000_000i64, "delta": 1}
+            ]),
+            10_080_000_000_000i64,
+        );
+        let failed = call_json(
+            &app(final_state.clone()),
+            Method::POST,
+            "/v1/ingest",
+            failing_ingest.clone(),
+        )
+        .await;
+        assert_eq!(failed.0, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
+        let after_failure =
+            read_latest_standing_runtime_checkpoint(&final_state, &identity, "cold_aggregates")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            after_failure.checkpoint_key, committed.checkpoint_key,
+            "archive failure cannot publish a new checkpoint"
+        );
+        assert!(
+            store.get(&Path::from(old_bob_archive)).await.is_ok(),
+            "prior archive must survive failed replacement"
+        );
+        let source_count = store
+            .list(Some(&Path::from("v1/ingest")))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len();
+        let retry = call_json(
+            &app(final_state.clone()),
+            Method::POST,
+            "/v1/ingest",
+            failing_ingest,
+        )
+        .await;
+        assert_eq!(retry.0, StatusCode::OK, "same ingest must recover after transient archive write failure without restart: {retry:?}");
+        let retry_query = call_json(
+            &app(final_state.clone()),
+            Method::POST,
+            "/v1/views/cold_aggregates/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(retry_query.0, StatusCode::OK, "{retry_query:?}");
+        let bob = retry_query.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["user_id"] == "bob")
+            .unwrap();
+        assert_eq!(bob["total"], 25);
+        assert_eq!(bob["count"], 2);
+        let recovered = new_state(true).await;
+        assert_eq!(
+            recovered
+                .restore_standing_program_runtimes_from_active_views()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .list(Some(&Path::from("v1/ingest")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .len(),
+            source_count,
+            "recovery must not duplicate committed source objects"
+        );
+        let restored = call_json(
+            &app(recovered),
+            Method::POST,
+            "/v1/views/cold_aggregates/query",
+            json!({}),
+        )
+        .await;
+        assert_eq!(restored.0, StatusCode::OK, "{restored:?}");
+        let bob = restored.1["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["user_id"] == "bob")
+            .unwrap();
+        assert_eq!(bob["total"], 25);
+        assert_eq!(bob["count"], 2);
+        assert_eq!(bob["minimum"], 5);
+        assert_eq!(bob["maximum"], 20);
+        assert_eq!(bob["average"].as_f64(), Some(12.5));
+    }
+}
+
+#[tokio::test]
+async fn rest_default_session_accepts_late_input_after_closure() {
+    let state = test_api_state().await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED);
+    let created = call_json(&router, Method::POST, "/v1/views", json!({"view_id": "late_session", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total from session(purchases, event_time, interval '30 seconds') group by user_id, window_start, window_end"})).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    for (offset, amount) in [(0, 10), (1, 7)] {
+        let ingested = call_json(&router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "session-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 1_000_000_000_000i64, "watermark_ns": 1_000_000_000_000i64}, "rows": [{"user_id": "alice", "amount": amount, "event_time": 10_000_000_000i64, "delta": 1}]})).await;
+        assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
+    }
+    let query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/late_session/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(query.1["rows"][0]["total"], 17);
+}
+
+#[tokio::test]
+async fn rest_window_archival_drains_multiple_bounded_export_chunks() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store.clone(), "archive-chunks-owner", false).await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED);
+    let created = call_json(&router, Method::POST, "/v1/views", json!({"view_id": "archive_chunks", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end"})).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    let rows = (0..130).map(|key| json!({"user_id": format!("user-{key}"), "amount": key, "event_time": 10_000_000_000i64, "delta": 1})).collect::<Vec<_>>();
+    let ingested = call_json(&router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "archive-chunks-stream", "partition_id": 0, "start_offset_inclusive": 0, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 10_080_000_000_000i64, "watermark_ns": 10_080_000_000_000i64}, "rows": rows})).await;
+    assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
+    let active = state
+        .view_registry()
+        .unwrap()
+        .read_active("archive_chunks")
+        .await
+        .unwrap();
+    let identity = active.runtime.unwrap().standing_program_identity;
+    let record = read_latest_standing_runtime_checkpoint(&state, &identity, "archive_chunks")
+        .await
+        .unwrap()
+        .unwrap();
+    let payload: Value =
+        serde_json::from_str(&record.checkpoint.state_payload.unwrap().payload).unwrap();
+    assert_eq!(payload["cold_state_refs"].as_object().unwrap().len(), 130);
+    assert!(payload["state"]["rows"].as_object().unwrap().is_empty());
+    let archived = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|object| object.location.as_ref().contains("/windows/"))
+        .count();
+    assert_eq!(
+        archived, 130,
+        "all three export chunks must be durable before checkpoint publication"
+    );
+    let runtime = state
+        .standing_runtime(&identity, "archive_chunks")
+        .unwrap()
+        .unwrap();
+    assert!(
+        runtime
+            .lock()
+            .unwrap()
+            .export_event_time_state()
+            .unwrap()
+            .is_empty(),
+        "published archives must be acknowledged"
+    );
+}
+
+async fn correction_restart_regression(authoritative: bool) {
+    async fn state_for_mode(
+        store: Arc<dyn ObjectStore>,
+        owner: &str,
+        reconstruct: bool,
+        meta: Option<Arc<DurableCapabilityMetaStore>>,
+    ) -> ApiState {
+        match meta {
+            Some(meta) => {
+                meta.inner
+                    .set_partition_authority_clock_for_test(
+                        u64::from(*owner.as_bytes().last().unwrap()) * 100_000,
+                    )
+                    .await;
+                let mut state =
+                    test_authoritative_api_state_with_store(store, "stable-correction-owner", meta)
+                        .await;
+                // Isolate correction reconstruction from lease expiry between process owners.
+                state.owner_id = "correction-runtime-owner".to_string();
+                state
+            }
+            None => test_api_state_with_store(store, owner, reconstruct).await,
+        }
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta = authoritative
+        .then(|| Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default())));
+    let state = state_for_mode(store.clone(), "api-correction-a", false, meta.clone()).await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED);
+    let request = json!({"view_id": "correctable", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total, count(*) as count from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end", "correction_horizon_ns": 120_000_000_000i64});
+    let created = call_json(&router, Method::POST, "/v1/views", request.clone()).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    let active = state
+        .view_registry()
+        .unwrap()
+        .read_active("correctable")
+        .await
+        .unwrap();
+    let binding = active.runtime.unwrap();
+    let reconstructed = state_for_mode(store.clone(), "api-correction-b", true, meta.clone()).await;
+    assert_eq!(
+        reconstructed
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let restored_active = reconstructed
+        .view_registry()
+        .unwrap()
+        .read_active("correctable")
+        .await
+        .unwrap();
+    assert_eq!(restored_active.runtime.as_ref(), Some(&binding));
+    let router = app(reconstructed.clone());
+    let duplicate = call_json(&router, Method::POST, "/v1/views", request.clone()).await;
+    assert_eq!(duplicate.0, StatusCode::OK, "{duplicate:?}");
+    let mut different = request;
+    different["correction_horizon_ns"] = json!(121_000_000_000i64);
+    let conflict = call_json(&router, Method::POST, "/v1/views", different).await;
+    assert_eq!(conflict.0, StatusCode::CONFLICT, "{conflict:?}");
+    let batch = |offset, amount, time, delta, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "correction-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": [{"user_id": "alice", "amount": amount, "event_time": time, "delta": delta}]});
+    let initial = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(0, 10, 10_000_000_000i64, 1, 60_000_000_000i64),
+    )
+    .await;
+    assert_eq!(initial.0, StatusCode::CREATED, "{initial:?}");
+    let published = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(published.0, StatusCode::OK, "{published:?}");
+    assert_eq!(
+        published.1["rows"],
+        json!([{"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total": 10, "count": 1}])
+    );
+    let correction = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(1, 7, 20_000_000_000i64, 1, 60_000_000_000i64),
+    )
+    .await;
+    assert_eq!(correction.0, StatusCode::CREATED, "{correction:?}");
+    let corrected = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(corrected.1["rows"][0]["total"], 17);
+    assert_eq!(corrected.1["rows"][0]["count"], 2);
+    let restarted = state_for_mode(store.clone(), "api-correction-c", true, meta.clone()).await;
+    assert_eq!(
+        restarted
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let checkpoint = read_latest_standing_runtime_checkpoint(
+        &restarted,
+        &binding.standing_program_identity,
+        "correctable",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(checkpoint
+        .checkpoint
+        .validate_identity(&binding.standing_program_identity)
+        .is_ok());
+    let mut wrong_identity = binding.standing_program_identity.clone();
+    wrong_identity
+        .runtime_compatibility
+        .push_str(":different correction horizon");
+    assert!(checkpoint
+        .checkpoint
+        .validate_identity(&wrong_identity)
+        .is_err());
+    let router = app(restarted.clone());
+    let restored_query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(restored_query.1["rows"], corrected.1["rows"]);
+    let retraction = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(2, 10, 10_000_000_000i64, -1, 60_000_000_000i64),
+    )
+    .await;
+    assert_eq!(retraction.0, StatusCode::CREATED, "{retraction:?}");
+    let retracted = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(retracted.1["rows"][0]["total"], 7);
+    assert_eq!(retracted.1["rows"][0]["count"], 1);
+    let advance = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(3, 5, 130_000_000_000i64, 1, 180_000_000_000i64),
+    )
+    .await;
+    assert_eq!(advance.0, StatusCode::CREATED, "{advance:?}");
+    let retained = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(retained.0, StatusCode::OK, "{retained:?}");
+    assert_eq!(retained.1["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(retained.1["rows"][0]["total"], 7);
+    let before = read_latest_standing_runtime_checkpoint(
+        &restarted,
+        &binding.standing_program_identity,
+        "correctable",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut mixed_epoch = batch(4, 2, 20_000_000_000i64, 1, 180_000_000_000i64);
+    mixed_epoch["rows"].as_array_mut().unwrap().insert(
+        0,
+        json!({
+            "user_id": "alice", "amount": 3, "event_time": 140_000_000_000i64, "delta": 1,
+        }),
+    );
+    let objects_before_rejection = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len();
+    let expired = call_json(&router, Method::POST, "/v1/ingest", mixed_epoch.clone()).await;
+    assert_eq!(expired.0, StatusCode::CREATED, "{expired:?}");
+    let objects_after_correction = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len();
+    assert!(objects_after_correction > objects_before_rejection);
+    let retry = call_json(&router, Method::POST, "/v1/ingest", mixed_epoch).await;
+    assert_eq!(retry.0, StatusCode::OK, "{retry:?}");
+    assert_eq!(
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        objects_after_correction
+    );
+    let after = read_latest_standing_runtime_checkpoint(
+        &restarted,
+        &binding.standing_program_identity,
+        "correctable",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(after.checkpoint.logical_epoch > before.checkpoint.logical_epoch);
+    assert_ne!(
+        after.checkpoint.state_payload,
+        before.checkpoint.state_payload
+    );
+    let mut lower_partition_watermark = batch(0, 3, 150_000_000_000i64, 1, 180_000_000_000i64);
+    lower_partition_watermark["partition_id"] = json!(1);
+    lower_partition_watermark["event_time_watermark"]["watermark_ns"] = json!(60_000_000_000i64);
+    let regressed = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        lower_partition_watermark,
+    )
+    .await;
+    assert_eq!(regressed.0, StatusCode::BAD_REQUEST, "{regressed:?}");
+    assert!(
+        regressed.1["error"]
+            .as_str()
+            .unwrap()
+            .contains("window correction watermark cannot move backwards"),
+        "{regressed:?}"
+    );
+    assert_eq!(
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        objects_after_correction
+    );
+    let accepted_retry = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(0, 10, 10_000_000_000i64, 1, 60_000_000_000i64),
+    )
+    .await;
+    assert_eq!(
+        accepted_retry.0,
+        StatusCode::OK,
+        "accepted retry after expiry: {accepted_retry:?}"
+    );
+    let after_rejection =
+        state_for_mode(store.clone(), "api-correction-d", true, meta.clone()).await;
+    assert_eq!(
+        after_rejection
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let router = app(after_rejection);
+    let mut replacement = batch(6, 4, 150_000_000_000i64, 1, 180_000_000_000i64);
+    replacement["rows"].as_array_mut().unwrap().push(
+        json!({"user_id": "alice", "amount": 6, "event_time": 160_000_000_000i64, "delta": 1}),
+    );
+    let valid = call_json(&router, Method::POST, "/v1/ingest", replacement).await;
+    assert_eq!(
+        valid.0,
+        StatusCode::CREATED,
+        "replacement at rejected start: {valid:?}"
+    );
+    let next = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(8, 2, 170_000_000_000i64, 1, 180_000_000_000i64),
+    )
+    .await;
+    assert_eq!(next.0, StatusCode::CREATED, "next valid ingest: {next:?}");
+    let mut partition_replacement = batch(0, 3, 150_000_000_000i64, 1, 180_000_000_000i64);
+    partition_replacement["partition_id"] = json!(1);
+    let partition_valid =
+        call_json(&router, Method::POST, "/v1/ingest", partition_replacement).await;
+    assert_eq!(
+        partition_valid.0,
+        StatusCode::CREATED,
+        "replacement at rejected partition offset zero: {partition_valid:?}"
+    );
+    let final_state = state_for_mode(store, "api-correction-e", true, meta).await;
+    assert_eq!(
+        final_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        1
+    );
+    let query = call_json(
+        &app(final_state),
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total": 9, "count": 2},
+            {"user_id": "alice", "window_start": 120_000_000_000i64, "window_end": 180_000_000_000i64, "total": 23, "count": 6},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn correction_source_commit_fences_concurrent_view_creation_and_backfill() {
+    let hook = Arc::new(GuardRaceHook {
+        reached: Notify::new(),
+        release: Notify::new(),
+        fire_once: AtomicBool::new(true),
+        all_checkpoints: true,
+    });
+    let meta: Arc<dyn MetaStore> = Arc::new(
+        DurableCapabilityMetaStore::new(InMemoryMetaStore::default()).with_guard_race(hook.clone()),
+    );
+    let state = test_authoritative_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "correction-race-owner",
+        meta,
+    )
+    .await;
+    let router = app(state);
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED);
+    let request = json!({"view_id": "correctable", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end", "correction_horizon_ns": 120_000_000_000i64});
+    let created = call_json(&router, Method::POST, "/v1/views", request.clone()).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    let ingest_router = router.clone();
+    let ingest = tokio::spawn(async move {
+        call_json(&ingest_router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "correction-race-stream", "partition_id": 0, "start_offset_inclusive": 0, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 60_000_000_000i64, "watermark_ns": 60_000_000_000i64}, "rows": [{"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1}]})).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), hook.reached.notified())
+        .await
+        .unwrap();
+    let create_router = router.clone();
+    let mut request = request;
+    request["view_id"] = json!("created_during_ingest");
+    let mut create =
+        tokio::spawn(
+            async move { call_json(&create_router, Method::POST, "/v1/views", request).await },
+        );
+    let backfill_router = router.clone();
+    let mut backfill = tokio::spawn(async move {
+        call_json(
+            &backfill_router,
+            Method::POST,
+            "/v1/views/correctable/backfill",
+            json!({}),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut create)
+            .await
+            .is_err(),
+        "view creation crossed an uncommitted source cut"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut backfill)
+            .await
+            .is_err(),
+        "backfill activated before source/runtime commit completed"
+    );
+    hook.release.notify_one();
+    let ingested = tokio::time::timeout(Duration::from_secs(5), ingest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
+    let created = tokio::time::timeout(Duration::from_secs(5), create)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    let backfilled = tokio::time::timeout(Duration::from_secs(5), backfill)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(backfilled.0, StatusCode::OK, "{backfilled:?}");
+    let query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(query.1["rows"][0]["total"], 10);
+}
+
+#[tokio::test]
+async fn deploying_correction_view_accepts_far_late_input_after_partial_backfill() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = test_api_state_with_store(store.clone(), "partial-correction-owner", false).await;
+    let router = app(state.clone());
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED);
+    let batch = |offset, amount, time, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "partial-correction-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": [{"user_id": "alice", "amount": amount, "event_time": time, "delta": 1}]});
+    for input in [
+        batch(0, 10, 10_000_000_000i64, 180_000_000_000i64),
+        batch(1, 5, 190_000_000_000i64, 240_000_000_000i64),
+    ] {
+        let ingested = call_json(&router, Method::POST, "/v1/ingest", input).await;
+        assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
+    }
+    let created = call_json(&router, Method::POST, "/v1/views", json!({"view_id": "partial_correctable", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end", "correction_horizon_ns": 120_000_000_000i64})).await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    assert_eq!(created.1["query_enabled"], false);
+    let initial = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(2, 3, 250_000_000_000i64, 300_000_000_000i64),
+    )
+    .await;
+    assert_eq!(
+        initial.0,
+        StatusCode::CREATED,
+        "a deploying view without a checkpoint must admit source: {initial:?}"
+    );
+    let partial = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/partial_correctable/backfill",
+        json!({"batch_limit": 1}),
+    )
+    .await;
+    assert_eq!(partial.0, StatusCode::OK, "{partial:?}");
+    assert_eq!(partial.1["query_enabled"], false);
+    assert_eq!(partial.1["applied_batches"], 1);
+    let before = store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len();
+    let expired = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(3, 2, 20_000_000_000i64, 300_000_000_000i64),
+    )
+    .await;
+    assert_eq!(expired.0, StatusCode::CREATED, "{expired:?}");
+    assert!(
+        store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len()
+            > before
+    );
+    let valid = call_json(
+        &router,
+        Method::POST,
+        "/v1/ingest",
+        batch(4, 4, 260_000_000_000i64, 300_000_000_000i64),
+    )
+    .await;
+    assert_eq!(
+        valid.0,
+        StatusCode::CREATED,
+        "valid replacement while deploying: {valid:?}"
+    );
+    let completed = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/partial_correctable/backfill",
+        json!({}),
+    )
+    .await;
+    assert_eq!(completed.0, StatusCode::OK, "{completed:?}");
+    assert_eq!(completed.1["query_enabled"], true);
+    let query = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/partial_correctable/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(query.0, StatusCode::OK, "{query:?}");
+    assert_eq!(
+        query.1["rows"],
+        json!([
+            {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total": 12},
+            {"user_id": "alice", "window_start": 180_000_000_000i64, "window_end": 240_000_000_000i64, "total": 5},
+            {"user_id": "alice", "window_start": 240_000_000_000i64, "window_end": 300_000_000_000i64, "total": 7},
+        ])
     );
 }

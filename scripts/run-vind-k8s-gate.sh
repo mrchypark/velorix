@@ -259,19 +259,19 @@ evidence = {
         "cargo test -p velorix-k8s --test live_ingest_admission",
         "cargo test -p velorix-k8s --test live_worker_shard",
     ],
-    "scope": "vind/vCluster live Kubernetes API evidence for the exercised operator paths; run-local filesystem authority slices do not satisfy RustFS/S3-compatible object-store evidence",
+    "scope": "vind/vCluster live Kubernetes API evidence for the exercised operator paths; run-local filesystem authority slices do not satisfy Versity Gateway/S3-compatible object-store evidence",
     "limitations": [
         "ingest-admission startup preflight and run-local expiry/restart use a run-local object-store authority",
         "stream watch uses run-local filesystem object-store authority through OperatorAuthorityStartupComponents before patching Kubernetes status",
         "worker-shard live Pod runtime uses a run-local filesystem-backed object-store authority for epoch records",
         "worker-shard startup and bounded periodic resync run against vind Kubernetes but do not prove replicated-controller lifecycle management",
         "worker-shard owner handoff is exercised across two independently assembled runtimes against vind Kubernetes but does not prove production multi-pod leader election",
-        "worker-shard stale Pod replacement is exercised after release/reacquire against vind Kubernetes but does not prove RustFS/S3-compatible authority behavior",
-        "worker-shard lease-loss cleanup is exercised after a conflicting owner acquires the Lease against vind Kubernetes but does not prove multi-pod leader election or RustFS/S3-compatible authority behavior",
+        "worker-shard stale Pod replacement is exercised after release/reacquire against vind Kubernetes but does not prove Versity Gateway/S3-compatible authority behavior",
+        "worker-shard lease-loss cleanup is exercised after a conflicting owner acquires the Lease against vind Kubernetes but does not prove multi-pod leader election or Versity Gateway/S3-compatible authority behavior",
         "worker-shard restart read-back recreates checked startup components over the same local filesystem authority root",
         "ingest writer Pod topology evidence only proves controller-created Pod spec/env after checked runtime assembly; it does not prove the Pod process used checked ingest runtime or completed an append",
         "does not exercise distributed or multi-pod admission races",
-        "does not prove worker-shard epoch durability on a RustFS/S3-compatible authority, multi-pod restart, or broader operator lifecycle management",
+        "does not prove worker-shard epoch durability on a Versity Gateway/S3-compatible authority, multi-pod restart, or broader operator lifecycle management",
     ],
 }
 with open(path, "w", encoding="utf-8") as f:

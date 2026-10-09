@@ -79,13 +79,13 @@ checks = {
         and 'backend_time_source_kind=process_clock' in doc
         and 'production_bounded_failover_safe=false' in doc
     ),
-    "first-E2E can pass external object-store durability attestation but rejects local RustFS attestation": (
+    "first-E2E can pass external object-store durability attestation but rejects local Versity Gateway attestation": (
         "VELORIX_FIRST_E2E_PRODUCT_OBJECT_STORE_DURABILITY_ATTESTATION_FILE" in script
         and "VELORIX_OBJECT_STORE_DURABILITY_ATTESTATION_FILE" in script
         and "product_object_store_durability_attestation_file" in script
         and "VELORIX_OBJECT_STORE_DURABILITY_ATTESTATION_FILE=$product_object_store_durability_attestation_file" in script
         and "cannot be used with" in script
-        and "internally generated first-E2E RustFS authority" in script
+        and "internally generated first-E2E Versity Gateway authority" in script
         and "VELORIX_FIRST_E2E_PRODUCT_OBJECT_STORE_DURABILITY_ATTESTATION_FILE" in doc
         and "object-store-durability-attestation.json" in doc
     ),
@@ -102,57 +102,57 @@ checks = {
         and "VELORIX_FIRST_E2E_PRODUCT_EVIDENCE_LEVEL=product-complete" in doc
         and "ingress-tls-auth-attestation.json" in doc
     ),
-    "keeps RustFS production GC artifact family together": (
+    "keeps Versity Gateway production GC artifact family together": (
         "production_gc_seed_evidence=" in script
         and "production_gc_run_evidence=" in script
         and "production_gc_validation_evidence=" in script
         and "VELORIX_FIRST_E2E_PRODUCTION_GC_SEED_EVIDENCE" in script
         and "VELORIX_FIRST_E2E_PRODUCTION_GC_RUN_EVIDENCE" in script
         and "VELORIX_FIRST_E2E_PRODUCTION_GC_VALIDATION_EVIDENCE" in script
-        and "VELORIX_RUSTFS_PRODUCTION_GC_SEED_PATH=$production_gc_seed_evidence" in script
-        and "VELORIX_RUSTFS_PRODUCTION_GC_RUN_PATH=$production_gc_run_evidence" in script
-        and "VELORIX_RUSTFS_PRODUCTION_GC_VALIDATION_PATH=$production_gc_validation_evidence" in script
+        and "VELORIX_VERSITYGW_PRODUCTION_GC_SEED_PATH=$production_gc_seed_evidence" in script
+        and "VELORIX_VERSITYGW_PRODUCTION_GC_RUN_PATH=$production_gc_run_evidence" in script
+        and "VELORIX_VERSITYGW_PRODUCTION_GC_VALIDATION_PATH=$production_gc_validation_evidence" in script
         and 'require_file "$production_gc_seed_evidence"' in script
         and 'require_file "$production_gc_run_evidence"' in script
         and 'require_file "$production_gc_validation_evidence"' in script
-        and '--rustfs-production-gc-validation-evidence "$production_gc_validation_evidence"'
+        and '--versitygw-production-gc-validation-evidence "$production_gc_validation_evidence"'
         in script
         and "production_gc_validation_evidence={production_gc_validation_path}" in script
-        and "rustfs_production_gc_evidence_family_validated" in script
+        and "versitygw_production_gc_evidence_family_validated" in script
     ),
-    "shares non-default RustFS credentials with product slice": (
-        "rustfs_access_key=" in script
-        and "rustfs_secret_key=" in script
-        and "rustfs_credentials_explicit=0" in script
-        and "VELORIX_RUSTFS_ACCESS_KEY and VELORIX_RUSTFS_SECRET_KEY must be set together"
+    "shares non-default Versity Gateway credentials with product slice": (
+        "versitygw_access_key=" in script
+        and "versitygw_secret_key=" in script
+        and "versitygw_credentials_explicit=0" in script
+        and "VELORIX_VERSITYGW_ACCESS_KEY and VELORIX_VERSITYGW_SECRET_KEY must be set together"
         in script
-        and "VELORIX_RUSTFS_ACCESS_KEY=$rustfs_access_key" in script
-        and "VELORIX_RUSTFS_SECRET_KEY=$rustfs_secret_key" in script
-        and 'product_aws_access_key_id="$rustfs_access_key"'
+        and "VELORIX_VERSITYGW_ACCESS_KEY=$versitygw_access_key" in script
+        and "VELORIX_VERSITYGW_SECRET_KEY=$versitygw_secret_key" in script
+        and 'product_aws_access_key_id="$versitygw_access_key"'
         in script
-        and 'product_aws_secret_access_key="$rustfs_secret_key"'
+        and 'product_aws_secret_access_key="$versitygw_secret_key"'
         in script
-        and "RustFS default credentials are not allowed for first-E2E readiness"
+        and "Versity Gateway default credentials are not allowed for first-E2E readiness"
         in script
     ),
-    "fails fast when reusing RustFS product backend without matching credentials": (
-        "VELORIX_FIRST_E2E_SKIP_RUSTFS=1 with RustFS product evidence requires explicit matching S3 credentials"
+    "fails fast when reusing Versity Gateway product backend without matching credentials": (
+        "VELORIX_FIRST_E2E_SKIP_VERSITYGW=1 with Versity Gateway product evidence requires explicit matching S3 credentials"
         in script
         and "VELORIX_FIRST_E2E_PRODUCT_AWS_ACCESS_KEY_ID and VELORIX_FIRST_E2E_PRODUCT_AWS_SECRET_ACCESS_KEY must be set together"
         in script
-        and "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together for RustFS product evidence"
+        and "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together for Versity Gateway product evidence"
         in script
-        and 'elif [ "$skip_rustfs" = "0" ] || [ "$rustfs_credentials_explicit" = "1" ]; then'
+        and 'elif [ "$skip_versitygw" = "0" ] || [ "$versitygw_credentials_explicit" = "1" ]; then'
         in script
     ),
     "release checklist documents product lifecycle default": (
         "target/velorix-product/ingest-writer-lifecycle-attestation.json" in doc
         and "VELORIX_FIRST_E2E_INGEST_WRITER_LIFECYCLE_EVIDENCE" in doc
-        and "target/release-evidence/rustfs-production-gc-seed.json" in doc
-        and "target/release-evidence/rustfs-production-gc-run.json" in doc
-        and "target/release-evidence/rustfs-production-gc-validation.json" in doc
-        and "--rustfs-production-gc-validation-evidence" in doc
-        and "non-default RustFS credentials" in doc
+        and "target/release-evidence/versitygw-production-gc-seed.json" in doc
+        and "target/release-evidence/versitygw-production-gc-run.json" in doc
+        and "target/release-evidence/versitygw-production-gc-validation.json" in doc
+        and "--versitygw-production-gc-validation-evidence" in doc
+        and "non-default Versity Gateway credentials" in doc
         and "requires explicit matching S3 credentials" in doc
     ),
 }

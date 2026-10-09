@@ -4,7 +4,7 @@
 Kubernetes API for CRD apply and k8s crate smoke testing without making
 Kubernetes the database authority. Velorix treats vind gate runs as live
 Kubernetes evidence for the exercised operator paths; object-store authority
-evidence still has to come from RustFS/S3-compatible storage instead of the
+evidence still has to come from Versity Gateway/S3-compatible storage instead of the
 run-local filesystem slices used by some tests.
 
 Prerequisites:
@@ -89,7 +89,7 @@ that cluster on exit, and writes
 `target/velorix-k8s/vind-k8s-gate-evidence.json` with the cluster context,
 namespace, applied CRDs, tool versions, and live k8s test set. The artifact is
 writes live Kubernetes evidence for the exercised paths, but it does not by
-itself claim multi-pod production ingest-admission readiness or RustFS/S3-backed
+itself claim multi-pod production ingest-admission readiness or Versity Gateway/S3-backed
 object-store authority. On failure, the gate
 writes `target/velorix-k8s/vind-k8s-gate-diagnostics.txt` before cleaning up
 owned resources.

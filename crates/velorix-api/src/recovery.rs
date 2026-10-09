@@ -113,6 +113,7 @@ pub(super) async fn migrate_legacy_single_key_runtime(
             ApiError::service_unavailable("legacy runtime rebuild requires owner fencing")
         })?;
     let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
+        state,
         Arc::clone(&shared_runtime),
         lower_bound_epoch,
         idempotency_key,
@@ -142,12 +143,18 @@ pub(super) async fn migrate_legacy_single_key_runtime(
             replay_checkpoints,
             Some(owner),
         )
+        .with_event_time_state(apply_result.staged_event_time_state.clone())
         .with_input_coverage(coverage)
         .replacing_replay_coverage()
         .with_expected_relation_source_cuts(source_cuts),
         None,
     )
     .await?;
+    shared_runtime
+        .lock()
+        .map_err(|_| ApiError::internal("legacy runtime rebuild lock poisoned"))?
+        .acknowledge_event_time_state(&apply_result.staged_event_time_state)
+        .map_err(ApiError::bad_request)?;
     let runtime = Arc::try_unwrap(shared_runtime)
         .map_err(|_| ApiError::internal("legacy runtime rebuild runtime still referenced"))?
         .into_inner()
@@ -556,6 +563,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             ))
             .map_err(ApiError::bad_request)?;
             let apply_result = match apply_standing_runtime_changes_and_checkpoint(
+                state,
                 Arc::clone(&runtime),
                 descriptor.end_offset_exclusive,
                 idempotency_key,
@@ -586,6 +594,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
                     )],
                     owner,
                 )
+                .with_event_time_state(apply_result.staged_event_time_state.clone())
                 .with_published_relation(published_relation_binding_for_active_view(active)?),
                 None,
             )
@@ -609,6 +618,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
         ))
         .map_err(ApiError::bad_request)?;
         let apply_result = match apply_standing_runtime_changes_and_checkpoint_many(
+            state,
             Arc::clone(&runtime),
             coalesced_lower_bound_epoch,
             idempotency_key,
@@ -629,6 +639,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             &apply_result.checkpoint,
             &apply_result.output_deltas,
             StandingRuntimeCheckpointPersistContext::new(None, coalesced_replay_checkpoints, owner)
+                .with_event_time_state(apply_result.staged_event_time_state.clone())
                 .with_published_relation(published_relation_binding_for_active_view(active)?),
             None,
         )
@@ -815,7 +826,7 @@ pub(super) async fn read_relation_catalog(
 /// Reads authoritative ingest only through Meta's committed relation source
 /// cut. Staging objects are opaque until a committed publication reference is
 /// returned, and every referenced object is read with its exact digest.
-async fn read_replay_ingest_batches(
+pub(super) async fn read_replay_ingest_batches(
     state: &ApiState,
     active: &ActiveMaterializedView,
     replay_plan: &StandingRuntimeReplayPlan,

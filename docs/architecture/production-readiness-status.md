@@ -14,7 +14,7 @@ cargo run -p velorix-cli -- readiness-report \
   --release-commit "$RELEASE_COMMIT" \
   --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
   --production-gc-run-evidence "$PRODUCTION_GC_RELEASE_PATH" \
-  --rustfs-production-gc-validation-evidence "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH" \
+  --versitygw-production-gc-validation-evidence "$VERSITYGW_PRODUCTION_GC_RECHECKED_PATH" \
   --ingest-writer-lifecycle-evidence "$INGEST_WRITER_LIFECYCLE_RELEASE_PATH" \
   --standing-runtime-product-evidence "$STANDING_RUNTIME_PRODUCT_RELEASE_PATH" \
   --s3-checkpoint-fault-matrix-evidence "$VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH" \
@@ -30,11 +30,14 @@ required artifacts were missing, local-only, stale, or failed their artifact
 requirements. The release decision must come from the generated readiness report
 and its concrete evidence artifacts, not from this file.
 
-RustFS production GC evidence is currently blocked: `gc-execute-s3-compatible`
+Fresh Versity Gateway production evidence is pending; historical RustFS evidence
+must not be relabeled as a successful Versity Gateway run.
+
+Versity Gateway production GC evidence is currently blocked: `gc-execute-s3-compatible`
 must not be treated as available while the durable cross-process coordinator is
 absent, and no live `GcRunV1` deletion evidence is claimed. The seed/planning
 fixture, historical evidence reads, and retention-debt accounting remain
 available. Once coordination is implemented and accepted,
 `gc-production-evidence` can emit the verification artifact and
-`rustfs-production-gc-evidence-validate` can bind seed, execute, and production
+`versitygw-production-gc-evidence-validate` can bind seed, execute, and production
 evidence to one authority, run id, retention policy, and persisted-run digest.

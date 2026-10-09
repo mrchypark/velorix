@@ -70,7 +70,7 @@ Optional:
   VELORIX_EXTERNAL_S3_RUN_PRODUCT=0
 
 This wrapper is for real external object-store authorities, not local Docker
-RustFS. It rejects localhost-style endpoints by default, writes a target-backed
+Versity Gateway. It rejects localhost-style endpoints by default, writes a target-backed
 input evidence file, then delegates to scripts/run-vind-product.sh with
 VELORIX_OBJECT_STORE_MODE=external-s3 and
 VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY=0.
@@ -351,7 +351,7 @@ except ValueError:
 if is_local and not allow_local:
     raise SystemExit(
         "AWS_ENDPOINT_URL looks like a local development endpoint; use "
-        "scripts/run-vind-product-external-rustfs.sh for local RustFS or set "
+        "scripts/run-vind-product-external-versitygw.sh for local Versity Gateway or set "
         "VELORIX_EXTERNAL_S3_ALLOW_LOCAL_ENDPOINT=1 only for diagnostics"
     )
 if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket):

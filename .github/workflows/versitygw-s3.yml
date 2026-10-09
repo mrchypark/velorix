@@ -1,0 +1,43 @@
+name: Versity Gateway S3-Compatible Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      versitygw-image:
+        description: Versity Gateway image pinned to a sha256 digest for the S3-compatible gate.
+        required: false
+        default: versity/versitygw:v1.8.0@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499
+
+env:
+  CARGO_TERM_COLOR: always
+  VELORIX_VERSITYGW_IMAGE: ${{ inputs.versitygw-image }}
+  VELORIX_VERSITYGW_EVIDENCE_PATH: target/velorix-s3/versitygw-s3-gate-evidence.json
+
+jobs:
+  versitygw-s3:
+    name: Versity Gateway S3-compatible gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install JSON evidence writer
+        run: sudo apt-get install -y --no-install-recommends jq
+
+      - name: Run Versity Gateway S3-compatible gate
+        run: scripts/run-versitygw-s3-gate.sh
+
+      - name: Upload Versity Gateway S3-compatible evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: versitygw-s3-compatible-evidence
+          path: |
+            target/velorix-s3/versitygw-s3-gate-evidence.json
+          if-no-files-found: warn

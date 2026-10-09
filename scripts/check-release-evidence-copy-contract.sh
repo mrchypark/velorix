@@ -135,22 +135,22 @@ product = {
 }
 (src / "lifecycle.json").write_text(json.dumps(lifecycle), encoding="utf-8")
 (src / "product.json").write_text(json.dumps(product), encoding="utf-8")
-(src / "rustfs-s3-gate-evidence.json").write_text("{}\n", encoding="utf-8")
-(src / "rustfs-production-gc-seed.json").write_text("{}\n", encoding="utf-8")
-(src / "rustfs-production-gc-run.json").write_text("{}\n", encoding="utf-8")
-(src / "rustfs-production-gc.json").write_text("{}\n", encoding="utf-8")
-(src / "rustfs-production-gc-validation.json").write_text(
+(src / "versitygw-s3-gate-evidence.json").write_text("{}\n", encoding="utf-8")
+(src / "versitygw-production-gc-seed.json").write_text("{}\n", encoding="utf-8")
+(src / "versitygw-production-gc-run.json").write_text("{}\n", encoding="utf-8")
+(src / "versitygw-production-gc.json").write_text("{}\n", encoding="utf-8")
+(src / "versitygw-production-gc-validation.json").write_text(
     json.dumps(
         {
             "schema_version": 1,
             "status": "pass",
-            "evidence_kind": "rustfs_production_gc_evidence_family_validated",
-            "gate_evidence_path": "target/velorix-s3/rustfs-s3-gate-evidence.json",
-            "seed_evidence_path": "target/release-evidence/rustfs-production-gc-seed.json",
-            "execute_evidence_path": "target/release-evidence/rustfs-production-gc-run.json",
-            "production_evidence_path": "target/release-evidence/rustfs-production-gc.json",
+            "evidence_kind": "versitygw_production_gc_evidence_family_validated",
+            "gate_evidence_path": "target/velorix-s3/versitygw-s3-gate-evidence.json",
+            "seed_evidence_path": "target/release-evidence/versitygw-production-gc-seed.json",
+            "execute_evidence_path": "target/release-evidence/versitygw-production-gc-run.json",
+            "production_evidence_path": "target/release-evidence/versitygw-production-gc.json",
             "checks": [
-                "rustfs_s3_compatible_gate_present",
+                "versitygw_s3_compatible_gate_present",
                 "seed_fixture_created_retired_checkpoint_state",
                 "s3_gc_execute_deleted_seeded_candidate",
                 "production_gc_evidence_verified_listing_retention_and_transition",
@@ -213,17 +213,17 @@ copied_product = subprocess.check_output(
     ],
     text=True,
 ).strip()
-copied_rustfs_gc = subprocess.check_output(
+copied_versitygw_gc = subprocess.check_output(
     [
         str(helper),
         "--kind",
-        "rustfs-production-gc",
+        "versitygw-production-gc",
         "--artifact",
-        str(src / "rustfs-production-gc-validation.json"),
+        str(src / "versitygw-production-gc-validation.json"),
         "--out-dir",
-        str(out / "rustfs-production-gc"),
+        str(out / "versitygw-production-gc"),
         "--artifact-name",
-        "rustfs-production-gc-validation.json",
+        "versitygw-production-gc-validation.json",
     ],
     text=True,
 ).strip()
@@ -231,11 +231,11 @@ copied_rustfs_gc = subprocess.check_output(
 required = [
     Path(copied_lifecycle),
     Path(copied_product),
-    Path(copied_rustfs_gc),
-    out / "rustfs-production-gc" / "rustfs-s3-gate-evidence.json",
-    out / "rustfs-production-gc" / "rustfs-production-gc-seed.json",
-    out / "rustfs-production-gc" / "rustfs-production-gc-run.json",
-    out / "rustfs-production-gc" / "rustfs-production-gc.json",
+    Path(copied_versitygw_gc),
+    out / "versitygw-production-gc" / "versitygw-s3-gate-evidence.json",
+    out / "versitygw-production-gc" / "versitygw-production-gc-seed.json",
+    out / "versitygw-production-gc" / "versitygw-production-gc-run.json",
+    out / "versitygw-production-gc" / "versitygw-production-gc.json",
     *(out / "lifecycle" / filename for filename in lifecycle_files.values()),
     *(out / "product" / filename for filename in lifecycle_files.values()),
     *(out / "product" / filename for filename in query_policy_files.values()),
@@ -359,24 +359,24 @@ run_helper_expect_fail(
     "ingest-writer-job-log.json",
 )
 
-missing_rustfs_gc_src = scratch_dir / "missing-rustfs-gc-src"
-missing_rustfs_gc_src.mkdir()
+missing_versitygw_gc_src = scratch_dir / "missing-versitygw-gc-src"
+missing_versitygw_gc_src.mkdir()
 for path in src.iterdir():
     if path.is_file():
-        (missing_rustfs_gc_src / path.name).write_bytes(path.read_bytes())
-(missing_rustfs_gc_src / "rustfs-production-gc-run.json").unlink()
+        (missing_versitygw_gc_src / path.name).write_bytes(path.read_bytes())
+(missing_versitygw_gc_src / "versitygw-production-gc-run.json").unlink()
 run_helper_expect_fail(
     [
         "--kind",
-        "rustfs-production-gc",
+        "versitygw-production-gc",
         "--artifact",
-        str(missing_rustfs_gc_src / "rustfs-production-gc-validation.json"),
+        str(missing_versitygw_gc_src / "versitygw-production-gc-validation.json"),
         "--out-dir",
-        str(scratch_dir / "missing-rustfs-gc-out"),
+        str(scratch_dir / "missing-versitygw-gc-out"),
         "--artifact-name",
-        "rustfs-production-gc-validation.json",
+        "versitygw-production-gc-validation.json",
     ],
-    "rustfs-production-gc-run.json",
+    "versitygw-production-gc-run.json",
 )
 
 invalid_src = scratch_dir / "invalid-src"
@@ -517,10 +517,10 @@ run_helper_expect_fail(
 
 workflow = workflow_path.read_text(encoding="utf-8")
 workflow_checks = {
-    "workflow requires RustFS production GC validation input": (
-        "rustfs-production-gc-validation-evidence-path" in workflow
-        and "RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH" in workflow
-        and "release gate requires inputs.rustfs-production-gc-validation-evidence-path"
+    "workflow requires Versity Gateway production GC validation input": (
+        "versitygw-production-gc-validation-evidence-path" in workflow
+        and "VERSITYGW_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH" in workflow
+        and "release gate requires inputs.versitygw-production-gc-validation-evidence-path"
         in workflow
     ),
     "workflow requires image subject digests for trusted release provenance": (
@@ -541,29 +541,29 @@ workflow_checks = {
         and '--standing-runtime-product-evidence "$STANDING_RUNTIME_PRODUCT_RELEASE_PATH"'
         in workflow
     ),
-    "workflow copies RustFS production GC family": (
-        "--kind rustfs-production-gc" in workflow
-        and "--out-dir target/release-evidence/rustfs-production-gc" in workflow
-        and "RUSTFS_PRODUCTION_GC_VALIDATION_RELEASE_PATH" in workflow
+    "workflow copies Versity Gateway production GC family": (
+        "--kind versitygw-production-gc" in workflow
+        and "--out-dir target/release-evidence/versitygw-production-gc" in workflow
+        and "VERSITYGW_PRODUCTION_GC_VALIDATION_RELEASE_PATH" in workflow
         and "PRODUCTION_GC_RELEASE_PATH" in workflow
     ),
-    "workflow validates copied RustFS production GC family": (
+    "workflow validates copied Versity Gateway production GC family": (
         'cmp -s "$PRODUCTION_GC_EVIDENCE_PATH" "$PRODUCTION_GC_RELEASE_PATH"' in workflow
-        and "rustfs-production-gc-evidence-validate" in workflow
-        and "--gate-evidence target/release-evidence/rustfs-production-gc/rustfs-s3-gate-evidence.json"
+        and "versitygw-production-gc-evidence-validate" in workflow
+        and "--gate-evidence target/release-evidence/versitygw-production-gc/versitygw-s3-gate-evidence.json"
         in workflow
-        and "--seed-evidence target/release-evidence/rustfs-production-gc/rustfs-production-gc-seed.json"
+        and "--seed-evidence target/release-evidence/versitygw-production-gc/versitygw-production-gc-seed.json"
         in workflow
-        and "--execute-evidence target/release-evidence/rustfs-production-gc/rustfs-production-gc-run.json"
+        and "--execute-evidence target/release-evidence/versitygw-production-gc/versitygw-production-gc-run.json"
         in workflow
         and '--production-evidence "$PRODUCTION_GC_RELEASE_PATH"' in workflow
-        and "rustfs-production-gc-validation-rechecked.json" in workflow
+        and "versitygw-production-gc-validation-rechecked.json" in workflow
         and '--production-gc-run-evidence "$PRODUCTION_GC_RELEASE_PATH"' in workflow
-        and '--rustfs-production-gc-validation-evidence "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH"'
+        and '--versitygw-production-gc-validation-evidence "$VERSITYGW_PRODUCTION_GC_RECHECKED_PATH"'
         in workflow
     ),
-    "workflow uploads RustFS production GC family directory": (
-        "target/release-evidence/rustfs-production-gc/**" in workflow
+    "workflow uploads Versity Gateway production GC family directory": (
+        "target/release-evidence/versitygw-production-gc/**" in workflow
     ),
     "workflow copies lifecycle siblings": (
         "scripts/copy-readiness-sibling-evidence.py \\" in workflow

@@ -63,7 +63,7 @@ the membership document, a log line, or diagnostics.
 `VELORIX_RHIZA_PEER_ADDR` is the native bind address (`host:port`); the
 `quic://` scheme belongs only in the member `peer_url`. For the native
 S3-compatible provider, `VELORIX_RHIZA_OBJECT_STORE_ENDPOINT` is also a host
-and port (for example `rustfs:9000`), with
+and port (for example `versitygw:9000`), with
 `VELORIX_RHIZA_OBJECT_STORE_INSECURE=1` selecting HTTP.
 
 This contract is greenfield. A run starts from a fresh empty

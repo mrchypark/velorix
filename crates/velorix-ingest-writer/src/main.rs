@@ -3220,7 +3220,7 @@ mod tests {
     fn s3_compatible_authority_config_reads_required_env_when_enabled() {
         let config = s3_compatible_authority_config_from_lookup(|name| match name {
             "VELORIX_S3_COMPAT" => Some("1".to_string()),
-            "AWS_ENDPOINT_URL" => Some("http://rustfs:9000".to_string()),
+            "AWS_ENDPOINT_URL" => Some("http://versitygw:9000".to_string()),
             "AWS_ACCESS_KEY_ID" => Some("access".to_string()),
             "AWS_SECRET_ACCESS_KEY" => Some("secret".to_string()),
             "AWS_REGION" => Some("us-east-1".to_string()),
@@ -3233,7 +3233,7 @@ mod tests {
         assert_eq!(
             config,
             S3CompatibleAuthorityConfig {
-                endpoint: "http://rustfs:9000".to_string(),
+                endpoint: "http://versitygw:9000".to_string(),
                 access_key_id: "access".to_string(),
                 secret_access_key: "secret".to_string(),
                 session_token: None,

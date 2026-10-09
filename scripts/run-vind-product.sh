@@ -56,12 +56,12 @@ load_existing_images="${VELORIX_LOAD_EXISTING_IMAGES:-0}"
 ingest_writer_smoke="${VELORIX_INGEST_WRITER_SMOKE:-1}"
 multi_replica_fencing_smoke="${VELORIX_MULTI_REPLICA_FENCING_SMOKE:-1}"
 standing_runtime_failover_smoke="${VELORIX_STANDING_RUNTIME_FAILOVER_SMOKE:-auto}"
-object_store_mode="${VELORIX_OBJECT_STORE_MODE:-rustfs}"
+object_store_mode="${VELORIX_OBJECT_STORE_MODE:-versitygw}"
 object_store_local_development_authority="${VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY:-0}"
 external_s3_validate="${VELORIX_EXTERNAL_S3_VALIDATE:-1}"
 s3_force_path_style="${VELORIX_S3_FORCE_PATH_STYLE:-1}"
-rustfs_image="${VELORIX_RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.4}"
-allow_mutable_rustfs_image="${VELORIX_ALLOW_MUTABLE_RUSTFS_IMAGE:-0}"
+versitygw_image="${VELORIX_VERSITYGW_IMAGE:-versity/versitygw:v1.8.0}"
+allow_mutable_versitygw_image="${VELORIX_ALLOW_MUTABLE_VERSITYGW_IMAGE:-0}"
 api_local_port="${VELORIX_API_LOCAL_PORT:-8080}"
 api_tls_enabled="${VELORIX_API_TLS_ENABLED:-1}"
 api_tls_local_port="${VELORIX_API_TLS_LOCAL_PORT:-8443}"
@@ -241,7 +241,7 @@ Main overrides:
   VELORIX_META_IMAGE=velorix-meta:product
   VELORIX_BUILD_META_IMAGE=1
   VELORIX_META_MODE=development
-  VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=0  # set 1 only for ephemeral local-development RustFS + durable authenticated Meta
+  VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=0  # set 1 only for ephemeral local-development Versity Gateway + durable authenticated Meta
   VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK=0  # set 1 only for a restricted existing remote context ephemeral test
   VELORIX_META_BACKEND=memory
   VELORIX_INGEST_WRITER_IMAGE=velorix-ingest-writer:product
@@ -250,15 +250,15 @@ Main overrides:
   VELORIX_LOAD_EXISTING_IMAGES=0  # set 1 with BUILD_*_IMAGE=0 to load local images into the selected product cluster
   VELORIX_IMAGE_PULL_SECRET=<optional namespace-scoped imagePullSecret for immutable external images>
   VELORIX_INGEST_WRITER_SMOKE=1
-  VELORIX_OBJECT_STORE_MODE=rustfs  # or external-s3
+  VELORIX_OBJECT_STORE_MODE=versitygw  # or external-s3
   VELORIX_EXTERNAL_S3_VALIDATE=1
   VELORIX_META_BEARER_TOKEN=<generated when unset>
-  VELORIX_RUSTFS_IMAGE=rustfs/rustfs:1.0.0-beta.4
-  VELORIX_ALLOW_MUTABLE_RUSTFS_IMAGE=0
+  VELORIX_VERSITYGW_IMAGE=versity/versitygw:v1.8.0
+  VELORIX_ALLOW_MUTABLE_VERSITYGW_IMAGE=0
   VELORIX_MULTI_REPLICA_FENCING_SMOKE=1
   AWS_ENDPOINT_URL=<required when VELORIX_OBJECT_STORE_MODE=external-s3>
-  AWS_ACCESS_KEY_ID=<required with AWS_SECRET_ACCESS_KEY for external-s3; unset both for local RustFS generation>
-  AWS_SECRET_ACCESS_KEY=<required with AWS_ACCESS_KEY_ID for external-s3; unset both for local RustFS generation>
+  AWS_ACCESS_KEY_ID=<required with AWS_SECRET_ACCESS_KEY for external-s3; unset both for local Versity Gateway generation>
+  AWS_SECRET_ACCESS_KEY=<required with AWS_ACCESS_KEY_ID for external-s3; unset both for local Versity Gateway generation>
   VELORIX_API_LOCAL_PORT=18080
   VELORIX_API_TLS_ENABLED=1
   VELORIX_API_TLS_LOCAL_PORT=18443
@@ -1139,12 +1139,12 @@ case "$api_tls_enabled" in
 esac
 
 case "$object_store_mode" in
-  rustfs | local-rustfs)
-    object_store_mode="rustfs"
-    s3_endpoint="http://rustfs:9000"
-    s3_backend_label="rustfs"
+  versitygw | local-versitygw)
+    object_store_mode="versitygw"
+    s3_endpoint="http://versitygw:9000"
+    s3_backend_label="versitygw"
     s3_durability_label="ephemeral-emptyDir"
-    s3_authority_store_id="${VELORIX_AUTHORITY_STORE_ID:-s3://rustfs/${bucket}/${s3_prefix}}"
+    s3_authority_store_id="${VELORIX_AUTHORITY_STORE_ID:-s3://versitygw/${bucket}/${s3_prefix}}"
     ;;
   external-s3 | external-s3-compatible | external-oss | oss)
     object_store_mode="external-s3"
@@ -1158,7 +1158,7 @@ case "$object_store_mode" in
     s3_authority_store_id="${VELORIX_AUTHORITY_STORE_ID:-s3://external/${bucket}/${s3_prefix}}"
     ;;
   *)
-    echo "VELORIX_OBJECT_STORE_MODE must be rustfs or external-s3" >&2
+    echo "VELORIX_OBJECT_STORE_MODE must be versitygw or external-s3" >&2
     exit 64
     ;;
 esac
@@ -1362,16 +1362,16 @@ case "$vcluster_create_retries" in
     ;;
 esac
 
-case "$allow_mutable_rustfs_image" in
+case "$allow_mutable_versitygw_image" in
   0 | 1) ;;
   *)
-    echo "VELORIX_ALLOW_MUTABLE_RUSTFS_IMAGE must be 0 or 1" >&2
+    echo "VELORIX_ALLOW_MUTABLE_VERSITYGW_IMAGE must be 0 or 1" >&2
     exit 64
     ;;
 esac
 
-if [ "$object_store_mode" = "rustfs" ] && [ "$allow_mutable_rustfs_image" != "1" ] && is_mutable_image_reference "$rustfs_image"; then
-  echo "VELORIX_RUSTFS_IMAGE must use a version tag or digest; set VELORIX_ALLOW_MUTABLE_RUSTFS_IMAGE=1 to use ${rustfs_image}" >&2
+if [ "$object_store_mode" = "versitygw" ] && [ "$allow_mutable_versitygw_image" != "1" ] && is_mutable_image_reference "$versitygw_image"; then
+  echo "VELORIX_VERSITYGW_IMAGE must use a version tag or digest; set VELORIX_ALLOW_MUTABLE_VERSITYGW_IMAGE=1 to use ${versitygw_image}" >&2
   exit 64
 fi
 
@@ -1385,7 +1385,7 @@ if [ "$s3_credentials_secret_managed" = "0" ]; then
     exit 64
   fi
   s3_credentials_source="existing-kubernetes-secret"
-elif [ -z "$aws_access_key_id" ] && [ -z "$aws_secret_access_key" ] && [ "$object_store_mode" = "rustfs" ]; then
+elif [ -z "$aws_access_key_id" ] && [ -z "$aws_secret_access_key" ] && [ "$object_store_mode" = "versitygw" ]; then
   aws_access_key_id="$(
     python3 - <<'PY'
 import secrets
@@ -1405,7 +1405,7 @@ elif [ -z "$aws_access_key_id" ] || [ -z "$aws_secret_access_key" ]; then
   if [ "$object_store_mode" = "external-s3" ]; then
 echo "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required together when VELORIX_OBJECT_STORE_MODE=external-s3 unless VELORIX_S3_CREDENTIALS_SECRET_MANAGED=0 uses an existing Kubernetes Secret" >&2
   else
-    echo "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be supplied together, or both left unset for generated RustFS credentials" >&2
+    echo "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be supplied together, or both left unset for generated Versity Gateway credentials" >&2
   fi
   exit 64
 fi
@@ -1422,8 +1422,8 @@ known_default_pairs = {
 }
 if (access_key, secret_key) in known_default_pairs:
     hint = (
-        "leave both unset to generate local RustFS credentials"
-        if object_store_mode == "rustfs"
+        "leave both unset to generate local Versity Gateway credentials"
+        if object_store_mode == "versitygw"
         else "supply non-default external object-store credentials"
     )
     raise SystemExit(
@@ -1650,11 +1650,11 @@ if { [ "$meta_mode" = "development" ] || [ "$meta_mode" = "dev" ]; } \
     || [ -n "${VELORIX_S3_PREFIX+x}" ] \
     || [ -n "${VELORIX_META_S3_PREFIX+x}" ] \
     || [ "$object_store_local_development_authority" != "1" ] \
-    || [ "$object_store_mode" != "rustfs" ] \
+    || [ "$object_store_mode" != "versitygw" ] \
     || [ "$meta_backend" = "memory" ] \
     || [ "$meta_backend" = "in-memory" ] \
     || [ -z "$meta_bearer_token" ]; then
-    echo "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1 requires ephemeral state (preserve_state=0 with no shared S3 prefix), local-development RustFS authority, a durable Meta backend, and bearer authentication" >&2
+    echo "VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=1 requires ephemeral state (preserve_state=0 with no shared S3 prefix), local-development Versity Gateway authority, a durable Meta backend, and bearer authentication" >&2
     exit 64
   fi
   meta_bind="0.0.0.0:9090"
@@ -1948,7 +1948,7 @@ validate_remote_ephemeral_gate() {
   fi
   if [ "$reuse_existing" != "1" ] \
     || [ "$preserve_state" != "0" ] \
-    || [ "$object_store_mode" != "rustfs" ] \
+    || [ "$object_store_mode" != "versitygw" ] \
     || [ "$object_store_local_development_authority" != "1" ] \
     || [ -n "${VELORIX_S3_PREFIX+x}" ] \
     || [ -n "${VELORIX_META_S3_PREFIX+x}" ] \
@@ -1956,7 +1956,7 @@ validate_remote_ephemeral_gate() {
     || [ "$meta_backend" = "in-memory" ] \
     || [ -z "$meta_bearer_token" ] \
     || [ "$api_replica_count" != "1" ]; then
-    echo "remote Meta non-loopback validation requires reuse_existing=1, preserve_state=0, internal ephemeral RustFS, no shared prefixes, durable authenticated Meta, and api_replica_count=1" >&2
+    echo "remote Meta non-loopback validation requires reuse_existing=1, preserve_state=0, internal ephemeral Versity Gateway, no shared prefixes, durable authenticated Meta, and api_replica_count=1" >&2
     return 1
   fi
   remote_ephemeral_test_mode=1
@@ -5961,14 +5961,14 @@ if ingress_tls_auth_attestation_validated != "1":
             "REST API bearer auth exists, but product-complete ingress/TLS/auth evidence is outside this script"
         )
 if object_store_mode != "external-s3":
-    product_complete_blockers.append("RustFS is deployed with emptyDir, so object-store state is ephemeral across pod loss")
+    product_complete_blockers.append("Versity Gateway is deployed with emptyDir, so object-store state is ephemeral across pod loss")
 elif external_s3_bucket_validated != "1":
     product_complete_blockers.append("external S3-compatible bucket reachability was not validated from inside the cluster")
 elif external_s3_prefix_validated != "1":
     product_complete_blockers.append("external S3-compatible authority prefix read/write/list/delete was not validated from inside the cluster")
 elif object_store_local_development_authority == "1":
     product_complete_blockers.append(
-        "external S3-compatible authority is local development RustFS and cannot prove production durability policy"
+        "external S3-compatible authority is local development Versity Gateway and cannot prove production durability policy"
     )
 elif object_store_durability_attestation_validated != "1":
     product_complete_blockers.append("external S3-compatible authority lacks operator-reviewed durability policy attestation")
@@ -6530,42 +6530,53 @@ else
               value: "1"'
 fi
 
-if [ "$object_store_mode" = "rustfs" ]; then
-cat >"${output_dir}/rustfs.yaml" <<EOF
+if [ "$object_store_mode" = "versitygw" ]; then
+cat >"${output_dir}/versitygw.yaml" <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rustfs
+  name: versitygw
   namespace: ${namespace}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: rustfs
+      app: versitygw
   template:
     metadata:
       labels:
-        app: rustfs
+        app: versitygw
         velorix.dev/run-id: "${run_id}"
       annotations:
         velorix.dev/run-id: "${run_id}"
-        velorix.dev/image-tag: "${rustfs_image}"
+        velorix.dev/image-tag: "${versitygw_image}"
         velorix.dev/s3-credentials-sha256: "${s3_credentials_hash}"
     spec:
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-        - name: rustfs
-          image: ${rustfs_image}
+        - name: versitygw
+          image: ${versitygw_image}
           imagePullPolicy: IfNotPresent
-          args: ["/data"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          args: ["--port", ":9000", "posix", "/data"]
           env:
-            - name: RUSTFS_ADDRESS
-              value: ":9000"
-            - name: RUSTFS_ACCESS_KEY
+            - name: ROOT_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: ${s3_credentials_secret_name}
                   key: access-key-id
-            - name: RUSTFS_SECRET_KEY
+            - name: ROOT_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: ${s3_credentials_secret_name}
@@ -6592,11 +6603,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: rustfs
+  name: versitygw
   namespace: ${namespace}
 spec:
   selector:
-    app: rustfs
+    app: versitygw
     velorix.dev/run-id: "${run_id}"
   ports:
     - name: s3
@@ -6604,14 +6615,14 @@ spec:
       targetPort: 9000
 EOF
 
-kubectl --context "$context" apply -f "${output_dir}/rustfs.yaml"
-wait_for_rollout rustfs
+kubectl --context "$context" apply -f "${output_dir}/versitygw.yaml"
+wait_for_rollout versitygw
 
 cat >"${output_dir}/bucket-job.yaml" <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rustfs-create-bucket
+  name: versitygw-create-bucket
   namespace: ${namespace}
 spec:
   backoffLimit: 6
@@ -6650,11 +6661,11 @@ spec:
               || aws --endpoint-url ${s3_endpoint} s3api create-bucket --bucket ${bucket}
 EOF
 
-kubectl --context "$context" -n "$namespace" delete job rustfs-create-bucket --ignore-not-found
+kubectl --context "$context" -n "$namespace" delete job versitygw-create-bucket --ignore-not-found
 kubectl --context "$context" apply -f "${output_dir}/bucket-job.yaml"
-wait_for_job_complete rustfs-create-bucket
+wait_for_job_complete versitygw-create-bucket
 else
-  echo "using external S3-compatible object store endpoint ${s3_endpoint}; skipping RustFS deployment and bucket creation"
+  echo "using external S3-compatible object store endpoint ${s3_endpoint}; skipping Versity Gateway deployment and bucket creation"
 fi
 run_external_s3_validation_job
 api_meta_env=""

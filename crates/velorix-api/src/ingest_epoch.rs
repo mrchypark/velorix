@@ -50,6 +50,7 @@ pub(super) struct StandingRuntimeCheckpointPersistContext {
     pub(super) input_coverage: Option<RuntimeCheckpointInputCoverageV1>,
     pub(super) replace_replay_coverage: bool,
     pub(super) expected_relation_source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
+    pub(super) staged_event_time_state: Vec<EventTimeStateRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +74,7 @@ impl StandingRuntimeCheckpointPersistContext {
             input_coverage: None,
             replace_replay_coverage: false,
             expected_relation_source_cuts: None,
+            staged_event_time_state: Vec::new(),
         }
     }
 
@@ -81,6 +83,11 @@ impl StandingRuntimeCheckpointPersistContext {
         published_relation: Option<PublishedRelationBindingV1>,
     ) -> Self {
         self.published_relation = published_relation;
+        self
+    }
+
+    pub(super) fn with_event_time_state(mut self, references: Vec<EventTimeStateRef>) -> Self {
+        self.staged_event_time_state = references;
         self
     }
 
@@ -319,6 +326,26 @@ pub(super) async fn ingest_epoch(
         )));
     }
     validate_ingest_epoch_batch_ranges(&prepared_batches)?;
+    let relations = prepared_batches
+        .iter()
+        .map(|prepared| {
+            (
+                prepared.request.relation_id.as_str(),
+                prepared.request.relation_version.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut _relation_guards = Vec::new();
+    for (relation_id, relation_version) in relations {
+        _relation_guards.push(
+            state
+                .relation_operation_lock(relation_id, relation_version)?
+                .lock_owned()
+                .await,
+        );
+    }
+    let (locked_view_ids, _correction_guards) =
+        preflight_correction_ingest(&state, &prepared_batches).await?;
     let epoch_manifest = persist_ingest_epoch_manifest(&state, &prepared_batches).await?;
     timer.mark("epoch_manifest");
 
@@ -330,6 +357,31 @@ pub(super) async fn ingest_epoch(
     if state.authoritative_relation_ingest_enabled() {
         let mut publication_outcomes = Vec::with_capacity(prepared_batches.len());
         for prepared in &prepared_batches {
+            let mut known_retry = false;
+            for active in state
+                .view_registry()?
+                .list_active()
+                .await
+                .map_err(materialized_view_registry_error_to_api)?
+            {
+                if !locked_view_ids.contains(&active.spec.view_id) {
+                    continue;
+                }
+                if let Some(identity) = active_standing_runtime_identity(&active) {
+                    known_retry |= read_ingest_epoch_view_convergence(
+                        &state,
+                        &epoch_manifest,
+                        identity,
+                        &active.spec.view_id,
+                    )
+                    .await?
+                    .is_some();
+                }
+            }
+            if known_retry && authoritative_ingest_is_published(&state, prepared).await? {
+                publication_outcomes.push(PublishIngestReservationOutcome::Duplicate);
+                continue;
+            }
             let publisher = state
                 .relation_ingest_publisher(&prepared.catalog, &prepared.request)
                 .await?;
@@ -378,6 +430,7 @@ pub(super) async fn ingest_epoch(
             prepared_batches.clone(),
             ack_mode,
             &mut timer,
+            &locked_view_ids,
         )
         .await?;
         drain_published_view_dependencies(&state).await?;
@@ -504,6 +557,7 @@ pub(super) async fn ingest_epoch(
         prepared_batches.clone(),
         ack_mode,
         &mut timer,
+        &locked_view_ids,
     )
     .await?;
 
@@ -698,6 +752,7 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
     prepared_batches: Vec<PreparedIngestBatch>,
     ack_mode: IngestAckMode,
     timer: &mut IngestTimer,
+    locked_view_ids: &BTreeSet<String>,
 ) -> Result<IngestMaterializationResponse, ApiError> {
     match ack_mode {
         IngestAckMode::Materialized => {
@@ -706,6 +761,7 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
                 epoch_manifest,
                 &prepared_batches,
                 Some(timer),
+                locked_view_ids,
             )
             .await?;
             timer.mark("materialize");
@@ -1362,7 +1418,7 @@ pub(super) async fn read_ingest_epoch_view_convergence(
         view_id,
         key.as_str(),
     )?;
-    let checkpoint = if let Some(meta_store) = state.meta_store.as_ref() {
+    let mut checkpoint = if let Some(meta_store) = state.meta_store.as_ref() {
         let pointer = meta_store
             .read_standing_runtime_checkpoint(
                 &record.tenant_id,
@@ -1389,11 +1445,25 @@ pub(super) async fn read_ingest_epoch_view_convergence(
                 ))
             })?
     };
-    if checkpoint.checkpoint_key != record.checkpoint_key {
-        return Err(ApiError::bad_request(format!(
-            "ingest epoch view convergence checkpoint pointer mismatch at {}",
-            key.as_str()
-        )));
+    while checkpoint.checkpoint_key != record.checkpoint_key {
+        let previous = checkpoint
+            .previous_checkpoint
+            .as_ref()
+            .filter(|previous| {
+                previous.logical_epoch < checkpoint.checkpoint.logical_epoch
+                    && previous.logical_epoch >= record.logical_epoch
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "ingest epoch view convergence checkpoint pointer mismatch at {}",
+                    key.as_str()
+                ))
+            })?
+            .clone();
+        checkpoint = read_standing_runtime_checkpoint_record_from_pointer(
+            state, identity, view_id, &previous,
+        )
+        .await?;
     }
     if checkpoint.checkpoint.logical_epoch != record.logical_epoch
         || checkpoint.checkpoint.state_root.content_hash != record.checkpoint_content_hash
@@ -1589,6 +1659,149 @@ pub(super) async fn standing_runtime_create_requires_backfill(
     Ok(false)
 }
 
+async fn authoritative_ingest_is_published(
+    state: &ApiState,
+    prepared: &PreparedIngestBatch,
+) -> Result<bool, ApiError> {
+    let meta = state
+        .meta_store
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("authoritative ingest requires metadata"))?;
+    let namespace = state
+        .relation_ingest_config
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::service_unavailable("authoritative ingest configuration is missing")
+        })?
+        .namespace
+        .clone();
+    let publications = meta
+        .list_relation_authoritative_ingest_publications(&RelationPartitionAuthorityKey {
+            namespace,
+            relation_id: prepared.request.relation_id.clone(),
+            stream_id: prepared.request.stream_id.clone(),
+            partition_id: prepared.request.partition_id,
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    let digest = stable_bytes_hash(&prepared.envelope);
+    for publication in publications {
+        if publication.reservation.start_offset_inclusive != prepared.request.start_offset_inclusive
+            || publication.reservation.end_offset_exclusive != prepared.end_offset_exclusive
+        {
+            continue;
+        }
+        if publication.reservation.payload_digest != digest {
+            return Err(ApiError::conflict(
+                "authoritative ingest retry payload differs from committed source",
+            ));
+        }
+        let reference = RelationIngestPublicationRefV1 {
+            request_id: publication.request_id,
+            start_offset_inclusive: publication.reservation.start_offset_inclusive,
+            end_offset_exclusive: publication.reservation.end_offset_exclusive,
+            batch_key: publication.reservation.batch_key,
+            payload_digest: publication.reservation.payload_digest,
+            object_key: publication.object_key,
+            object_digest: publication.object_digest,
+        };
+        validate_relation_publication_ref(
+            state,
+            &prepared.request.relation_id,
+            &prepared.request.relation_version,
+            prepared.catalog.schema_fingerprint.as_str(),
+            &prepared.request.stream_id,
+            prepared.request.partition_id,
+            &reference,
+        )
+        .await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn preflight_correction_ingest(
+    state: &ApiState,
+    prepared_batches: &[PreparedIngestBatch],
+) -> Result<(BTreeSet<String>, Vec<tokio::sync::OwnedMutexGuard<()>>), ApiError> {
+    let mut active_views = state
+        .view_registry()?
+        .list_active()
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    active_views.retain(|active| {
+        (standing_runtime_can_accept_incremental_ingest(active) || view_has_backfill_required_lag(active))
+            && prepared_batches.iter().any(|prepared| view_uses_prepared_ingest_batch(active, prepared))
+            && active.runtime.as_ref().and_then(|binding| binding.logical_plan.as_ref())
+                .is_some_and(|logical| matches!(&logical.execution,
+                    VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan }
+                        if matches!(plan.late_row_policy, Some(LateRowPolicy::CorrectWithinHorizon { .. }))
+                ))
+    });
+    if active_views.is_empty() {
+        return Ok((BTreeSet::new(), Vec::new()));
+    }
+    for prepared in prepared_batches {
+        ensure_standing_runtimes_for_ingest(state, &prepared.request).await?;
+        preacquire_standing_runtime_owners_for_ingest(state, &prepared.request).await?;
+    }
+    active_views.sort_by(|left, right| {
+        let left =
+            active_standing_runtime_identity(left).expect("correction view has runtime identity");
+        let right =
+            active_standing_runtime_identity(right).expect("correction view has runtime identity");
+        (&left.tenant_id, &left.program_id, &left.view_ids).cmp(&(
+            &right.tenant_id,
+            &right.program_id,
+            &right.view_ids,
+        ))
+    });
+    let mut locked_view_ids = BTreeSet::new();
+    let mut guards = Vec::new();
+    for active in &active_views {
+        let identity = active_standing_runtime_identity(active)
+            .ok_or_else(|| ApiError::bad_request("correction view is missing runtime identity"))?;
+        guards.push(
+            state
+                .standing_runtime_operation_lock(identity, &active.spec.view_id)?
+                .lock_owned()
+                .await,
+        );
+        locked_view_ids.insert(active.spec.view_id.clone());
+    }
+    for active in &active_views {
+        let identity = active_standing_runtime_identity(active)
+            .ok_or_else(|| ApiError::bad_request("correction view is missing runtime identity"))?;
+        if state
+            .standing_runtime(identity, &active.spec.view_id)?
+            .is_none()
+        {
+            ensure_standing_runtime_for_active_view(state, active).await?;
+        }
+        let input_batches = prepared_batches
+            .iter()
+            .filter(|prepared| view_uses_prepared_ingest_batch(active, prepared))
+            .map(relation_input_batch_from_prepared_ingest)
+            .collect::<Vec<_>>();
+        let runtime = state
+            .standing_runtime(identity, &active.spec.view_id)?
+            .ok_or_else(|| ApiError::service_unavailable("correction runtime is unavailable"))?;
+        let validation = async {
+        cold_window_state::prepare_event_time_state(state, &runtime, &input_batches).await?;
+        runtime.lock().map_err(|_| ApiError::internal("standing runtime lock poisoned"))?
+            .validate_event_time_corrections(&input_batches).map_err(|error| match error {
+            StandingProgramRuntimeError::InvalidProgramIdentity { field: "window_correction_watermark_regression" } => ApiError::bad_request("window correction watermark cannot move backwards; the entire ingest epoch was rejected before source publication"),
+            error => ApiError::bad_request(error),
+        })
+        }.await;
+        if let Err(error) = validation {
+            remove_standing_runtime(state, identity, &active.spec.view_id)?;
+            return Err(error);
+        }
+    }
+    Ok((locked_view_ids, guards))
+}
+
 pub(super) async fn ensure_standing_runtimes_for_ingest(
     state: &ApiState,
     request: &IngestRowsRequest,
@@ -1727,9 +1940,16 @@ pub(super) async fn apply_standing_runtime_ingest_epoch(
     epoch_manifest: &PersistedIngestEpochManifest,
     prepared_batches: &[PreparedIngestBatch],
     timer: Option<&mut IngestTimer>,
+    locked_view_ids: &BTreeSet<String>,
 ) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
-    apply_standing_runtime_prepared_ingests(state, Some(epoch_manifest), prepared_batches, timer)
-        .await
+    apply_standing_runtime_prepared_ingests(
+        state,
+        Some(epoch_manifest),
+        prepared_batches,
+        timer,
+        locked_view_ids,
+    )
+    .await
 }
 
 pub(super) async fn apply_standing_runtime_prepared_ingests(
@@ -1737,6 +1957,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
     epoch_manifest: Option<&PersistedIngestEpochManifest>,
     prepared_batches: &[PreparedIngestBatch],
     mut timer: Option<&mut IngestTimer>,
+    locked_view_ids: &BTreeSet<String>,
 ) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
     let active_views = state
@@ -1796,7 +2017,11 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
             .collect::<Vec<_>>();
         let operation_lock =
             state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
-        let _operation_guard = operation_lock.lock().await;
+        let _operation_guard = if locked_view_ids.contains(&active.spec.view_id) {
+            None
+        } else {
+            Some(operation_lock.lock().await)
+        };
         let mut uncovered_prepared_batches = matching_prepared_batches.clone();
         let previous_checkpoint =
             read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
@@ -1858,6 +2083,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
             .max()
             .unwrap_or(0);
         let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
+            state,
             Arc::clone(&runtime),
             lower_bound_epoch,
             idempotency_key,
@@ -1875,7 +2101,9 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
         let apply_result = match apply_result {
             Ok(apply_result) => apply_result,
             Err(error) => {
-                if let Some(epoch_manifest) = epoch_manifest {
+                if let Some(epoch_manifest) =
+                    epoch_manifest.filter(|_| !error.retryable_materialization)
+                {
                     persist_ingest_epoch_view_runtime_failure(
                         state,
                         epoch_manifest,
@@ -1900,6 +2128,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
                 epoch_replay_checkpoints.clone(),
                 owner,
             )
+            .with_event_time_state(apply_result.staged_event_time_state.clone())
             .with_published_relation(published_relation_binding_for_active_view(&active)?),
             timer.as_deref_mut(),
         )
@@ -2045,6 +2274,7 @@ pub(super) fn next_standing_runtime_logical_epoch(
 }
 
 pub(super) async fn apply_standing_runtime_changes_and_checkpoint(
+    state: &ApiState,
     runtime: SharedStandingRuntime,
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
@@ -2052,6 +2282,7 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint(
     budget_limits: StandingRuntimeBudgetLimits,
 ) -> Result<StandingRuntimeApplyResult, ApiError> {
     apply_standing_runtime_changes_and_checkpoint_many(
+        state,
         runtime,
         lower_bound_epoch,
         idempotency_key,
@@ -2077,11 +2308,55 @@ impl StandingRuntimeBudgetLimits {
 }
 
 pub(super) async fn apply_standing_runtime_changes_and_checkpoint_many(
+    state: &ApiState,
     runtime: SharedStandingRuntime,
     lower_bound_epoch: u64,
     idempotency_key: EpochIdempotencyKey,
     input_batches: Vec<RelationInputBatch>,
     budget_limits: StandingRuntimeBudgetLimits,
+) -> Result<StandingRuntimeApplyResult, ApiError> {
+    let before = runtime
+        .lock()
+        .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?
+        .checkpoint()
+        .map_err(ApiError::bad_request)?;
+    let result = async {
+        cold_window_state::prepare_event_time_state(state, &runtime, &input_batches).await?;
+        let mut result = apply_standing_runtime_changes_and_checkpoint_many_pure(
+            Arc::clone(&runtime),
+            lower_bound_epoch,
+            idempotency_key,
+            input_batches,
+        )
+        .await?;
+        result.staged_event_time_state =
+            cold_window_state::persist_event_time_state(state, &runtime).await?;
+        if !result.staged_event_time_state.is_empty() {
+            result.checkpoint = runtime
+                .lock()
+                .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?
+                .checkpoint()
+                .map_err(ApiError::bad_request)?;
+        }
+        validate_standing_runtime_budget(&result.output_deltas, &result.checkpoint, budget_limits)?;
+        Ok(result)
+    }
+    .await;
+    if result.is_err() {
+        *runtime
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime lock poisoned"))? =
+            velorix_runtime::materialized_view_runtime::restore_standing_runtime(before)
+                .map_err(ApiError::internal)?;
+    }
+    result
+}
+
+async fn apply_standing_runtime_changes_and_checkpoint_many_pure(
+    runtime: SharedStandingRuntime,
+    lower_bound_epoch: u64,
+    idempotency_key: EpochIdempotencyKey,
+    input_batches: Vec<RelationInputBatch>,
 ) -> Result<StandingRuntimeApplyResult, ApiError> {
     tokio::task::spawn_blocking(move || {
         let mut runtime = runtime
@@ -2089,36 +2364,14 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint_many(
             .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?;
         let logical_epoch =
             next_standing_runtime_logical_epoch(runtime.as_ref(), lower_bound_epoch)?;
-        let before = runtime.checkpoint().map_err(ApiError::bad_request)?;
-        let commit = match runtime.apply_changes_delta_only(logical_epoch, idempotency_key, input_batches) {
-            Ok(commit) => commit,
-            Err(error) => {
-                *runtime = velorix_runtime::materialized_view_runtime::restore_standing_runtime(
-                    before,
-                )
-                .map_err(|restore| {
-                    ApiError::internal(format!(
-                        "standing runtime apply failed with {error}; rollback failed with {restore}"
-                    ))
-                })?;
-                return Err(ApiError::bad_request(error));
-            }
-        };
+        let commit = runtime
+            .apply_changes_delta_only(logical_epoch, idempotency_key, input_batches)
+            .map_err(ApiError::bad_request)?;
         let checkpoint = runtime.checkpoint().map_err(ApiError::bad_request)?;
-        if let Err(error) =
-            validate_standing_runtime_budget(&commit.output_deltas, &checkpoint, budget_limits)
-        {
-            *runtime = velorix_runtime::materialized_view_runtime::restore_standing_runtime(before)
-                .map_err(|restore| {
-                    ApiError::internal(format!(
-                        "standing runtime budget rejected the epoch with {error}; rollback failed with {restore}"
-                    ))
-                })?;
-            return Err(error);
-        }
         Ok(StandingRuntimeApplyResult {
             checkpoint,
             output_deltas: commit.output_deltas,
+            staged_event_time_state: Vec::new(),
         })
     })
     .await

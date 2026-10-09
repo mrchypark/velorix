@@ -722,32 +722,35 @@ fn live_gc_config_from_lookup(
 fn s3_compatible_gc_config_accepts_known_prefix_and_run_id_for_release_evidence() {
     let config = LiveConfig {
         endpoint: "http://127.0.0.1:9000".to_string(),
-        access_key_id: "rustfsadmin".to_string(),
-        secret_access_key: "rustfsadmin".to_string(),
+        access_key_id: "versitygwadmin".to_string(),
+        secret_access_key: "versitygwadmin".to_string(),
         region: "us-east-1".to_string(),
-        bucket: "velorix-rustfs".to_string(),
+        bucket: "velorix-versitygw".to_string(),
         allow_http: true,
         run_prefix: "generated/test-prefix".to_string(),
     };
 
     let gc_config = live_gc_config_from_lookup(&config, |name| match name {
-        "VELORIX_S3_GC_PREFIX" => Some("/rustfs-s3-gate/run-1/production-gc/".to_string()),
-        "VELORIX_S3_GC_RUN_ID" => Some("rustfs-production-gc-run-1".to_string()),
+        "VELORIX_S3_GC_PREFIX" => Some("/versitygw-s3-gate/run-1/production-gc/".to_string()),
+        "VELORIX_S3_GC_RUN_ID" => Some("versitygw-production-gc-run-1".to_string()),
         _ => None,
     });
 
-    assert_eq!(gc_config.run_prefix, "rustfs-s3-gate/run-1/production-gc");
-    assert_eq!(gc_config.run_id, "rustfs-production-gc-run-1");
+    assert_eq!(
+        gc_config.run_prefix,
+        "versitygw-s3-gate/run-1/production-gc"
+    );
+    assert_eq!(gc_config.run_id, "versitygw-production-gc-run-1");
 }
 
 #[test]
 fn s3_compatible_gc_config_defaults_to_isolated_test_prefix() {
     let config = LiveConfig {
         endpoint: "http://127.0.0.1:9000".to_string(),
-        access_key_id: "rustfsadmin".to_string(),
-        secret_access_key: "rustfsadmin".to_string(),
+        access_key_id: "versitygwadmin".to_string(),
+        secret_access_key: "versitygwadmin".to_string(),
         region: "us-east-1".to_string(),
-        bucket: "velorix-rustfs".to_string(),
+        bucket: "velorix-versitygw".to_string(),
         allow_http: true,
         run_prefix: "generated/test-prefix".to_string(),
     };

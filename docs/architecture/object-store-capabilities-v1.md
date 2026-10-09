@@ -35,7 +35,7 @@ Overwrite-based emulation is forbidden in production. Local filesystem or fake
 object-store emulation is dev/test only and must require an explicit local mode.
 Active view lifecycle records additionally require conditional update support
 (`PutMode::Update` / ETag CAS) in product `velorix-api` startup, because view
-activation must not fall back to last-writer-wins on shared RustFS/S3-compatible
+activation must not fall back to last-writer-wins on shared Versity Gateway/S3-compatible
 storage.
 
 All storage users must be created through one shared object-store registry.

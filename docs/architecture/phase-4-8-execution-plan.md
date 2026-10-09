@@ -205,13 +205,20 @@ non-monotonic watermarks fail closed. Evidence:
 - [x] **Persist late-row handling state for recovery**
 - [x] **Add late-row workload to benchmark corpus**
 
-**Current state**: Complete. `LateRowPolicy` (strict_reject default,
-drop_with_evidence, admit_within_allowance) is persisted in the plan and
-checkpoint; dropped-late-row evidence counters are durable. Evidence:
-`late_row_policy_default_strict_reject_fails_closed_on_late_row`,
-`late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence`,
-`late_row_policy_admit_within_allowance_defers_finalization_until_frontier`,
-`runtime_rejects_late_rows_for_already_closed_tumbling_window`.
+**Current state**: Revised core/runtime/API unlimited-lateness verification is complete.
+`LateRowPolicy` is persisted in the plan and checkpoint; dropped-late-row
+evidence counters remain durable. Plan `None` accepts valid late rows with all
+state retained; explicit internal `Some(Reject)` opts into strict rejection.
+The enum default remains `Reject`, independently of absent-plan semantics.
+New public compatible TUMBLE/HOP views default to `CorrectWithinHorizon` with
+positive `horizon_ns = window_size_ns`. Existing names describe hot retention,
+not an age cutoff. SESSION/TopK stay on `None`; cold correction configuration
+is unsupported for those families. Core planner passed 363 tests; runtime passed
+261 integration and 55 library tests, plus clippy `-D warnings` and formatting.
+`legacy_none_accepts_unlimited_late_tumble_hop_session_and_top_k` verifies
+absent-policy acceptance. API library passed 221/221 tests; workspace formatting
+and clippy `--workspace --all-targets -- -D warnings` passed. Storage library and
+storage test targets also passed.
 
 ### 5.4 State Boundedness and Retention
 
@@ -220,10 +227,44 @@ checkpoint; dropped-late-row evidence counters are durable. Evidence:
 - [x] **Persist retention policy in operator contract**
 - [x] **Add state boundedness tests for window operators**
 
-**Current state**: Complete. `StateRetentionContractV1`
+**Current state**: Revised runtime/API hot/cold retention verification is complete.
+`StateRetentionContractV1`
 (operator_contract.rs) bounds retained open-window state and is persisted
-in `SupportedTumblingWindowPlan`; closed windows are not published again
-and their state is released. Retraction-after-closure fails closed.
+in `SupportedTumblingWindowPlan`. This contract alone does not establish that
+the legacy runtime releases all closed-window state. Fixed-window correction
+hot retention ends at `window_end <= watermark - horizon`, while valid late
+rows remain accepted. Eviction requires durable cold state; corrections load
+only affected windows and preserve published output, without full-source
+recomputation. SESSION/TopK retain all state under plan `None`.
+Published-output memory and the existing 8 MiB snapshot cap remain cardinality
+constraints, not lateness limits. The local API admission fence remains local
+to one `ApiState`; no distributed guarantee is added.
+Immutable cold-object keys are intentionally excluded from legacy GC; archive
+versions remain without GC until traversal of references from retained standing
+checkpoints is implemented and verified. Disk/object storage grows with history
+and corrections. Source retention under external TTL/lifecycle policies is not
+guaranteed, and the full-snapshot/output-memory baseline remains unchanged.
+API tests verify far-late new-range ingest returning HTTP 201 Created,
+idempotent retry returning HTTP 200, and query returning HTTP 200 with the old
+window's updated output and checkpoint recovery. Runtime tests verify atomic
+mixed hot/cold HOP updates. Runtime fixtures
+`late_correction_hop_hydrates_only_expired_fanout_atomically`,
+`cold_correction_exports_bounded_chunks_and_keeps_pending_rows_in_rollback_checkpoint`,
+`cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback`, and
+`cold_correction_legacy_expired_auxiliary_state_replays_only_requested_window`
+verify targeted hydration, bounded export, integrity/fault rollback, and
+requested-window legacy replay. Cold restore validates hash/key/epoch/program
+identity. API fixtures
+`rest_default_window_far_late_extrema_and_avg_load_only_affected_state` and
+`authoritative_default_window_far_late_extrema_and_avg_load_only_affected_state`
+also verify identical retry after archive failure without restart.
+`rest_far_late_legacy_checkpoint_reconstructs_affected_window` and
+`authoritative_far_late_legacy_checkpoint_reconstructs_affected_window` verify
+affected reconstruction of legacy checkpoints across both ingress paths.
+Missing cold state returns HTTP 503; corrupt cold state returns HTTP 400.
+These availability/integrity failures remain fail closed, never age based.
+See [the current window contract](supported-sql.md#event-time-windows-and-unlimited-lateness)
+for scope and verification limits.
 
 ### 5.5 Window Retraction Verification
 

@@ -15,8 +15,8 @@ on:
         description: Path to production GC run evidence JSON.
         required: false
         default: ""
-      rustfs-production-gc-validation-evidence-path:
-        description: Path to RustFS production GC evidence-family validation JSON.
+      versitygw-production-gc-validation-evidence-path:
+        description: Path to Versity Gateway production GC evidence-family validation JSON.
         required: false
         default: ""
       ingest-writer-lifecycle-evidence-path:
@@ -65,7 +65,7 @@ env:
   S3_BENCHMARK_RESULT_PATH: ${{ inputs.s3-result-path }}
   READINESS_EVIDENCE_PATH: ${{ inputs.readiness-evidence-path }}
   PRODUCTION_GC_EVIDENCE_PATH: ${{ inputs.production-gc-evidence-path }}
-  RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH: ${{ inputs.rustfs-production-gc-validation-evidence-path }}
+  VERSITYGW_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH: ${{ inputs.versitygw-production-gc-validation-evidence-path }}
   INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH: ${{ inputs.ingest-writer-lifecycle-evidence-path }}
   STANDING_RUNTIME_PRODUCT_EVIDENCE_PATH: ${{ inputs.standing-runtime-product-evidence-path }}
   VELORIX_S3_CHECKPOINT_FAULT_MATRIX_EVIDENCE_PATH: ${{ inputs.s3-checkpoint-fault-matrix-evidence-path }}
@@ -102,8 +102,8 @@ jobs:
             echo "release gate requires inputs.production-gc-evidence-path"
             exit 1
           fi
-          if [ -z "$RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH" ]; then
-            echo "release gate requires inputs.rustfs-production-gc-validation-evidence-path"
+          if [ -z "$VERSITYGW_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH" ]; then
+            echo "release gate requires inputs.versitygw-production-gc-validation-evidence-path"
             exit 1
           fi
           if [ -z "$INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH" ]; then
@@ -229,7 +229,7 @@ jobs:
           test -f "$READINESS_EVIDENCE_PATH"
           test -f target/dependency-governance/local-dependency-governance-evidence.json
           test -f "$PRODUCTION_GC_EVIDENCE_PATH"
-          test -f "$RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH"
+          test -f "$VERSITYGW_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH"
           test -f "$INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH"
           test -f "$STANDING_RUNTIME_PRODUCT_EVIDENCE_PATH"
           test -f "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH"
@@ -237,29 +237,29 @@ jobs:
           test -f "$QUERY_OUTPUT_ISOLATION_RELEASE_PATH"
           test -f "$SECURITY_RELEASE_PROVENANCE_RELEASE_PATH"
           test -f "$REMAINING_RELEASE_READINESS_RELEASE_PATH"
-          mkdir -p target/release-evidence/rustfs-production-gc
+          mkdir -p target/release-evidence/versitygw-production-gc
           mkdir -p target/release-evidence/ingest-writer-lifecycle
           mkdir -p target/release-evidence/standing-runtime-product
           cp "$READINESS_EVIDENCE_PATH" target/release-evidence/production-readiness-evidence.json
           cp target/dependency-governance/local-dependency-governance-evidence.json target/release-evidence/dependency-governance-release-evidence.json
-          RUSTFS_PRODUCTION_GC_VALIDATION_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py \
-            --kind rustfs-production-gc \
-            --artifact "$RUSTFS_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH" \
-            --out-dir target/release-evidence/rustfs-production-gc \
-            --artifact-name rustfs-production-gc-validation.json)"
-          test -f "$RUSTFS_PRODUCTION_GC_VALIDATION_RELEASE_PATH"
-          PRODUCTION_GC_RELEASE_PATH="target/release-evidence/rustfs-production-gc/rustfs-production-gc.json"
+          VERSITYGW_PRODUCTION_GC_VALIDATION_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py \
+            --kind versitygw-production-gc \
+            --artifact "$VERSITYGW_PRODUCTION_GC_VALIDATION_EVIDENCE_PATH" \
+            --out-dir target/release-evidence/versitygw-production-gc \
+            --artifact-name versitygw-production-gc-validation.json)"
+          test -f "$VERSITYGW_PRODUCTION_GC_VALIDATION_RELEASE_PATH"
+          PRODUCTION_GC_RELEASE_PATH="target/release-evidence/versitygw-production-gc/versitygw-production-gc.json"
           if ! cmp -s "$PRODUCTION_GC_EVIDENCE_PATH" "$PRODUCTION_GC_RELEASE_PATH"; then
-            echo "production-gc-evidence-path does not match the production artifact bound by rustfs-production-gc-validation-evidence-path"
+            echo "production-gc-evidence-path does not match the production artifact bound by versitygw-production-gc-validation-evidence-path"
             exit 1
           fi
-          RUSTFS_PRODUCTION_GC_RECHECKED_PATH="target/release-evidence/rustfs-production-gc/rustfs-production-gc-validation-rechecked.json"
-          cargo run -p velorix-cli -- rustfs-production-gc-evidence-validate \
-            --gate-evidence target/release-evidence/rustfs-production-gc/rustfs-s3-gate-evidence.json \
-            --seed-evidence target/release-evidence/rustfs-production-gc/rustfs-production-gc-seed.json \
-            --execute-evidence target/release-evidence/rustfs-production-gc/rustfs-production-gc-run.json \
+          VERSITYGW_PRODUCTION_GC_RECHECKED_PATH="target/release-evidence/versitygw-production-gc/versitygw-production-gc-validation-rechecked.json"
+          cargo run -p velorix-cli -- versitygw-production-gc-evidence-validate \
+            --gate-evidence target/release-evidence/versitygw-production-gc/versitygw-s3-gate-evidence.json \
+            --seed-evidence target/release-evidence/versitygw-production-gc/versitygw-production-gc-seed.json \
+            --execute-evidence target/release-evidence/versitygw-production-gc/versitygw-production-gc-run.json \
             --production-evidence "$PRODUCTION_GC_RELEASE_PATH" \
-            --json > "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH"
+            --json > "$VERSITYGW_PRODUCTION_GC_RECHECKED_PATH"
           INGEST_WRITER_LIFECYCLE_RELEASE_PATH="$(scripts/copy-readiness-sibling-evidence.py \
             --kind ingest-writer-lifecycle \
             --artifact "$INGEST_WRITER_LIFECYCLE_EVIDENCE_PATH" \
@@ -278,7 +278,7 @@ jobs:
             --release-commit "$RELEASE_COMMIT" \
             --s3-release-benchmark-gate-evidence target/release-evidence/s3-release-benchmark-gate.json \
             --production-gc-run-evidence "$PRODUCTION_GC_RELEASE_PATH" \
-            --rustfs-production-gc-validation-evidence "$RUSTFS_PRODUCTION_GC_RECHECKED_PATH" \
+            --versitygw-production-gc-validation-evidence "$VERSITYGW_PRODUCTION_GC_RECHECKED_PATH" \
             --ingest-writer-lifecycle-evidence "$INGEST_WRITER_LIFECYCLE_RELEASE_PATH" \
             --standing-runtime-product-evidence "$STANDING_RUNTIME_PRODUCT_RELEASE_PATH" \
             --s3-checkpoint-fault-matrix-evidence "$S3_CHECKPOINT_FAULT_MATRIX_RELEASE_PATH" \
@@ -309,7 +309,7 @@ jobs:
           name: release-evidence
           path: |
             target/release-evidence/*.json
-            target/release-evidence/rustfs-production-gc/**
+            target/release-evidence/versitygw-production-gc/**
             target/release-evidence/ingest-writer-lifecycle/**
             target/release-evidence/standing-runtime-product/**
             target/release-evidence/critique/**

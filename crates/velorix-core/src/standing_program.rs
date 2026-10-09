@@ -584,6 +584,29 @@ pub struct MaterializedViewSqlPage {
     pub next_page_token: Option<String>,
 }
 
+/// Immutable, content-addressed accumulator object owned by a runtime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventTimeStateRef {
+    pub window_key: String,
+    pub logical_epoch: LogicalEpoch,
+    pub state_root: DurableStateRoot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventTimeStateObject {
+    pub reference: EventTimeStateRef,
+    pub payload: String,
+}
+
+/// `reference: None` requires complete retained-source replay through `logical_epoch`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventTimeStateRequest {
+    pub window_key: String,
+    pub logical_epoch: LogicalEpoch,
+    pub reference: Option<EventTimeStateRef>,
+}
+
 pub trait StandingProgramRuntime {
     fn program_identity(&self) -> &StandingProgramIdentity;
 
@@ -592,6 +615,85 @@ pub trait StandingProgramRuntime {
     fn output_schemas(&self) -> Vec<RelationSchema>;
 
     fn logical_epoch(&self) -> LogicalEpoch;
+
+    /// Validate event-time corrections before persisting source input.
+    /// The caller must hold its ingest lock through validation, persistence and apply.
+    fn validate_event_time_corrections(
+        &self,
+        inputs: &[RelationInputBatch],
+    ) -> Result<(), StandingProgramRuntimeError> {
+        let _ = inputs;
+        Ok(())
+    }
+
+    /// Load only these accumulators before apply, under the caller's ingest lock.
+    fn event_time_state_requests(
+        &self,
+        inputs: &[RelationInputBatch],
+    ) -> Result<Vec<EventTimeStateRequest>, StandingProgramRuntimeError> {
+        let _ = inputs;
+        Ok(Vec::new())
+    }
+
+    fn hydrate_event_time_state(
+        &mut self,
+        request: &EventTimeStateRequest,
+        payload: &str,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        let _ = (request, payload);
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "event_time_state_hydration_unsupported",
+        })
+    }
+
+    /// Migration only: replay complete retained inputs through the requested epoch.
+    /// The runtime accumulates only the requested window, without advancing frontiers.
+    fn reconstruct_event_time_state(
+        &mut self,
+        request: &EventTimeStateRequest,
+        inputs: &[RelationInputBatch],
+    ) -> Result<(), StandingProgramRuntimeError> {
+        let _ = (request, inputs);
+        Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "event_time_state_reconstruction_unsupported",
+        })
+    }
+
+    /// Persist these immutable objects asynchronously before acknowledging eviction.
+    fn export_event_time_state(
+        &self,
+    ) -> Result<Vec<EventTimeStateObject>, StandingProgramRuntimeError> {
+        Ok(Vec::new())
+    }
+
+    /// Stage already-durable refs in the next checkpoint while retaining hot rows.
+    fn stage_event_time_state(
+        &mut self,
+        references: &[EventTimeStateRef],
+    ) -> Result<(), StandingProgramRuntimeError> {
+        if references.is_empty() {
+            Ok(())
+        } else {
+            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "event_time_state_staging_unsupported",
+            })
+        }
+    }
+
+    /// Evict staged rows after the checkpoint containing these refs is published.
+    /// The caller guarantees durable checkpoint publication. Stale refs fail atomically.
+    fn acknowledge_event_time_state(
+        &mut self,
+        references: &[EventTimeStateRef],
+    ) -> Result<(), StandingProgramRuntimeError> {
+        if references.is_empty() {
+            Ok(())
+        } else {
+            Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "event_time_state_eviction_unsupported",
+            })
+        }
+    }
 
     fn apply_changes(
         &mut self,

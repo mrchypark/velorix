@@ -563,6 +563,21 @@ pub(super) async fn run_active_view_backfill_step(
     range: Option<&BackfillRangeRequest>,
     scope: Option<&BackfillScopeRequest>,
 ) -> Result<ActiveViewBackfillStepOutcome, ApiError> {
+    let relations = active
+        .spec
+        .input_relations
+        .iter()
+        .map(|input| (input.relation_id.as_str(), input.relation_version.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut _relation_guards = Vec::new();
+    for (relation_id, relation_version) in relations {
+        _relation_guards.push(
+            state
+                .relation_operation_lock(relation_id, relation_version)?
+                .lock_owned()
+                .await,
+        );
+    }
     if view_query_availability(&active.lifecycle) {
         let progress = committed_backfill_progress(state, &active).await?;
         if progress.remaining_batches == 0 {

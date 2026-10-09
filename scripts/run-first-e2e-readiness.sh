@@ -11,12 +11,12 @@ bench_dir="${VELORIX_FIRST_E2E_BENCH_DIR:-target/velorix-bench}"
 
 cargo_deny_jsonl="${VELORIX_FIRST_E2E_CARGO_DENY_JSONL:-${dependency_dir}/cargo-deny.jsonl}"
 dependency_evidence="${VELORIX_FIRST_E2E_DEPENDENCY_EVIDENCE:-${dependency_dir}/local-dependency-governance-evidence.json}"
-rustfs_benchmark_result="${VELORIX_FIRST_E2E_RUSTFS_BENCHMARK_RESULT:-${bench_dir}/rustfs-s3-release.json}"
+versitygw_benchmark_result="${VELORIX_FIRST_E2E_VERSITYGW_BENCHMARK_RESULT:-${bench_dir}/versitygw-s3-release.json}"
 s3_benchmark_gate_evidence="${VELORIX_FIRST_E2E_S3_BENCHMARK_GATE_EVIDENCE:-${evidence_dir}/s3-release-benchmark-gate.json}"
-production_gc_seed_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_SEED_EVIDENCE:-${evidence_dir}/rustfs-production-gc-seed.json}"
-production_gc_run_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_RUN_EVIDENCE:-${evidence_dir}/rustfs-production-gc-run.json}"
-production_gc_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_EVIDENCE:-${evidence_dir}/rustfs-production-gc.json}"
-production_gc_validation_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_VALIDATION_EVIDENCE:-${evidence_dir}/rustfs-production-gc-validation.json}"
+production_gc_seed_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_SEED_EVIDENCE:-${evidence_dir}/versitygw-production-gc-seed.json}"
+production_gc_run_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_RUN_EVIDENCE:-${evidence_dir}/versitygw-production-gc-run.json}"
+production_gc_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_EVIDENCE:-${evidence_dir}/versitygw-production-gc.json}"
+production_gc_validation_evidence="${VELORIX_FIRST_E2E_PRODUCTION_GC_VALIDATION_EVIDENCE:-${evidence_dir}/versitygw-production-gc-validation.json}"
 vind_evidence="${VELORIX_FIRST_E2E_VIND_EVIDENCE:-${k8s_dir}/vind-k8s-gate-evidence.json}"
 ingest_writer_lifecycle_evidence_default="${k8s_dir}/ingest-writer-lifecycle-attestation.json"
 ingest_writer_lifecycle_evidence="${VELORIX_FIRST_E2E_INGEST_WRITER_LIFECYCLE_EVIDENCE:-$ingest_writer_lifecycle_evidence_default}"
@@ -46,32 +46,32 @@ meta_image="${VELORIX_META_IMAGE:-}"
 ingest_writer_image="${VELORIX_INGEST_WRITER_IMAGE:-velorix-ingest-writer:e2e}"
 max_regression_fraction="${VELORIX_FIRST_E2E_MAX_REGRESSION_FRACTION:-0.35}"
 
-skip_rustfs="${VELORIX_FIRST_E2E_SKIP_RUSTFS:-0}"
+skip_versitygw="${VELORIX_FIRST_E2E_SKIP_VERSITYGW:-0}"
 skip_docker_build="${VELORIX_FIRST_E2E_SKIP_DOCKER_BUILD:-0}"
 skip_vind="${VELORIX_FIRST_E2E_SKIP_VIND:-0}"
 
-rustfs_cleanup_requested="${VELORIX_RUSTFS_CLEANUP:-1}"
-rustfs_cleanup_after_product=0
-rustfs_product_container="${VELORIX_RUSTFS_CONTAINER:-velorix-first-e2e-rustfs-${run_id}}"
-rustfs_product_network="${VELORIX_RUSTFS_NETWORK:-velorix-first-e2e-rustfs-${run_id}}"
-rustfs_product_volume="${VELORIX_RUSTFS_VOLUME:-velorix-first-e2e-rustfs-${run_id}}"
-rustfs_access_key="${VELORIX_RUSTFS_ACCESS_KEY:-velorix-first-e2e-rustfs}"
-rustfs_secret_key="${VELORIX_RUSTFS_SECRET_KEY:-velorix-first-e2e-rustfs-${run_id}}"
-rustfs_credentials_explicit=0
-if [ -n "${VELORIX_RUSTFS_ACCESS_KEY:-}" ] || [ -n "${VELORIX_RUSTFS_SECRET_KEY:-}" ]; then
-  rustfs_credentials_explicit=1
+versitygw_cleanup_requested="${VELORIX_VERSITYGW_CLEANUP:-1}"
+versitygw_cleanup_after_product=0
+versitygw_product_container="${VELORIX_VERSITYGW_CONTAINER:-velorix-first-e2e-versitygw-${run_id}}"
+versitygw_product_network="${VELORIX_VERSITYGW_NETWORK:-velorix-first-e2e-versitygw-${run_id}}"
+versitygw_product_volume="${VELORIX_VERSITYGW_VOLUME:-velorix-first-e2e-versitygw-${run_id}}"
+versitygw_access_key="${VELORIX_VERSITYGW_ACCESS_KEY:-velorix-first-e2e-versitygw}"
+versitygw_secret_key="${VELORIX_VERSITYGW_SECRET_KEY:-velorix-first-e2e-versitygw-${run_id}}"
+versitygw_credentials_explicit=0
+if [ -n "${VELORIX_VERSITYGW_ACCESS_KEY:-}" ] || [ -n "${VELORIX_VERSITYGW_SECRET_KEY:-}" ]; then
+  versitygw_credentials_explicit=1
 fi
 
-cleanup_first_e2e_rustfs() {
-  if [ "$rustfs_cleanup_after_product" != "1" ]; then
+cleanup_first_e2e_versitygw() {
+  if [ "$versitygw_cleanup_after_product" != "1" ]; then
     return 0
   fi
-  docker rm -f "$rustfs_product_container" >/dev/null 2>&1 || true
-  docker network rm "$rustfs_product_network" >/dev/null 2>&1 || true
-  docker volume rm "$rustfs_product_volume" >/dev/null 2>&1 || true
+  docker rm -f "$versitygw_product_container" >/dev/null 2>&1 || true
+  docker network rm "$versitygw_product_network" >/dev/null 2>&1 || true
+  docker volume rm "$versitygw_product_volume" >/dev/null 2>&1 || true
 }
 
-trap cleanup_first_e2e_rustfs EXIT
+trap cleanup_first_e2e_versitygw EXIT
 
 usage() {
   cat <<'EOF'
@@ -85,22 +85,22 @@ Main environment overrides:
   VELORIX_API_IMAGE=<required with RUN_PRODUCT=1 and SKIP_DOCKER_BUILD=1>
   VELORIX_META_IMAGE=<required with RUN_PRODUCT=1 and SKIP_DOCKER_BUILD=1>
   VELORIX_INGEST_WRITER_IMAGE=velorix-ingest-writer:e2e
-  VELORIX_FIRST_E2E_SKIP_RUSTFS=1
+  VELORIX_FIRST_E2E_SKIP_VERSITYGW=1
   VELORIX_FIRST_E2E_SKIP_DOCKER_BUILD=1
   VELORIX_FIRST_E2E_SKIP_VIND=1
   VELORIX_FIRST_E2E_RUN_PRODUCT=1
   VELORIX_FIRST_E2E_PRODUCT_PROFILE=logical-fencing
   VELORIX_FIRST_E2E_PRODUCT_EVIDENCE=target/velorix-product/product-evidence.json
   VELORIX_FIRST_E2E_PRODUCT_AWS_ENDPOINT_URL=http://host.docker.internal:9000
-  VELORIX_RUSTFS_CLEANUP=1  # with RUN_PRODUCT=1, cleanup happens after product evidence
+  VELORIX_VERSITYGW_CLEANUP=1  # with RUN_PRODUCT=1, cleanup happens after product evidence
   VELORIX_LOCAL_DISK_PREFLIGHT=1
   VELORIX_FIRST_E2E_MIN_FREE_DISK_GIB=20
 
 Default output:
   target/dependency-governance/local-dependency-governance-evidence.json
   target/release-evidence/s3-release-benchmark-gate.json
-  target/release-evidence/rustfs-production-gc.json
-  target/release-evidence/rustfs-production-gc-validation.json
+  target/release-evidence/versitygw-production-gc.json
+  target/release-evidence/versitygw-production-gc-validation.json
   target/velorix-k8s/vind-k8s-gate-evidence.json
   target/velorix-product/ingest-writer-lifecycle-attestation.json via RUN_PRODUCT=1,
     or target/velorix-k8s/ingest-writer-lifecycle-attestation.json / explicit override
@@ -272,21 +272,21 @@ first-E2E readiness schema v5.
 EOF
   exit 64
 fi
-case "$rustfs_cleanup_requested" in
+case "$versitygw_cleanup_requested" in
   0 | 1) ;;
   *)
-    echo "VELORIX_RUSTFS_CLEANUP must be 0 or 1" >&2
+    echo "VELORIX_VERSITYGW_CLEANUP must be 0 or 1" >&2
     exit 64
     ;;
 esac
-if [ "$rustfs_credentials_explicit" = "1" ]; then
-  if [ -z "${VELORIX_RUSTFS_ACCESS_KEY:-}" ] || [ -z "${VELORIX_RUSTFS_SECRET_KEY:-}" ]; then
-    echo "VELORIX_RUSTFS_ACCESS_KEY and VELORIX_RUSTFS_SECRET_KEY must be set together" >&2
+if [ "$versitygw_credentials_explicit" = "1" ]; then
+  if [ -z "${VELORIX_VERSITYGW_ACCESS_KEY:-}" ] || [ -z "${VELORIX_VERSITYGW_SECRET_KEY:-}" ]; then
+    echo "VELORIX_VERSITYGW_ACCESS_KEY and VELORIX_VERSITYGW_SECRET_KEY must be set together" >&2
     exit 64
   fi
 fi
-if [ "$rustfs_access_key" = "rustfsadmin" ] || [ "$rustfs_secret_key" = "rustfsadmin" ]; then
-  echo "RustFS default credentials are not allowed for first-E2E readiness" >&2
+if [ "$versitygw_access_key" = "rustfsadmin" ] || [ "$versitygw_secret_key" = "rustfsadmin" ]; then
+  echo "Versity Gateway default credentials are not allowed for first-E2E readiness" >&2
   exit 64
 fi
 
@@ -318,45 +318,52 @@ cargo run -p velorix-cli -- dependency-governance-validate \
   --cargo-deny-json "$cargo_deny_jsonl" \
   --json >"$dependency_evidence"
 
-if [ "$skip_rustfs" = "1" ]; then
-  step "Skipping RustFS S3 gate and reusing existing artifacts"
-  require_file "$rustfs_benchmark_result"
+if [ "$skip_versitygw" = "1" ]; then
+  step "Skipping Versity Gateway S3 gate and reusing existing artifacts"
+  require_file "$versitygw_benchmark_result"
   require_file "$production_gc_seed_evidence"
   require_file "$production_gc_run_evidence"
   require_file "$production_gc_evidence"
   require_file "$production_gc_validation_evidence"
 else
-  step "Running RustFS S3-compatible gate"
-  rustfs_env=(
+  step "Running Versity Gateway S3-compatible gate"
+  versitygw_env=(
     "VELORIX_BENCHMARK_GATE_LEVEL=release"
-    "VELORIX_RUSTFS_BENCHMARK_PATH=$rustfs_benchmark_result"
-    "VELORIX_RUSTFS_PRODUCTION_GC_SEED_PATH=$production_gc_seed_evidence"
-    "VELORIX_RUSTFS_PRODUCTION_GC_RUN_PATH=$production_gc_run_evidence"
-    "VELORIX_RUSTFS_PRODUCTION_GC_PATH=$production_gc_evidence"
-    "VELORIX_RUSTFS_PRODUCTION_GC_VALIDATION_PATH=$production_gc_validation_evidence"
-    "VELORIX_RUSTFS_ACCESS_KEY=$rustfs_access_key"
-    "VELORIX_RUSTFS_SECRET_KEY=$rustfs_secret_key"
+    "VELORIX_VERSITYGW_BENCHMARK_PATH=$versitygw_benchmark_result"
+    "VELORIX_VERSITYGW_PRODUCTION_GC_SEED_PATH=$production_gc_seed_evidence"
+    "VELORIX_VERSITYGW_PRODUCTION_GC_RUN_PATH=$production_gc_run_evidence"
+    "VELORIX_VERSITYGW_PRODUCTION_GC_PATH=$production_gc_evidence"
+    "VELORIX_VERSITYGW_PRODUCTION_GC_VALIDATION_PATH=$production_gc_validation_evidence"
+    "VELORIX_VERSITYGW_ACCESS_KEY=$versitygw_access_key"
+    "VELORIX_VERSITYGW_SECRET_KEY=$versitygw_secret_key"
   )
   if [ "$run_product" = "1" ]; then
-    rustfs_env+=(
-      "VELORIX_RUSTFS_CLEANUP=0"
-      "VELORIX_RUSTFS_CONTAINER=$rustfs_product_container"
-      "VELORIX_RUSTFS_NETWORK=$rustfs_product_network"
-      "VELORIX_RUSTFS_VOLUME=$rustfs_product_volume"
+    versitygw_env+=(
+      "VELORIX_VERSITYGW_CLEANUP=0"
+      "VELORIX_VERSITYGW_CONTAINER=$versitygw_product_container"
+      "VELORIX_VERSITYGW_NETWORK=$versitygw_product_network"
+      "VELORIX_VERSITYGW_VOLUME=$versitygw_product_volume"
     )
-    if [ "$rustfs_cleanup_requested" = "1" ]; then
-      rustfs_cleanup_after_product=1
+    if [ "$versitygw_cleanup_requested" = "1" ]; then
+      versitygw_cleanup_after_product=1
     fi
   fi
-  env "${rustfs_env[@]}" scripts/run-rustfs-s3-gate.sh
+  env "${versitygw_env[@]}" scripts/run-versitygw-s3-gate.sh
 fi
+
+# The compatibility gate alone does not certify release benchmarks or GC.
+require_file "$versitygw_benchmark_result"
+require_file "$production_gc_seed_evidence"
+require_file "$production_gc_run_evidence"
+require_file "$production_gc_evidence"
+require_file "$production_gc_validation_evidence"
 
 step "Generating first-E2E S3 release benchmark gate evidence"
 cargo run -p velorix-cli -- benchmark-gate \
   --gate-level release \
   --backend s3-compatible \
   --baseline baselines/benchmark/s3/release.json \
-  --result "$rustfs_benchmark_result" \
+  --result "$versitygw_benchmark_result" \
   --max-regression-fraction "$max_regression_fraction" \
   --json >"$s3_benchmark_gate_evidence"
 
@@ -404,9 +411,9 @@ if not isinstance(authority_store_id, str) or not authority_store_id.strip():
 
 parsed = urlparse(authority_store_id)
 parts = [part for part in parsed.path.split("/") if part]
-if parsed.scheme != "s3" or parsed.netloc not in {"rustfs", "external"} or len(parts) < 2:
+if parsed.scheme != "s3" or parsed.netloc not in {"versitygw", "external"} or len(parts) < 2:
     raise SystemExit(
-        "production GC authority_store_id must be s3://rustfs/<bucket>/<prefix> "
+        "production GC authority_store_id must be s3://versitygw/<bucket>/<prefix> "
         "or s3://external/<bucket>/<prefix> when VELORIX_FIRST_E2E_RUN_PRODUCT=1"
     )
 bucket = parts[0]
@@ -418,8 +425,8 @@ PY
   product_aws_access_key_id="${AWS_ACCESS_KEY_ID:-}"
   product_aws_secret_access_key="${AWS_SECRET_ACCESS_KEY:-}"
   product_aws_region="${AWS_REGION:-}"
-  if [ "$product_authority_kind" = "rustfs" ]; then
-    product_aws_endpoint_url="${VELORIX_FIRST_E2E_PRODUCT_AWS_ENDPOINT_URL:-http://host.docker.internal:${VELORIX_RUSTFS_PORT:-9000}}"
+  if [ "$product_authority_kind" = "versitygw" ]; then
+    product_aws_endpoint_url="${VELORIX_FIRST_E2E_PRODUCT_AWS_ENDPOINT_URL:-http://host.docker.internal:${VELORIX_VERSITYGW_PORT:-9000}}"
     if [ -n "${VELORIX_FIRST_E2E_PRODUCT_AWS_ACCESS_KEY_ID:-}" ] || [ -n "${VELORIX_FIRST_E2E_PRODUCT_AWS_SECRET_ACCESS_KEY:-}" ]; then
       if [ -z "${VELORIX_FIRST_E2E_PRODUCT_AWS_ACCESS_KEY_ID:-}" ] || [ -z "${VELORIX_FIRST_E2E_PRODUCT_AWS_SECRET_ACCESS_KEY:-}" ]; then
         echo "VELORIX_FIRST_E2E_PRODUCT_AWS_ACCESS_KEY_ID and VELORIX_FIRST_E2E_PRODUCT_AWS_SECRET_ACCESS_KEY must be set together" >&2
@@ -429,22 +436,22 @@ PY
       product_aws_secret_access_key="$VELORIX_FIRST_E2E_PRODUCT_AWS_SECRET_ACCESS_KEY"
     elif [ -n "${AWS_ACCESS_KEY_ID:-}" ] || [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]; then
       if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-        echo "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together for RustFS product evidence" >&2
+        echo "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together for Versity Gateway product evidence" >&2
         exit 64
       fi
       product_aws_access_key_id="$AWS_ACCESS_KEY_ID"
       product_aws_secret_access_key="$AWS_SECRET_ACCESS_KEY"
-    elif [ "$skip_rustfs" = "0" ] || [ "$rustfs_credentials_explicit" = "1" ]; then
-      product_aws_access_key_id="$rustfs_access_key"
-      product_aws_secret_access_key="$rustfs_secret_key"
+    elif [ "$skip_versitygw" = "0" ] || [ "$versitygw_credentials_explicit" = "1" ]; then
+      product_aws_access_key_id="$versitygw_access_key"
+      product_aws_secret_access_key="$versitygw_secret_key"
     else
       cat >&2 <<'EOF'
-VELORIX_FIRST_E2E_SKIP_RUSTFS=1 with RustFS product evidence requires explicit matching S3 credentials.
+VELORIX_FIRST_E2E_SKIP_VERSITYGW=1 with Versity Gateway product evidence requires explicit matching S3 credentials.
 
 Set VELORIX_FIRST_E2E_PRODUCT_AWS_ACCESS_KEY_ID and
 VELORIX_FIRST_E2E_PRODUCT_AWS_SECRET_ACCESS_KEY, or AWS_ACCESS_KEY_ID and
-AWS_SECRET_ACCESS_KEY, or VELORIX_RUSTFS_ACCESS_KEY and
-VELORIX_RUSTFS_SECRET_KEY to match the reused RustFS backend.
+AWS_SECRET_ACCESS_KEY, or VELORIX_VERSITYGW_ACCESS_KEY and
+VELORIX_VERSITYGW_SECRET_KEY to match the reused Versity Gateway backend.
 EOF
       exit 64
     fi
@@ -471,11 +478,11 @@ EOF
   if [ -n "$product_evidence_level" ]; then
     product_env+=("VELORIX_PRODUCT_EVIDENCE_LEVEL=$product_evidence_level")
   fi
-  if [ "$product_authority_kind" = "rustfs" ]; then
+  if [ "$product_authority_kind" = "versitygw" ]; then
     if [ -n "$product_object_store_durability_attestation_file" ]; then
       cat >&2 <<'EOF'
 VELORIX_FIRST_E2E_PRODUCT_OBJECT_STORE_DURABILITY_ATTESTATION_FILE cannot be used with
-the internally generated first-E2E RustFS authority. That authority is local
+the internally generated first-E2E Versity Gateway authority. That authority is local
 development evidence and must not receive product-complete durability attestation.
 EOF
       exit 64
@@ -601,7 +608,7 @@ if not str(production_gc.get("verified_gc_run_digest", "")).startswith("sha256:"
     raise SystemExit(f"production GC evidence is missing verified GC run digest: {production_gc_path}")
 if production_gc_validation.get("status") != "pass":
     raise SystemExit(f"production GC validation evidence is not pass: {production_gc_validation_path}")
-if production_gc_validation.get("evidence_kind") != "rustfs_production_gc_evidence_family_validated":
+if production_gc_validation.get("evidence_kind") != "versitygw_production_gc_evidence_family_validated":
     raise SystemExit(f"production GC validation evidence has wrong evidence_kind: {production_gc_validation_path}")
 if production_gc_validation.get("deployment_id") != production_gc["deployment_id"]:
     raise SystemExit("production GC validation deployment_id does not match production GC evidence")
@@ -610,7 +617,7 @@ if production_gc_validation.get("authority_store_id") != production_gc["authorit
 if production_gc_validation.get("gc_run_id") != production_gc["gc_run_id"]:
     raise SystemExit("production GC validation gc_run_id does not match production GC evidence")
 required_gc_validation_checks = {
-    "rustfs_s3_compatible_gate_present",
+    "versitygw_s3_compatible_gate_present",
     "seed_fixture_created_retired_checkpoint_state",
     "s3_gc_execute_deleted_seeded_candidate",
     "production_gc_evidence_verified_listing_retention_and_transition",
@@ -688,7 +695,7 @@ if product is not None:
         )
     production_authority = urlparse(production_gc["authority_store_id"])
     production_authority_parts = [part for part in production_authority.path.split("/") if part]
-    if production_authority.scheme != "s3" or production_authority.netloc not in {"rustfs", "external"} or len(production_authority_parts) < 2:
+    if production_authority.scheme != "s3" or production_authority.netloc not in {"versitygw", "external"} or len(production_authority_parts) < 2:
         raise SystemExit(f"production GC authority_store_id is not a supported S3 authority: {production_gc_path}")
     expected_s3_bucket = production_authority_parts[0]
     expected_s3_prefix = "/".join(production_authority_parts[1:])
@@ -970,12 +977,12 @@ readiness = {
     "authority_store_id": production_gc["authority_store_id"],
     "capability_status": {
         "status": "pass",
-        "evidence": "RustFS S3-compatible capability probe through configured S3 API",
+        "evidence": "Versity Gateway S3-compatible capability probe through configured S3 API",
         "evidence_kind": ["s3_compatible"],
     },
     "s3_compatible_test_status": {
         "status": "pass",
-        "evidence": "RustFS S3-compatible integration harness passed through scripts/run-rustfs-s3-gate.sh",
+        "evidence": "Versity Gateway S3-compatible integration harness passed through scripts/run-versitygw-s3-gate.sh",
         "evidence_kind": ["s3_compatible_integration_harness"],
     },
     "ownership_status": {
@@ -1017,7 +1024,7 @@ readiness = {
     },
     "state_status": {
         "status": "pass",
-        "evidence": "SlateDB checkpoint ref and checked recovery evidence from RustFS runtime recovery harness",
+        "evidence": "SlateDB checkpoint ref and checked recovery evidence from Versity Gateway runtime recovery harness",
         "evidence_kind": ["slate_db_checkpoint_ref", "slate_db_checked_recovery"],
     },
     "query_policy_status": {
@@ -1027,7 +1034,7 @@ readiness = {
     },
     "table_catalog_status": {
         "status": "pass",
-        "evidence": "registry-backed table catalog evidence through RustFS S3-compatible query harness",
+        "evidence": "registry-backed table catalog evidence through Versity Gateway S3-compatible query harness",
         "evidence_kind": ["registry_backed_table_catalog"],
     },
     "dependency_governance_status": {
@@ -1037,16 +1044,16 @@ readiness = {
     },
     "benchmark_gate_status": {
         "status": "pass",
-        "evidence": "RustFS S3-compatible benchmark gate evidence generated for local first E2E",
+        "evidence": "Versity Gateway S3-compatible benchmark gate evidence generated for local first E2E",
         "evidence_kind": ["s3_compatible_benchmark_gate"],
     },
     "gc_status": {
         "status": "pass",
-        "evidence": "RustFS production GC run evidence with retention and checkpoint GC transition checks",
+        "evidence": "Versity Gateway production GC run evidence with retention and checkpoint GC transition checks",
         "evidence_kind": [
             "gc_run_evidence",
             "production_gc_run_evidence",
-            "rustfs_production_gc_evidence_family_validated",
+            "versitygw_production_gc_evidence_family_validated",
             "checkpoint_retention_record",
         ],
     },
@@ -1069,7 +1076,7 @@ cargo run -p velorix-cli -- readiness-report \
   --dependency-governance-evidence "$dependency_evidence" \
   --s3-release-benchmark-gate-evidence "$s3_benchmark_gate_evidence" \
   --production-gc-run-evidence "$production_gc_evidence" \
-  --rustfs-production-gc-validation-evidence "$production_gc_validation_evidence" \
+  --versitygw-production-gc-validation-evidence "$production_gc_validation_evidence" \
   --ingest-writer-lifecycle-evidence "$ingest_writer_lifecycle_evidence" \
   --standing-runtime-product-evidence "$product_evidence" \
   --json >"$readiness_report"

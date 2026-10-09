@@ -69,6 +69,8 @@ pub enum ReadinessEvidenceKind {
     S3CompatibleBenchmarkGate,
     GcRunEvidence,
     ProductionGcRunEvidence,
+    VersitygwProductionGcEvidenceFamilyValidated,
+    /// Historical RustFS evidence remains readable but cannot satisfy the Versity Gateway gate.
     RustfsProductionGcEvidenceFamilyValidated,
     MetadataAuthorityNoPvcRecovery,
     CheckpointRetentionRecord,
@@ -420,10 +422,10 @@ impl ProductionReadinessEvidenceV1 {
         }
         if !self
             .gc_status
-            .has_evidence(ReadinessEvidenceKind::RustfsProductionGcEvidenceFamilyValidated)
+            .has_evidence(ReadinessEvidenceKind::VersitygwProductionGcEvidenceFamilyValidated)
         {
             blocking_reasons.push(
-                "gc_status missing rustfs_production_gc_evidence_family_validated evidence"
+                "gc_status missing versitygw_production_gc_evidence_family_validated evidence"
                     .to_string(),
             );
         }
@@ -644,7 +646,7 @@ mod tests {
             gc_status: passing_check(vec![
                 ReadinessEvidenceKind::GcRunEvidence,
                 ReadinessEvidenceKind::ProductionGcRunEvidence,
-                ReadinessEvidenceKind::RustfsProductionGcEvidenceFamilyValidated,
+                ReadinessEvidenceKind::VersitygwProductionGcEvidenceFamilyValidated,
                 ReadinessEvidenceKind::CheckpointRetentionRecord,
                 ReadinessEvidenceKind::UpgradeRollbackRepairGcFaultMatrix,
             ]),
@@ -684,6 +686,31 @@ mod tests {
         assert!(!report.production_ready);
         assert!(report.blocking_reasons.iter().any(|reason| {
             reason == "s3_compatible_test_status missing s3_compatible_checkpoint_fault_matrix evidence"
+        }));
+    }
+
+    #[test]
+    fn historical_rustfs_gc_evidence_does_not_satisfy_versitygw_gate() {
+        assert_eq!(
+            serde_json::to_string(
+                &ReadinessEvidenceKind::VersitygwProductionGcEvidenceFamilyValidated
+            )
+            .unwrap(),
+            "\"versitygw_production_gc_evidence_family_validated\""
+        );
+        let mut evidence = release_ready_evidence();
+        evidence.gc_status.evidence_kind.retain(|kind| {
+            *kind != ReadinessEvidenceKind::VersitygwProductionGcEvidenceFamilyValidated
+        });
+        let legacy_kind = serde_json::from_str::<ReadinessEvidenceKind>(
+            "\"rustfs_production_gc_evidence_family_validated\"",
+        )
+        .unwrap();
+        evidence.gc_status.evidence_kind.push(legacy_kind);
+        let report = evidence.try_into_report().unwrap();
+        assert!(!report.production_ready);
+        assert!(report.blocking_reasons.iter().any(|reason| {
+            reason == "gc_status missing versitygw_production_gc_evidence_family_validated evidence"
         }));
     }
 

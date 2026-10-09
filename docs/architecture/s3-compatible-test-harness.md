@@ -89,25 +89,25 @@ evidence independent:
   correctness/performance nightly gate still runs. An explicit live request
   with missing credentials fails closed before any S3 test starts.
 
-## RustFS S3-Compatible Gate
+## Versity Gateway S3-Compatible Gate
 
-For RustFS-backed S3 API compatibility checks,
-`scripts/run-rustfs-s3-gate.sh` starts a RustFS container, creates a test bucket
+For Versity Gateway-backed S3 API compatibility checks,
+`scripts/run-versitygw-s3-gate.sh` starts a Versity Gateway container, creates a test bucket
 through the AWS S3 API, and runs the same env-gated storage/runtime harnesses
 against `http://127.0.0.1:9000`.
 Before setup, it creates a disposable Docker bridge network and runs a
 short-lived AWS CLI container on that network so Docker network-store or
 container-attach failures fail before evidence artifacts are written.
 It also checks repository-filesystem free space before starting Docker/Cargo
-work and exits early when it is below `VELORIX_RUSTFS_MIN_FREE_KIB`, avoiding
-partial mid-compile failures. Cargo builds run in `target/rustfs-s3-gate` by
+work and exits early when it is below `VELORIX_VERSITYGW_MIN_FREE_KIB`, avoiding
+partial mid-compile failures. Cargo builds run in `target/versitygw-s3-gate` by
 default so live-gate compilation stays inside the repository's local target tree
 while remaining separate from default development profile artifacts; set
-`VELORIX_RUSTFS_CARGO_TARGET_DIR` when a different local target cache is
+`VELORIX_VERSITYGW_CARGO_TARGET_DIR` when a different local target cache is
 desired.
 
 ```bash
-scripts/run-rustfs-s3-gate.sh
+scripts/run-versitygw-s3-gate.sh
 ```
 
 The script sets the normal live harness environment:
@@ -115,11 +115,11 @@ The script sets the normal live harness environment:
 ```text
 VELORIX_S3_COMPAT=1
 AWS_ENDPOINT_URL=http://127.0.0.1:9000
-AWS_ACCESS_KEY_ID=<run-local non-default RustFS access key>
-AWS_SECRET_ACCESS_KEY=<run-local non-default RustFS secret key>
+AWS_ACCESS_KEY_ID=<run-local non-default Versity Gateway access key>
+AWS_SECRET_ACCESS_KEY=<run-local non-default Versity Gateway secret key>
 AWS_REGION=us-east-1
-VELORIX_S3_BUCKET=velorix-rustfs
-VELORIX_S3_PREFIX=rustfs-s3-gate/<timestamp>
+VELORIX_S3_BUCKET=velorix-versitygw
+VELORIX_S3_PREFIX=versitygw-s3-gate/<timestamp>
 ```
 
 It runs:
@@ -129,27 +129,16 @@ cargo test -p velorix-storage --test s3_compat --features s3-compat-tests
 cargo test -p velorix-storage --test multi_process_ingest_admission --features s3-compat-tests
 ```
 
-The `s3_compat` target also executes a manifest-retiring GC run inside an
-isolated S3-compatible prefix after probing authoritative startup capabilities
-and constructing `CheckpointPublisher::new_authoritative`; the test verifies the
-listed `GcRunV1`, checkpoint-retention records, and checkpoint-GC-transition
-records before the RustFS gate can report success. When
-`scripts/run-rustfs-s3-gate.sh` leaves `VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE=1`
-at its default, that GC run uses a deterministic RustFS prefix and run id, then
-the gate runs `velorix-cli gc-production-evidence --json` against the same
-prefix and writes `target/release-evidence/rustfs-production-gc.json`. Release
-readiness also records
-`target/release-evidence/rustfs-production-gc-validation.json` from
-`rustfs-production-gc-evidence-validate`, proving the gate JSON, seed fixture,
-executed `GcRunV1`, and production verifier artifact all refer to the same live
-run by matching the canonical persisted-run digest and seed-declared full
-deleted object keys. The fixed release-smoke fixture keeps
-`retain_latest_manifests=1` because it seeds exactly two checkpoints. The full
-readiness report still has to validate this production GC artifact together with
-the selected deployment and authority store.
+The `s3_compat` target probes authoritative startup capabilities, including
+conditional PUT/CAS. GC checks cover planning, retention, and denial of unsafe
+execution; they do not establish production deletion evidence. Production GC
+remains blocked without the durable cross-process coordinator. The gate defaults
+`VELORIX_VERSITYGW_RUN_PRODUCTION_GC_EVIDENCE=0`; setting it to `1` exits 75 before
+setup. Its evidence records `s3_compatible_gc_execution_unavailable`, and no
+production GC artifact family is emitted.
 
 The `multi_process_ingest_admission` target exercises the checked
-`RangeAdmissionIndexV1` coordinator path against RustFS through the S3 API: two
+`RangeAdmissionIndexV1` coordinator path against Versity Gateway through the S3 API: two
 same-host OS processes mark themselves ready after store/coordinator/payload
 setup, are released together into overlapping appends with zero artificial
 post-release delay, and admit exactly one append with the loser returning
@@ -161,29 +150,21 @@ proving stale retries return `admission_expired` without a new transition, and
 then appending an adjacent range with the chained index preserved. Deployed
 writer/operator topology evidence remains a separate ingest row blocker.
 
-The benchmark step can be skipped with `VELORIX_RUSTFS_RUN_BENCHMARK=0`, and the
-production GC verifier artifact can be skipped for fast diagnostics with
-`VELORIX_RUSTFS_RUN_PRODUCTION_GC_EVIDENCE=0`. The script writes
-`target/velorix-s3/rustfs-s3-gate-evidence.json`, conditionally writes
-`target/release-evidence/rustfs-production-gc.json` plus
-`target/release-evidence/rustfs-production-gc-validation.json`, and deletes the
-RustFS container/network/volume by default. Set `VELORIX_RUSTFS_CLEANUP=0` to
+The script writes `target/velorix-s3/versitygw-s3-gate-evidence.json` and deletes the
+Versity Gateway container/network/volume by default. Set `VELORIX_VERSITYGW_CLEANUP=0` to
 keep the container for debugging.
-When the benchmark step runs, it marks the benchmark JSON with
-`backend_evidence_scope=live_or_native`; S3-compatible benchmark gate results
-must include an explicit `backend_evidence_scope`; omitted scope remains
-backward-compatible for old baselines but is rejected for current S3-compatible
-gate evidence.
+The gate always records `benchmark.ran=false`; it does not emit a benchmark
+result. Fresh Versity Gateway benchmark and production GC evidence remain
+pending. Historical RustFS measurements retain their original provider identity.
 
-The manual `RustFS S3-Compatible Gate` workflow runs this same RustFS-backed
+The manual `Versity Gateway S3-Compatible Gate` workflow runs this same Versity Gateway-backed
 gate on a GitHub-hosted runner and uploads the JSON as
-`rustfs-s3-compatible-evidence`.
-Its benchmark input defaults off so the fast storage/runtime API behavior gate
-can be reviewed separately from slower benchmark output. The evidence file
+`versitygw-s3-compatible-evidence`.
+The workflow has no benchmark input. The evidence file
 records the `s3_compatible` and `s3_compatible_integration_harness` readiness
 evidence kinds plus gate-local detail
 `s3_compatible_ingest_admission_crash_restart` for the indexed admission
-crash/restart path. RustFS evidence counts as live S3-compatible evidence for
+crash/restart path. Versity Gateway evidence counts as live S3-compatible evidence for
 Velorix readiness when it is produced through the S3 API, with local filesystem
 and generic emulator evidence still rejected by readiness validators.
 

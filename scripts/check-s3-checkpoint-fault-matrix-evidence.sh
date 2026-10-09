@@ -95,6 +95,7 @@ def valid_scenario_names(scenarios):
 
 forbidden_tokens = {
     "rustfs-only",
+    "versitygw-only",
     "local-only",
     "local_only",
     "local smoke",

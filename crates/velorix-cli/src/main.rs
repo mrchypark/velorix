@@ -202,7 +202,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    RustfsProductionGcEvidenceValidate {
+    VersitygwProductionGcEvidenceValidate {
         #[arg(long)]
         gate_evidence: PathBuf,
         #[arg(long)]
@@ -264,7 +264,7 @@ enum Command {
         #[arg(long)]
         production_gc_run_evidence: Option<PathBuf>,
         #[arg(long)]
-        rustfs_production_gc_validation_evidence: Option<PathBuf>,
+        versitygw_production_gc_validation_evidence: Option<PathBuf>,
         #[arg(long)]
         ingest_writer_lifecycle_evidence: Option<PathBuf>,
         #[arg(long)]
@@ -455,14 +455,14 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", format_production_gc_run_evidence(&artifact));
             }
         }
-        Some(Command::RustfsProductionGcEvidenceValidate {
+        Some(Command::VersitygwProductionGcEvidenceValidate {
             gate_evidence,
             seed_evidence,
             execute_evidence,
             production_evidence,
             json,
         }) => {
-            let report = validate_rustfs_production_gc_evidence_family(
+            let report = validate_versitygw_production_gc_evidence_family(
                 &gate_evidence,
                 &seed_evidence,
                 &execute_evidence,
@@ -471,10 +471,13 @@ async fn main() -> anyhow::Result<()> {
             if json {
                 println!(
                     "{}",
-                    format_rustfs_production_gc_evidence_report_json(&report)?
+                    format_versitygw_production_gc_evidence_report_json(&report)?
                 );
             } else {
-                print!("{}", format_rustfs_production_gc_evidence_report(&report));
+                print!(
+                    "{}",
+                    format_versitygw_production_gc_evidence_report(&report)
+                );
             }
         }
         Some(Command::IngestWriterAppend {
@@ -546,7 +549,7 @@ async fn main() -> anyhow::Result<()> {
             release_commit,
             s3_release_benchmark_gate_evidence,
             production_gc_run_evidence,
-            rustfs_production_gc_validation_evidence,
+            versitygw_production_gc_validation_evidence,
             ingest_writer_lifecycle_evidence,
             standing_runtime_product_evidence,
             s3_checkpoint_fault_matrix_evidence,
@@ -564,7 +567,7 @@ async fn main() -> anyhow::Result<()> {
                 release_commit,
                 s3_release_benchmark_gate_evidence,
                 production_gc_run_evidence,
-                rustfs_production_gc_validation_evidence,
+                versitygw_production_gc_validation_evidence,
                 ingest_writer_lifecycle_evidence,
                 standing_runtime_product_evidence,
                 s3_checkpoint_fault_matrix_evidence,
@@ -645,7 +648,7 @@ struct ReadinessReleaseArtifactPaths {
     release_commit: Option<String>,
     s3_release_benchmark_gate_evidence: Option<PathBuf>,
     production_gc_run_evidence: Option<PathBuf>,
-    rustfs_production_gc_validation_evidence: Option<PathBuf>,
+    versitygw_production_gc_validation_evidence: Option<PathBuf>,
     ingest_writer_lifecycle_evidence: Option<PathBuf>,
     standing_runtime_product_evidence: Option<PathBuf>,
     s3_checkpoint_fault_matrix_evidence: Option<PathBuf>,
@@ -789,17 +792,17 @@ fn validate_readiness_release_artifacts(
     }
     if release_artifacts_required {
         require_artifact_path(
-            "rustfs-production-gc-validation-evidence",
-            &artifacts.rustfs_production_gc_validation_evidence,
+            "versitygw-production-gc-validation-evidence",
+            &artifacts.versitygw_production_gc_validation_evidence,
         )?;
     } else if artifacts.first_e2e_artifacts {
         require_first_e2e_artifact_path(
-            "rustfs-production-gc-validation-evidence",
-            &artifacts.rustfs_production_gc_validation_evidence,
+            "versitygw-production-gc-validation-evidence",
+            &artifacts.versitygw_production_gc_validation_evidence,
         )?;
     }
-    if let Some(path) = &artifacts.rustfs_production_gc_validation_evidence {
-        validate_rustfs_production_gc_validation_evidence_artifact(
+    if let Some(path) = &artifacts.versitygw_production_gc_validation_evidence {
+        validate_versitygw_production_gc_validation_evidence_artifact(
             path,
             artifacts.production_gc_run_evidence.as_deref(),
             deployment_id,
@@ -1223,6 +1226,7 @@ fn reject_critique_release_forbidden_tokens(
     for token in match evidence_kind {
         "s3_compatible_checkpoint_fault_matrix" => &[
             "rustfs-only",
+            "versitygw-only",
             "localstack",
             "minio",
             "moto",
@@ -1722,7 +1726,7 @@ mod tests {
     #[test]
     fn s3_checkpoint_fault_matrix_rejects_non_s3_compatible_backend() {
         let mut artifact = valid_s3_checkpoint_fault_matrix();
-        artifact["backend"] = json!("rustfs-only");
+        artifact["backend"] = json!("versitygw-only");
         artifact["provider"] = json!("release-object-store");
         let path = write_artifact("s3-checkpoint-fault-matrix", artifact);
 
@@ -2191,18 +2195,22 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn write_rustfs_production_gc_family(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-        let gate = dir.join("rustfs-s3-gate-evidence.json");
-        let seed = dir.join("rustfs-production-gc-seed.json");
-        let execute = dir.join("rustfs-production-gc-run.json");
-        let production = dir.join("rustfs-production-gc.json");
-        let authority_store_id = "s3://rustfs/velorix-rustfs/rustfs-s3-gate/test/production-gc";
-        let gc_run_id = "rustfs-production-gc-test";
-        let deleted_object_key = "v1/state/orders_sum_count/p=0000000000/chk=00000000000000000000/rustfs-production-gc-test-state-0000.state";
+    fn write_versitygw_production_gc_family(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let gate = dir.join("versitygw-s3-gate-evidence.json");
+        let seed = dir.join("versitygw-production-gc-seed.json");
+        let execute = dir.join("versitygw-production-gc-run.json");
+        let production = dir.join("versitygw-production-gc.json");
+        let authority_store_id =
+            "s3://versitygw/velorix-versitygw/versitygw-s3-gate/test/production-gc";
+        let gc_run_id = "versitygw-production-gc-test";
+        let deleted_object_key = "v1/state/orders_sum_count/p=0000000000/chk=00000000000000000000/versitygw-production-gc-test-state-0000.state";
 
         fs::write(&gate, serde_json::to_vec(&json!({
             "schema_version": 1,
-            "evidence_kind": "rustfs_s3_compatible_gate",
+            "evidence_kind": "versitygw_s3_compatible_gate",
+            "provider": "versitygw",
+            "versitygw_image": "versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499",
+            "versitygw_image_digest": "sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499",
             "readiness_evidence_kind": ["s3_compatible", "s3_compatible_integration_harness"],
             "gate_detail_kind": ["s3_compatible_ingest_admission_crash_restart", "s3_compatible_gc_execution_retention"],
             "backend_evidence_scope": "live_or_native",
@@ -2213,10 +2221,10 @@ mod tests {
                 "seed_artifact_path": seed.display().to_string(),
                 "execute_artifact_path": execute.display().to_string(),
                 "artifact_path": production.display().to_string(),
-                "deployment_id": "rustfs-s3-gate",
+                "deployment_id": "versitygw-s3-gate",
                 "authority_store_id": authority_store_id,
                 "gc_run_id": gc_run_id,
-                "prefix": "rustfs-s3-gate/test/production-gc",
+                "prefix": "versitygw-s3-gate/test/production-gc",
                 "retain_latest_manifests": 1,
                 "expected_min_deleted_candidates": 1
             }
@@ -2229,7 +2237,7 @@ mod tests {
             "authority_store_id": authority_store_id,
             "seed_id": gc_run_id,
             "checkpoint_versions": [0, 1],
-            "state_object_ids": ["rustfs-production-gc-test-state-0000", "rustfs-production-gc-test-state-0001"],
+            "state_object_ids": ["versitygw-production-gc-test-state-0000", "versitygw-production-gc-test-state-0001"],
             "expected_deleted_object_keys": [deleted_object_key],
             "state_objects_written": 2,
             "expected_min_deleted_candidates": 1,
@@ -2250,7 +2258,7 @@ mod tests {
                 "schema_version": 1,
                 "status": "pass",
                 "evidence_kind": "production_gc_run_evidence",
-                "deployment_id": "rustfs-s3-gate",
+                "deployment_id": "versitygw-s3-gate",
                 "authority_store_id": authority_store_id,
                 "gc_run_id": gc_run_id,
                 "listing_consistency_checked": true,
@@ -2268,9 +2276,116 @@ mod tests {
     }
 
     #[test]
-    fn rustfs_production_gc_evidence_validate_rejects_stale_execute_digest() {
+    fn versitygw_gc_contract_uses_canonical_cli_and_json_names() {
+        let args = Cli::try_parse_from([
+            "velorix-cli",
+            "versitygw-production-gc-evidence-validate",
+            "--gate-evidence",
+            "gate.json",
+            "--seed-evidence",
+            "seed.json",
+            "--execute-evidence",
+            "execute.json",
+            "--production-evidence",
+            "production.json",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::VersitygwProductionGcEvidenceValidate { .. })
+        ));
         let dir = tempdir().unwrap();
-        let (gate, seed, execute, production) = write_rustfs_production_gc_family(dir.path());
+        let (gate, seed, execute, production) = write_versitygw_production_gc_family(dir.path());
+        let report =
+            validate_versitygw_production_gc_evidence_family(&gate, &seed, &execute, &production)
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            &format_versitygw_production_gc_evidence_report_json(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["evidence_kind"],
+            "versitygw_production_gc_evidence_family_validated"
+        );
+        assert_eq!(json["status"], "pass");
+        assert_eq!(json["checks"][0], "versitygw_s3_compatible_gate_present");
+        assert_eq!(json["gate_evidence_path"], gate.display().to_string());
+    }
+
+    #[test]
+    fn versitygw_gc_gate_rejects_historical_rustfs_evidence() {
+        let dir = tempdir().unwrap();
+        let (gate, seed, execute, production) = write_versitygw_production_gc_family(dir.path());
+        let mut evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(&gate).unwrap()).unwrap();
+        evidence["evidence_kind"] = json!("rustfs_s3_compatible_gate");
+        fs::write(&gate, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        let error =
+            validate_versitygw_production_gc_evidence_family(&gate, &seed, &execute, &production)
+                .unwrap_err();
+        assert!(error.to_string().contains("versitygw_s3_compatible_gate"));
+    }
+
+    #[test]
+    fn versitygw_gc_gate_rejects_relabelled_rustfs_provider_identity() {
+        let dir = tempdir().unwrap();
+        let (gate, seed, execute, production) = write_versitygw_production_gc_family(dir.path());
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&gate).unwrap()).unwrap();
+        let mut relabelled = original.clone();
+        relabelled
+            .as_object_mut()
+            .unwrap()
+            .remove("versitygw_image");
+        relabelled
+            .as_object_mut()
+            .unwrap()
+            .remove("versitygw_image_digest");
+        relabelled["rustfs_image"] = json!("rustfs/rustfs:1.0.0-beta.4");
+        let mut wrong_image = original.clone();
+        wrong_image["versitygw_image"] = json!("rustfs/rustfs:1.0.0-beta.4");
+        let mut wrong_digest = original.clone();
+        wrong_digest["versitygw_image_digest"] = json!(format!("sha256:{}", "a".repeat(64)));
+        let mut wrong_provider = original.clone();
+        wrong_provider["provider"] = json!("rustfs");
+        let mut legacy_authority = original.clone();
+        legacy_authority["production_gc_artifact"]["authority_store_id"] =
+            json!("s3://rustfs/bucket/prefix");
+        for (evidence, expected_error) in [
+            (relabelled, "rustfs_"),
+            (wrong_image, "official Versity Gateway"),
+            (wrong_digest, "image digest"),
+            (wrong_provider, "provider must be versitygw"),
+            (legacy_authority, "RustFS authority"),
+        ] {
+            fs::write(&gate, serde_json::to_vec(&evidence).unwrap()).unwrap();
+            let error = validate_versitygw_production_gc_evidence_family(
+                &gate,
+                &seed,
+                &execute,
+                &production,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn s3_authority_scope_preserves_provider_identity() {
+        for provider in ["external", "versitygw", "rustfs"] {
+            let authority = format!("s3://{provider}/bucket/prefix");
+            let scope = s3_authority_scope(&authority).unwrap();
+            assert_eq!(scope.raw, authority);
+            assert_eq!(scope.bucket, "bucket");
+            assert_eq!(scope.prefix, "prefix");
+        }
+    }
+
+    #[test]
+    fn versitygw_production_gc_evidence_validate_rejects_stale_execute_digest() {
+        let dir = tempdir().unwrap();
+        let (gate, seed, execute, production) = write_versitygw_production_gc_family(dir.path());
         let mut run: serde_json::Value =
             serde_json::from_slice(&fs::read(&execute).unwrap()).unwrap();
         run["report"]["skipped"] = json!([{
@@ -2280,7 +2395,7 @@ mod tests {
         fs::write(&execute, serde_json::to_vec(&run).unwrap()).unwrap();
 
         let error =
-            validate_rustfs_production_gc_evidence_family(&gate, &seed, &execute, &production)
+            validate_versitygw_production_gc_evidence_family(&gate, &seed, &execute, &production)
                 .unwrap_err();
         assert!(
             format!("{error:#}").contains("verified_gc_run_digest"),
@@ -2289,10 +2404,10 @@ mod tests {
     }
 
     #[test]
-    fn rustfs_production_gc_evidence_validate_rejects_seed_id_substring_key() {
+    fn versitygw_production_gc_evidence_validate_rejects_seed_id_substring_key() {
         let dir = tempdir().unwrap();
-        let (gate, seed, execute, production) = write_rustfs_production_gc_family(dir.path());
-        let different_key = "v1/state/other_owner/p=0000000000/chk=00000000000000000000/rustfs-production-gc-test-state-0000.state";
+        let (gate, seed, execute, production) = write_versitygw_production_gc_family(dir.path());
+        let different_key = "v1/state/other_owner/p=0000000000/chk=00000000000000000000/versitygw-production-gc-test-state-0000.state";
         let mut run: serde_json::Value =
             serde_json::from_slice(&fs::read(&execute).unwrap()).unwrap();
         run["plan"]["candidates"][0]["object_key"] = json!(different_key);
@@ -2307,7 +2422,7 @@ mod tests {
         fs::write(&production, serde_json::to_vec(&evidence).unwrap()).unwrap();
 
         let error =
-            validate_rustfs_production_gc_evidence_family(&gate, &seed, &execute, &production)
+            validate_versitygw_production_gc_evidence_family(&gate, &seed, &execute, &production)
                 .unwrap_err();
         assert!(format!("{error:#}").contains("deleted keys do not match seeded expectation"));
     }
@@ -2762,14 +2877,14 @@ fn validate_production_gc_run_evidence_artifact(
     Ok(())
 }
 
-fn validate_rustfs_production_gc_validation_evidence_artifact(
+fn validate_versitygw_production_gc_validation_evidence_artifact(
     path: &Path,
     production_gc_run_evidence_path: Option<&Path>,
     deployment_id: &str,
     authority_store_id: &str,
 ) -> anyhow::Result<()> {
     reject_local_readiness_artifact(&read_artifact_evidence_kind(path)?, path)?;
-    let artifact: RustfsProductionGcEvidenceValidationReportV1 = read_json_artifact(path)?;
+    let artifact: VersitygwProductionGcEvidenceValidationReportV1 = read_json_artifact(path)?;
 
     if artifact.schema_version != 1 {
         bail!(
@@ -2780,38 +2895,38 @@ fn validate_rustfs_production_gc_validation_evidence_artifact(
     }
     if artifact.status != "pass" {
         bail!(
-            "{} RustFS production GC validation evidence is not pass",
+            "{} Versity Gateway production GC validation evidence is not pass",
             path.display()
         );
     }
-    if artifact.evidence_kind != "rustfs_production_gc_evidence_family_validated" {
+    if artifact.evidence_kind != "versitygw_production_gc_evidence_family_validated" {
         bail!(
-            "{} has evidence_kind {}, expected rustfs_production_gc_evidence_family_validated",
+            "{} has evidence_kind {}, expected versitygw_production_gc_evidence_family_validated",
             path.display(),
             artifact.evidence_kind
         );
     }
     if artifact.deployment_id != deployment_id {
         bail!(
-            "{} RustFS production GC validation deployment_id does not match readiness report",
+            "{} Versity Gateway production GC validation deployment_id does not match readiness report",
             path.display()
         );
     }
     if artifact.authority_store_id != authority_store_id {
         bail!(
-            "{} RustFS production GC validation authority_store_id does not match readiness report",
+            "{} Versity Gateway production GC validation authority_store_id does not match readiness report",
             path.display()
         );
     }
     if artifact.gc_run_id.trim().is_empty() {
         bail!(
-            "{} RustFS production GC validation evidence is missing gc_run_id",
+            "{} Versity Gateway production GC validation evidence is missing gc_run_id",
             path.display()
         );
     }
     if artifact.retain_latest_manifests == 0 || artifact.deleted_candidates == 0 {
         bail!(
-            "{} RustFS production GC validation evidence must include a retained policy and deleted candidates",
+            "{} Versity Gateway production GC validation evidence must include a retained policy and deleted candidates",
             path.display()
         );
     }
@@ -2829,14 +2944,14 @@ fn validate_rustfs_production_gc_validation_evidence_artifact(
     ] {
         if reported.trim().is_empty() {
             bail!(
-                "{} RustFS production GC validation {} must be non-empty",
+                "{} Versity Gateway production GC validation {} must be non-empty",
                 path.display(),
                 label
             );
         }
     }
     for required_check in [
-        "rustfs_s3_compatible_gate_present",
+        "versitygw_s3_compatible_gate_present",
         "seed_fixture_created_retired_checkpoint_state",
         "s3_gc_execute_deleted_seeded_candidate",
         "production_gc_evidence_verified_listing_retention_and_transition",
@@ -2844,7 +2959,7 @@ fn validate_rustfs_production_gc_validation_evidence_artifact(
     ] {
         if !artifact.checks.iter().any(|check| check == required_check) {
             bail!(
-                "{} RustFS production GC validation evidence is missing check {}",
+                "{} Versity Gateway production GC validation evidence is missing check {}",
                 path.display(),
                 required_check
             );
@@ -2859,7 +2974,7 @@ fn validate_rustfs_production_gc_validation_evidence_artifact(
             production_gc_run_evidence_path,
         ) {
             bail!(
-                "{} RustFS production GC validation production_evidence_path does not match {}",
+                "{} Versity Gateway production GC validation production_evidence_path does not match {}",
                 path.display(),
                 production_gc_run_evidence_path.display()
             );
@@ -4740,7 +4855,8 @@ fn s3_authority_scope(authority_store_id: &str) -> anyhow::Result<S3AuthoritySco
         bail!("authority_store_id must include a bucket");
     };
     let remaining = parts.collect::<Vec<_>>();
-    if matches!(first, "external" | "rustfs") {
+    // Historical RustFS authority IDs keep their original provider identity.
+    if matches!(first, "external" | "versitygw" | "rustfs") {
         let Some(bucket) = remaining.first() else {
             bail!("authority_store_id must include a bucket after {first}");
         };
@@ -5940,7 +6056,7 @@ async fn seed_s3_compatible_gc_fixture(
             schema_version: 1,
             checkpoint_version: 0,
             input_ranges: vec![InputRange {
-                stream_id: "rustfs-gc-seed".to_string(),
+                stream_id: "versitygw-gc-seed".to_string(),
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,
@@ -5973,7 +6089,7 @@ async fn seed_s3_compatible_gc_fixture(
             schema_version: 1,
             checkpoint_version: 1,
             input_ranges: vec![InputRange {
-                stream_id: "rustfs-gc-seed".to_string(),
+                stream_id: "versitygw-gc-seed".to_string(),
                 partition_id: 0,
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
@@ -6006,12 +6122,12 @@ async fn seed_s3_compatible_gc_fixture(
     })
 }
 
-fn validate_rustfs_production_gc_evidence_family(
+fn validate_versitygw_production_gc_evidence_family(
     gate_evidence_path: &Path,
     seed_evidence_path: &Path,
     execute_evidence_path: &Path,
     production_evidence_path: &Path,
-) -> anyhow::Result<RustfsProductionGcEvidenceValidationReportV1> {
+) -> anyhow::Result<VersitygwProductionGcEvidenceValidationReportV1> {
     let gate: serde_json::Value = read_json_artifact(gate_evidence_path)?;
     let seed: S3CompatibleGcSeedFixtureArtifactV1 = read_json_artifact(seed_evidence_path)?;
     let run: GarbageCollectionRunV1 = read_json_artifact(execute_evidence_path)?;
@@ -6026,25 +6142,67 @@ fn validate_rustfs_production_gc_evidence_family(
             gate_schema_version
         );
     }
-    if require_json_str(gate_evidence_path, &gate, "/evidence_kind")? != "rustfs_s3_compatible_gate"
+    if require_json_str(gate_evidence_path, &gate, "/evidence_kind")?
+        != "versitygw_s3_compatible_gate"
     {
         bail!(
-            "{} has evidence_kind other than rustfs_s3_compatible_gate",
+            "{} has evidence_kind other than versitygw_s3_compatible_gate",
             gate_evidence_path.display()
         );
+    }
+    if gate
+        .as_object()
+        .is_some_and(|fields| fields.keys().any(|key| key.starts_with("rustfs_")))
+    {
+        bail!("Versity Gateway gate must not contain historical rustfs_ fields");
+    }
+    if require_json_str(gate_evidence_path, &gate, "/provider")? != "versitygw" {
+        bail!("gate provider must be versitygw");
+    }
+    let image = require_json_str(gate_evidence_path, &gate, "/versitygw_image")?;
+    let Some((repository, pinned_digest)) = image.split_once('@') else {
+        bail!("gate image must declare the official Versity Gateway repository pinned by digest");
+    };
+    let repository = repository.strip_prefix("docker.io/").unwrap_or(repository);
+    if !matches!(repository, "versity/versitygw" | "versity/versitygw:v1.8.0") {
+        bail!("gate image must declare the official Versity Gateway repository versity/versitygw");
+    }
+    let image_digest = require_json_str(gate_evidence_path, &gate, "/versitygw_image_digest")?;
+    validate_sha256_digest(gate_evidence_path, image_digest, "versitygw_image_digest")?;
+    if pinned_digest != image_digest {
+        bail!("gate image digest does not match versitygw_image_digest");
+    }
+    // Bind declared provider identity; these fields do not independently prove provenance.
+    let gate_authority = require_json_str(
+        gate_evidence_path,
+        &gate,
+        "/production_gc_artifact/authority_store_id",
+    )?;
+    for authority in [
+        gate_authority,
+        &seed.authority_store_id,
+        &production.authority_store_id,
+    ] {
+        if authority.strip_prefix("s3://").is_some_and(|rest| {
+            rest.split('/')
+                .next()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("rustfs"))
+        }) {
+            bail!("Versity Gateway GC family must not declare a historical RustFS authority");
+        }
     }
     let readiness_kinds =
         require_json_string_array(gate_evidence_path, &gate, "/readiness_evidence_kind")?;
     if !readiness_kinds.contains(&"s3_compatible_integration_harness") {
         bail!(
-            "{} RustFS gate evidence is missing s3_compatible_integration_harness",
+            "{} Versity Gateway gate evidence is missing s3_compatible_integration_harness",
             gate_evidence_path.display()
         );
     }
     let detail_kinds = require_json_string_array(gate_evidence_path, &gate, "/gate_detail_kind")?;
     if !detail_kinds.contains(&"s3_compatible_gc_execution_retention") {
         bail!(
-            "{} RustFS gate evidence is missing s3_compatible_gc_execution_retention",
+            "{} Versity Gateway gate evidence is missing s3_compatible_gc_execution_retention",
             gate_evidence_path.display()
         );
     }
@@ -6060,7 +6218,7 @@ fn validate_rustfs_production_gc_evidence_family(
     )? != "production_gc_run_evidence"
     {
         bail!(
-            "{} RustFS gate production_gc_artifact evidence_kind must be production_gc_run_evidence",
+            "{} Versity Gateway gate production_gc_artifact evidence_kind must be production_gc_run_evidence",
             gate_evidence_path.display()
         );
     }
@@ -6202,22 +6360,22 @@ fn validate_rustfs_production_gc_evidence_family(
     if gate_authority_store_id != seed.authority_store_id
         || gate_authority_store_id != production.authority_store_id
     {
-        bail!("RustFS production GC evidence authority_store_id values do not match");
+        bail!("Versity Gateway production GC evidence authority_store_id values do not match");
     }
     if gate_gc_run_id != seed.seed_id
         || gate_gc_run_id != run.run_id
         || gate_gc_run_id != production.gc_run_id
     {
-        bail!("RustFS production GC evidence run identifiers do not match");
+        bail!("Versity Gateway production GC evidence run identifiers do not match");
     }
     if gate_deployment_id != production.deployment_id {
-        bail!("RustFS production GC evidence deployment_id values do not match");
+        bail!("Versity Gateway production GC evidence deployment_id values do not match");
     }
     if gate_retain_latest_manifests != run.policy.retain_latest_manifests {
-        bail!("RustFS production GC retain_latest_manifests values do not match");
+        bail!("Versity Gateway production GC retain_latest_manifests values do not match");
     }
     if seed.expected_deleted_candidates_at_retain_latest_manifests != run.report.deleted.len() {
-        bail!("RustFS production GC deleted candidate count does not match seeded expectation");
+        bail!("Versity Gateway production GC deleted candidate count does not match seeded expectation");
     }
 
     for (pointer, path) in [
@@ -6237,17 +6395,17 @@ fn validate_rustfs_production_gc_evidence_family(
         let reported = require_json_str(gate_evidence_path, &gate, pointer)?;
         if !evidence_path_matches(reported, path) {
             bail!(
-                "{} RustFS gate {pointer} did not match {}",
+                "{} Versity Gateway gate {pointer} did not match {}",
                 gate_evidence_path.display(),
                 path.display()
             );
         }
     }
 
-    Ok(RustfsProductionGcEvidenceValidationReportV1 {
+    Ok(VersitygwProductionGcEvidenceValidationReportV1 {
         schema_version: 1,
         status: "pass".to_string(),
-        evidence_kind: "rustfs_production_gc_evidence_family_validated".to_string(),
+        evidence_kind: "versitygw_production_gc_evidence_family_validated".to_string(),
         gate_evidence_path: gate_evidence_path.display().to_string(),
         seed_evidence_path: seed_evidence_path.display().to_string(),
         execute_evidence_path: execute_evidence_path.display().to_string(),
@@ -6258,7 +6416,7 @@ fn validate_rustfs_production_gc_evidence_family(
         retain_latest_manifests: run.policy.retain_latest_manifests,
         deleted_candidates: run.report.deleted.len(),
         checks: vec![
-            "rustfs_s3_compatible_gate_present".to_string(),
+            "versitygw_s3_compatible_gate_present".to_string(),
             "seed_fixture_created_retired_checkpoint_state".to_string(),
             "s3_gc_execute_deleted_seeded_candidate".to_string(),
             "production_gc_evidence_verified_listing_retention_and_transition".to_string(),
@@ -6365,19 +6523,19 @@ fn format_production_gc_run_evidence(artifact: &ProductionGcRunEvidenceArtifactV
     )
 }
 
-fn format_rustfs_production_gc_evidence_report_json(
-    report: &RustfsProductionGcEvidenceValidationReportV1,
+fn format_versitygw_production_gc_evidence_report_json(
+    report: &VersitygwProductionGcEvidenceValidationReportV1,
 ) -> anyhow::Result<String> {
     serde_json::to_string_pretty(report)
-        .context("failed to serialize RustFS production GC evidence validation report")
+        .context("failed to serialize Versity Gateway production GC evidence validation report")
 }
 
-fn format_rustfs_production_gc_evidence_report(
-    report: &RustfsProductionGcEvidenceValidationReportV1,
+fn format_versitygw_production_gc_evidence_report(
+    report: &VersitygwProductionGcEvidenceValidationReportV1,
 ) -> String {
     let mut output = String::new();
     output.push_str(&format!(
-        "rustfs_production_gc_evidence status={} deployment_id={} authority_store_id={} gc_run_id={} retain_latest_manifests={} deleted_candidates={}\n",
+        "versitygw_production_gc_evidence status={} deployment_id={} authority_store_id={} gc_run_id={} retain_latest_manifests={} deleted_candidates={}\n",
         report.status,
         report.deployment_id,
         report.authority_store_id,
@@ -6981,7 +7139,7 @@ struct ProductionGcRunEvidenceArtifactV1 {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct RustfsProductionGcEvidenceValidationReportV1 {
+struct VersitygwProductionGcEvidenceValidationReportV1 {
     schema_version: u16,
     status: String,
     evidence_kind: String,

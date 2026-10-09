@@ -899,6 +899,8 @@ pub enum LogicalPlanLatestByKeyFunctionV1 {
 /// Public late-row handling policy for event-time windows. The policy is
 /// part of the admitted plan and the checkpoint payload, so retractions and
 /// restart replay the same decisions deterministically.
+/// The enum default is an explicit strict policy; an absent plan policy
+/// accepts late rows using retained state instead.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LateRowPolicy {
@@ -916,10 +918,18 @@ pub enum LateRowPolicy {
         /// Maximum allowed lateness in nanoseconds.
         allowance_ns: i64,
     },
+    /// Correct published TUMBLE/HOP windows without a lateness cutoff.
+    /// The legacy name is retained for serialized-plan compatibility.
+    /// `horizon_ns` controls hot-state retention behind the watermark;
+    /// older corrections require cold-state recovery, not rejection.
+    CorrectWithinHorizon { horizon_ns: i64 },
 }
 
 impl LateRowPolicy {
     pub fn validate(&self) -> Result<(), ViewPlanError> {
+        if matches!(self, Self::CorrectWithinHorizon { horizon_ns } if *horizon_ns <= 0) {
+            return unsupported("late-row correction hot-state retention must be positive");
+        }
         if let LateRowPolicy::AdmitWithinAllowance { allowance_ns } = self {
             if *allowance_ns < 0 {
                 return Err(ViewPlanError::UnsupportedShape {
@@ -958,6 +968,10 @@ pub struct SupportedTumblingWindowPlan {
     pub top_k: Option<SupportedTopKPlan>,
     pub window_start_output_column_id: String,
     pub window_end_output_column_id: String,
+    /// `None` accepts late rows and retains all window state, including for
+    /// SESSION/TopK. `Some(Reject)` explicitly opts into strict rejection.
+    /// Public admission supplies correction hot-state retention for new
+    /// supported TUMBLE/HOP views without TopK.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late_row_policy: Option<LateRowPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2143,8 +2157,8 @@ pub fn lower_supported_tumbling_window_sql_to_logical_plan(
 
 /// Lowering variant with an explicit late-row policy. The policy becomes part
 /// of the admitted plan (and therefore the checkpoint payload), so retractions
-/// and restart replay identical decisions. `None` means the default
-/// `LateRowPolicy::Reject`.
+/// and restart replay identical decisions. `None` accepts late rows with
+/// retained state; strict rejection requires `Some(LateRowPolicy::Reject)`.
 pub fn lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
     sql: &str,
     catalog: &VelorixRelationCatalogV1,
@@ -2401,6 +2415,8 @@ pub fn validate_supported_tumbling_window_sql(
     let query = parse_single_query(sql)?;
     let (select, cte_source) =
         supported_plain_select_allow_identity_cte_and_top_k(&query, catalog)?;
+    let normalized_select = normalize_projected_event_time_window(select, catalog)?;
+    let select = normalized_select.as_ref().unwrap_or(select);
     validate_plain_select_clauses_allow_having(select)?;
     let (event_time_column, from_window, from_source) =
         match validate_event_time_window_from_relation_with_cte(
@@ -2542,6 +2558,13 @@ pub fn validate_supported_tumbling_window_sql_with_policy(
         policy.validate()?;
     }
     let mut plan = validate_supported_tumbling_window_sql(sql, catalog)?;
+    if matches!(
+        late_row_policy,
+        Some(LateRowPolicy::CorrectWithinHorizon { .. })
+    ) && (plan.window_kind == SupportedEventTimeWindowKind::Session || plan.top_k.is_some())
+    {
+        return unsupported("late-row correction supports TUMBLE/HOP without TopK only");
+    }
     plan.late_row_policy = late_row_policy;
     Ok(plan)
 }
@@ -14261,6 +14284,82 @@ fn select_item_alias_or_source_default(
         }
         _ => unsupported("projection item must be an expression"),
     }
+}
+
+/// Expand a projected window alias into the flat boundary contract used by
+/// the internal runtime, leaving legacy projections untouched.
+fn normalize_projected_event_time_window(
+    select: &Select,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Option<Select>, ViewPlanError> {
+    let windows: Vec<_> = select
+        .projection
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            SelectItem::ExprWithAlias { expr, alias }
+                if expression_is_event_time_window_function(expr) =>
+            {
+                Some((index, expr, alias))
+            }
+            _ => None,
+        })
+        .collect();
+    let [(index, window, alias)] = windows.as_slice() else {
+        return if windows.is_empty() {
+            Ok(None)
+        } else {
+            unsupported("exactly one projected event-time window is supported")
+        };
+    };
+    if catalog.relation_schema.columns.iter().any(|column| column.name.eq_ignore_ascii_case(&alias.value))
+        || select.projection.iter().enumerate().any(|(other_index, item)| {
+            other_index != *index && matches!(item, SelectItem::ExprWithAlias { alias: other_alias, .. } if other_alias.value.eq_ignore_ascii_case(&alias.value))
+        })
+    {
+        return unsupported("projected window alias must not reuse a source column or projection alias");
+    }
+    // Validate modifiers and intervals before expanding the alias.
+    event_time_window_group_by_spec(window)?;
+    let GroupByExpr::Expressions(groups, modifiers) = &select.group_by else {
+        return unsupported("projected event-time window requires GROUP BY window alias, key");
+    };
+    if !modifiers.is_empty() || groups.len() != 2 {
+        return unsupported("projected event-time window requires GROUP BY window alias, key");
+    }
+    let alias_positions: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, expr)| {
+            expression_references_identifier(expr, &alias.value).then_some(index)
+        })
+        .collect();
+    let [alias_index] = alias_positions.as_slice() else {
+        return unsupported("GROUP BY must reference the projected window alias exactly once");
+    };
+    if matches!(groups[1 - *alias_index], Expr::Value(_)) {
+        return unsupported("projected event-time window requires a named grouping key");
+    }
+    if !matches!(*index, 0 | 1) || select.projection.len() < 3 {
+        return unsupported("projected window and grouping key must precede aggregates");
+    }
+    let mut normalized = select.clone();
+    let key = normalized.projection.remove(1 - *index);
+    normalized.projection.remove(0);
+    normalized.projection.insert(0, key);
+    normalized.projection.insert(
+        1,
+        SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("window_start"))),
+    );
+    normalized.projection.insert(
+        2,
+        SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("window_end"))),
+    );
+    normalized.group_by = GroupByExpr::Expressions(
+        vec![groups[1 - *alias_index].clone(), (*window).clone()],
+        Vec::new(),
+    );
+    Ok(Some(normalized))
 }
 
 fn validate_tumbling_group_by(

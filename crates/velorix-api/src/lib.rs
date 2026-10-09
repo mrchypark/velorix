@@ -104,9 +104,9 @@ use velorix_core::{
     },
     standing_program::{
         BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, EpochIdempotencyKey,
-        InputEventTimeWatermark, MaterializedViewPage, NativeCodePolicy, RelationFrontier,
-        RelationInputBatch, RelationInputEncodingV1, RuntimeCheckpoint,
-        RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
+        EventTimeStateObject, EventTimeStateRef, InputEventTimeWatermark, MaterializedViewPage,
+        NativeCodePolicy, RelationFrontier, RelationInputBatch, RelationInputEncodingV1,
+        RuntimeCheckpoint, RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
         RuntimeCheckpointRelationCoverageV1, RuntimeCheckpointStatePayload, ScopedViewId,
         SnapshotPageRequest, StandingProgramIdentity, StandingProgramRuntime,
         StandingProgramRuntimeError, ViewOutputDelta,
@@ -124,22 +124,25 @@ use velorix_core::{
     },
     view_plan::{
         lower_supported_analytic_row_number_sql_to_logical_plan,
-        lower_supported_sql_to_logical_plan, supported_join_view_plan_aggregate_outputs,
-        supported_join_view_plan_is_self_join, supported_join_view_plan_is_singleton,
-        supported_view_plan_aggregate_outputs, supported_view_plan_group_keys,
-        validate_catalog_backed_sum_count_view_sql, validate_supported_analytic_row_number_sql,
-        validate_supported_cross_join_sql, validate_supported_filter_project_sql,
-        validate_supported_interval_join_sql, validate_supported_join_view_sql,
-        validate_supported_latest_by_key_sql, validate_supported_recursive_cte_sql,
-        validate_supported_scalar_aggregate_filter_sql, validate_supported_semi_anti_join_sql,
-        validate_supported_temporal_join_sql, validate_supported_three_input_inner_join_count_sql,
-        validate_supported_tumbling_window_sql, CrossJoinSideV1, LogicalPlanAggregateFunctionV1,
-        SupportedAggregateInputRelationSide, SupportedAggregateOutput,
-        SupportedAnalyticRowNumberPlan, SupportedCrossJoinPlanV1, SupportedFilterProjectPlan,
-        SupportedIntervalJoinPlanV1, SupportedJoinViewPlan, SupportedLatestByKeyPlan,
-        SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1, SupportedTemporalJoinPlanV1,
-        SupportedThreeInputInnerJoinCountPlanV1, SupportedTumblingWindowPlan, SupportedViewPlan,
-        TemporalJoinSideV1, VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
+        lower_supported_sql_to_logical_plan,
+        lower_supported_tumbling_window_sql_to_logical_plan_with_policy,
+        supported_join_view_plan_aggregate_outputs, supported_join_view_plan_is_self_join,
+        supported_join_view_plan_is_singleton, supported_view_plan_aggregate_outputs,
+        supported_view_plan_group_keys, validate_catalog_backed_sum_count_view_sql,
+        validate_supported_analytic_row_number_sql, validate_supported_cross_join_sql,
+        validate_supported_filter_project_sql, validate_supported_interval_join_sql,
+        validate_supported_join_view_sql, validate_supported_latest_by_key_sql,
+        validate_supported_recursive_cte_sql, validate_supported_scalar_aggregate_filter_sql,
+        validate_supported_semi_anti_join_sql, validate_supported_temporal_join_sql,
+        validate_supported_three_input_inner_join_count_sql,
+        validate_supported_tumbling_window_sql, CrossJoinSideV1, LateRowPolicy,
+        LogicalPlanAggregateFunctionV1, SupportedAggregateInputRelationSide,
+        SupportedAggregateOutput, SupportedAnalyticRowNumberPlan, SupportedCrossJoinPlanV1,
+        SupportedFilterProjectPlan, SupportedIntervalJoinPlanV1, SupportedJoinViewPlan,
+        SupportedLatestByKeyPlan, SupportedProjectionExpr, SupportedRecursiveFixpointPlanV1,
+        SupportedTemporalJoinPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
+        SupportedTumblingWindowPlan, SupportedViewPlan, TemporalJoinSideV1,
+        VelorixLogicalViewExecutionV1, VelorixLogicalViewPlanV1, ViewPlanError,
         INCREMENTAL_BAG_SEMANTICS_VERSION_V1, INCREMENTAL_KEY_SEMANTICS_VERSION_V1,
         OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1,
     },
@@ -156,6 +159,7 @@ use velorix_runtime::{
 };
 
 mod checkpoint_publication;
+mod cold_window_state;
 mod ingest_epoch;
 mod openapi;
 mod query_serving;
@@ -291,10 +295,14 @@ struct BackgroundTaskStatus {
     last_compaction_error: Option<String>,
 }
 
+type RelationOperationLockMap = HashMap<(String, String), Arc<AsyncMutex<()>>>;
+
 #[derive(Default)]
 struct StandingRuntimeRegistry {
     runtimes: Mutex<HashMap<StandingRuntimeKey, SharedStandingRuntime>>,
     operation_locks: Mutex<HashMap<StandingRuntimeKey, Arc<AsyncMutex<()>>>>,
+    // ponytail: Shared by this API state only; distributed admission needs a metadata fence.
+    relation_operation_locks: Mutex<RelationOperationLockMap>,
     local_state: Mutex<HashMap<StandingRuntimeKey, StandingRuntimeLocalState>>,
 }
 
@@ -592,6 +600,7 @@ struct StandingRuntimeDeltaPublication {
 struct StandingRuntimeApplyResult {
     checkpoint: RuntimeCheckpoint,
     output_deltas: Vec<ViewOutputDelta>,
+    staged_event_time_state: Vec<EventTimeStateRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -1202,6 +1211,23 @@ impl ApiState {
             .clone())
     }
 
+    fn relation_operation_lock(
+        &self,
+        relation_id: &str,
+        relation_version: &str,
+    ) -> Result<Arc<AsyncMutex<()>>, ApiError> {
+        let key = (relation_id.to_string(), relation_version.to_string());
+        let mut locks = self
+            .standing_runtimes
+            .relation_operation_locks
+            .lock()
+            .map_err(|_| ApiError::internal("relation operation lock registry poisoned"))?;
+        Ok(locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone())
+    }
+
     async fn acquire_standing_runtime_owner(
         &self,
         identity: &StandingProgramIdentity,
@@ -1665,6 +1691,7 @@ fn default_positive_scores_view_request(
         response_schema: None,
         response_formats: vec!["json".to_string()],
         query_policy_id: None,
+        correction_horizon_ns: None,
     })
 }
 
@@ -1940,6 +1967,12 @@ pub struct CreateViewRequest {
     pub response_formats: Vec<String>,
     #[serde(default)]
     pub query_policy_id: Option<String>,
+    #[serde(
+        default,
+        alias = "correctionHorizonNs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub correction_horizon_ns: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -7759,6 +7792,7 @@ pub struct ApiError {
     status: StatusCode,
     message: String,
     details: Option<Value>,
+    retryable_materialization: bool,
 }
 
 impl ApiError {
@@ -7767,6 +7801,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: error.to_string(),
             details: None,
+            retryable_materialization: false,
         }
     }
 
@@ -7775,6 +7810,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             message: error.to_string(),
             details: None,
+            retryable_materialization: false,
         }
     }
 
@@ -7783,6 +7819,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             message: error.to_string(),
             details: None,
+            retryable_materialization: false,
         }
     }
 
@@ -7791,6 +7828,7 @@ impl ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: error.to_string(),
             details: None,
+            retryable_materialization: false,
         }
     }
 
@@ -7799,6 +7837,7 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: error.to_string(),
             details: None,
+            retryable_materialization: false,
         }
     }
 
@@ -7807,6 +7846,7 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: error.to_string(),
             details: Some(details),
+            retryable_materialization: false,
         }
     }
 
@@ -7815,7 +7855,14 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
             details: None,
+            retryable_materialization: false,
         }
+    }
+
+    fn retryable_materialization_io(error: impl std::fmt::Display) -> Self {
+        let mut error = Self::internal(error);
+        error.retryable_materialization = true;
+        error
     }
 }
 

@@ -40,7 +40,8 @@ jobs:
           bash -n scripts/check-vind-product-contract.sh
           bash -n scripts/check-release-evidence-copy-contract.sh
           bash -n scripts/validate-nightly-output.sh
-          bash -n scripts/check-rustfs-s3-gate-contract.sh
+          bash -n scripts/check-versitygw-s3-gate-contract.sh
+          bash -n scripts/run-versitygw-s3-gate.sh
           bash -n scripts/check-no-external-runtime-artifacts.sh
           sh -n scripts/check-rust-toolchain-contract.sh
           sh -n scripts/check-rhiza-operator-manifests-contract.sh
@@ -52,7 +53,7 @@ jobs:
           scripts/check-vind-product-contract.sh
           scripts/check-release-evidence-copy-contract.sh
           scripts/check-nightly-workflow-contract.sh
-          scripts/check-rustfs-s3-gate-contract.sh
+          scripts/check-versitygw-s3-gate-contract.sh
           scripts/check-no-external-runtime-artifacts.sh
           sh scripts/check-rust-toolchain-contract.sh
           scripts/check-rhiza-operator-manifests-contract.sh

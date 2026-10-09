@@ -12210,3 +12210,174 @@ fn count_utf8_input_uses_numeric_runtime_value_column() {
     );
     validate_logical_view_plan(&plan).unwrap();
 }
+
+#[test]
+fn projected_event_time_window_alias_uses_flat_boundary_schema() {
+    let catalog = purchases_event_time_catalog();
+    let output = purchases_window_output_schema();
+    for (function, kind) in [
+        (
+            "tumble(interval '60 seconds')",
+            SupportedEventTimeWindowKind::Tumbling,
+        ),
+        (
+            "hop(interval '30 seconds', interval '60 seconds')",
+            SupportedEventTimeWindowKind::Hopping,
+        ),
+        (
+            "session(interval '30 seconds')",
+            SupportedEventTimeWindowKind::Session,
+        ),
+    ] {
+        for projection in [
+            format!("{function} as window, user_id"),
+            format!("user_id, {function} as window"),
+        ] {
+            let sql = format!("select {projection}, sum(amount) as total_amount, count(*) as event_count from purchases group by window, user_id");
+            let plan =
+                lower_supported_sql_to_logical_plan(&sql, std::slice::from_ref(&catalog), &output)
+                    .unwrap();
+            assert_eq!(plan.view_sql, sql);
+            let default_policy_plan = velorix_core::view_plan::lower_supported_tumbling_window_sql_to_logical_plan_with_policy(&sql, &catalog, &output, None).unwrap();
+            assert_eq!(plan, default_policy_plan);
+            let VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan: supported } =
+                &plan.execution
+            else {
+                panic!("expected window execution")
+            };
+            assert_eq!(supported.window_kind, kind);
+            assert_eq!(supported.window_start_output_column_id, "window_start");
+            assert_eq!(supported.window_end_output_column_id, "window_end");
+            validate_logical_view_plan(&plan).unwrap();
+        }
+    }
+}
+
+#[test]
+fn projected_event_time_window_alias_fails_closed() {
+    let catalog = purchases_event_time_catalog();
+    for sql in [
+        "select tumble(interval '0 seconds') as window, user_id, count(*) from purchases group by window, user_id",
+        "select tumble(interval '60 seconds') as window, user_id, count(*) from purchases group by user_id",
+        "select tumble(interval '60 seconds') as window, user_id, count(*) from purchases group by window, window",
+        "select tumble(interval '60 seconds') as window, amount, count(*) from purchases group by window, amount",
+        "select tumble(interval '60 seconds') as user_id, user_id, count(*) from purchases group by user_id, user_id",
+        "select tumble(interval '60 seconds') as window, user_id as window, count(*) from purchases group by window, user_id",
+        "select tumble(interval '60 seconds') as window, user_id, sum(window.start) from purchases group by window, user_id",
+        "select tumble(interval '60 seconds') as window, user_id, count(*) from purchases group by window, 1",
+        "select hop(interval '40 seconds', interval '60 seconds') as window, user_id, count(*) from purchases group by window, user_id",
+        "select tumble(interval '60 seconds') as window, user_id, count(*) from hop(purchases, event_time, interval '30 seconds', interval '60 seconds') group by window, user_id",
+    ] {
+        assert!(validate_supported_tumbling_window_sql(sql, &catalog).is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn correction_policy_requires_positive_hot_retention_and_fixed_windows_only() {
+    use velorix_core::view_plan::{
+        validate_supported_tumbling_window_sql_with_policy, LateRowPolicy,
+    };
+    let catalog = purchases_event_time_catalog();
+    for horizon_ns in [0, -1] {
+        let error = LateRowPolicy::CorrectWithinHorizon { horizon_ns }
+            .validate()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("hot-state retention must be positive"));
+    }
+    for horizon_ns in [1, 60_000_000_000, i64::MAX] {
+        LateRowPolicy::CorrectWithinHorizon { horizon_ns }
+            .validate()
+            .unwrap();
+    }
+    let policy = Some(LateRowPolicy::CorrectWithinHorizon {
+        horizon_ns: 60_000_000_000,
+    });
+    for function in [
+        "tumble(interval '60 seconds')",
+        "hop(interval '30 seconds', interval '60 seconds')",
+    ] {
+        let sql = format!("select {function} as window, user_id, sum(amount) as total_amount from purchases group by window, user_id");
+        let plan =
+            validate_supported_tumbling_window_sql_with_policy(&sql, &catalog, policy).unwrap();
+        assert_eq!(plan.late_row_policy, policy);
+        let top_k = format!("{sql} order by total_amount desc limit 1");
+        assert!(
+            validate_supported_tumbling_window_sql_with_policy(&top_k, &catalog, policy).is_err()
+        );
+    }
+    let sql = "select session(interval '30 seconds') as window, user_id, count(*) as event_count from purchases group by window, user_id";
+    assert!(validate_supported_tumbling_window_sql_with_policy(sql, &catalog, policy).is_err());
+    let encoded = serde_json::to_value(policy).unwrap();
+    assert_eq!(
+        encoded,
+        json!({"correct_within_horizon": {"horizon_ns": 60_000_000_000i64}})
+    );
+    assert_eq!(
+        serde_json::from_value::<Option<LateRowPolicy>>(encoded).unwrap(),
+        policy
+    );
+}
+
+#[test]
+fn correction_policy_lowering_preserves_sql_identity_and_absent_policy() {
+    use velorix_core::view_plan::{
+        lower_supported_tumbling_window_sql_to_logical_plan_with_policy, LateRowPolicy,
+    };
+    let catalog = purchases_event_time_catalog();
+    let output = purchases_window_output_schema();
+    let sql = "SELECT user_id, window_start, window_end, sum(amount) AS total_amount, count(*) AS event_count FROM tumble(purchases, event_time, interval '60 seconds') GROUP BY user_id, window_start, window_end";
+    let legacy =
+        lower_supported_tumbling_window_sql_to_logical_plan(sql, &catalog, &output).unwrap();
+    let lower = |policy| {
+        lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+            sql, &catalog, &output, policy,
+        )
+        .unwrap()
+    };
+    assert_eq!(legacy, lower(None));
+    let VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan: supported } =
+        &legacy.execution
+    else {
+        panic!("expected window execution")
+    };
+    assert_eq!(supported.late_row_policy, None);
+    assert_eq!(LateRowPolicy::default(), LateRowPolicy::Reject);
+    let strict = lower(Some(LateRowPolicy::Reject));
+    let VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate {
+        plan: strict_supported,
+    } = &strict.execution
+    else {
+        panic!("expected window execution")
+    };
+    assert_eq!(
+        strict_supported.late_row_policy,
+        Some(LateRowPolicy::Reject)
+    );
+    assert_ne!(strict.plan_hash, legacy.plan_hash);
+    let mut stored = serde_json::to_value(&legacy).unwrap();
+    stored["execution"]["plan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("late_row_policy");
+    assert_eq!(
+        serde_json::from_value::<VelorixLogicalViewPlanV1>(stored).unwrap(),
+        legacy
+    );
+    let policy = Some(LateRowPolicy::CorrectWithinHorizon {
+        horizon_ns: supported.window_size_ns,
+    });
+    let corrected = lower(policy);
+    assert_eq!(corrected.view_sql, sql);
+    assert_eq!(corrected, lower(policy));
+    assert_eq!(
+        logical_view_plan_hash(&corrected).unwrap(),
+        corrected.plan_hash.clone().unwrap()
+    );
+    assert_ne!(corrected.plan_hash, legacy.plan_hash);
+    let encoded = serde_json::to_value(&corrected).unwrap();
+    let decoded: VelorixLogicalViewPlanV1 = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, corrected);
+    validate_logical_view_plan(&decoded).unwrap();
+}

@@ -151,7 +151,7 @@ the `docs/architecture-critique.md` recovery blocker.
 Release readiness also requires S3-compatible delayed-visibility, retry, and
 fault-injection checkpoint matrix evidence proving metadata CAS and the
 object-store object set cannot publish a mixed checkpoint. Local object-store or
-RustFS-only checkpoint evidence does not satisfy this release gate.
+Versity Gateway-only checkpoint evidence does not satisfy this release gate.
 
 ## Verification
 

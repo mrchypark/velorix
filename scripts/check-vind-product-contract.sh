@@ -3,6 +3,13 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 script_path="${repo_root}/scripts/run-vind-product.sh"
+gateway_manifest=$(awk '/^cat >.*\/versitygw.yaml/ { capture=1; next } capture && /^EOF$/ { exit } capture { print }' "$script_path")
+for required in 'fsGroup: 1000' 'type: RuntimeDefault' 'runAsNonRoot: true' 'runAsUser: 1000' 'runAsGroup: 1000' 'allowPrivilegeEscalation: false' 'readOnlyRootFilesystem: true' 'capabilities:' 'drop:' '- ALL' 'mountPath: /data' 'emptyDir: {}'; do
+  if ! printf '%s\n' "$gateway_manifest" | grep -F -- "$required" >/dev/null; then
+    echo "gateway manifest contract missing: $required" >&2
+    exit 1
+  fi
+done
 first_e2e_path="${repo_root}/scripts/run-first-e2e-readiness.sh"
 cli_path="${repo_root}/crates/velorix-cli/src/main.rs"
 meta_cargo_path="${repo_root}/crates/velorix-meta/Cargo.toml"
@@ -10,8 +17,103 @@ doc_path="${repo_root}/docs/development/vind-product.md"
 release_copy_path="${repo_root}/scripts/copy-readiness-sibling-evidence.py"
 attest_path="${repo_root}/scripts/attest-ingress-tls-auth.sh"
 durability_attest_path="${repo_root}/scripts/attest-object-store-durability-policy.sh"
-external_rustfs_path="${repo_root}/scripts/run-vind-product-external-rustfs.sh"
+external_versitygw_path="${repo_root}/scripts/run-vind-product-external-versitygw.sh"
 external_s3_path="${repo_root}/scripts/run-vind-product-external-s3.sh"
+# Exercise the external runner's helpers without starting Docker or the product.
+(
+  eval "$(awk '
+    /^random_token\(\) \{/ { capture=1 }
+    /^wait_for_versitygw\(\) \{/ { capture=0 }
+    /^write_external_versitygw_evidence\(\) \{/ { capture=1 }
+    /^write_env_file\(\) \{/ { capture=0 }
+    capture { print }
+  ' "$external_versitygw_path")"
+  output_dir="$(mktemp -d)"
+  trap 'rm -rf "$output_dir"' EXIT
+  evidence_file="$output_dir/evidence.json"
+  expect_rejection() {
+    local expected="$1"
+    shift
+    local status=0
+    "$@" >"$output_dir/error" 2>&1 || status=$?
+    [ "$status" = 1 ]
+    [ "$(cat "$output_dir/error")" = "$expected" ]
+  }
+  validate_token TOKEN 'aZ09._~+/=-'
+  expect_rejection 'TOKEN must be nonempty' validate_token TOKEN ''
+  expect_rejection 'TOKEN must not have leading or trailing whitespace' validate_token TOKEN ' a'
+  expect_rejection 'TOKEN must not have leading or trailing whitespace' validate_token TOKEN $'a\n'
+  expect_rejection 'TOKEN must not have leading or trailing whitespace' validate_token TOKEN $'\xc2\xa0a'
+  expect_rejection 'TOKEN must be ASCII' validate_token TOKEN $'a\xc3\xa9'
+  expect_rejection 'TOKEN must not contain whitespace' validate_token TOKEN $'a\tb'
+  expect_rejection 'TOKEN must not contain control characters' validate_token TOKEN $'a\001b'
+  expect_rejection 'TOKEN must not contain control characters' validate_token TOKEN $'a\177b'
+  expect_rejection 'TOKEN must contain only URL/header-safe token characters' validate_token TOKEN "a'b"
+  for bucket in abc a.b a-b "$(printf '%063d' 0)"; do
+    validate_bucket
+  done
+  for bucket in ab "$(printf '%064d' 0)" Abc abc_ .abc abc- $'abc\n'; do
+    expect_rejection 'VELORIX_S3_BUCKET must be a DNS-compatible S3 bucket name' validate_bucket
+  done
+  for bucket in a..b a.-b a-.b; do
+    expect_rejection 'VELORIX_S3_BUCKET must not contain adjacent dots or dot-hyphen sequences' validate_bucket
+  done
+  bucket=999.2.3.4
+  expect_rejection 'VELORIX_S3_BUCKET must not look like an IPv4 address' validate_bucket
+  for image in repo registry:5000/repo repo:latest repo:latest-glibc repo:beta repo:beta-glibc; do
+    is_mutable_image_reference "$image"
+  done
+  for image in repo:v1.8.0 registry:5000/repo:v1 repo:latest@sha256:abc; do
+    status=0
+    is_mutable_image_reference "$image" || status=$?
+    [ "$status" = 1 ]
+  done
+  token="$(random_token)"
+  [[ "$token" =~ ^[A-Za-z0-9_-]{43}$ ]]
+  validate_token TOKEN "$token"
+  access_key="vlx$(openssl rand -hex 16)"
+  [[ "$access_key" =~ ^vlx[0-9a-f]{32}$ ]]
+  validate_token TOKEN "$access_key"
+  run_id=contract-run
+  container=contract-container
+  network=contract-network
+  volume=contract-volume
+  image=versity/versitygw:v1.8.0
+  bucket=contract-bucket
+  prefix=$'prefix/"quoted"\\path\nline'
+  region=us-east-1
+  local_endpoint=http://127.0.0.1:9000
+  pod_endpoint=http://host.docker.internal:9000
+  write_external_versitygw_evidence
+  jq -e --arg prefix "$prefix" '
+    keys == ["bucket", "container", "docker_network", "docker_volume", "evidence_kind",
+      "generated_at", "host_endpoint", "image", "object_store_mode_for_product",
+      "pod_endpoint", "region", "remaining_product_complete_gates", "run_id",
+      "s3_prefix", "schema_version", "trusted_for_product_complete", "trusted_scope",
+      "uses_kubernetes_pvc"] and
+    .schema_version == 1 and
+    .evidence_kind == "velorix_external_versitygw_product_authority" and
+    (.generated_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    .run_id == "contract-run" and .container == "contract-container" and
+    .docker_network == "contract-network" and .docker_volume == "contract-volume" and
+    .image == "versity/versitygw:v1.8.0" and .bucket == "contract-bucket" and
+    .s3_prefix == $prefix and .region == "us-east-1" and
+    .host_endpoint == "http://127.0.0.1:9000" and
+    .pod_endpoint == "http://host.docker.internal:9000" and
+    .object_store_mode_for_product == "external-s3" and
+    .uses_kubernetes_pvc == false and .trusted_for_product_complete == false and
+    .trusted_scope == "local Docker Versity Gateway authority for manual vind product execution" and
+    .remaining_product_complete_gates == [
+      "public ingress/TLS/auth attestation",
+      "metadata-authority bounded wall-clock failover",
+      "operator-reviewed external object-store durability policy"]
+  ' "$evidence_file" >/dev/null
+  if grep -n 'python' "$external_versitygw_path"; then
+    echo "external Versity Gateway runner must not require Python" >&2
+    exit 1
+  fi
+  echo "external Versity Gateway shell helper contracts passed"
+)
 durability_assess_path="${repo_root}/scripts/assess-object-store-durability-policy.sh"
 attach_rest_path="${repo_root}/scripts/attach-vind-product-rest.sh"
 rest_api_smoke_path="${repo_root}/scripts/smoke-vind-rest-api.sh"
@@ -33,7 +135,7 @@ crate_boundary_policy_path="${repo_root}/scripts/check-crate-boundary-policy.sh"
 no_external_runtime_artifacts_path="${repo_root}/scripts/check-no-external-runtime-artifacts.sh"
 s3_checkpoint_fault_matrix_runner_path="${repo_root}/scripts/run-s3-checkpoint-fault-matrix.sh"
 
-python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$external_rustfs_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$rest_join_smoke_path" "$stress_chaos_soak_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" "$crate_boundary_policy_path" "$no_external_runtime_artifacts_path" "$s3_checkpoint_fault_matrix_runner_path" <<'PY'
+python3 - "$script_path" "$first_e2e_path" "$cli_path" "$meta_cargo_path" "$doc_path" "$release_copy_path" "$attest_path" "$durability_attest_path" "$external_versitygw_path" "$external_s3_path" "$durability_assess_path" "$attach_rest_path" "$rest_api_smoke_path" "$rest_join_smoke_path" "$stress_chaos_soak_path" "$product_completion_report_path" "$refresh_deployed_images_path" "$product_ingress_attest_path" "$product_ingress_apply_path" "$product_ingress_attach_path" "$product_ingress_complete_path" "$object_store_durability_attach_path" "$object_store_durability_complete_path" "$product_complete_path" "$failover_evidence_writer_path" "$complete_input_preflight_path" "$next_product_step_path" "$crate_boundary_policy_path" "$no_external_runtime_artifacts_path" "$s3_checkpoint_fault_matrix_runner_path" <<'PY'
 import json
 import os
 import re
@@ -44,7 +146,7 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-script_path, first_e2e_path, cli_path, meta_cargo_path, doc_path, release_copy_path, attest_path, durability_attest_path, external_rustfs_path, external_s3_path, durability_assess_path, attach_rest_path, rest_api_smoke_path, rest_join_smoke_path, stress_chaos_soak_path, product_completion_report_path, refresh_deployed_images_path, product_ingress_attest_path, product_ingress_apply_path, product_ingress_attach_path, product_ingress_complete_path, object_store_durability_attach_path, object_store_durability_complete_path, product_complete_path, failover_evidence_writer_path, complete_input_preflight_path, next_product_step_path, crate_boundary_policy_path, no_external_runtime_artifacts_path, s3_checkpoint_fault_matrix_runner_path = sys.argv[1:]
+script_path, first_e2e_path, cli_path, meta_cargo_path, doc_path, release_copy_path, attest_path, durability_attest_path, external_versitygw_path, external_s3_path, durability_assess_path, attach_rest_path, rest_api_smoke_path, rest_join_smoke_path, stress_chaos_soak_path, product_completion_report_path, refresh_deployed_images_path, product_ingress_attest_path, product_ingress_apply_path, product_ingress_attach_path, product_ingress_complete_path, object_store_durability_attach_path, object_store_durability_complete_path, product_complete_path, failover_evidence_writer_path, complete_input_preflight_path, next_product_step_path, crate_boundary_policy_path, no_external_runtime_artifacts_path, s3_checkpoint_fault_matrix_runner_path = sys.argv[1:]
 repo_root = Path(script_path).parents[1]
 fixture_ref_digest = "a" * 64
 fixture_source_revision = "9f1c0e2d4b6a8c0f13579bdf2468ace013579bdf"
@@ -380,8 +482,8 @@ with open(attest_path, "r", encoding="utf-8") as f:
     attest = f.read()
 with open(durability_attest_path, "r", encoding="utf-8") as f:
     durability_attest = f.read()
-with open(external_rustfs_path, "r", encoding="utf-8") as f:
-    external_rustfs = f.read()
+with open(external_versitygw_path, "r", encoding="utf-8") as f:
+    external_versitygw = f.read()
 with open(external_s3_path, "r", encoding="utf-8") as f:
     external_s3 = f.read()
 with open(durability_assess_path, "r", encoding="utf-8") as f:
@@ -645,7 +747,7 @@ def s3_checkpoint_fault_matrix_evidence_policy_has_pass_fail_coverage():
                 {
                     "evidence_kind": "s3_compatible_checkpoint_fault_matrix",
                     "status": "pass",
-                    "backend": "rustfs-only emulator",
+                    "backend": "versitygw-only emulator",
                     "live_s3_compatible": False,
                     "scenarios": ["object_write_failure"],
                 }
@@ -704,7 +806,7 @@ def s3_checkpoint_fault_matrix_evidence_policy_has_pass_fail_coverage():
         pass_payload.get("status") == "pass"
         and pass_payload.get("evidence_kind") == "s3_compatible_checkpoint_fault_matrix"
         and "live_s3_compatible" in fail_result.stdout
-        and "rustfs-only" in fail_result.stdout.lower()
+        and "versitygw-only" in fail_result.stdout.lower()
         and missing_deployment_result.returncode != 0
         and "deployment_id" in missing_deployment_result.stdout
         and missing_release_identity_result.returncode != 0
@@ -1373,7 +1475,7 @@ def external_s3_out_of_scope_fixture_completes_required_gates():
                 },
             },
             "object_store": {
-                "mode": "rustfs-local",
+                "mode": "versitygw-local",
                 "local_development_authority": True,
             },
             "metadata_store": {
@@ -1507,7 +1609,7 @@ def public_ingress_out_of_scope_local_tls_boundary_fixture():
                 },
             },
             "object_store": {
-                "mode": "rustfs-local",
+                "mode": "versitygw-local",
                 "local_development_authority": True,
             },
             "metadata_store": {
@@ -1735,26 +1837,28 @@ checks = {
         and "readiness_report_rejects_product_query_policy_claim_with_unbounded_policy_sibling"
         in cli
     ),
-    "external RustFS wrapper runs product in external-s3 mode without PVC": (
-        "VELORIX_OBJECT_STORE_MODE=external-s3" in external_rustfs
-        and "scripts/run-vind-product.sh" in external_rustfs
-        and "docker volume create" in external_rustfs
-        and "docker run -d" in external_rustfs
-        and "RUSTFS_ACCESS_KEY" in external_rustfs
-        and "RustFS default credentials are not allowed" in external_rustfs
-        and "trusted_for_product_complete" in external_rustfs
-        and "False" in external_rustfs
-        and "external-rustfs.env" in external_rustfs
-        and "s3://external/${bucket}/${prefix}" in external_rustfs
-        and "resolve_pod_endpoint()" in external_rustfs
-        and "resolved k3d pod endpoint for external RustFS" in external_rustfs
-        and "host.docker.internal" in external_rustfs
-        and "VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY=1" in external_rustfs
+    "external Versity Gateway wrapper runs product in external-s3 mode without PVC": (
+        "VELORIX_OBJECT_STORE_MODE=external-s3" in external_versitygw
+        and "scripts/run-vind-product.sh" in external_versitygw
+        and "docker volume create" in external_versitygw
+        and "docker run -d" in external_versitygw
+        and "ROOT_ACCESS_KEY" in external_versitygw
+        and "ROOT_SECRET_KEY" in external_versitygw
+        and "--port :9000 posix /data" in external_versitygw
+        and "Versity Gateway default credentials are not allowed" in external_versitygw
+        and "trusted_for_product_complete" in external_versitygw
+        and "trusted_for_product_complete: false" in external_versitygw
+        and "external-versitygw.env" in external_versitygw
+        and "s3://external/${bucket}/${prefix}" in external_versitygw
+        and "resolve_pod_endpoint()" in external_versitygw
+        and "resolved k3d pod endpoint for external Versity Gateway" in external_versitygw
+        and "host.docker.internal" in external_versitygw
+        and "VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY=1" in external_versitygw
         and "local_development_authority" in script
         and "local development object-store authorities cannot satisfy product-complete durability policy attestation" in cli
-        and "PersistentVolumeClaim" not in external_rustfs
+        and "PersistentVolumeClaim" not in external_versitygw
     ),
-    "nonlocal external S3 wrapper is distinct from local RustFS and fail-closed": (
+    "nonlocal external S3 wrapper is distinct from local Versity Gateway and fail-closed": (
         "velorix_external_s3_product_input" in external_s3
         and "VELORIX_OBJECT_STORE_MODE=external-s3" in external_s3
         and "VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY=0" in external_s3
@@ -1787,7 +1891,7 @@ checks = {
         and "--env-file target/velorix-product/complete-vind-product.env" in doc
         and "--validate-only" in doc
         and "external-s3-product-input.json" in doc
-        and "Local Docker RustFS remains intentionally separate" in doc
+        and "Local Docker Versity Gateway remains intentionally separate" in doc
         and "scripts/run-vind-product-external-s3.sh" in product_completion_report
     ),
     "vCluster bootstrap retries clean transient failed standalone resources": (
@@ -2106,8 +2210,8 @@ checks = {
         and "no-pvc-namespace.json" in doc
             and "ingress-tls-auth-attestation.json" in doc
         and "ingest-writer-job-log.json" in doc
-        and "scripts/run-vind-product-external-rustfs.sh" in doc
-        and "external-rustfs.env" in doc
+        and "scripts/run-vind-product-external-versitygw.sh" in doc
+        and "external-versitygw.env" in doc
     ),
     "REST attach prefers standing-runtime writer owner": (
         '"/v1/standing-runtime/owners"' in (repo_root / "crates" / "velorix-api" / "src" / "lib.rs").read_text()
@@ -2141,7 +2245,6 @@ checks = {
         and "mktemp" not in rest_api_smoke
         and "PersistentVolumeClaim" not in rest_api_smoke
         and "scripts/smoke-vind-rest-api.sh" in doc
-        and "target/velorix-product-external-rustfs-corrected" in doc
         and "REST E2E check" in doc
     ),
     "product run wires existing-product REST API smoke into default authenticated path": (
@@ -2702,8 +2805,8 @@ external_object_store_optional_checks = {
     "external S3 path-style setting reaches validation and product clients",
     "external S3 supports existing Kubernetes credential Secret and session token",
     "release validator parses external S3 validation job and log evidence",
-    "external RustFS wrapper runs product in external-s3 mode without PVC",
-    "nonlocal external S3 wrapper is distinct from local RustFS and fail-closed",
+    "external Versity Gateway wrapper runs product in external-s3 mode without PVC",
+    "nonlocal external S3 wrapper is distinct from local Versity Gateway and fail-closed",
     "records and validates external object-store durability attestation",
     "generates object-store durability attestation only from explicit operator review",
     "object-store durability completion wrapper attaches evidence without rerun",
@@ -3170,7 +3273,7 @@ checks["deployment emits explicit no-PVC emptyDir storage only"] = (
     and '        - name: data\n          emptyDir: {}' in script
     and 'kind: PersistentVolumeClaim' not in script
     and 'persistentVolumeClaim:' not in script
-    and ("claim" + "Name: velorix-rustfs-data") not in script
+    and ("claim" + "Name: velorix-versitygw-data") not in script
 )
 
 checks["production ingest writer uses Meta partition authority without Kubernetes lease authority"] = (
@@ -3616,7 +3719,7 @@ checks["remote ephemeral Meta validation is gated and NetworkPolicy-probed"] = (
     and "validate_remote_ephemeral_gate()" in script
     and '"$reuse_existing" != "1"' in script
     and '"$preserve_state" != "0"' in script
-    and '"$object_store_mode" != "rustfs"' in script
+    and '"$object_store_mode" != "versitygw"' in script
     and '"$object_store_local_development_authority" != "1"' in script
     and '"${VELORIX_S3_PREFIX+x}"' in script
     and '"${VELORIX_META_S3_PREFIX+x}"' in script
