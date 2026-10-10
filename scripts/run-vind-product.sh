@@ -7510,7 +7510,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "Accept: application/json" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
-  echo '  curl "$VELORIX_API_URL/v1/api/scores/positive" -H "$VELORIX_API_AUTH_HEADER"'
+  echo '  curl "$VELORIX_API_URL/v1/api/scores/positive" -H "Accept: application/json" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/v1/standing-runtime/owners" -H "$VELORIX_ADMIN_AUTH_HEADER"'
   echo "  VELORIX_VIND_PRODUCT_DIR=${output_dir} scripts/smoke-vind-rest-api.sh"
@@ -7519,7 +7519,7 @@ else
   echo "  curl http://127.0.0.1:${api_local_port}/healthz"
   echo "  curl -X POST http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest -H 'content-type: application/json' -d '{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"scores\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"u1\",\"score\":5,\"delta\":1},{\"user_id\":\"u1\",\"score\":7,\"delta\":1},{\"user_id\":\"u2\",\"score\":-1,\"delta\":1}]}'"
   echo "  curl -H 'Accept: application/json' http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query"
-  echo "  curl http://127.0.0.1:${api_local_port}/v1/api/scores/positive"
+  echo "  curl -H 'Accept: application/json' http://127.0.0.1:${api_local_port}/v1/api/scores/positive"
 fi
 
 if [ "$hold_port_forward" = "1" ]; then
