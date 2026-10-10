@@ -219,6 +219,7 @@ curl -fsS --max-time 10 \
   >"$post_ingest_response"
 curl -fsS --max-time 10 \
   "$VELORIX_API_URL/v1/api/scores/positive" \
+  -H 'Accept: application/json' \
   -H "$VELORIX_API_AUTH_HEADER" >"$post_query_response"
 kubectl --context "$context" -n "$namespace" get pods -l app=velorix-api -o json >"$pod_after_file"
 end_ms="$(python3 - <<'PY'

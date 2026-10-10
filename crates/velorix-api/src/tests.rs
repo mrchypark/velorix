@@ -1,4 +1,8 @@
 use super::*;
+#[path = "generic_query_http_format_tests.rs"]
+mod generic_query_http_format_tests;
+#[path = "materialized_output_pages_tests.rs"]
+mod materialized_output_pages_tests;
 use async_trait::async_trait;
 use axum::http::Method;
 use futures::{stream::BoxStream, StreamExt};
@@ -2119,11 +2123,7 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
             .await
             .unwrap()
             .unwrap();
-    assert!(record
-        .checkpoint
-        .output_manifest_refs
-        .iter()
-        .all(|output_ref| { output_ref.starts_with(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX) }));
+    assert_snapshot_and_commit_refs(&record.checkpoint.output_manifest_refs);
     let checkpoint_key =
         ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
             .unwrap()
@@ -6621,6 +6621,7 @@ async fn call_json(app: &Router, method: Method, uri: &str, body: Value) -> (Sta
                 .method(method)
                 .uri(uri)
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -8502,8 +8503,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         convergence.output_publication_protocol_id,
         OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1
     );
-    assert_eq!(convergence.output_refs.len(), 1);
-    assert!(convergence.output_refs[0].starts_with(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX));
+    assert_snapshot_and_commit_refs(&convergence.output_refs);
     let authoritative = read_latest_standing_runtime_checkpoint(
         &inspection_state,
         identity,
@@ -14309,7 +14309,7 @@ async fn rest_standing_runtime_output_query_without_sql_reads_materialized_rows_
                 "max_output_bytes": 1048576,
                 "max_scan_files": 1,
                 "max_scan_bytes": 1048576,
-                "max_object_requests": 1,
+                "max_object_requests": 64,
                 "max_concurrent_queries": 1,
                 "memory_limit_bytes": 1048576,
                 "spill_limit_bytes": 1048576
@@ -14517,7 +14517,7 @@ async fn rest_view_compaction_and_openapi_paths_are_available_after_materializat
 }
 
 #[tokio::test]
-async fn raw_sql_count_and_sum_fail_closed_when_the_materialized_input_is_paged() {
+async fn raw_sql_count_and_sum_use_complete_materialized_input_despite_page_caps() {
     let state = test_api_state_with_store(
         Arc::new(InMemory::new()),
         "api-test-raw-sql-page-cap-owner",
@@ -14552,7 +14552,7 @@ async fn raw_sql_count_and_sum_fail_closed_when_the_materialized_input_is_paged(
                 "max_output_bytes": 1048576,
                 "max_scan_files": 1,
                 "max_scan_bytes": 1048576,
-                "max_object_requests": 1,
+                "max_object_requests": 64,
                 "max_concurrent_queries": 1,
                 "memory_limit_bytes": 1048576,
                 "spill_limit_bytes": 1048576
@@ -14669,13 +14669,12 @@ async fn raw_sql_count_and_sum_fail_closed_when_the_materialized_input_is_paged(
             request,
         )
         .await;
-        assert_eq!(response.0, StatusCode::CONFLICT, "{response:?}");
-        assert!(response.1["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("full materialized snapshot"));
-        assert!(response.1.get("rows").is_none(), "{response:?}");
-        assert!(response.1.get("next_page_token").is_none(), "{response:?}");
+        assert_eq!(response.0, StatusCode::OK, "{response:?}");
+        assert_eq!(
+            response.1["rows"],
+            json!([{"total_count":4,"total_sum":100}])
+        );
+        assert!(response.1["next_page_token"].is_null(), "{response:?}");
     }
 }
 
@@ -15219,8 +15218,13 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
             .unwrap()
             .unwrap();
     assert_eq!(checkpoint.checkpoint.input_frontiers.len(), 3);
-    assert_eq!(checkpoint.checkpoint.output_manifest_refs.len(), 1);
-    let output_commit_ref = &checkpoint.checkpoint.output_manifest_refs[0];
+    assert_snapshot_and_commit_refs(&checkpoint.checkpoint.output_manifest_refs);
+    let output_commit_ref = checkpoint
+        .checkpoint
+        .output_manifest_refs
+        .iter()
+        .find(|reference| reference.starts_with(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX))
+        .unwrap();
     assert!(output_commit_ref.starts_with(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX));
     let (_, output_commit_record) = read_standing_runtime_output_delta_record(
         &state,
@@ -15741,7 +15745,11 @@ async fn run_join_differential_api_trace(
         .await
         .unwrap()
         .unwrap();
-    let initial_output_refs = initial_record.checkpoint.output_manifest_refs.clone();
+    validate_standing_runtime_checkpoint_output_manifest_records(&state, &initial_record)
+        .await
+        .unwrap();
+    let initial_output_refs =
+        assert_snapshot_and_commit_refs(&initial_record.checkpoint.output_manifest_refs);
     let initial_canonical_checkpoint = canonical_join_api_checkpoint(&initial_record.checkpoint);
 
     drop(router);
@@ -15845,10 +15853,35 @@ async fn run_join_differential_api_trace(
         restored_query: restored_query.1,
         tail_query: tail_query.1,
         initial_output_refs,
-        tail_output_refs: tail_record.checkpoint.output_manifest_refs.clone(),
+        // Snapshot roots bind runtime-specific checkpoint bytes; compare logical
+        // output commits after validating each snapshot against its own checkpoint.
+        tail_output_refs: assert_snapshot_and_commit_refs(
+            &tail_record.checkpoint.output_manifest_refs,
+        ),
         initial_canonical_checkpoint,
         tail_canonical_checkpoint: canonical_join_api_checkpoint(&tail_record.checkpoint),
     }
+}
+
+fn assert_snapshot_and_commit_refs(refs: &[String]) -> Vec<String> {
+    let commits = refs
+        .iter()
+        .filter(|reference| reference.starts_with(STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX))
+        .cloned()
+        .collect::<Vec<_>>();
+    let snapshots = refs
+        .iter()
+        .filter_map(|reference| reference.strip_prefix(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refs.len(),
+        2,
+        "one durable output commit and one immutable snapshot"
+    );
+    assert_eq!(commits.len(), 1);
+    assert_eq!(snapshots.len(), 1);
+    ObjectKey::parse_standing_runtime_output_manifest(snapshots[0]).unwrap();
+    commits
 }
 
 fn canonical_join_api_checkpoint(checkpoint: &RuntimeCheckpoint) -> Value {
@@ -19150,6 +19183,7 @@ async fn rest_http_two_writers_materialize_exact_aggregate_with_latency_diagnost
     let query_started = std::time::Instant::now();
     let response = client
         .post(format!("{base}/v1/views/http_orders_by_user/query"))
+        .header(header::ACCEPT, "application/json")
         .json(&json!({}))
         .send()
         .await

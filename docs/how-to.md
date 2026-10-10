@@ -206,10 +206,18 @@ stream and partition, start at offset `4`; do not reuse or skip offsets.
 
 ## 5. Query Materialized Output
 
+Query routes default to Arrow IPC streams (`application/vnd.apache.arrow.stream`)
+when `Accept` is absent or `*/*`. Send `Accept: application/json` for the JSON
+envelope below. Both formats include `x-velorix-logical-epoch` and, when another
+page exists, `x-velorix-next-page-token` headers. Arrow schema metadata carries
+`velorix.logical_epoch` and `velorix.next_page_token`. Continue with the token as
+`page_token` and the same `epoch`. Unsupported or malformed Accept values return
+406; output row and wire-byte limits apply to both formats.
+
 Query the view directly:
 
 ```bash
-curl -fsS \
+curl -fsS -H 'Accept: application/json' \
   'http://127.0.0.1:8080/v1/views/positive_scores_by_user/query?max_rows=100'
 ```
 
@@ -231,7 +239,7 @@ does not recompute the view from the source relation.
 The same view is also exposed through its promoted API path:
 
 ```bash
-curl -fsS \
+curl -fsS -H 'Accept: application/json' \
   'http://127.0.0.1:8080/v1/api/scores/positive?max_rows=100'
 ```
 
@@ -453,7 +461,7 @@ curl -fsS -X POST http://127.0.0.1:8080/v1/ingest \
 curl -fsS -X POST http://127.0.0.1:8080/v1/views/purchases_by_user_minute/backfill \
   -H 'content-type: application/json' --data-binary '{}'
 
-curl -fsS -X POST http://127.0.0.1:8080/v1/views/purchases_by_user_minute/query \
+curl -fsS -H 'Accept: application/json' -X POST http://127.0.0.1:8080/v1/views/purchases_by_user_minute/query \
   -H 'content-type: application/json' --data-binary '{}'
 ```
 
