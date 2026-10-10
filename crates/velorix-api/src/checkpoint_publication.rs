@@ -106,9 +106,22 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_state_payload");
     }
+    let publication =
+        materialized_output_pages::checkpoint_publication(checkpoint, view_id, &checkpoint_key)?;
+    if let Some(publication) = &publication {
+        for (key, page) in &publication.page_records {
+            persist_standing_runtime_output_page(state, key, page).await?;
+        }
+        persist_standing_runtime_output_manifest(
+            state,
+            &publication.manifest_key,
+            &publication.manifest_record,
+        )
+        .await?;
+    }
     let checkpoint_for_record = standing_runtime_checkpoint_with_durable_publication_refs(
         checkpoint,
-        None,
+        publication.as_ref().map(|p| &p.manifest_key),
         &output_delta_publications,
         &state_payload_key,
     );
@@ -970,8 +983,7 @@ pub(super) async fn persist_standing_runtime_output_page(
     output_page_key: &ObjectKey,
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
-    let bytes =
-        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let bytes = materialized_output_pages::encode_page(record)?;
     let path = ObjectPath::from(output_page_key.as_str());
     let result = state
         .store
@@ -1012,8 +1024,7 @@ pub(super) async fn put_standing_runtime_output_page(
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
     validate_standing_runtime_output_page_record(output_page_key, record)?;
-    let bytes =
-        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let bytes = materialized_output_pages::encode_page(record)?;
     state
         .store
         .put(
@@ -2082,14 +2093,36 @@ pub(super) async fn validate_standing_runtime_checkpoint_output_manifest_records
                 record.view_id
             )));
         }
+        let generic = materialized_output_pages::is_materialized_codec(&manifest.output_encoding);
+        if generic {
+            materialized_output_pages::validate_checkpoint_binding(&manifest, &record.checkpoint)?;
+        }
+        let mut previous = None;
         for page in &manifest.pages {
             let (_page_key, page_record) =
                 read_standing_runtime_output_page_record(state, page, &record.view_id).await?;
+            if generic {
+                let rows =
+                    materialized_output_pages::validate_page_binding(&manifest, &page_record)?;
+                for row in rows.records() {
+                    let pair = velorix_core::delta::encode_kv_ordered(
+                        row.key.as_json(),
+                        row.value.as_json(),
+                    );
+                    if previous.as_ref().is_some_and(|last| last > &pair) {
+                        return Err(ApiError::bad_request(
+                            "materialized pages are not globally ordered",
+                        ));
+                    }
+                    previous = Some(pair);
+                }
+            }
             if page_record.tenant_id != record.checkpoint.identity.tenant_id
                 || page_record.program_id != record.checkpoint.identity.program_id
                 || page_record.view_id != record.view_id
                 || page_record.logical_epoch != record.checkpoint.logical_epoch
-                || page_record.output_content_hash != manifest.output_content_hash
+                || (page_record.output_content_hash != manifest.output_content_hash
+                    && !(generic && page_record.output_content_hash.is_empty()))
             {
                 return Err(ApiError::bad_request(format!(
                     "standing runtime output page body/checkpoint mismatch for `{}/{}/{}`",
@@ -2101,6 +2134,36 @@ pub(super) async fn validate_standing_runtime_checkpoint_output_manifest_records
         }
     }
     Ok(())
+}
+
+pub(super) async fn read_object_bytes_bounded(
+    state: &ApiState,
+    path: &ObjectPath,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, ApiError> {
+    use futures::StreamExt;
+    let result = state.store.get(path).await.map_err(ApiError::internal)?;
+    if max_bytes.is_some_and(|limit| result.meta.size > limit) {
+        return Err(ApiError::bad_request(
+            "materialized read exceeds query byte budget",
+        ));
+    }
+    let mut stream = result.into_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ApiError::internal)?;
+        let length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::bad_request("materialized read size overflow"))?;
+        if max_bytes.is_some_and(|limit| length as u64 > limit) {
+            return Err(ApiError::bad_request(
+                "materialized read exceeds query byte budget",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub(super) async fn read_standing_runtime_output_manifest_record(
@@ -2161,8 +2224,7 @@ pub(super) async fn read_standing_runtime_output_page_record(
         .bytes()
         .await
         .map_err(ApiError::internal)?;
-    let record: StandingRuntimeOutputPageRecord = serde_json::from_slice(&bytes)
-        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let record = materialized_output_pages::decode_page(&bytes, &page.output_encoding)?;
     let (key, _) = ObjectKey::parse_standing_runtime_output_page(page.page_key.clone())
         .map_err(ApiError::bad_request)?;
     validate_standing_runtime_output_page_ref(page, view_id)?;
@@ -2212,6 +2274,9 @@ pub(super) fn validate_standing_runtime_output_manifest_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputManifestRecord,
 ) -> Result<(), ApiError> {
+    if materialized_output_pages::is_materialized_codec(&record.output_encoding) {
+        return materialized_output_pages::validate_manifest(key, record);
+    }
     if record.schema_version != 1 || record.record_kind != "standing_runtime_output_manifest_v1" {
         return Err(ApiError::bad_request(format!(
             "standing runtime output manifest record identity mismatch for `{}/{}/{}`",
@@ -2448,7 +2513,9 @@ pub(super) fn validate_standing_runtime_output_page_ref(
     page: &StandingRuntimeOutputPageRef,
     view_id: &str,
 ) -> Result<(), ApiError> {
-    if page.output_encoding != "velorix-delta-batch-json-v1" {
+    if page.output_encoding != "velorix-delta-batch-json-v1"
+        && !materialized_output_pages::is_materialized_codec(&page.output_encoding)
+    {
         return Err(ApiError::bad_request(format!(
             "standing runtime output page codec mismatch for view `{view_id}`"
         )));
@@ -2462,6 +2529,9 @@ pub(super) fn validate_standing_runtime_output_page_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
+    if materialized_output_pages::is_materialized_codec(&record.output_encoding) {
+        return materialized_output_pages::validate_page(key, record);
+    }
     if record.schema_version != 1 || record.record_kind != "standing_runtime_output_page_v1" {
         return Err(ApiError::bad_request(format!(
             "standing runtime output page record identity mismatch for `{}/{}/{}`",

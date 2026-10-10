@@ -223,6 +223,33 @@
       "reason": "sqlparser 0.63.0 is used by velorix-core admission; sqlparser 0.62.0 is used by datafusion, datafusion-common, datafusion-expr, and datafusion-sql 55.1.0. Admission AST types stay inside velorix-core and the DataFusion boundary receives SQL text.",
       "replacement_plan": "Converge when DataFusion widens its parser range to 0.63. Re-check `cargo tree -i sqlparser` after each DataFusion release and retain fail-closed admission plus DataFusion query conformance tests regardless of the parser split.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "duplicate",
+      "crate": "sqlparser_derive",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "sqlparser_derive 0.5.0 supports DataFusion's sqlparser 0.62.0 line, while 0.6.0 supports the visitor feature of velorix-core's sqlparser 0.63.0. These build-time macros follow the two parser versions; admission ASTs stay inside velorix-core and DataFusion receives SQL text.",
+      "replacement_plan": "Converge with the parser versions when DataFusion adopts sqlparser 0.63 or later. Re-check version-qualified sqlparser_derive dependency paths after parser upgrades and remove this exception when only one derive version remains.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "bincode",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "Foyer 0.22.6 enables bincode 1.3.3 through foyer-common's serde feature for cache serialization; RUSTSEC-2025-0141 reports it unmaintained. This integration stores disposable cache bytes, never authoritative checkpoints, and revalidates returned payloads. That scope limits database authority exposure but does not eliminate maintenance or decoding risk.",
+      "replacement_plan": "Track upstream Foyer migration to a maintained serializer, or remove the serde-enabled hybrid-cache dependency if this exception cannot be renewed before expiry. Disabling cache through environment settings alone does not remove the dependency warning; preserve authoritative reads and payload validation during replacement.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "paste",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "foyer-memory 0.22.6 uses paste 1.0.15 for compile-time macros; RUSTSEC-2024-0436 reports it unmaintained. Foyer is confined to disposable, non-authoritative caching, while the unmaintained build dependency still requires a bounded review exception.",
+      "replacement_plan": "Track upstream foyer-memory removal or replacement of paste with a maintained macro dependency. Upgrade or remove the Foyer integration if this exception cannot be renewed before expiry, and remove this record once cargo-deny no longer reports the warning.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     }
   ]
 }

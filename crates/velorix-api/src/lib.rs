@@ -161,7 +161,10 @@ use velorix_runtime::{
 mod checkpoint_publication;
 mod cold_window_state;
 mod ingest_epoch;
+mod materialized_output_pages;
+pub mod materialized_read_cache;
 mod openapi;
+mod query_response;
 mod query_serving;
 mod recovery;
 mod view_admission;
@@ -183,6 +186,8 @@ const DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn ObjectStore>,
+    materialized_read_cache: Option<Arc<materialized_read_cache::MaterializedReadCache>>,
+    materialized_read_cache_store_id: String,
     capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
     ingest_writer: Arc<DeployedIngestWriterRuntime<ObjectStoreAuthorityRef>>,
     meta_store: Option<Arc<dyn MetaStore>>,
@@ -845,6 +850,8 @@ impl ApiState {
 
         let state = Self {
             store,
+            materialized_read_cache: None,
+            materialized_read_cache_store_id: components.authority().store_id.clone(),
             capabilities,
             ingest_writer: Arc::new(ingest_writer),
             meta_store: None,
@@ -882,6 +889,22 @@ impl ApiState {
         );
 
         Ok(state)
+    }
+
+    pub fn with_materialized_read_cache(
+        mut self,
+        cache: Arc<materialized_read_cache::MaterializedReadCache>,
+    ) -> Self {
+        self.materialized_read_cache = Some(cache);
+        self
+    }
+
+    pub fn materialized_read_cache_store_id(&self) -> &str {
+        &self.materialized_read_cache_store_id
+    }
+
+    pub fn materialized_read_cache_namespace(&self) -> &str {
+        &self.ingest_writer.authority().namespace
     }
 
     pub fn with_meta_store(mut self, meta_store: Arc<dyn MetaStore>) -> Self {
@@ -1794,39 +1817,196 @@ pub async fn run_from_env() -> anyhow::Result<()> {
             config.standing_runtime_owner_ttl_ms,
         )?;
     }
-    state
-        .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
-        .await
-        .map_err(|error| anyhow!(error.to_string()))?;
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    let app = app(state);
-    if let Some(tls) = config.tls {
-        let tls_config = RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+    state.materialized_read_cache_store_id = stable_bytes_hash(&serde_json::to_vec(&(
+        &config.endpoint,
+        &config.bucket,
+        &config.prefix,
+        &config.authority_store_id,
+    ))?);
+    if let Some(cache_config) = config.materialized_read_cache {
+        match materialized_read_cache::MaterializedReadCache::open(cache_config).await {
+            Ok(cache) => state = state.with_materialized_read_cache(Arc::new(cache)),
+            Err(error) => {
+                eprintln!("materialized read cache unavailable; using authoritative reads: {error}")
+            }
+        }
+    }
+    let materialized_read_cache = state.materialized_read_cache.clone();
+    let serve_result = async {
+        state
+            .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to load VELORIX_API_TLS_CERT_PATH/VELORIX_API_TLS_KEY_PATH from `{}` and `{}`",
-                    tls.cert_path, tls.key_path
-                )
-            })?;
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let listener = tokio::net::TcpListener::bind(config.bind).await?;
+        let app = app(state);
+        let tls = match config.tls {
+            Some(tls) => {
+                let tls_config = RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load VELORIX_API_TLS_CERT_PATH/VELORIX_API_TLS_KEY_PATH from `{}` and `{}`",
+                            tls.cert_path, tls.key_path
+                        )
+                    })?;
+                Some((tls.bind, tls_config))
+            }
+            None => None,
+        };
+        let tls_enabled = tls.is_some();
+        let tls_handle = axum_server::Handle::new();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let http_app = app.clone();
-        let https_app = app;
         let http = async move {
             axum::serve(listener, http_app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.wait_for(|stop| *stop).await;
+                })
                 .await
                 .context("velorix-api HTTP listener stopped")
         };
+        let https_handle = tls_handle.clone();
         let https = async move {
-            axum_server::tls_rustls::bind_rustls(tls.bind, tls_config)
-                .serve(https_app.into_make_service())
-                .await
-                .context("velorix-api TLS listener stopped")
+            if let Some((bind, tls_config)) = tls {
+                axum_server::tls_rustls::bind_rustls(bind, tls_config)
+                    .handle(https_handle)
+                    .serve(app.into_make_service())
+                    .await
+                    .context("velorix-api TLS listener stopped")?;
+            }
+            Ok(())
         };
-        tokio::try_join!(http, https)?;
-    } else {
-        axum::serve(listener, app).await?;
+        let result = drain_api_listeners(http, https, tls_enabled, api_shutdown_signal(), || {
+            shutdown_tx.send_replace(true);
+            tls_handle.graceful_shutdown(None);
+        })
+        .await;
+        // axum-server's error path returns before its connection watchers finish.
+        while tls_handle.connection_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        result
     }
-    Ok(())
+    .await;
+    if let Some(cache) = materialized_read_cache {
+        if let Err(error) = cache.close().await {
+            eprintln!("materialized read cache close failed: {error}");
+        }
+    }
+    serve_result
+}
+
+async fn api_shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("register API SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("receive API Ctrl-C"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("receive API Ctrl-C")
+    }
+}
+
+async fn drain_api_listeners<H, T, S>(
+    http: H,
+    tls: T,
+    tls_enabled: bool,
+    signal: S,
+    begin_shutdown: impl FnOnce(),
+) -> anyhow::Result<()>
+where
+    H: std::future::Future<Output = anyhow::Result<()>>,
+    T: std::future::Future<Output = anyhow::Result<()>>,
+    S: std::future::Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(http, tls);
+    let (first_result, http_done, tls_done) = tokio::select! {
+        result = &mut http => (result, true, false),
+        result = &mut tls, if tls_enabled => (result, false, true),
+        result = signal => (result, false, false),
+    };
+    begin_shutdown();
+    // Drain the peer even on an error before the caller closes the disk cache.
+    let (http_result, tls_result) = tokio::join!(
+        async {
+            if http_done {
+                Ok(())
+            } else {
+                http.await
+            }
+        },
+        async {
+            if tls_done {
+                Ok(())
+            } else {
+                tls.await
+            }
+        },
+    );
+    first_result.and(http_result).and(tls_result)
+}
+
+#[cfg(test)]
+mod api_shutdown_tests {
+    use super::drain_api_listeners;
+    use anyhow::anyhow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn signal_drains_both_listeners() {
+        let (http_tx, http_rx) = tokio::sync::oneshot::channel();
+        let (tls_tx, tls_rx) = tokio::sync::oneshot::channel();
+        let drained = AtomicUsize::new(0);
+        let http = async {
+            http_rx.await?;
+            tokio::task::yield_now().await;
+            drained.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let tls = async {
+            tls_rx.await?;
+            tokio::task::yield_now().await;
+            drained.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        drain_api_listeners(http, tls, true, std::future::ready(Ok(())), || {
+            http_tx.send(()).unwrap();
+            tls_tx.send(()).unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(drained.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn listener_error_drains_peer_and_preserves_original_error() {
+        let (tls_tx, tls_rx) = tokio::sync::oneshot::channel();
+        let drained = AtomicUsize::new(0);
+        let tls = async {
+            tls_rx.await?;
+            drained.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow!("peer error"))
+        };
+        let error = drain_api_listeners(
+            std::future::ready(Err(anyhow!("original HTTP error"))),
+            tls,
+            true,
+            std::future::pending(),
+            || {
+                tls_tx.send(()).unwrap();
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
+        assert_eq!(error.to_string(), "original HTTP error");
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5710,7 +5890,7 @@ fn api_metadata_from_create_view_request(
         response_schema: request.response_schema.clone(),
         sql_template: request.sql_template.clone(),
         response_formats: if request.response_formats.is_empty() {
-            vec!["json".to_string()]
+            vec!["arrow".to_string(), "json".to_string()]
         } else {
             request.response_formats.clone()
         },
@@ -5788,7 +5968,7 @@ fn view_response(
         request: api.request,
         response_schema: api.response_schema,
         sql_template: api.sql_template,
-        response_formats: api.response_formats,
+        response_formats: vec!["arrow".to_string(), "json".to_string()],
         query_policy_id: api.query_policy_id,
         outcome: outcome.map(ToString::to_string),
     })
@@ -7991,6 +8171,7 @@ impl IntoResponse for ApiError {
 #[derive(Clone, Debug)]
 struct ApiConfig {
     bind: SocketAddr,
+    materialized_read_cache: Option<materialized_read_cache::MaterializedReadCacheConfig>,
     tls: Option<ApiTlsConfig>,
     endpoint: String,
     access_key_id: String,
@@ -8060,6 +8241,31 @@ impl ApiConfig {
             std::env::var("VELORIX_STATE_PATH").unwrap_or_else(|_| "v1/state/slatedb".to_string());
         let operator_id =
             std::env::var("VELORIX_OPERATOR_ID").unwrap_or_else(|_| "velorix-api".to_string());
+        let materialized_read_cache_directory =
+            std::env::var("VELORIX_MATERIALIZED_READ_CACHE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::env::temp_dir()
+                        .join("velorix-materialized-read-cache")
+                        .join(stable_bytes_hash(operator_id.as_bytes()))
+                });
+        let materialized_read_cache = if materialized_read_cache_directory.as_os_str().is_empty() {
+            None
+        } else {
+            let cache = materialized_read_cache::MaterializedReadCacheConfig {
+                directory: materialized_read_cache_directory,
+                memory_bytes: parse_positive_usize_env(
+                    "VELORIX_MATERIALIZED_READ_CACHE_MEMORY_BYTES",
+                    64 * 1024 * 1024,
+                )?,
+                disk_bytes: parse_positive_usize_env(
+                    "VELORIX_MATERIALIZED_READ_CACHE_DISK_BYTES",
+                    512 * 1024 * 1024,
+                )?,
+            };
+            cache.validate()?;
+            Some(cache)
+        };
         let backend_name = std::env::var("VELORIX_OBJECT_STORE_BACKEND")
             .unwrap_or_else(|_| "s3-compatible".into());
         let meta_grpc_endpoint = std::env::var("VELORIX_META_GRPC_ENDPOINT")
@@ -8130,6 +8336,7 @@ impl ApiConfig {
         }
         Ok(Self {
             bind,
+            materialized_read_cache,
             tls,
             endpoint,
             access_key_id,

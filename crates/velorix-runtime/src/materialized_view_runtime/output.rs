@@ -656,3 +656,95 @@ pub(super) fn parse_decimal128(value: &str, precision: u8, scale: u8) -> Option<
         Some(magnitude)
     }
 }
+
+fn materialized_canonical_output_rows_batch(
+    schema: &RelationSchema,
+    rows: &[DeltaRecord],
+    offset: usize,
+    count: usize,
+) -> Result<RecordBatch, StandingProgramRuntimeError> {
+    let end = offset
+        .checked_add(count)
+        .ok_or_else(invalid_runtime_state)?;
+    let mut values = vec![Vec::new(); schema.columns.len()];
+    let mut position = 0usize;
+    for row in rows {
+        let copies = usize::try_from(row.weight).map_err(|_| invalid_runtime_state())?;
+        let next = position
+            .checked_add(copies)
+            .ok_or_else(invalid_runtime_state)?;
+        let take = next.min(end).saturating_sub(position.max(offset));
+        if take > 0 {
+            for (index, column) in schema.columns.iter().enumerate() {
+                let value = row
+                    .value
+                    .as_json()
+                    .as_object()
+                    .and_then(|value| value.get(&column.name))
+                    .or_else(|| {
+                        row.key
+                            .as_json()
+                            .as_object()
+                            .and_then(|key| key.get(&column.name))
+                    })
+                    .or_else(|| {
+                        if schema.primary_key == [column.name.clone()] {
+                            Some(row.key.as_json())
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(invalid_runtime_state)?;
+                values[index].extend(std::iter::repeat_n(value.clone(), take));
+            }
+        }
+        position = next;
+        if position >= end {
+            break;
+        }
+    }
+    let fields = schema
+        .columns
+        .iter()
+        .map(|column| {
+            Ok(Field::new(
+                &column.name,
+                arrow_data_type(&column.data_type)?,
+                column.nullable,
+            ))
+        })
+        .collect::<Result<Vec<_>, StandingProgramRuntimeError>>()?;
+    let arrays = schema
+        .columns
+        .iter()
+        .zip(values.iter())
+        .map(|(column, values)| output_column_value_array(column, values))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|_| invalid_runtime_state())?;
+    Ok(batch)
+}
+
+pub(super) fn materialized_canonical_output_batch(
+    schema: &RelationSchema,
+    rows: &DeltaBatch,
+) -> Result<RecordBatch, StandingProgramRuntimeError> {
+    let mut total = 0usize;
+    let mut previous = None;
+    for row in rows.records() {
+        let copies = usize::try_from(row.weight)
+            .ok()
+            .filter(|copies| *copies > 0)
+            .ok_or_else(invalid_runtime_state)?;
+        total = total
+            .checked_add(copies)
+            .filter(|total| *total <= 512)
+            .ok_or_else(invalid_runtime_state)?;
+        let order = encode_kv_ordered(row.key.as_json(), row.value.as_json());
+        if previous.as_ref().is_some_and(|previous| previous >= &order) {
+            return Err(invalid_runtime_state());
+        }
+        previous = Some(order);
+    }
+    materialized_canonical_output_rows_batch(schema, rows.records(), 0, total)
+}

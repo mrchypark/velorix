@@ -219,7 +219,7 @@ After it finishes, call the REST API through the local port-forward:
   curl -X POST "$VELORIX_API_URL/v1/relations/scores-default" -H "$VELORIX_API_AUTH_HEADER"
   curl -X POST "$VELORIX_API_URL/v1/views" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"view_id":"positive_scores_by_user","urlPath":"/scores/positive","input_relation_id":"scores","input_relation_version":"2026-05-24.v1","sql":"select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id","response_formats":["json"]}'
   curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'
-  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "$VELORIX_API_AUTH_HEADER"
+  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H 'Accept: application/json' -H "$VELORIX_API_AUTH_HEADER"
 
 Main overrides:
   VELORIX_VIND_CLUSTER=velorix-product
@@ -2903,9 +2903,9 @@ wait_for_api() {
 
 curl_api() {
   if [ -n "$api_bearer_token" ]; then
-    curl -fsS -H "authorization: Bearer ${api_bearer_token}" "$@"
+    curl -H "Accept: application/json" -fsS -H "authorization: Bearer ${api_bearer_token}" "$@"
   else
-    curl -fsS "$@"
+    curl -H "Accept: application/json" -fsS "$@"
   fi
 }
 
@@ -2921,9 +2921,9 @@ curl_api_status() {
   local output_file="$1"
   shift
   if [ -n "$api_bearer_token" ]; then
-    curl -sS -o "$output_file" -w '%{http_code}' -H "authorization: Bearer ${api_bearer_token}" "$@"
+    curl -H "Accept: application/json" -sS -o "$output_file" -w '%{http_code}' -H "authorization: Bearer ${api_bearer_token}" "$@"
   else
-    curl -sS -o "$output_file" -w '%{http_code}' "$@"
+    curl -H "Accept: application/json" -sS -o "$output_file" -w '%{http_code}' "$@"
   fi
 }
 
@@ -7508,7 +7508,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   # shellcheck disable=SC2016
   echo '  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H '\''content-type: application/json'\'' -d '\''{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'\'''
   # shellcheck disable=SC2016
-  echo '  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "$VELORIX_API_AUTH_HEADER"'
+  echo '  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "Accept: application/json" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/v1/api/scores/positive" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
@@ -7518,7 +7518,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
 else
   echo "  curl http://127.0.0.1:${api_local_port}/healthz"
   echo "  curl -X POST http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest -H 'content-type: application/json' -d '{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"scores\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"u1\",\"score\":5,\"delta\":1},{\"user_id\":\"u1\",\"score\":7,\"delta\":1},{\"user_id\":\"u2\",\"score\":-1,\"delta\":1}]}'"
-  echo "  curl http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query"
+  echo "  curl -H 'Accept: application/json' http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query"
   echo "  curl http://127.0.0.1:${api_local_port}/v1/api/scores/positive"
 fi
 
