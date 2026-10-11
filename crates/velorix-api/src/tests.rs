@@ -21296,6 +21296,44 @@ async fn authoritative_correction_configuration_survives_activation_and_checkpoi
     correction_restart_regression(true).await;
 }
 
+#[test]
+fn authoritative_correction_checkpoint_restart_on_two_mib_stack() {
+    const CHILD: &str = "VELORIX_CORRECTION_TWO_MIB_STACK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        std::thread::Builder::new()
+            .name("correction-checkpoint-two-mib".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(correction_restart_regression(true));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        return;
+    }
+    // Isolate a stack-overflow abort while exercising the existing correction assertions.
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::authoritative_correction_checkpoint_restart_on_two_mib_stack",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "2 MiB correction checkpoint child failed: {}\n{}\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+}
+
 #[tokio::test]
 async fn rest_default_window_far_late_extrema_and_avg_load_only_affected_state() {
     far_late_window_regression(false, false).await;

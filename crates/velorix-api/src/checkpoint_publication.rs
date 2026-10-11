@@ -82,49 +82,17 @@ pub(super) async fn persist_standing_runtime_checkpoint(
         )?;
     let (state_payload_key, state_payload_record) =
         standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
-    let legacy_checkpoint = standing_runtime_checkpoint_with_durable_publication_refs(
+    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
+    // Keep descriptor hydration and validation out of the ingest/recovery caller's future.
+    let existing_legacy_record = Box::pin(read_validated_legacy_checkpoint_record(
+        state,
+        view_id,
         checkpoint,
-        None,
+        &checkpoint_key,
         &output_delta_publications,
         &state_payload_key,
-    );
-    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
-    let existing_legacy_record = match state.store.get(&checkpoint_path).await {
-        Ok(object) => {
-            let bytes = collect_object_bytes_bounded(object, Some(16 * 1024 * 1024)).await?;
-            let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
-                .map_err(ApiError::bad_request)?;
-            let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
-            validate_standing_runtime_checkpoint_record(
-                &checkpoint.identity,
-                view_id,
-                &pointer,
-                &record,
-            )?;
-            if record.checkpoint_key != checkpoint_key.as_str() {
-                return Err(ApiError::conflict(
-                    "standing runtime checkpoint key mismatch",
-                ));
-            }
-            hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
-            record
-                .checkpoint
-                .validate_identity(&checkpoint.identity)
-                .map_err(ApiError::bad_request)?;
-            validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
-            validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
-            let payload = record.checkpoint.state_payload.take();
-            if record.checkpoint == legacy_checkpoint
-                && payload.as_ref() == checkpoint.state_payload.as_ref()
-            {
-                Some(record)
-            } else {
-                None
-            }
-        }
-        Err(object_store::Error::NotFound { .. }) => None,
-        Err(error) => return Err(ApiError::internal(error)),
-    };
+    ))
+    .await?;
     let mut write_summary = StandingRuntimeCheckpointWriteSummary {
         output_delta_writes: output_delta_publications.len(),
         state_payload_writes: 1,
@@ -292,6 +260,56 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     }
 
     Ok(write_summary)
+}
+
+async fn read_validated_legacy_checkpoint_record(
+    state: &ApiState,
+    view_id: &str,
+    checkpoint: &RuntimeCheckpoint,
+    checkpoint_key: &ObjectKey,
+    output_delta_publications: &[StandingRuntimeDeltaPublication],
+    state_payload_key: &ObjectKey,
+) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
+    let object = match state
+        .store
+        .get(&ObjectPath::from(checkpoint_key.as_str()))
+        .await
+    {
+        Ok(object) => object,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let bytes = collect_object_bytes_bounded(object, Some(16 * 1024 * 1024)).await?;
+    let mut record =
+        standing_runtime_checkpoint_record_from_slice(&bytes).map_err(ApiError::bad_request)?;
+    let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+    validate_standing_runtime_checkpoint_record(&checkpoint.identity, view_id, &pointer, &record)?;
+    if record.checkpoint_key != checkpoint_key.as_str() {
+        return Err(ApiError::conflict(
+            "standing runtime checkpoint key mismatch",
+        ));
+    }
+    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    record
+        .checkpoint
+        .validate_identity(&checkpoint.identity)
+        .map_err(ApiError::bad_request)?;
+    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
+    validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
+    let payload = record.checkpoint.state_payload.take();
+    let legacy_checkpoint = standing_runtime_checkpoint_with_durable_publication_refs(
+        checkpoint,
+        None,
+        output_delta_publications,
+        state_payload_key,
+    );
+    if record.checkpoint == legacy_checkpoint
+        && payload.as_ref() == checkpoint.state_payload.as_ref()
+    {
+        Ok(Some(record))
+    } else {
+        Ok(None)
+    }
 }
 
 fn standing_runtime_checkpoint_with_prior_input_coverage(

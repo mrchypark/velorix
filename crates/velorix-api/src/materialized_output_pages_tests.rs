@@ -740,6 +740,28 @@ fn publication_schema(checkpoint: &RuntimeCheckpoint) -> RelationSchema {
     serde_json::from_value(payload["output_schema"].clone()).unwrap()
 }
 
+#[tokio::test]
+async fn publication_checkpoint_future_has_bounded_inline_size() {
+    let checkpoint = publication_checkpoint(SqlDataType::Int32, json!(7), 1);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = publication_state(store, Arc::new(InMemoryMetaStore::default())).await;
+    let future = persist_standing_runtime_checkpoint(
+        &state,
+        "synthetic_output",
+        &checkpoint,
+        &[],
+        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        None,
+    );
+    let bytes = std::mem::size_of_val(&future);
+    eprintln!("checkpoint publication inline future: {bytes} bytes");
+    // This future is embedded in ingest and recovery; reserve under 1% of a 2 MiB stack.
+    assert!(
+        bytes <= 19 * 1024,
+        "checkpoint publication future uses {bytes} bytes"
+    );
+}
+
 #[test]
 fn publication_scalar_key_matrix_preserves_native_ipc_including_empty_snapshots() {
     for (key_type, value) in [
