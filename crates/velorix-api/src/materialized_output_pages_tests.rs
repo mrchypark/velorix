@@ -615,3 +615,754 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
     let stale = call_json(&router, Method::POST, uri, request).await;
     assert_eq!(stale.0, StatusCode::BAD_REQUEST, "{}", stale.1);
 }
+
+// Standalone neutral fixtures; these do not load customer harnesses or workloads.
+fn publication_checkpoint(
+    key_type: SqlDataType,
+    key_value: Value,
+    weight: i64,
+) -> RuntimeCheckpoint {
+    use velorix_core::standing_program::DurableStateRoot;
+    let schema = RelationSchema {
+        relation_id: "synthetic_output".into(),
+        relation_name: "synthetic_output".into(),
+        relation_version: "synthetic-v1".into(),
+        schema_fingerprint: stable_bytes_hash(format!("synthetic-{key_type:?}").as_bytes()),
+        columns: vec![
+            ColumnSchema {
+                name: "k".into(),
+                data_type: key_type,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "v".into(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["k".into()],
+    };
+    let output = if weight == 0 {
+        DeltaBatch::default()
+    } else {
+        DeltaBatch::from_records([DeltaRecord::new(
+            DeltaKey::from_json(key_value),
+            DeltaValue::from_json(json!({"v":17})),
+            weight,
+        )])
+    };
+    let payload =
+        json!({"schema_version":1,"output_schema":schema,"published_output":output}).to_string();
+    RuntimeCheckpoint {
+        identity: StandingProgramIdentity {
+            tenant_id: "synthetic_tenant".into(),
+            program_id: "synthetic_program".into(),
+            view_ids: vec!["synthetic_output".into()],
+            sql_hash: stable_bytes_hash(b"synthetic-plan"),
+            input_catalog_hash: stable_bytes_hash(b"synthetic-catalog"),
+            output_schema_hash: stable_bytes_hash(b"synthetic-schema"),
+            planner_identity: "velorix-logical-view-planner-v1".into(),
+            builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+                name: "velorix-runtime".into(),
+                version: "test".into(),
+            }],
+            runtime_capabilities: vec!["materialized-view-runtime".into()],
+            runtime_compatibility: "velorix-materialized-view-runtime-v1".into(),
+            checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".into(),
+            native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+        },
+        logical_epoch: 1,
+        input_frontiers: vec![RelationFrontier {
+            relation_id: "synthetic_input".into(),
+            relation_version: "synthetic-v1".into(),
+            stream_id: "synthetic_stream".into(),
+            partition_id: 0,
+            committed_offset_exclusive: 1,
+        }],
+        input_event_time_frontiers: Vec::new(),
+        output_frontiers: vec![ViewFrontier {
+            view_id: "synthetic_output".into(),
+            committed_epoch: 1,
+        }],
+        checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".into(),
+        state_root: DurableStateRoot {
+            object_key: "synthetic-state".into(),
+            content_hash: stable_bytes_hash(payload.as_bytes()),
+        },
+        state_payload: Some(RuntimeCheckpointStatePayload {
+            codec_identity: "velorix-standing-program-checkpoint-v1".into(),
+            payload,
+        }),
+        output_manifest_refs: Vec::new(),
+        owner_epoch: None,
+        input_coverage: None,
+        causal_cut: None,
+    }
+}
+
+fn publication_key(checkpoint: &RuntimeCheckpoint) -> ObjectKey {
+    ObjectKey::standing_runtime_checkpoint(
+        &checkpoint.identity.tenant_id,
+        &checkpoint.identity.program_id,
+        "synthetic_output",
+        checkpoint.logical_epoch,
+        &checkpoint.state_root.content_hash,
+    )
+    .unwrap()
+}
+
+async fn publication_state(store: Arc<dyn ObjectStore>, meta: Arc<InMemoryMetaStore>) -> ApiState {
+    let authority = validate_operator_authority(
+        ObjectStoreAuthorityRef {
+            store_id: "synthetic_store".into(),
+            namespace: "synthetic_namespace".into(),
+        },
+        store,
+        "memory",
+        "synthetic-publication",
+    )
+    .await
+    .unwrap();
+    ApiState::from_validated_authority_with_ingest_admission_startup(
+        authority,
+        "ignored",
+        "synthetic-owner",
+        false,
+    )
+    .await
+    .unwrap()
+    .with_meta_store(meta)
+}
+
+fn publication_schema(checkpoint: &RuntimeCheckpoint) -> RelationSchema {
+    let payload: Value =
+        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+    serde_json::from_value(payload["output_schema"].clone()).unwrap()
+}
+
+#[test]
+fn publication_scalar_key_matrix_preserves_native_ipc_including_empty_snapshots() {
+    for (key_type, value) in [
+        (SqlDataType::Int8, json!(-128)),
+        (SqlDataType::Int16, json!(-32768)),
+        (SqlDataType::Int32, json!(i32::MIN)),
+        (SqlDataType::Int64, json!(i64::MIN)),
+        (SqlDataType::UInt8, json!(u8::MAX)),
+        (SqlDataType::UInt16, json!(u16::MAX)),
+        (SqlDataType::UInt32, json!(u32::MAX)),
+        (SqlDataType::UInt64, json!(u64::MAX)),
+        (SqlDataType::Float32, json!(1.25)),
+        (
+            SqlDataType::Float32,
+            json!(f32::from_bits(0x3dcccccd) as f64),
+        ),
+        (SqlDataType::Float64, json!(1.25)),
+        (SqlDataType::Bool, json!(true)),
+        (SqlDataType::Utf8, json!("synthetic-key")),
+        (SqlDataType::Char { length: Some(1) }, json!("x")),
+        (
+            SqlDataType::Uuid,
+            json!("00000000-0000-0000-0000-000000000001"),
+        ),
+        (SqlDataType::Binary { length: 2 }, json!("0x0102")),
+        (SqlDataType::Varbinary, json!("0x0102")),
+        (SqlDataType::Date, json!(1)),
+        (SqlDataType::Time, json!(42)),
+        (SqlDataType::Timestamp { timezone: None }, json!(42)),
+        (
+            SqlDataType::Timestamp {
+                timezone: Some("UTC".into()),
+            },
+            json!(42),
+        ),
+        (
+            SqlDataType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            json!("1.25"),
+        ),
+        (SqlDataType::Json, json!({"synthetic":7})),
+        (SqlDataType::Json, json!("synthetic-key")),
+    ] {
+        for weight in [0, 1] {
+            let checkpoint = publication_checkpoint(key_type.clone(), value.clone(), weight);
+            let schema = publication_schema(&checkpoint);
+            let encoded_schema =
+                velorix_runtime::materialized_view_runtime::materialized_canonical_output_batch(
+                    &schema,
+                    &DeltaBatch::default(),
+                )
+                .unwrap()
+                .schema();
+            assert_eq!(
+                arrow_schema_from_incremental_relation_schema(&schema).unwrap(),
+                encoded_schema,
+                "{key_type:?}"
+            );
+            let key = publication_key(&checkpoint);
+            let publication = pages::checkpoint_publication(&checkpoint, "synthetic_output", &key)
+                .unwrap_or_else(|error| panic!("{key_type:?}: {}", error.message))
+                .unwrap();
+            assert_eq!(publication.manifest_record.output_encoding, pages::CODEC);
+            assert_eq!(
+                publication.manifest_record.output_row_count,
+                weight as usize
+            );
+            pages::validate_checkpoint_binding(&publication.manifest_record, &checkpoint).unwrap();
+            for (key, page) in &publication.page_records {
+                let bytes = pages::encode_page(page).unwrap();
+                let restored = pages::decode_page(&bytes, pages::CODEC).unwrap_or_else(|error| {
+                    panic!("{key_type:?}, weight {weight}: {}", error.message)
+                });
+                pages::validate_page(key, &restored).unwrap();
+                assert_eq!(
+                    pages::validate_page_binding(&publication.manifest_record, &restored).unwrap(),
+                    pages::validate_page_binding(&publication.manifest_record, page).unwrap(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn publication_rejects_invalid_typed_keys_and_negative_bags() {
+    for (key_type, key) in [
+        (SqlDataType::Int32, json!(i64::MAX)),
+        (SqlDataType::UInt32, json!(-1)),
+        (SqlDataType::Float32, json!(f64::MAX)),
+        (SqlDataType::Binary { length: 2 }, json!("0x01")),
+        (SqlDataType::Varbinary, json!("0xzz")),
+        (SqlDataType::Int64, Value::Null),
+    ] {
+        for weight in [1, 8192 * 512 + 1] {
+            let checkpoint = publication_checkpoint(key_type.clone(), key.clone(), weight);
+            assert!(pages::checkpoint_publication(
+                &checkpoint,
+                "synthetic_output",
+                &publication_key(&checkpoint)
+            )
+            .is_err());
+        }
+    }
+    let checkpoint = publication_checkpoint(SqlDataType::Int64, json!(1), -1);
+    assert!(pages::checkpoint_publication(
+        &checkpoint,
+        "synthetic_output",
+        &publication_key(&checkpoint)
+    )
+    .is_err());
+}
+
+#[test]
+fn publication_page_capacity_boundary_retains_eligible_index() {
+    for count in [8192 * 512 - 1, 8192 * 512] {
+        let checkpoint = publication_checkpoint(SqlDataType::Int64, json!(1), count);
+        let publication = pages::checkpoint_publication(
+            &checkpoint,
+            "synthetic_output",
+            &publication_key(&checkpoint),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(publication.manifest_record.output_row_count, count as usize);
+        assert_eq!(publication.page_records.len(), 8192);
+        pages::validate_checkpoint_binding(&publication.manifest_record, &checkpoint).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn publication_above_page_capacity_preserves_bag_checkpoint_pointer_and_bounded_pages() {
+    let meta = Arc::new(InMemoryMetaStore::default());
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = publication_state(store.clone(), meta.clone()).await;
+    let checkpoint = publication_checkpoint(SqlDataType::Int64, json!(1), 8192 * 512 + 1);
+    assert!(pages::checkpoint_publication(
+        &checkpoint,
+        "synthetic_output",
+        &publication_key(&checkpoint)
+    )
+    .unwrap()
+    .is_none());
+    let owner = state
+        .acquire_standing_runtime_owner(&checkpoint.identity, "synthetic_output")
+        .await
+        .unwrap()
+        .unwrap();
+    persist_standing_runtime_checkpoint(
+        &state,
+        "synthetic_output",
+        &checkpoint,
+        &[],
+        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner)),
+        None,
+    )
+    .await
+    .unwrap();
+    let pointer = meta
+        .read_standing_runtime_checkpoint(
+            "synthetic_tenant",
+            "synthetic_program",
+            "synthetic_output",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pointer.checkpoint_key,
+        publication_key(&checkpoint).as_str()
+    );
+    assert!(pointer.output_manifest_refs.is_empty());
+    let restarted = publication_state(store, meta).await;
+    let restored = read_latest_standing_runtime_checkpoint(
+        &restarted,
+        &checkpoint.identity,
+        "synthetic_output",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(restored.checkpoint.state_payload, checkpoint.state_payload);
+    let schema = publication_schema(&restored.checkpoint);
+    let output: DeltaBatch = serde_json::from_value(
+        standing_runtime_checkpoint_published_output(&restored.checkpoint).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(output.records().len(), 1);
+    assert_eq!(output.records()[0].weight, 8192 * 512 + 1);
+    let scoped = ScopedViewId {
+        tenant_id: "synthetic_tenant".into(),
+        program_id: "synthetic_program".into(),
+        view_id: "synthetic_output".into(),
+    };
+    let first = velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
+        &schema,
+        &output,
+        scoped.clone(),
+        1,
+        SnapshotPageRequest {
+            max_rows: Some(3),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(first.batches[0].num_rows(), 3);
+    let second = velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
+        &schema,
+        &output,
+        scoped.clone(),
+        1,
+        SnapshotPageRequest {
+            max_rows: Some(3),
+            page_token: first.next_page_token.clone(),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(second.batches[0].num_rows(), 3);
+    assert_ne!(first.next_page_token, second.next_page_token);
+    assert!(
+        velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
+            &schema,
+            &output,
+            scoped,
+            2,
+            SnapshotPageRequest {
+                max_rows: Some(3),
+                page_token: first.next_page_token,
+                ..Default::default()
+            },
+            None,
+        )
+        .is_err()
+    );
+    let error = super::super::query_serving::legacy_materialized_page(
+        &restarted,
+        "synthetic_output",
+        &checkpoint.identity,
+        "synthetic_output",
+        &schema,
+        SnapshotPageRequest {
+            max_rows: Some(3),
+            ..Default::default()
+        },
+        false,
+        QueryPolicy {
+            memory_limit_bytes: Some(1024),
+            ..Default::default()
+        },
+        0,
+        0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn publication_legacy_duplicate_and_orphan_reuse_original_descriptor_bytes() {
+    for published in [false, true] {
+        let meta = Arc::new(InMemoryMetaStore::default());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = publication_state(store.clone(), meta.clone()).await;
+        let checkpoint = publication_checkpoint(SqlDataType::Int32, json!(7), 1);
+        let owner = state
+            .acquire_standing_runtime_owner(&checkpoint.identity, "synthetic_output")
+            .await
+            .unwrap()
+            .unwrap();
+        let (state_key, payload) =
+            standing_runtime_state_payload_record_for_checkpoint(&checkpoint, "synthetic_output")
+                .unwrap();
+        persist_standing_runtime_state_payload(&state, &state_key, &payload)
+            .await
+            .unwrap();
+        // This is the base-version publication: durable state, no native manifest ref.
+        let record = StandingRuntimeCheckpointRecord {
+            schema_version: 1,
+            record_kind: "standing_runtime_checkpoint_v1".into(),
+            view_id: "synthetic_output".into(),
+            checkpoint_key: publication_key(&checkpoint).as_str().into(),
+            previous_checkpoint: None,
+            checkpoint: standing_runtime_checkpoint_with_durable_publication_refs(
+                &checkpoint,
+                None,
+                &[],
+                &state_key,
+            ),
+            replay_checkpoints: Vec::new(),
+            manifest_hash: String::new(),
+        };
+        let original = serde_json::to_vec(&record).unwrap();
+        let path = Path::from(record.checkpoint_key.clone());
+        store
+            .put_opts(&path, original.clone().into(), PutMode::Create.into())
+            .await
+            .unwrap();
+        if published {
+            publish_standing_runtime_checkpoint_pointer(
+                &state,
+                None,
+                standing_runtime_checkpoint_pointer_from_record(&record),
+                Some(owner.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        persist_standing_runtime_checkpoint(
+            &state,
+            "synthetic_output",
+            &checkpoint,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            original.as_slice()
+        );
+        let pointer = meta
+            .read_standing_runtime_checkpoint(
+                "synthetic_tenant",
+                "synthetic_program",
+                "synthetic_output",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pointer.manifest_hash, stable_bytes_hash(&original));
+        assert!(pointer.output_manifest_refs.is_empty());
+        let restored = read_latest_standing_runtime_checkpoint(
+            &state,
+            &checkpoint.identity,
+            "synthetic_output",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(restored.checkpoint.state_payload, checkpoint.state_payload);
+        let mut conflict = checkpoint.clone();
+        conflict.owner_epoch = Some(9);
+        let error = persist_standing_runtime_checkpoint(
+            &state,
+            "synthetic_output",
+            &conflict,
+            &[],
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            original.as_slice()
+        );
+        assert_eq!(
+            meta.read_standing_runtime_checkpoint(
+                "synthetic_tenant",
+                "synthetic_program",
+                "synthetic_output"
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            pointer
+        );
+    }
+}
+
+fn publication_catalog(
+    logical_type: VelorixLogicalTypeV1,
+    physical_type: ArrowPhysicalTypeV1,
+) -> VelorixRelationCatalogV1 {
+    use velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID;
+    VelorixRelationCatalogV1::from_relation_schema(
+        VelorixRelationSchemaV1 {
+            relation_id: "synthetic_input".into(),
+            relation_name: "synthetic_input".into(),
+            relation_version: "synthetic-v1".into(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "k".into(),
+                    name: "k".into(),
+                    logical_type,
+                    physical_arrow_type: physical_type,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::PrimaryKey,
+                },
+                RelationColumnV1 {
+                    column_id: "v".into(),
+                    name: "v".into(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Value,
+                },
+                RelationColumnV1 {
+                    column_id: "weight".into(),
+                    name: "weight".into(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["k".into()],
+            weight_column_id: "weight".into(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: None,
+        },
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn publication_admission_rejects_nested_keys_and_keeps_value_type_rules() {
+    let catalog = publication_catalog(
+        VelorixLogicalTypeV1::Array {
+            element_type: Box::new(VelorixLogicalTypeV1::Int64),
+        },
+        ArrowPhysicalTypeV1::List {
+            element_type: Box::new(ArrowPhysicalTypeV1::Int64),
+        },
+    );
+    let error = validate_supported_filter_project_sql("select k,v from synthetic_input", &catalog)
+        .unwrap_err();
+    assert!(error.to_string().contains("primary key type"));
+    let mut schema = publication_catalog(VelorixLogicalTypeV1::Int32, ArrowPhysicalTypeV1::Int32)
+        .relation_schema;
+    schema.columns[1].logical_type = VelorixLogicalTypeV1::Int32;
+    schema.columns[1].physical_arrow_type = ArrowPhysicalTypeV1::Int32;
+    let catalog = VelorixRelationCatalogV1::from_relation_schema(
+        schema,
+        velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
+    )
+    .unwrap();
+    assert!(
+        validate_supported_filter_project_sql("select k,v from synthetic_input", &catalog).is_err()
+    );
+}
+
+#[tokio::test]
+async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
+    for (logical, physical, value) in [
+        (
+            VelorixLogicalTypeV1::Int32,
+            ArrowPhysicalTypeV1::Int32,
+            json!(-7),
+        ),
+        (
+            VelorixLogicalTypeV1::UInt32,
+            ArrowPhysicalTypeV1::UInt32,
+            json!(u32::MAX),
+        ),
+        (
+            VelorixLogicalTypeV1::Float32,
+            ArrowPhysicalTypeV1::Float32,
+            json!(1.25),
+        ),
+        (
+            VelorixLogicalTypeV1::Timestamp {
+                timezone: Some("UTC".into()),
+            },
+            ArrowPhysicalTypeV1::TimestampNanosecond {
+                timezone: Some("UTC".into()),
+            },
+            json!(42),
+        ),
+    ] {
+        let timezone_key = matches!(
+            &logical,
+            VelorixLogicalTypeV1::Timestamp { timezone: Some(_) }
+        );
+        let meta = Arc::new(InMemoryMetaStore::default());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let state = publication_state(store.clone(), meta.clone()).await;
+        let router = app(state.clone());
+        let registered = call_json(&router, Method::POST, "/v1/relations",
+            json!({"catalog":publication_catalog(logical,physical),"default_orders_sum_count":false})).await;
+        assert_eq!(registered.0, StatusCode::CREATED, "{}", registered.1);
+        // A retained cancelling batch supplies the bootstrap frontier with empty output.
+        let seeded = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
+            "relation_id":"synthetic_input","relation_version":"synthetic-v1","stream_id":"synthetic_stream",
+            "partition_id":0,"start_offset_inclusive":0,"rows":[
+                {"k":value,"v":17,"weight":1}, {"k":value,"v":17,"weight":-1}
+            ]
+        }]})).await;
+        assert_eq!(seeded.0, StatusCode::CREATED, "{}", seeded.1);
+        let created = call_json(&router, Method::POST, "/v1/views", json!({
+            "view_id":"synthetic_output", "sql":"select k,v from synthetic_input",
+            "input_relation_id":"synthetic_input", "input_relation_version":"synthetic-v1", "response_formats":["json"]
+        })).await;
+        if timezone_key {
+            // Native IPC preserves UTC; SQL admission still rejects timezone-bearing inputs.
+            assert_eq!(created.0, StatusCode::BAD_REQUEST, "{}", created.1);
+            let error = created.1["error"].as_str().unwrap();
+            assert!(error.contains("spec.input_relations.synthetic_input.k"));
+            assert!(error.contains("timezone-bearing timestamps are not supported yet"));
+            assert!(error.contains("timezone=UTC"));
+            assert!(state
+                .view_registry()
+                .unwrap()
+                .list_active()
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(meta
+                .read_view_bootstrap("default", "synthetic_output", "synthetic_output")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(meta
+                .read_standing_runtime_checkpoint("default", "synthetic_output", "synthetic_output")
+                .await
+                .unwrap()
+                .is_none());
+            let checkpoint_prefix = Path::from(
+                "v1/standing-runtime-checkpoints/default/synthetic_output/synthetic_output/epochs",
+            );
+            assert!(store
+                .list(Some(&checkpoint_prefix))
+                .try_next()
+                .await
+                .unwrap()
+                .is_none());
+            continue;
+        }
+        assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+        let activated = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/synthetic_output/backfill",
+            json!({}),
+        )
+        .await;
+        assert_eq!(activated.0, StatusCode::OK, "{}", activated.1);
+        let empty = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/synthetic_output/query",
+            json!({"sql":"select * from synthetic_output"}),
+        )
+        .await;
+        assert_eq!(empty.0, StatusCode::OK, "{}", empty.1);
+        assert_eq!(empty.1["rows"], json!([]));
+        let ingested = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
+            "relation_id":"synthetic_input","relation_version":"synthetic-v1","stream_id":"synthetic_stream",
+            "partition_id":0,"start_offset_inclusive":2,"rows":[{"k":value,"v":17,"weight":1}]
+        }]})).await;
+        assert_eq!(ingested.0, StatusCode::CREATED, "{}", ingested.1);
+        let rows = call_json(
+            &router,
+            Method::POST,
+            "/v1/views/synthetic_output/query",
+            json!({"sql":"select * from synthetic_output"}),
+        )
+        .await;
+        assert_eq!(rows.0, StatusCode::OK, "{}", rows.1);
+        assert_eq!(rows.1["rows"], json!([{"k":value,"v":17}]));
+        let restarted = publication_state(store, meta).await;
+        restarted
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap();
+        let rows = call_json(
+            &app(restarted),
+            Method::POST,
+            "/v1/views/synthetic_output/query",
+            json!({"sql":"select * from synthetic_output"}),
+        )
+        .await;
+        assert_eq!(rows.0, StatusCode::OK, "{}", rows.1);
+        assert_eq!(rows.1["rows"], json!([{"k":value,"v":17}]));
+    }
+}
+
+#[tokio::test]
+async fn publication_descriptor_collector_bounds_actual_bytes_with_understated_metadata() {
+    let store = InMemory::new();
+    let path = Path::from("synthetic-descriptor");
+    store
+        .put_opts(
+            &path,
+            bytes::Bytes::from_static(b"1234").into(),
+            PutMode::Create.into(),
+        )
+        .await
+        .unwrap();
+    let mut result = store.get(&path).await.unwrap();
+    result.meta.size = 0;
+    let error = collect_object_bytes_bounded(result, Some(3))
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    let result = store.get(&path).await.unwrap();
+    assert_eq!(
+        collect_object_bytes_bounded(result, Some(4)).await.unwrap(),
+        b"1234"
+    );
+}

@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
-        StringArray, TimestampNanosecondArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+        Time64NanosecondArray, TimestampNanosecondArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
     record_batch::RecordBatch,
@@ -368,6 +370,50 @@ pub(super) fn materialized_generic_delta_page_batch(
     let mut rows = published_output
         .net_rows()
         .map_err(|_| invalid_runtime_state())?;
+    if rows.iter().any(|row| row.weight != 1) {
+        let total = rows.iter().try_fold(0usize, |total, row| {
+            let copies = usize::try_from(row.weight)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(invalid_runtime_state)?;
+            total.checked_add(copies).ok_or_else(invalid_runtime_state)
+        })?;
+        let offset = if let Some(token) = &page.page_token {
+            let token = token
+                .strip_prefix("velorix-bag:")
+                .ok_or_else(invalid_runtime_state)?;
+            let (schema, epoch, offset): (String, u64, usize) =
+                serde_json::from_str(token).map_err(|_| invalid_runtime_state())?;
+            if schema != output_schema.schema_fingerprint
+                || epoch != logical_epoch
+                || offset >= total
+            {
+                return Err(invalid_runtime_state());
+            }
+            offset
+        } else {
+            0
+        };
+        let limit = page.max_rows.unwrap_or(total);
+        if limit == 0 {
+            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                field: "snapshot_page.max_rows",
+            });
+        }
+        let count = limit.min(total - offset);
+        let end = offset + count;
+        let next = if end < total {
+            Some(format!(
+                "velorix-bag:{}",
+                serde_json::to_string(&(&output_schema.schema_fingerprint, logical_epoch, end,))
+                    .map_err(|_| invalid_runtime_state())?
+            ))
+        } else {
+            None
+        };
+        return materialized_canonical_output_rows_batch(output_schema, &rows, offset, count)
+            .map(|batch| (batch, next));
+    }
     if let Some(page_token) = &page.page_token {
         let token_key = encode_kv_ordered(
             &serde_json::from_str::<serde_json::Value>(page_token)
@@ -402,76 +448,12 @@ fn key_array(
     data_type: &SqlDataType,
     values: &[Value],
 ) -> Result<ArrayRef, StandingProgramRuntimeError> {
-    match data_type {
-        SqlDataType::Utf8 => Ok(Arc::new(StringArray::from(
-            values
-                .iter()
-                .map(|value| value.as_str().ok_or_else(invalid_runtime_state))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        SqlDataType::Int64 => Ok(Arc::new(Int64Array::from(
-            values
-                .iter()
-                .map(|value| value.as_i64().ok_or_else(invalid_runtime_state))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        SqlDataType::Float64 => Ok(Arc::new(Float64Array::from(
-            values
-                .iter()
-                .map(|value| value.as_f64().ok_or_else(invalid_runtime_state))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        SqlDataType::Bool => Ok(Arc::new(BooleanArray::from(
-            values
-                .iter()
-                .map(|value| value.as_bool().ok_or_else(invalid_runtime_state))
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        SqlDataType::Decimal { precision, scale } => Ok(Arc::new(
-            Decimal128Array::from(
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .and_then(|value| parse_decimal128(value, *precision, *scale))
-                            .ok_or_else(invalid_runtime_state)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .with_precision_and_scale(
-                *precision,
-                i8::try_from(*scale).map_err(|_| invalid_runtime_state())?,
-            )
-            .map_err(|_| invalid_runtime_state())?,
-        )),
-        SqlDataType::Json => Ok(Arc::new(StringArray::from(
-            values.iter().map(canonical_json).collect::<Vec<_>>(),
-        ))),
-        SqlDataType::Date => Ok(Arc::new(Date32Array::from(
-            values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_i64()
-                        .and_then(|value| i32::try_from(value).ok())
-                        .ok_or_else(invalid_runtime_state)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        SqlDataType::Timestamp { timezone } => Ok(Arc::new(
-            TimestampNanosecondArray::from(
-                values
-                    .iter()
-                    .map(|value| value.as_i64().ok_or_else(invalid_runtime_state))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .with_timezone_opt(timezone.clone()),
-        )),
-        _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-            field: "output_schema.key",
-        }),
+    if !matches!(data_type, SqlDataType::Json) {
+        return output_value_array(data_type, values);
     }
+    Ok(Arc::new(StringArray::from(
+        values.iter().map(canonical_json).collect::<Vec<_>>(),
+    )))
 }
 
 fn output_value_array(
@@ -495,19 +477,94 @@ fn output_column_value_array(
     if !column.nullable && values.iter().any(Value::is_null) {
         return Err(invalid_runtime_state());
     }
+    macro_rules! primitive_array {
+        ($array:ty, $convert:expr) => {
+            Ok(Arc::new(<$array>::from(
+                values
+                    .iter()
+                    .map(|value| {
+                        if value.is_null() {
+                            Ok(None)
+                        } else {
+                            ($convert)(value)
+                                .map(Some)
+                                .ok_or_else(invalid_runtime_state)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )))
+        };
+    }
     match &column.data_type {
-        SqlDataType::Utf8 => Ok(Arc::new(StringArray::from(
+        SqlDataType::Int8 => primitive_array!(Int8Array, |v: &Value| v
+            .as_i64()
+            .and_then(|n| i8::try_from(n).ok())),
+        SqlDataType::Int16 => primitive_array!(Int16Array, |v: &Value| v
+            .as_i64()
+            .and_then(|n| i16::try_from(n).ok())),
+        SqlDataType::Int32 => primitive_array!(Int32Array, |v: &Value| v
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())),
+        SqlDataType::UInt8 => primitive_array!(UInt8Array, |v: &Value| v
+            .as_u64()
+            .and_then(|n| u8::try_from(n).ok())),
+        SqlDataType::UInt16 => primitive_array!(UInt16Array, |v: &Value| v
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())),
+        SqlDataType::UInt32 => primitive_array!(UInt32Array, |v: &Value| v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())),
+        SqlDataType::UInt64 => primitive_array!(UInt64Array, Value::as_u64),
+        SqlDataType::Float32 => primitive_array!(Float32Array, |v: &Value| v
+            .as_f64()
+            .map(|n| n as f32)
+            .filter(|n| n.is_finite())),
+        SqlDataType::Time => primitive_array!(Time64NanosecondArray, Value::as_i64),
+        SqlDataType::Json => Ok(Arc::new(StringArray::from(
             values
+                .iter()
+                .map(|value| (!value.is_null()).then(|| canonical_json(value)))
+                .collect::<Vec<_>>(),
+        ))),
+        SqlDataType::Binary { .. } | SqlDataType::Varbinary => {
+            let bytes = values
                 .iter()
                 .map(|value| {
                     if value.is_null() {
-                        Ok(None)
-                    } else {
-                        value.as_str().map(Some).ok_or_else(invalid_runtime_state)
+                        return Ok(None);
                     }
+                    let raw = value.as_str().ok_or_else(invalid_runtime_state)?.trim();
+                    let raw = raw
+                        .strip_prefix("0x")
+                        .or_else(|| raw.strip_prefix("0X"))
+                        .unwrap_or(raw);
+                    let bytes = hex::decode(raw).map_err(|_| invalid_runtime_state())?;
+                    if let SqlDataType::Binary { length } = &column.data_type {
+                        if bytes.len() != *length as usize {
+                            return Err(invalid_runtime_state());
+                        }
+                    }
+                    Ok(Some(bytes))
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Arc::new(BinaryArray::from_iter(
+                bytes.iter().map(|bytes| bytes.as_deref()),
+            )))
+        }
+        SqlDataType::Utf8 | SqlDataType::Char { .. } | SqlDataType::Uuid => {
+            Ok(Arc::new(StringArray::from(
+                values
+                    .iter()
+                    .map(|value| {
+                        if value.is_null() {
+                            Ok(None)
+                        } else {
+                            value.as_str().map(Some).ok_or_else(invalid_runtime_state)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )))
+        }
         SqlDataType::Int64 => Ok(Arc::new(Int64Array::from(
             values
                 .iter()
@@ -603,9 +660,19 @@ fn output_column_value_array(
 
 fn arrow_data_type(data_type: &SqlDataType) -> Result<DataType, StandingProgramRuntimeError> {
     match data_type {
-        SqlDataType::Utf8 => Ok(DataType::Utf8),
+        SqlDataType::Utf8 | SqlDataType::Char { .. } | SqlDataType::Uuid => Ok(DataType::Utf8),
+        SqlDataType::Int8 => Ok(DataType::Int8),
+        SqlDataType::Int16 => Ok(DataType::Int16),
+        SqlDataType::Int32 => Ok(DataType::Int32),
         SqlDataType::Int64 => Ok(DataType::Int64),
+        SqlDataType::UInt8 => Ok(DataType::UInt8),
+        SqlDataType::UInt16 => Ok(DataType::UInt16),
+        SqlDataType::UInt32 => Ok(DataType::UInt32),
+        SqlDataType::UInt64 => Ok(DataType::UInt64),
+        SqlDataType::Float32 => Ok(DataType::Float32),
         SqlDataType::Float64 => Ok(DataType::Float64),
+        SqlDataType::Binary { .. } | SqlDataType::Varbinary => Ok(DataType::Binary),
+        SqlDataType::Time => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         SqlDataType::Bool => Ok(DataType::Boolean),
         SqlDataType::Decimal { precision, scale } => Ok(DataType::Decimal128(
             *precision,

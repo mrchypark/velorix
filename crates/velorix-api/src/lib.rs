@@ -3252,9 +3252,9 @@ fn arrow_data_type_from_sql_data_type(data_type: &SqlDataType) -> Result<DataTyp
         SqlDataType::Binary { .. } | SqlDataType::Varbinary => Ok(DataType::Binary),
         SqlDataType::Date => Ok(DataType::Date32),
         SqlDataType::Time => Ok(DataType::Time64(TimeUnit::Nanosecond)),
-        SqlDataType::Timestamp { .. } => Ok(DataType::Timestamp(
+        SqlDataType::Timestamp { timezone } => Ok(DataType::Timestamp(
             arrow::datatypes::TimeUnit::Nanosecond,
-            None,
+            timezone.clone().map(Into::into),
         )),
         SqlDataType::Interval { .. } => Ok(DataType::Utf8),
         SqlDataType::Array { element_type } => Ok(DataType::List(Arc::new(Field::new(

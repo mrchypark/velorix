@@ -6795,8 +6795,12 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
         .collect::<Vec<_>>();
     assert_eq!(
         checkpoint_get_paths.len(),
-        1,
-        "direct apply should reuse the pre-apply checkpoint record during checkpoint publish"
+        2,
+        "direct apply reads the prior checkpoint once and probes the new immutable descriptor once"
+    );
+    assert_ne!(
+        checkpoint_get_paths[0], checkpoint_get_paths[1],
+        "checkpoint publication must not reread the prior checkpoint"
     );
     let checkpoint_list_prefixes = object_access_counts
         .list_prefixes()

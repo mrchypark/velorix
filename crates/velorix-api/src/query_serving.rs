@@ -394,49 +394,30 @@ async fn query_active_view_output_batches_impl(
                 &page_request,
             )?;
             let (batches, logical_epoch, next_page_token) = if let Some(sql) = request_sql {
-                let requested_epoch = page_request.committed_epoch;
                 let sql = render_caller_sql_as_bound_sql(&sql, &parameters)?;
-                let predicate = materialized_sql_predicate(
-                    &active,
-                    &output_id,
-                    &normalize_view_query_sql(&sql, &output_id),
-                    &[],
-                );
+                let bound_sql = BoundViewSql {
+                    sql: normalize_view_query_sql(&sql, &output_id),
+                    bind_values: Vec::new(),
+                };
                 let page_request =
                     page_request_with_query_policy_limit(page_request, query_policy.policy);
-                let page = standing_runtime_sql_page(
+                query_standing_runtime_batches_with_sql(
                     &state,
                     &active,
                     &output_id,
+                    bound_sql,
                     page_request,
-                    predicate.as_ref(),
-                    policy,
-                )
-                .await?;
-                validate_standing_runtime_full_snapshot_page(
-                    &active,
-                    &output_id,
-                    &page,
-                    requested_epoch,
-                )?;
-                let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
-                    &output_id,
-                    page.batches,
-                    &normalize_view_query_sql(&sql, &output_id),
-                    &[],
-                    query_policy.policy,
+                    query_policy,
                     &permit,
                 )
-                .await
-                .map_err(ApiError::bad_request)?;
-                (batches, page.logical_epoch, None)
+                .await?
             } else if let Some(sql_template) = api.sql_template.as_deref() {
                 let bound_sql = render_view_sql_template(
                     &normalize_view_query_sql(sql_template, &output_id),
                     &api.request,
                     &parameters,
                 )?;
-                query_standing_runtime_batches_with_template(
+                query_standing_runtime_batches_with_sql(
                     &state,
                     &active,
                     &output_id,
@@ -794,7 +775,22 @@ pub(super) async fn activate_authoritative_view_bootstrap(
     }
 }
 
-async fn query_standing_runtime_batches_with_template(
+pub(super) fn remaining_query_execution_policy(
+    mut policy: QueryPolicy,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<QueryPolicy, ApiError> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ApiError::bad_request("query execution timeout exceeded"));
+        }
+        // Keep a positive submillisecond budget valid; timeout_at enforces the exact deadline.
+        policy.execution_timeout_ms = Some((remaining.as_millis() as u64).max(1));
+    }
+    Ok(policy)
+}
+
+async fn query_standing_runtime_batches_with_sql(
     state: &ApiState,
     active: &ActiveMaterializedView,
     output_id: &str,
@@ -803,31 +799,43 @@ async fn query_standing_runtime_batches_with_template(
     query_policy: ViewQueryPolicy,
     permit: &QueryExecutionPermit,
 ) -> Result<(Vec<RecordBatch>, u64, Option<String>), ApiError> {
+    let policy = query_policy.policy;
+    let deadline = policy
+        .execution_timeout_ms
+        .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
     let requested_epoch = page_request.committed_epoch;
     let predicate =
         materialized_sql_predicate(active, output_id, &bound_sql.sql, &bound_sql.bind_values);
-    let page = standing_runtime_sql_page(
-        state,
-        active,
-        output_id,
-        page_request,
-        predicate.as_ref(),
-        query_policy.policy,
-    )
-    .await?;
-    validate_standing_runtime_full_snapshot_page(active, output_id, &page, requested_epoch)?;
-    let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
-        output_id,
-        page.batches,
-        &bound_sql.sql,
-        &bound_sql.bind_values,
-        query_policy.policy,
-        permit,
-    )
-    .await
-    .map_err(ApiError::bad_request)?;
+    let query = async {
+        let page = standing_runtime_sql_page(
+            state,
+            active,
+            output_id,
+            page_request,
+            predicate.as_ref(),
+            remaining_query_execution_policy(policy, deadline)?,
+        )
+        .await?;
+        validate_standing_runtime_full_snapshot_page(active, output_id, &page, requested_epoch)?;
+        let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
+            output_id,
+            page.batches,
+            &bound_sql.sql,
+            &bound_sql.bind_values,
+            remaining_query_execution_policy(policy, deadline)?,
+            permit,
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
 
-    Ok((batches, page.logical_epoch, None))
+        Ok((batches, page.logical_epoch, None))
+    };
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, query)
+            .await
+            .map_err(|_| ApiError::bad_request("query execution timeout exceeded"))?,
+        None => query.await,
+    }
 }
 
 async fn standing_runtime_sql_page(

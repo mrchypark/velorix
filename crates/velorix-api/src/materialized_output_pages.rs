@@ -1650,6 +1650,9 @@ pub(super) fn checkpoint_publication(
         return Ok(None);
     }
     let schema = checkpoint_output_schema(checkpoint)?;
+    if schema.relation_id != view_id {
+        return Err(invalid());
+    }
     let output: DeltaBatch = serde_json::from_value(value).map_err(ApiError::bad_request)?;
     let aggregates =
         super::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(checkpoint)?;
@@ -1661,9 +1664,6 @@ pub(super) fn checkpoint_publication(
             .ok_or_else(invalid)?;
         n.checked_add(copies).ok_or_else(invalid)
     })?;
-    if total.div_ceil(PAGE_ROWS).max(1) > MAX_PAGES {
-        return Err(invalid());
-    }
     let mut normalized = Vec::new();
     // Each normalization batch is bounded; the existing converter supplies aliases,
     // aggregate values and composite keys exactly as the public runtime query does.
@@ -1693,7 +1693,11 @@ pub(super) fn checkpoint_publication(
                 for i in 0..batch.num_rows() {
                     let mut value = serde_json::Map::new();
                     for (column, array) in schema.columns.iter().zip(batch.columns()) {
-                        let scalar = arrow_value_to_json(array, i)?;
+                        let mut scalar = arrow_value_to_json(array, i)?;
+                        if column.data_type == SqlDataType::Json && !scalar.is_null() {
+                            scalar = serde_json::from_str(scalar.as_str().ok_or_else(invalid)?)
+                                .map_err(ApiError::bad_request)?;
+                        }
                         value.insert(column.name.clone(), scalar);
                     }
                     converted.push(velorix_core::delta::DeltaRecord::new(
@@ -1712,6 +1716,10 @@ pub(super) fn checkpoint_publication(
                     .map_err(ApiError::bad_request)?,
             );
         }
+    }
+    if total.div_ceil(PAGE_ROWS).max(1) > MAX_PAGES {
+        // The durable payload retains the exact BAG after validating every compact row.
+        return Ok(None);
     }
     publication(
         checkpoint,

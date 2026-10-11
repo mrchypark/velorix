@@ -80,6 +80,51 @@ pub(super) async fn persist_standing_runtime_checkpoint(
             &checkpoint_key,
             published_relation.as_ref(),
         )?;
+    let (state_payload_key, state_payload_record) =
+        standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
+    let legacy_checkpoint = standing_runtime_checkpoint_with_durable_publication_refs(
+        checkpoint,
+        None,
+        &output_delta_publications,
+        &state_payload_key,
+    );
+    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
+    let existing_legacy_record = match state.store.get(&checkpoint_path).await {
+        Ok(object) => {
+            let bytes = collect_object_bytes_bounded(object, Some(16 * 1024 * 1024)).await?;
+            let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
+                .map_err(ApiError::bad_request)?;
+            let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+            validate_standing_runtime_checkpoint_record(
+                &checkpoint.identity,
+                view_id,
+                &pointer,
+                &record,
+            )?;
+            if record.checkpoint_key != checkpoint_key.as_str() {
+                return Err(ApiError::conflict(
+                    "standing runtime checkpoint key mismatch",
+                ));
+            }
+            hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+            record
+                .checkpoint
+                .validate_identity(&checkpoint.identity)
+                .map_err(ApiError::bad_request)?;
+            validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
+            validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
+            let payload = record.checkpoint.state_payload.take();
+            if record.checkpoint == legacy_checkpoint
+                && payload.as_ref() == checkpoint.state_payload.as_ref()
+            {
+                Some(record)
+            } else {
+                None
+            }
+        }
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(error) => return Err(ApiError::internal(error)),
+    };
     let mut write_summary = StandingRuntimeCheckpointWriteSummary {
         output_delta_writes: output_delta_publications.len(),
         state_payload_writes: 1,
@@ -99,15 +144,17 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_output_delta");
     }
-    let (state_payload_key, state_payload_record) =
-        standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
     persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
         .await?;
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_state_payload");
     }
-    let publication =
-        materialized_output_pages::checkpoint_publication(checkpoint, view_id, &checkpoint_key)?;
+    // Replaying a legacy immutable descriptor must retain its original publication refs.
+    let publication = if existing_legacy_record.is_some() {
+        None
+    } else {
+        materialized_output_pages::checkpoint_publication(checkpoint, view_id, &checkpoint_key)?
+    };
     if let Some(publication) = &publication {
         for (key, page) in &publication.page_records {
             persist_standing_runtime_output_page(state, key, page).await?;
@@ -163,36 +210,47 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     };
     let bytes =
         serde_json::to_vec(&record).map_err(|source| ApiError::internal(source.to_string()))?;
-    let candidate = standing_runtime_checkpoint_pointer_from_record(&record);
-    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
-    let result = state
-        .store
-        .put_opts(
-            &checkpoint_path,
-            bytes::Bytes::from(bytes.clone()).into(),
-            PutMode::Create.into(),
-        )
-        .await;
-    match result {
-        Ok(_) => {}
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            let existing = state
-                .store
-                .get(&checkpoint_path)
-                .await
-                .map_err(ApiError::internal)?
-                .bytes()
-                .await
-                .map_err(ApiError::internal)?;
-            if existing.as_ref() != bytes.as_slice() {
-                return Err(ApiError::conflict(format!(
-                    "standing runtime checkpoint conflict at {}",
-                    checkpoint_key.as_str()
-                )));
-            }
+    let candidate = if let Some(existing) = existing_legacy_record {
+        if serde_json::to_value(&existing).map_err(ApiError::internal)?
+            != serde_json::to_value(&record).map_err(ApiError::internal)?
+        {
+            return Err(ApiError::conflict(format!(
+                "standing runtime checkpoint conflict at {}",
+                checkpoint_key.as_str()
+            )));
         }
-        Err(error) => return Err(ApiError::internal(error)),
-    }
+        standing_runtime_checkpoint_pointer_from_record(&existing)
+    } else {
+        let result = state
+            .store
+            .put_opts(
+                &checkpoint_path,
+                bytes::Bytes::from(bytes.clone()).into(),
+                PutMode::Create.into(),
+            )
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = state
+                    .store
+                    .get(&checkpoint_path)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .bytes()
+                    .await
+                    .map_err(ApiError::internal)?;
+                if existing.as_ref() != bytes.as_slice() {
+                    return Err(ApiError::conflict(format!(
+                        "standing runtime checkpoint conflict at {}",
+                        checkpoint_key.as_str()
+                    )));
+                }
+            }
+            Err(error) => return Err(ApiError::internal(error)),
+        }
+        standing_runtime_checkpoint_pointer_from_record(&record)
+    };
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_record");
     }
@@ -2141,8 +2199,15 @@ pub(super) async fn read_object_bytes_bounded(
     path: &ObjectPath,
     max_bytes: Option<u64>,
 ) -> Result<Vec<u8>, ApiError> {
-    use futures::StreamExt;
     let result = state.store.get(path).await.map_err(ApiError::internal)?;
+    collect_object_bytes_bounded(result, max_bytes).await
+}
+
+pub(super) async fn collect_object_bytes_bounded(
+    result: object_store::GetResult,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, ApiError> {
+    use futures::StreamExt;
     if max_bytes.is_some_and(|limit| result.meta.size > limit) {
         return Err(ApiError::bad_request(
             "materialized read exceeds query byte budget",

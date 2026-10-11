@@ -339,6 +339,188 @@ async fn generic_exhausted_query_permit_rejects_before_snapshot_reads() {
     );
 }
 
+#[derive(Debug)]
+struct DelayedMaterializedPageStore {
+    inner: Arc<dyn ObjectStore>,
+    delay: Duration,
+    completed_page_read: AtomicBool,
+}
+
+impl fmt::Display for DelayedMaterializedPageStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DelayedMaterializedPageStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DelayedMaterializedPageStore {
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        let result = self.inner.get_opts(location, options).await?;
+        if location
+            .as_ref()
+            .starts_with("v1/standing-runtime-output-pages/")
+        {
+            // Finish this poll after the deadline: an async throttle alone tests only the read timeout.
+            std::thread::sleep(self.delay);
+            self.completed_page_read.store(true, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
+    use velorix_runtime::runtime_contract::acquire_query_permit;
+
+    let (state, _, counts) = generic_fixture().await;
+    for (timeout_ms, succeeds) in [(200, false), (5_000, true)] {
+        let policy = QueryPolicy {
+            execution_timeout_ms: Some(timeout_ms),
+            planning_timeout_ms: Some(1_000),
+            max_concurrent_queries: Some(1),
+            ..QueryPolicy::default()
+        };
+        let policy_id = format!("shared-deadline-{timeout_ms}");
+        state
+            .query_policy_catalog()
+            .unwrap()
+            .create_for_production_table_scan("default", &policy_id, policy)
+            .await
+            .unwrap();
+        let limiter = state
+            .query_limiter_for_policy(&policy_id, policy)
+            .unwrap()
+            .unwrap();
+        for (view, body, accept) in [
+            (
+                "format_group",
+                json!({"sql":"SELECT * FROM format_group WHERE customer_id='alice'"}),
+                None,
+            ),
+            (
+                "format_template",
+                json!({"parameters":{"user":"alice"}}),
+                Some("application/json"),
+            ),
+        ] {
+            let key = Path::from(format!("v1/views/{view}/active.json"));
+            let bytes = state.store.get(&key).await.unwrap().bytes().await.unwrap();
+            let mut active: Value = serde_json::from_slice(&bytes).unwrap();
+            active["api"]["query_policy_id"] = json!(policy_id);
+            state
+                .store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&active).unwrap()).into(),
+                )
+                .await
+                .unwrap();
+            let store = Arc::new(DelayedMaterializedPageStore {
+                inner: state.store.clone(),
+                delay: Duration::from_millis(300),
+                completed_page_read: AtomicBool::new(false),
+            });
+            let mut delayed = state.clone();
+            delayed.store = store.clone();
+            if !succeeds {
+                // Prove the native read itself completes; the regression is the SQL handoff.
+                let active = delayed
+                    .view_registry()
+                    .unwrap()
+                    .read_active(view)
+                    .await
+                    .unwrap();
+                let page = crate::query_serving::standing_runtime_page(
+                    &delayed,
+                    &active,
+                    view,
+                    SnapshotPageRequest::default(),
+                    policy,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    page.batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>(),
+                    3
+                );
+                assert!(store.completed_page_read.swap(false, Ordering::SeqCst));
+            }
+            counts.clear();
+            let result = wire_query(
+                &app(delayed),
+                Method::POST,
+                &format!("/v1/views/{view}/query"),
+                body,
+                accept,
+            )
+            .await;
+            assert!(store.completed_page_read.load(Ordering::SeqCst));
+            assert!(counts
+                .get_paths()
+                .iter()
+                .any(|p| p.starts_with("v1/standing-runtime-output-pages/")));
+            if succeeds {
+                assert_eq!(
+                    wire_rows(&result),
+                    vec![json!({"customer_id":"alice","sum":17,"count":2})]
+                );
+            } else {
+                assert_eq!(result.0, StatusCode::BAD_REQUEST);
+                assert!(
+                    String::from_utf8_lossy(&result.2).contains("query execution timeout exceeded")
+                );
+            }
+            // The HTTP handler must release its one permit after success or deadline failure.
+            let permit = acquire_query_permit(policy, Some(&limiter)).unwrap();
+            drop(permit);
+        }
+    }
+}
+
 #[tokio::test]
 async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap() {
     let state = test_api_state_with_store(

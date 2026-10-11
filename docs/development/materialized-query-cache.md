@@ -5,6 +5,14 @@ not recompute the source relations. View admission, incremental maintenance,
 publication and query execution remain separate steps; unsupported view SQL
 must fail during admission rather than use an external execution fallback.
 
+Native read pages are an optional index over the authoritative materialized
+checkpoint. If expanded output exceeds the index capacity, checkpoint publication
+retains the compact weighted output through the existing checkpoint format;
+bounded queries and restart validation remain available. This path can require
+more reads and does not provide native page pruning. Invalid typed rows or
+checkpoint commitments still fail validation. Retrying a compatible legacy
+checkpoint preserves its immutable descriptor bytes and publication references.
+
 ## Cache configuration
 
 The API uses a disposable Foyer hybrid cache for validated immutable object
@@ -94,6 +102,15 @@ limit applies to the SQL result, not a truncated input prefix. For example,
 rows than the output row limit. A source budget failure must return an error
 rather than a partial aggregate. A valid SQL query without a pruning proof
 still needs complete bounded input.
+
+For raw and templated HTTP SQL queries, `execution_timeout_ms` sets one total
+deadline starting before materialized page reads. Snapshot reads and validation,
+DataFusion planning, and SQL collection all consume that same budget; SQL receives
+only the time remaining after the reads. `planning_timeout_ms` remains an
+independent, potentially tighter cap on planning and cannot extend the total
+deadline. Deadline expiry fails the request and releases its concurrency permit;
+successful requests retain the permit through response encoding, which is outside
+this execution deadline.
 
 For legacy discovery without a metadata store, the request budget
 conservatively charges LIST initialization and each discovery poll, including
