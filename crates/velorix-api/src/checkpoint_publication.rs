@@ -80,6 +80,19 @@ pub(super) async fn persist_standing_runtime_checkpoint(
             &checkpoint_key,
             published_relation.as_ref(),
         )?;
+    let (state_payload_key, state_payload_record) =
+        standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
+    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
+    // Keep descriptor hydration and validation out of the ingest/recovery caller's future.
+    let existing_legacy_record = Box::pin(read_validated_legacy_checkpoint_record(
+        state,
+        view_id,
+        checkpoint,
+        &checkpoint_key,
+        &output_delta_publications,
+        &state_payload_key,
+    ))
+    .await?;
     let mut write_summary = StandingRuntimeCheckpointWriteSummary {
         output_delta_writes: output_delta_publications.len(),
         state_payload_writes: 1,
@@ -99,16 +112,31 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_output_delta");
     }
-    let (state_payload_key, state_payload_record) =
-        standing_runtime_state_payload_record_for_checkpoint(checkpoint, view_id)?;
     persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
         .await?;
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_state_payload");
     }
+    // Replaying a legacy immutable descriptor must retain its original publication refs.
+    let publication = if existing_legacy_record.is_some() {
+        None
+    } else {
+        materialized_output_pages::checkpoint_publication(checkpoint, view_id, &checkpoint_key)?
+    };
+    if let Some(publication) = &publication {
+        for (key, page) in &publication.page_records {
+            persist_standing_runtime_output_page(state, key, page).await?;
+        }
+        persist_standing_runtime_output_manifest(
+            state,
+            &publication.manifest_key,
+            &publication.manifest_record,
+        )
+        .await?;
+    }
     let checkpoint_for_record = standing_runtime_checkpoint_with_durable_publication_refs(
         checkpoint,
-        None,
+        publication.as_ref().map(|p| &p.manifest_key),
         &output_delta_publications,
         &state_payload_key,
     );
@@ -150,36 +178,47 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     };
     let bytes =
         serde_json::to_vec(&record).map_err(|source| ApiError::internal(source.to_string()))?;
-    let candidate = standing_runtime_checkpoint_pointer_from_record(&record);
-    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
-    let result = state
-        .store
-        .put_opts(
-            &checkpoint_path,
-            bytes::Bytes::from(bytes.clone()).into(),
-            PutMode::Create.into(),
-        )
-        .await;
-    match result {
-        Ok(_) => {}
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            let existing = state
-                .store
-                .get(&checkpoint_path)
-                .await
-                .map_err(ApiError::internal)?
-                .bytes()
-                .await
-                .map_err(ApiError::internal)?;
-            if existing.as_ref() != bytes.as_slice() {
-                return Err(ApiError::conflict(format!(
-                    "standing runtime checkpoint conflict at {}",
-                    checkpoint_key.as_str()
-                )));
-            }
+    let candidate = if let Some(existing) = existing_legacy_record {
+        if serde_json::to_value(&existing).map_err(ApiError::internal)?
+            != serde_json::to_value(&record).map_err(ApiError::internal)?
+        {
+            return Err(ApiError::conflict(format!(
+                "standing runtime checkpoint conflict at {}",
+                checkpoint_key.as_str()
+            )));
         }
-        Err(error) => return Err(ApiError::internal(error)),
-    }
+        standing_runtime_checkpoint_pointer_from_record(&existing)
+    } else {
+        let result = state
+            .store
+            .put_opts(
+                &checkpoint_path,
+                bytes::Bytes::from(bytes.clone()).into(),
+                PutMode::Create.into(),
+            )
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = state
+                    .store
+                    .get(&checkpoint_path)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .bytes()
+                    .await
+                    .map_err(ApiError::internal)?;
+                if existing.as_ref() != bytes.as_slice() {
+                    return Err(ApiError::conflict(format!(
+                        "standing runtime checkpoint conflict at {}",
+                        checkpoint_key.as_str()
+                    )));
+                }
+            }
+            Err(error) => return Err(ApiError::internal(error)),
+        }
+        standing_runtime_checkpoint_pointer_from_record(&record)
+    };
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_record");
     }
@@ -221,6 +260,56 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     }
 
     Ok(write_summary)
+}
+
+async fn read_validated_legacy_checkpoint_record(
+    state: &ApiState,
+    view_id: &str,
+    checkpoint: &RuntimeCheckpoint,
+    checkpoint_key: &ObjectKey,
+    output_delta_publications: &[StandingRuntimeDeltaPublication],
+    state_payload_key: &ObjectKey,
+) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
+    let object = match state
+        .store
+        .get(&ObjectPath::from(checkpoint_key.as_str()))
+        .await
+    {
+        Ok(object) => object,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let bytes = collect_object_bytes_bounded(object, Some(16 * 1024 * 1024)).await?;
+    let mut record =
+        standing_runtime_checkpoint_record_from_slice(&bytes).map_err(ApiError::bad_request)?;
+    let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+    validate_standing_runtime_checkpoint_record(&checkpoint.identity, view_id, &pointer, &record)?;
+    if record.checkpoint_key != checkpoint_key.as_str() {
+        return Err(ApiError::conflict(
+            "standing runtime checkpoint key mismatch",
+        ));
+    }
+    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    record
+        .checkpoint
+        .validate_identity(&checkpoint.identity)
+        .map_err(ApiError::bad_request)?;
+    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
+    validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
+    let payload = record.checkpoint.state_payload.take();
+    let legacy_checkpoint = standing_runtime_checkpoint_with_durable_publication_refs(
+        checkpoint,
+        None,
+        output_delta_publications,
+        state_payload_key,
+    );
+    if record.checkpoint == legacy_checkpoint
+        && payload.as_ref() == checkpoint.state_payload.as_ref()
+    {
+        Ok(Some(record))
+    } else {
+        Ok(None)
+    }
 }
 
 fn standing_runtime_checkpoint_with_prior_input_coverage(
@@ -970,8 +1059,7 @@ pub(super) async fn persist_standing_runtime_output_page(
     output_page_key: &ObjectKey,
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
-    let bytes =
-        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let bytes = materialized_output_pages::encode_page(record)?;
     let path = ObjectPath::from(output_page_key.as_str());
     let result = state
         .store
@@ -1012,8 +1100,7 @@ pub(super) async fn put_standing_runtime_output_page(
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
     validate_standing_runtime_output_page_record(output_page_key, record)?;
-    let bytes =
-        serde_json::to_vec(record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let bytes = materialized_output_pages::encode_page(record)?;
     state
         .store
         .put(
@@ -2082,14 +2169,36 @@ pub(super) async fn validate_standing_runtime_checkpoint_output_manifest_records
                 record.view_id
             )));
         }
+        let generic = materialized_output_pages::is_materialized_codec(&manifest.output_encoding);
+        if generic {
+            materialized_output_pages::validate_checkpoint_binding(&manifest, &record.checkpoint)?;
+        }
+        let mut previous = None;
         for page in &manifest.pages {
             let (_page_key, page_record) =
                 read_standing_runtime_output_page_record(state, page, &record.view_id).await?;
+            if generic {
+                let rows =
+                    materialized_output_pages::validate_page_binding(&manifest, &page_record)?;
+                for row in rows.records() {
+                    let pair = velorix_core::delta::encode_kv_ordered(
+                        row.key.as_json(),
+                        row.value.as_json(),
+                    );
+                    if previous.as_ref().is_some_and(|last| last > &pair) {
+                        return Err(ApiError::bad_request(
+                            "materialized pages are not globally ordered",
+                        ));
+                    }
+                    previous = Some(pair);
+                }
+            }
             if page_record.tenant_id != record.checkpoint.identity.tenant_id
                 || page_record.program_id != record.checkpoint.identity.program_id
                 || page_record.view_id != record.view_id
                 || page_record.logical_epoch != record.checkpoint.logical_epoch
-                || page_record.output_content_hash != manifest.output_content_hash
+                || (page_record.output_content_hash != manifest.output_content_hash
+                    && !(generic && page_record.output_content_hash.is_empty()))
             {
                 return Err(ApiError::bad_request(format!(
                     "standing runtime output page body/checkpoint mismatch for `{}/{}/{}`",
@@ -2101,6 +2210,43 @@ pub(super) async fn validate_standing_runtime_checkpoint_output_manifest_records
         }
     }
     Ok(())
+}
+
+pub(super) async fn read_object_bytes_bounded(
+    state: &ApiState,
+    path: &ObjectPath,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, ApiError> {
+    let result = state.store.get(path).await.map_err(ApiError::internal)?;
+    collect_object_bytes_bounded(result, max_bytes).await
+}
+
+pub(super) async fn collect_object_bytes_bounded(
+    result: object_store::GetResult,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, ApiError> {
+    use futures::StreamExt;
+    if max_bytes.is_some_and(|limit| result.meta.size > limit) {
+        return Err(ApiError::bad_request(
+            "materialized read exceeds query byte budget",
+        ));
+    }
+    let mut stream = result.into_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ApiError::internal)?;
+        let length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::bad_request("materialized read size overflow"))?;
+        if max_bytes.is_some_and(|limit| length as u64 > limit) {
+            return Err(ApiError::bad_request(
+                "materialized read exceeds query byte budget",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub(super) async fn read_standing_runtime_output_manifest_record(
@@ -2161,8 +2307,7 @@ pub(super) async fn read_standing_runtime_output_page_record(
         .bytes()
         .await
         .map_err(ApiError::internal)?;
-    let record: StandingRuntimeOutputPageRecord = serde_json::from_slice(&bytes)
-        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let record = materialized_output_pages::decode_page(&bytes, &page.output_encoding)?;
     let (key, _) = ObjectKey::parse_standing_runtime_output_page(page.page_key.clone())
         .map_err(ApiError::bad_request)?;
     validate_standing_runtime_output_page_ref(page, view_id)?;
@@ -2212,6 +2357,9 @@ pub(super) fn validate_standing_runtime_output_manifest_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputManifestRecord,
 ) -> Result<(), ApiError> {
+    if materialized_output_pages::is_materialized_codec(&record.output_encoding) {
+        return materialized_output_pages::validate_manifest(key, record);
+    }
     if record.schema_version != 1 || record.record_kind != "standing_runtime_output_manifest_v1" {
         return Err(ApiError::bad_request(format!(
             "standing runtime output manifest record identity mismatch for `{}/{}/{}`",
@@ -2448,7 +2596,9 @@ pub(super) fn validate_standing_runtime_output_page_ref(
     page: &StandingRuntimeOutputPageRef,
     view_id: &str,
 ) -> Result<(), ApiError> {
-    if page.output_encoding != "velorix-delta-batch-json-v1" {
+    if page.output_encoding != "velorix-delta-batch-json-v1"
+        && !materialized_output_pages::is_materialized_codec(&page.output_encoding)
+    {
         return Err(ApiError::bad_request(format!(
             "standing runtime output page codec mismatch for view `{view_id}`"
         )));
@@ -2462,6 +2612,9 @@ pub(super) fn validate_standing_runtime_output_page_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
+    if materialized_output_pages::is_materialized_codec(&record.output_encoding) {
+        return materialized_output_pages::validate_page(key, record);
+    }
     if record.schema_version != 1 || record.record_kind != "standing_runtime_output_page_v1" {
         return Err(ApiError::bad_request(format!(
             "standing runtime output page record identity mismatch for `{}/{}/{}`",

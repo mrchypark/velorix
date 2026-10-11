@@ -83,13 +83,13 @@ if ! curl -fsS --max-time 5 ${auth_args[@]+"${auth_args[@]}"} "$base_url/v1/open
 fi
 
 curl_api() {
-  curl -fsS --max-time 15 ${auth_args[@]+"${auth_args[@]}"} "$@"
+  curl -H "Accept: application/json" -fsS --max-time 15 ${auth_args[@]+"${auth_args[@]}"} "$@"
 }
 
 curl_api_status() {
   local output_file="$1"
   shift
-  curl -sS --max-time 15 -o "$output_file" -w '%{http_code}' ${auth_args[@]+"${auth_args[@]}"} "$@"
+  curl -H "Accept: application/json" -sS --max-time 15 -o "$output_file" -w '%{http_code}' ${auth_args[@]+"${auth_args[@]}"} "$@"
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"

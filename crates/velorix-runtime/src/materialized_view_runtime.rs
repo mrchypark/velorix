@@ -463,6 +463,14 @@ pub fn restore_common_dag_reference_standing_runtime(
         .map_err(|error| error.to_string())
 }
 
+/// Convert schema-normalized canonical output without evaluating source state.
+pub fn materialized_canonical_output_batch(
+    schema: &RelationSchema,
+    rows: &DeltaBatch,
+) -> Result<RecordBatch, StandingProgramRuntimeError> {
+    output::materialized_canonical_output_batch(schema, rows)
+}
+
 pub fn materialized_delta_to_page(
     output_schema: &RelationSchema,
     published_output: &DeltaBatch,
@@ -7089,7 +7097,7 @@ fn compare_output_scalar(
                 _ => {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "generic_view_plan.having.op",
-                    })
+                    });
                 }
             }),
             _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -8480,7 +8488,7 @@ fn compare_catalog_scalar(
             _ => {
                 return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                     field: "generic_view_plan.predicate.op",
-                })
+                });
             }
         }),
         _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -8629,7 +8637,7 @@ fn compare_ord<T: PartialOrd + PartialEq>(
         | PredicateOp::IsNotDistinctFrom => {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "generic_view_plan.predicate.op",
-            })
+            });
         }
     })
 }
@@ -8654,7 +8662,7 @@ fn compare_string_predicate(
         | PredicateOp::IsNotDistinctFrom => {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "generic_view_plan.predicate.op",
-            })
+            });
         }
     })
 }

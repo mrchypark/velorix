@@ -119,6 +119,12 @@ pub struct QueryExecutionLimiter {
     max_concurrent_queries: usize,
 }
 
+#[derive(Debug)]
+pub struct QueryExecutionPermit {
+    _permit: Option<OwnedSemaphorePermit>,
+    max_concurrent_queries: Option<usize>,
+}
+
 impl QueryExecutionLimiter {
     pub fn from_policy(policy: QueryPolicy) -> Option<Self> {
         policy
@@ -192,7 +198,43 @@ pub async fn query_record_batches_table_with_bindings_and_policy_and_limiter(
     policy.validate().map_err(QueryError::from)?;
     validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
 
-    let _permit = acquire_query_permit(policy, limiter.as_ref())?;
+    let permit = acquire_query_permit(policy, limiter.as_ref())?;
+    query_record_batches_table_with_bindings_and_policy_and_permit(
+        table_name,
+        batches,
+        sql,
+        bind_values,
+        policy,
+        &permit,
+    )
+    .await
+}
+
+pub async fn query_record_batches_table_with_bindings_and_policy_and_permit(
+    table_name: &str,
+    batches: Vec<RecordBatch>,
+    sql: &str,
+    bind_values: &[QueryBindValue],
+    policy: QueryPolicy,
+    permit: &QueryExecutionPermit,
+) -> Result<Vec<RecordBatch>, QueryError> {
+    policy.validate().map_err(QueryError::from)?;
+    validate_sql_text_policy(sql, policy).map_err(QueryError::from)?;
+    if let Some(required) = policy.max_concurrent_queries {
+        let actual =
+            permit
+                .max_concurrent_queries
+                .ok_or(QueryPolicyError::ConcurrencyLimiterRequired {
+                    max_concurrent_queries: required,
+                })?;
+        if actual != required {
+            return Err(QueryPolicyError::ConcurrencyLimiterPolicyMismatch {
+                required_max_concurrent_queries: required,
+                actual_max_concurrent_queries: actual,
+            }
+            .into());
+        }
+    }
     let context = record_batches_context(table_name, batches, policy)?;
     let limits = QueryRuntimeLimits::from_policy(policy);
     let dataframe = limits
@@ -321,11 +363,12 @@ fn query_bind_value_to_scalar_value(value: &QueryBindValue) -> ScalarValue {
     }
 }
 
-fn acquire_query_permit(
+pub fn acquire_query_permit(
     policy: QueryPolicy,
     limiter: Option<&QueryExecutionLimiter>,
-) -> Result<Option<OwnedSemaphorePermit>, QueryError> {
-    match (policy.max_concurrent_queries, limiter) {
+) -> Result<QueryExecutionPermit, QueryError> {
+    policy.validate().map_err(QueryError::from)?;
+    let permit = match (policy.max_concurrent_queries, limiter) {
         (Some(max_concurrent_queries), None) => Err(QueryPolicyError::ConcurrencyLimiterRequired {
             max_concurrent_queries,
         }
@@ -341,7 +384,11 @@ fn acquire_query_permit(
         }
         (_, Some(limiter)) => limiter.try_acquire().map(Some).map_err(QueryError::from),
         (None, None) => Ok(None),
-    }
+    }?;
+    Ok(QueryExecutionPermit {
+        _permit: permit,
+        max_concurrent_queries: limiter.map(QueryExecutionLimiter::max_concurrent_queries),
+    })
 }
 
 async fn collect_with_policy(
@@ -375,6 +422,7 @@ async fn collect_record_batches(
         .execute_stream()
         .await
         .map_err(map_datafusion_error)?;
+    let schema = stream.schema();
 
     while let Some(batch) = stream.try_next().await.map_err(map_datafusion_error)? {
         observed_rows = observed_rows.saturating_add(batch.num_rows());
@@ -403,6 +451,9 @@ async fn collect_record_batches(
         output.push(batch);
     }
 
+    if output.is_empty() {
+        output.push(RecordBatch::new_empty(schema));
+    }
     Ok(output)
 }
 

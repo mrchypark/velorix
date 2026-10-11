@@ -122,15 +122,23 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                     ),
                     "responses": {
                         "200": {
-                            "description": "View query result rows",
+                            "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows",
+                            "headers": {
+                                "x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}},
+                                "x-velorix-next-page-token": {"schema": {"type": "string"}}
+                            },
                             "content": {
+                                "application/vnd.apache.arrow.stream": {
+                                    "schema": {"type": "string", "format": "binary"}
+                                },
                                 "application/json": {
                                     "schema": openapi_query_response_schema(
                                         response.response_schema.as_ref()
                                     )
                                 }
                             }
-                        }
+                        },
+                        "406": {"description": "No supported query response format is acceptable"}
                     }
                 }
             }),
@@ -152,14 +160,14 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                             true,
                             true,
                         ),
-                        "responses": { "200": { "description": "Rows" } }
+                        "responses": { "200": { "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows", "headers": {"x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}}, "x-velorix-next-page-token": {"schema": {"type": "string"}}}, "content": {"application/vnd.apache.arrow.stream": {"schema": {"type": "string", "format": "binary"}}, "application/json": {"schema": openapi_query_response_schema(None)}} }, "406": {"description": "No supported query response format is acceptable"} }
                     },
                     "post": {
                         "summary": format!("Query {} output {}", response.view_id, output.relation_id),
                         "x-velorix-view-id": response.view_id,
                         "x-velorix-output-relation-id": output.relation_id,
                         "x-velorix-output-schema-fingerprint": output.schema_fingerprint,
-                        "responses": { "200": { "description": "Rows" } }
+                        "responses": { "200": { "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows", "headers": {"x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}}, "x-velorix-next-page-token": {"schema": {"type": "string"}}}, "content": {"application/vnd.apache.arrow.stream": {"schema": {"type": "string", "format": "binary"}}, "application/json": {"schema": openapi_query_response_schema(None)}} }, "406": {"description": "No supported query response format is acceptable"} }
                     }
                 }),
             );

@@ -171,13 +171,13 @@ if ! curl -fsS --max-time 5 "$VELORIX_API_URL/v1/openapi.json" -H "$VELORIX_API_
 fi
 
 curl_api() {
-  curl -fsS --max-time 15 "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
+  curl -H "Accept: application/json" -fsS --max-time 15 "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
 }
 
 curl_api_status() {
   local output_file="$1"
   shift
-  curl -sS --max-time 15 -o "$output_file" -w '%{http_code}' "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
+  curl -H "Accept: application/json" -sS --max-time 15 -o "$output_file" -w '%{http_code}' "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"
