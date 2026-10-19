@@ -20,6 +20,7 @@ service VelorixMeta {
   rpc FixViewBootstrapActivationCut(FixViewBootstrapActivationCutRequest) returns (FixViewBootstrapActivationCutResponse);
   rpc PromoteViewBootstrap(PromoteViewBootstrapRequest) returns (PromoteViewBootstrapResponse);
   rpc AcquireStandingRuntimeOwner(AcquireStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
+  rpc RenewStandingRuntimeOwner(RenewStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
   rpc ReadStandingRuntimeOwner(ReadStandingRuntimeOwnerRequest) returns (ReadStandingRuntimeOwnerResponse);
   rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
   rpc PublishStandingRuntimeCheckpointGuarded(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
@@ -378,6 +379,7 @@ message StandingRuntimeCheckpointPointer {
   bytes input_coverage_json = 12;
   string previous_checkpoint_key = 13;
   string previous_manifest_hash = 14;
+  bytes published_input_bootstrap_json = 15;
 }
 
 message StandingRuntimeOwnerClaim {
@@ -408,6 +410,11 @@ message AcquireStandingRuntimeOwnerRequest {
 message AcquireStandingRuntimeOwnerResponse {
   string outcome = 1;
   StandingRuntimeOwnerClaim claim = 2;
+}
+
+message RenewStandingRuntimeOwnerRequest {
+  StandingRuntimeOwnerToken owner = 1;
+  uint64 ttl_ms = 2;
 }
 
 message ReadStandingRuntimeOwnerRequest {

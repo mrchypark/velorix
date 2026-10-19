@@ -29,9 +29,37 @@
 //! - Can produce BooleanArray masks for vectorized filter
 //! - Reduces per-row branching
 
+use crate::materialized_view_runtime::expression_eval::{
+    evaluate_node, ExpressionEvaluationError, RuntimeScalarValue,
+};
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
 use serde_json::Value;
 use velorix_core::standing_program::StandingProgramRuntimeError;
+use velorix_core::view_plan::{TypedExprNodeV1, TypedExprProgramV1};
+
+/// The typed IR is executable directly: compilation validates its persisted
+/// contract once, while evaluation uses the shared scalar semantics.
+pub struct CompiledTypedExpr<'a> {
+    root: &'a TypedExprNodeV1,
+}
+
+impl<'a> CompiledTypedExpr<'a> {
+    pub fn compile(program: &'a TypedExprProgramV1) -> Result<Self, ExpressionEvaluationError> {
+        program
+            .validate()
+            .map_err(|error| ExpressionEvaluationError::Failed(error.to_string()))?;
+        Ok(Self {
+            root: &program.root,
+        })
+    }
+
+    pub fn evaluate(
+        &self,
+        get_column: &dyn Fn(&str) -> Option<RuntimeScalarValue>,
+    ) -> Result<RuntimeScalarValue, ExpressionEvaluationError> {
+        evaluate_node(self.root, get_column)
+    }
+}
 
 /// Returns an invalid runtime state error.
 fn invalid_runtime_state() -> StandingProgramRuntimeError {

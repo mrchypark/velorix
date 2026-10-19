@@ -325,6 +325,23 @@ async fn grpc_rhiza_backend_native_mtls_requires_trusted_client_identity() {
         capabilities.standing_runtime_fencing.backend_name,
         "rhiza-kv"
     );
+    // The replacement transport must retain the trusted CA, client identity,
+    // domain, endpoint, and application bearer token, including through Arc.
+    let isolated = std::sync::Arc::new(client.clone())
+        .isolated_owner_renewal_store()
+        .await
+        .unwrap()
+        .expect("gRPC renewal requires independent transport");
+    let isolated_capabilities = isolated.read_meta_store_capabilities().await.unwrap();
+    assert_eq!(
+        isolated_capabilities.standing_runtime_fencing.backend_name,
+        "rhiza-kv"
+    );
+    assert!(
+        isolated_capabilities
+            .standing_runtime_fencing
+            .control_plane_auth_enforced
+    );
     assert!(
         capabilities
             .standing_runtime_fencing
@@ -608,6 +625,38 @@ fn bearer_token_validation_rejects_empty_whitespace_and_control_characters() {
     assert!(validate_bearer_token("sec ret").is_err());
     assert!(validate_bearer_token("secret\n").is_err());
     assert!(MetaGrpcService::with_bearer_token(InMemoryMetaStore::default(), "   ").is_err());
+}
+
+#[tokio::test]
+async fn grpc_conditional_owner_renewal_retains_epoch_and_rejects_foreign_token() {
+    let endpoint = spawn_meta_service().await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let acquired = store
+        .acquire_standing_runtime_owner(owner_request("renew-owner"))
+        .await
+        .unwrap();
+    let AcquireStandingRuntimeOwnerOutcome::Acquired(claim) = acquired else {
+        panic!("expected acquired");
+    };
+    let token = velorix_meta::StandingRuntimeOwnerToken {
+        tenant_id: claim.tenant_id.clone(),
+        program_id: claim.program_id.clone(),
+        view_id: claim.view_id.clone(),
+        owner_id: claim.owner_id.clone(),
+        owner_epoch: claim.owner_epoch,
+    };
+    let renewed = store
+        .renew_standing_runtime_owner(token.clone(), 30_000)
+        .await
+        .unwrap();
+    assert_eq!(renewed.owner_epoch, token.owner_epoch);
+    assert_eq!(renewed.owner_id, token.owner_id);
+    let mut foreign = token;
+    foreign.owner_epoch += 1;
+    assert!(store
+        .renew_standing_runtime_owner(foreign, 30_000)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -1693,6 +1742,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         plan_hash: proto.plan_hash,
         coverage_hash: proto.coverage_hash,
         input_coverage: None,
+        published_input_bootstrap: None,
         previous_checkpoint_key: proto.previous_checkpoint_key,
         previous_manifest_hash: proto.previous_manifest_hash,
     }
@@ -1715,6 +1765,7 @@ fn proto_checkpoint_pointer(epoch: u64, hash_seed: &str) -> ProtoCheckpointPoint
         plan_hash: String::new(),
         coverage_hash: String::new(),
         input_coverage_json: Vec::new(),
+        published_input_bootstrap_json: Vec::new(),
         previous_checkpoint_key: String::new(),
         previous_manifest_hash: String::new(),
     }

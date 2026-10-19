@@ -5,6 +5,13 @@ use tempfile::tempdir;
 use velorix_meta::rhiza_kv::RhizaKvStore;
 use velorix_meta::rhiza_kv_snapshot::{CompareExchange, RhizaKvSnapshot};
 
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[tokio::test]
 async fn kv_binary_absent_cas_reject_and_reopen() {
     let d = tempdir().unwrap();
@@ -171,4 +178,54 @@ async fn snapshot_rejects_oversize() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("exceeds"));
+}
+
+#[tokio::test]
+async fn snapshot_reuses_existing_pages_when_one_page_changes() {
+    const PAGE_BYTES: usize = 64 * 1024;
+
+    let d = tempdir().unwrap();
+    let kv = RhizaKvStore::open(d.path().display().to_string(), "snap-reuse")
+        .await
+        .unwrap();
+    let snap = RhizaKvSnapshot::new(kv.clone());
+    let first = vec![7u8; PAGE_BYTES * 2 + 17];
+    let token = match snap
+        .compare_exchange(None, first.clone(), "reuse-a")
+        .await
+        .unwrap()
+    {
+        CompareExchange::Applied(token) => token,
+        CompareExchange::Conflict => panic!(),
+    };
+    let old_first_hash = digest(&first[..PAGE_BYTES]);
+    assert_eq!(
+        kv.get(format!("velorix/snapshot/page/{old_first_hash}"))
+            .await
+            .unwrap(),
+        Some(first[..PAGE_BYTES].to_vec())
+    );
+
+    let mut second = first.clone();
+    second[PAGE_BYTES + 3] = 9;
+    let new_second_hash = digest(&second[PAGE_BYTES..PAGE_BYTES * 2]);
+    assert!(matches!(
+        snap.compare_exchange(Some(token), second.clone(), "reuse-b")
+            .await
+            .unwrap(),
+        CompareExchange::Applied(_)
+    ));
+    assert_eq!(snap.load().await.unwrap().unwrap().1, second);
+    assert_eq!(
+        kv.get(format!("velorix/snapshot/page/{old_first_hash}"))
+            .await
+            .unwrap(),
+        Some(first[..PAGE_BYTES].to_vec())
+    );
+    assert_eq!(
+        kv.get(format!("velorix/snapshot/page/{new_second_hash}"))
+            .await
+            .unwrap(),
+        Some(second[PAGE_BYTES..PAGE_BYTES * 2].to_vec())
+    );
 }

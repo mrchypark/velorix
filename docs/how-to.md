@@ -14,6 +14,14 @@ authentication and multi-writer fencing. Do not use these settings for a
 shared or production deployment. Metadata lives in the development Meta process;
 this guide does not demonstrate recovery after that process restarts.
 
+The API and `scripts/run-vind-product.sh` default to **authoritative relation
+ingest** and create new demand-managed views. Explicit
+`VELORIX_API_AUTHORITATIVE_RELATION_INGEST=false` (or `0`) selects Legacy eager
+ingest instead. Missing authoritative configuration fails startup; it never
+silently selects Legacy. This guide uses an explicitly configured development
+Meta. See [runtime modes and migration](development/generic-view-pipeline.md#runtime-modes-and-actual-defaults)
+before applying the new default to an existing deployment.
+
 ## Prerequisites
 
 - Rust and Cargo
@@ -22,6 +30,11 @@ this guide does not demonstrate recovery after that process restarts.
 - free local ports `8080`, `9090`, and `9000`
 
 Run all commands from the repository root.
+
+External native family specifications are unsupported. A nonempty
+`VELORIX_NATIVE_FAMILY_SPEC_PATH` causes API startup to fail; unset it and use
+supported generic SQL views. External specs do not establish that SQL has the
+same semantics as the fixed native runtime.
 
 ## 1. Start Versity Gateway
 
@@ -104,6 +117,8 @@ export VELORIX_S3_PREFIX=quickstart
 export VELORIX_META_GRPC_ENDPOINT=http://127.0.0.1:9090
 export VELORIX_META_BEARER_TOKEN=velorix-local-meta-token
 export VELORIX_API_BIND=127.0.0.1:8080
+export VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1
+export VELORIX_RELATION_INGEST_OWNER_ID=velorix-local-api
 export VELORIX_API_ALLOW_UNAUTHENTICATED_DEV=1
 export VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-only
 
@@ -120,7 +135,11 @@ curl -fsS http://127.0.0.1:8080/readyz
 ```
 
 `/readyz` should report `"status":"ready"`, an object store configured with
-conditional updates, and `"standing_runtime_fencing_mode":"unsafe-dev-only"`.
+conditional updates, `"standing_runtime_fencing_mode":"unsafe-dev-only"`, and
+`"relation_ingest":{"mode":"authoritative","authoritative":true,...}`.
+Use a stable ingest owner ID for this single API instance. The memory Meta in
+this example is development-only; durable production recovery requires a
+compatible durable metadata authority and production fencing/authentication.
 
 ## 3. Create a Relation and a View
 
@@ -147,8 +166,11 @@ curl -fsS -X POST \
 ```
 
 This shortcut uses the built-in default query policy; no separate query-policy
-registration is needed. Creating the view does not complete authoritative
-activation: ingest the first batch, then backfill before querying.
+registration is needed. With the authoritative mode selected above, new views
+are demand-managed: creation does not replay
+historical input, and ingest commits source changes without eagerly updating the
+view. Querying requests the materialization needed for the result; an explicit
+backfill is optional.
 
 The view response should contain:
 
@@ -156,10 +178,15 @@ The view response should contain:
 {
   "view_id": "positive_scores_by_user",
   "execution_mode": "standing_runtime",
-  "query_enabled": true,
+  "query_enabled": false,
   "outcome": "created"
 }
 ```
+
+New authoritative declarations start in `Deploying`, including on empty input.
+`query_enabled` describes the lifecycle's full readiness, not whether a demand
+request is allowed: the query route can advance an admitted view and return a
+completed requested range before the whole view is complete.
 
 ## 4. Ingest Rows
 
@@ -183,11 +210,10 @@ curl -fsS -X POST \
   }'
 ```
 
-Inspect the ingest response: only `"ack_mode":"materialized"` together with
-`"materialization":{"status":"completed",...}` confirms a materialized
-checkpoint update. Authoritative activation is separate, so even a completed
-acknowledgement does not establish query availability. After this first ingest,
-explicitly backfill the view before querying:
+An ingest acknowledgement confirms source progress, not that a demand-managed
+view is current. Continue directly to the query in the next section. If you want
+to advance materialization explicitly before querying, use a controlled backfill
+step instead:
 
 ```bash
 curl -fsS -X POST \
@@ -196,10 +222,10 @@ curl -fsS -X POST \
   -d '{}'
 ```
 
-Querying before backfill can return HTTP `503` with `MATERIALIZATION_LAG` because
-authoritative activation is incomplete. Running backfill before the first
-ingest can return HTTP `409` because no checkpoint covers the bootstrap cut.
-Keep the order above: create view, ingest, backfill, query.
+A backfill step returns HTTP `202` while work remains and `200` when complete.
+It accepts `scope`, `budget`, `action` (`step`, `pause`, or `resume`), and `order`
+(`forward` or `reverse`). Pause/resume change control state; they do not start a
+background worker. The default authoritative flow is create view, ingest, query.
 
 Offsets identify an ordered stream partition. For the next request on the same
 stream and partition, start at offset `4`; do not reuse or skip offsets.
@@ -208,12 +234,30 @@ stream and partition, start at offset `4`; do not reuse or skip offsets.
 
 Query the view directly:
 
+Completed query routes return Arrow IPC streams (`application/vnd.apache.arrow.stream`) by
+default, including when `Accept` is absent or `*/*`. Set `Accept: application/json`
+to receive the JSON envelope shown below. Arrow IPC uses ZSTD compression at
+level 3 by default; both formats return identical rows. Both formats include
+`x-velorix-logical-epoch` and, when another page exists,
+`x-velorix-next-page-token` response headers. Arrow schemas also carry
+`velorix.logical_epoch` and `velorix.next_page_token` metadata. Send the token
+as `page_token` with the same `epoch` to continue a snapshot. Unsupported or
+malformed `Accept` values return HTTP 406; query row and byte limits apply to
+both formats.
+
 ```bash
-curl -fsS \
+curl -fsS -H 'Accept: application/json' \
   'http://127.0.0.1:8080/v1/views/positive_scores_by_user/query?max_rows=100'
 ```
 
-Expected rows:
+A demand query returns HTTP `202` with a JSON `materialization` progress object
+while required work remains, even when Arrow was requested. Repeat the query to
+advance bounded work until it returns `200` with the completed result. Committed
+materialization and validated coverage are reused across requests; later ingest
+is reconciled before a newer cut is reported complete. Simple output `WHERE`
+predicates can infer scope; unsupported optimizations use broader dependencies.
+
+Expected rows once complete:
 
 ```json
 {
@@ -228,10 +272,19 @@ The negative score is stored in the relation but excluded by the view's
 `WHERE score > 0` predicate. The query reads published materialized output; it
 does not recompute the view from the source relation.
 
+Demand limits are cooperative: `max_duration_ms` does not interrupt an in-flight
+operation. Authenticating a physical source object can require more bytes than
+the selected rows; HTTP `413` reports `required_min_bytes` when the supplied
+budget is too small. Ancestor stages conservatively use full dependency closure.
+Demand pagination tokens are process-local and cannot survive restart or routing
+to another instance; start a new query to reuse durable progress. See the
+[demand controls and limits](development/generic-view-pipeline.md#demand-driven-materialization--validation-pending)
+for the current source contract, which still requires integration validation.
+
 The same view is also exposed through its promoted API path:
 
 ```bash
-curl -fsS \
+curl -fsS -H 'Accept: application/json' \
   'http://127.0.0.1:8080/v1/api/scores/positive?max_rows=100'
 ```
 
@@ -260,6 +313,69 @@ bootstrap-capable durable metadata backend, such as Rhiza; see
 [Meta service](architecture/meta-service.md) and
 [Rhiza Kubernetes recovery](development/rhiza-kv-k8s.md). An absent Meta endpoint
 can cause authoritative view admission to return HTTP `503`.
+
+## Use Existing Rhiza Meta for the Default Server
+
+The product launcher uses an existing Rhiza Meta service. Its Meta binary/image
+must include the `rhiza-backend` feature; setting `VELORIX_META_BACKEND=rhiza-kv`
+alone cannot enable a backend absent from the binary. For a separately managed
+Meta build, the explicit build command is:
+
+```sh
+cargo build --release -p velorix-meta --features rhiza-backend
+```
+
+Provision and start that Meta service using the
+[Rhiza deployment contract](development/rhiza-kv-k8s.md). Production Meta requires
+its configured membership, native mTLS, bearer authentication, and durable
+object storage with `before-ack`. API S3 variables do not configure Meta's Rhiza
+archive: connect that archive to VersityGW separately with its own prefix. The
+launcher neither provisions nor restarts this existing service.
+
+After loading the API S3 settings and production API authentication, supply the
+existing Meta connection settings (replace paths and host with your deployment):
+
+```sh
+export VELORIX_META_GRPC_ENDPOINT=https://meta.example:9090
+export VELORIX_META_BEARER_TOKEN='<existing-meta-token>'
+export VELORIX_META_TLS_CA_FILE=/secure/meta-ca.pem
+export VELORIX_META_TLS_CLIENT_CERT_FILE=/secure/api-client.pem
+export VELORIX_META_TLS_CLIENT_KEY_FILE=/secure/api-client-key.pem
+export VELORIX_META_TLS_DOMAIN_NAME=meta.example
+export VELORIX_RELATION_INGEST_OWNER_ID=velorix-api-primary
+export VELORIX_STANDING_RUNTIME_FENCING=logical-fencing
+unset VELORIX_API_AUTHORITATIVE_RELATION_INGEST
+cargo run -p velorix-api
+```
+
+Use a separate terminal to inspect `/readyz`: `relation_ingest.mode` must be
+`authoritative`, `relation_ingest.authoritative` must be true, and the metadata
+endpoint/backend must match the intended Rhiza service. With the flag unset,
+missing connection/authentication settings must fail startup rather than silently
+selecting Legacy. The local development authentication/fencing overrides from
+earlier sections must not be carried into a production launch.
+
+Alternatively, with the same Meta settings, run `scripts/run-vind-product.sh` to
+deploy the API to the selected Kubernetes context. The endpoint must be reachable
+from its pods. The script creates API-side auth/mTLS Secrets from the supplied
+files, but leaves the external Meta deployment and storage untouched. Existing
+object storage is selected with `VELORIX_OBJECT_STORE_MODE=external-s3`; use an
+isolated API namespace/prefix for validation. Configuring an external Meta does
+not by itself select external API object storage or preserve an existing API
+namespace. For shared/preserved state, explicitly retain the namespace, prefix,
+and stable owner ID; do not let generated run identifiers select new storage.
+
+After deployment, validate in that isolated namespace: declare a view, ingest
+rows, confirm no eager materialization, query a bounded range until HTTP 200,
+repeat it to verify reuse, then restart only the API and verify the same result.
+Do not count readiness alone as workload or recovery validation. The launcher's
+external-Meta path deliberately does not run the older data-mutating/managed-Meta
+smoke suites and reports external recovery as `UNVERIFIED`.
+
+Before upgrading an existing Legacy deployment, explicitly set
+`VELORIX_API_AUTHORITATIVE_RELATION_INGEST=0` to preserve its behavior until a
+separate migration has been validated. Changing the default does not migrate
+old source records or eager checkpoints.
 
 ## Unsupported SQL Fails During Admission
 
@@ -297,8 +413,8 @@ Save this example as `/tmp/measurements-schema.json`:
   "relation_version": "v1",
   "columns": [
     {
-      "column_id": "sensor_id",
-      "name": "sensor_id",
+      "column_id": "key",
+      "name": "key",
       "logical_type": {"kind": "utf8"},
       "physical_arrow_type": {"kind": "utf8"},
       "nullable": false,
@@ -324,7 +440,7 @@ Save this example as `/tmp/measurements-schema.json`:
       "semantic_role": "weight"
     }
   ],
-  "primary_key_column_ids": ["sensor_id"],
+  "primary_key_column_ids": ["key"],
   "weight_column_id": "weight",
   "allowed_operations": ["insert", "delete"],
   "event_time_column_id": null
@@ -373,8 +489,9 @@ durable affected-window cold recovery and idempotent retries. It
 requires a build containing the revised window correction extension; it is not a claim
 that an older release or a deployed cluster supports it. Keep the Meta/API
 processes from this guide running. Register a new relation before ingesting any
-rows, then create its view. As in the quickstart, authoritative activation
-requires first ingest, then backfill, then query.
+rows, then create its view. As in the quickstart, ingest commits source changes
+and querying advances demand materialization. Retry a `202` query until complete;
+explicit backfill is optional.
 
 Save this canonical schema as `/tmp/purchases-event-time-schema.json`:
 
@@ -450,11 +567,8 @@ curl -fsS -X POST http://127.0.0.1:8080/v1/ingest \
     ]
   }'
 
-curl -fsS -X POST http://127.0.0.1:8080/v1/views/purchases_by_user_minute/backfill \
-  -H 'content-type: application/json' --data-binary '{}'
-
 curl -fsS -X POST http://127.0.0.1:8080/v1/views/purchases_by_user_minute/query \
-  -H 'content-type: application/json' --data-binary '{}'
+  -H 'Accept: application/json' -H 'content-type: application/json' --data-binary '{}'
 ```
 
 The published `[0, 60 seconds)` row has `total_amount=10` and `event_count=1`;

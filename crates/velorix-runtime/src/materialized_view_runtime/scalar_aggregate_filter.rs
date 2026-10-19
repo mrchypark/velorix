@@ -165,6 +165,10 @@ impl ScalarAggregateFilterRuntime {
     /// is empty for MIN/MAX/SUM/AVG, 0 for COUNT).
     fn current_scalar(&self) -> Result<Option<Value>, StandingProgramRuntimeError> {
         let scalar = match self.plan.scalar_aggregate.function {
+            LogicalPlanAggregateFunctionV1::ArgMax { .. }
+            | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
+                return Err(invalid_runtime_state())
+            }
             LogicalPlanAggregateFunctionV1::Count => {
                 Value::Number(JsonNumber::from(self.scalar_state.count))
             }
@@ -719,6 +723,10 @@ impl ScalarAggregateFilterRuntime {
             }
             let key = canonical_json(&value);
             match self.plan.scalar_aggregate.function {
+                LogicalPlanAggregateFunctionV1::ArgMax { .. }
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
+                    return Err(invalid_runtime_state())
+                }
                 LogicalPlanAggregateFunctionV1::Count
                 | LogicalPlanAggregateFunctionV1::CountDistinct => {
                     let entry = self

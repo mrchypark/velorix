@@ -1,4 +1,6 @@
 //! Bounded immutable-page snapshot protocol over Rhiza KV.
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -85,6 +87,10 @@ impl RhizaKvSnapshot {
     pub fn new(kv: super::rhiza_kv::RhizaKvStore) -> Self {
         Self { kv }
     }
+    /// The current root token, read with exactly one KV get.
+    pub async fn root(&self) -> Result<Option<RootToken>, SnapshotError> {
+        Ok(self.kv.get(ROOT_KEY).await?.map(RootToken))
+    }
     pub async fn load(&self) -> Result<Option<(RootToken, Vec<u8>)>, SnapshotError> {
         let root = self.kv.get(ROOT_KEY).await?;
         let Some(root) = root else { return Ok(None) };
@@ -139,44 +145,46 @@ impl RhizaKvSnapshot {
             return Err(SnapshotError::TooLarge);
         }
         let current = expected.as_ref().map(|t| t.0.clone());
-        if let Some(root) = current.as_deref() {
-            let _ = parse_manifest(root)?;
-        }
+        let expected_manifest = current.as_deref().map(parse_manifest).transpose()?;
+        let mut known_pages = expected_manifest
+            .as_ref()
+            .map(|manifest| manifest.pages.iter().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
         let mut pages = Vec::new();
         for chunk in bytes.chunks(PAGE_BYTES) {
             let hash = digest(chunk);
-            let page_request_id = Sha256::digest(format!("page:{request_id}:{hash}"))
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            self.kv
-                .put_if_absent(
-                    page_request_id,
-                    format!("velorix/snapshot/page/{hash}"),
-                    chunk.to_vec(),
-                )
-                .await?;
-            if self
-                .kv
-                .get(format!("velorix/snapshot/page/{hash}"))
-                .await?
-                .as_deref()
-                != Some(chunk)
-            {
-                return Err(SnapshotError::Invalid("immutable page mismatch".into()));
+            if !known_pages.contains(&hash) {
+                let page_request_id = Sha256::digest(format!("page:{request_id}:{hash}"))
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                self.kv
+                    .put_if_absent(
+                        page_request_id,
+                        format!("velorix/snapshot/page/{hash}"),
+                        chunk.to_vec(),
+                    )
+                    .await?;
+                if self
+                    .kv
+                    .get(format!("velorix/snapshot/page/{hash}"))
+                    .await?
+                    .as_deref()
+                    != Some(chunk)
+                {
+                    return Err(SnapshotError::Invalid("immutable page mismatch".into()));
+                }
+                known_pages.insert(hash.clone());
             }
             pages.push(hash);
         }
         let manifest = serde_json::to_vec(&Manifest {
             schema_version: 1,
-            generation: current
+            generation: expected_manifest
                 .as_ref()
-                .map(|r| {
-                    serde_json::from_slice::<Manifest>(r)
-                        .map_err(|e| SnapshotError::Invalid(e.to_string()))
-                })
-                .map(|m| {
-                    m?.generation
+                .map(|manifest| {
+                    manifest
+                        .generation
                         .checked_add(1)
                         .ok_or(SnapshotError::Invalid("generation overflow".into()))
                 })
@@ -264,5 +272,29 @@ mod tests {
         let pages = MAX_SNAPSHOT_BYTES / PAGE_BYTES;
         assert_eq!(pages, 128);
         assert!(pages * (64 + 3) + 512 <= 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn root_reads_only_the_root_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let kv = crate::rhiza_kv::RhizaKvStore::open_config(
+            rhizadb::Config::new(directory.path())
+                .node_id("snapshot-root")
+                .local(),
+        )
+        .await
+        .unwrap();
+        let snapshot = RhizaKvSnapshot::new(kv);
+        assert_eq!(snapshot.root().await.unwrap(), None);
+        let bytes = b"snapshot".to_vec();
+        let CompareExchange::Applied(root) = snapshot
+            .compare_exchange(None, bytes.clone(), "root-test")
+            .await
+            .unwrap()
+        else {
+            panic!("first publish must apply");
+        };
+        assert_eq!(snapshot.root().await.unwrap(), Some(root.clone()));
+        assert_eq!(snapshot.load().await.unwrap(), Some((root, bytes)));
     }
 }

@@ -22,7 +22,7 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         json!({
             "post": {
                 "summary": "Ingest rows into one relation and update active views",
-                "description": "Preferred product ingest path. The relation is selected by the URL path; successful materialized ack updates all active materialized views that depend on the relation before returning.",
+                "description": "Preferred product ingest path. The relation is selected by the URL path. Demand-managed views refresh on a subsequent query or explicit backfill against the current cut; ingest does not eagerly refresh them. Other active dependent views retain their materialized-ack behavior.",
                 "parameters": [{
                     "name": "relation_id",
                     "in": "path",
@@ -55,7 +55,7 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         json!({
             "post": {
                 "summary": "Ingest ordered batches for one or more relations",
-                "description": "Public multi-relation ingest convenience path. It applies the submitted relation batches in request order and publishes materialized views at the resulting per-relation frontier vector; it is not an atomic multi-relation transaction API. A successful materialized ack durably appends every batch and updates every active dependent materialized view before returning.",
+                "description": "Public multi-relation ingest convenience path. It applies submitted batches in request order and is not an atomic multi-relation transaction API. Successful materialized ack durably appends each batch and updates eager dependent views. Demand-managed views instead refresh on subsequent query/backfill at the current cut.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -92,6 +92,37 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
             }
         }),
     );
+    paths.insert("/v1/views/{view_id}/query".to_string(), json!({
+        "post": {
+            "summary": "Query materialized output with bounded foreground materialization",
+            "description": "Demand routing is implemented but uncompiled and unverified. Ordinary bound WHERE predicates can infer scope without explicit materialization.scope. Ancestor stages conservatively require full dependency closure. Demand-managed views refresh on query/backfill against the current cut, rather than eagerly on ingest. Explicit epoch and continuation reads retain their pinned-read semantics.",
+            "parameters": [{"name":"view_id", "in":"path", "required":true, "schema":{"type":"string"}}],
+            "requestBody": {"required":true, "content":{"application/json":{"schema":openapi_demand_query_schema()}}},
+            "responses": {
+                "200": {"description":"Complete requested output at its validated cut; Arrow IPC by default or JSON via Accept", "content":{
+                    "application/vnd.apache.arrow.stream":{"schema":{"type":"string","format":"binary"}},
+                    "application/json":{"schema":openapi_query_response_schema(None)}
+                }},
+                "202": {"description":"Materialization is incomplete; this JSON progress response is not a complete query result", "content":{"application/json":{"schema":{"type":"object","properties":{"materialization":{"type":"object","properties":{
+                    "status":{"type":"string"}, "complete":{"type":"boolean"},
+                    "processed_rows":{"type":"integer"}, "read_bytes":{"type":"integer"}, "remaining_rows":{"type":"integer"}, "dependency_mode":{"type":"string"}
+                }}}}}}},
+                "413": openapi_demand_budget_response(),
+                "406": {"description":"No supported query response format is acceptable"}
+            }
+        }
+    }));
+    paths.insert("/v1/views/{view_id}/backfill".to_string(), json!({
+        "post": {
+            "summary":"Advance explicit historical backfill",
+            "description":"Implemented but uncompiled and unverified. Does not start automatic background backfill. Step advances bounded work; pause/resume persist control state without starting a worker. Foreground demand can cause explicit work to yield. Ancestors conservatively use full dependency closure.",
+            "parameters":[{"name":"view_id","in":"path","required":true,"schema":{"type":"string"}}],
+            "requestBody":{"required":true,"content":{"application/json":{"schema":openapi_demand_backfill_schema()}}},
+            "responses":{"200":{"description":"Completed step or acknowledged pause/resume; control acknowledgement does not imply materialization completeness"},
+                "202":{"description":"Incomplete, paused, or yielded work; JSON materialization status"},
+                "413":openapi_demand_budget_response()}
+        }
+    }));
     for view in views {
         let response = active_view_response(&view, None)?;
         if !response.query_enabled {
@@ -122,15 +153,23 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                     ),
                     "responses": {
                         "200": {
-                            "description": "View query result rows",
+                            "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows",
+                            "headers": {
+                                "x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}},
+                                "x-velorix-next-page-token": {"schema": {"type": "string"}}
+                            },
                             "content": {
+                                "application/vnd.apache.arrow.stream": {
+                                    "schema": {"type": "string", "format": "binary"}
+                                },
                                 "application/json": {
                                     "schema": openapi_query_response_schema(
                                         response.response_schema.as_ref()
                                     )
                                 }
                             }
-                        }
+                        },
+                        "406": {"description": "No supported query response format is acceptable"}
                     }
                 }
             }),
@@ -152,14 +191,14 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                             true,
                             true,
                         ),
-                        "responses": { "200": { "description": "Rows" } }
+                        "responses": { "200": { "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows", "content": {"application/vnd.apache.arrow.stream": {"schema": {"type": "string", "format": "binary"}}, "application/json": {"schema": openapi_query_response_schema(None)}} }, "406": {"description": "No supported query response format is acceptable"} }
                     },
                     "post": {
                         "summary": format!("Query {} output {}", response.view_id, output.relation_id),
                         "x-velorix-view-id": response.view_id,
                         "x-velorix-output-relation-id": output.relation_id,
                         "x-velorix-output-schema-fingerprint": output.schema_fingerprint,
-                        "responses": { "200": { "description": "Rows" } }
+                        "responses": { "200": { "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows", "content": {"application/vnd.apache.arrow.stream": {"schema": {"type": "string", "format": "binary"}}, "application/json": {"schema": openapi_query_response_schema(None)}} }, "406": {"description": "No supported query response format is acceptable"} }
                     }
                 }),
             );
@@ -175,6 +214,58 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         },
         "paths": Value::Object(paths)
     })))
+}
+
+fn openapi_demand_query_schema() -> Value {
+    let defaults = demand_materialization::DemandBudget::default();
+    json!({
+        "type":"object",
+        "properties": {
+            "sql":{"type":"string","nullable":true},
+            "parameters":{"type":"object","additionalProperties":true},
+            "epoch":{"type":"integer","minimum":0,"nullable":true},
+            "page_token":{"type":"string","nullable":true,"description":"Demand query continuation tokens are process-local; restart or another instance rejects the token. Start a new query to reuse durable materialization."},
+            "max_rows":{"type":"integer","minimum":1,"nullable":true,"description":"Output page limit, separate from the materialization inspection budget"},
+            "materialization":{
+                "type":"object","additionalProperties":false,
+                "properties":{
+                    "scope":{"type":"object","nullable":true,"additionalProperties":false,"required":["where"],"properties":{"where":{"type":"string","description":"Predicate over output columns; unknown dependencies require broader computation"}}},
+                    "budget":{"type":"object","additionalProperties":false,"properties":{
+                        "batch_limit":{"type":"integer","minimum":1,"default":defaults.batch_limit},
+                        "max_rows":{"type":"integer","minimum":1,"default":defaults.max_rows,"description":"Inspection row budget; not an output page limit. An indivisible signed update can require a larger atomic unit; HTTP 413 reports details.required_min_rows rather than splitting it unsafely."},
+                        "max_bytes":{"type":"integer","minimum":1,"default":defaults.max_bytes,"description":"Serialized source read cap and post-decode size acceptance limit; not a peak allocation or RSS bound"},
+                        "max_duration_ms":{"type":"integer","minimum":1,"default":defaults.max_duration_ms,"description":"Cooperative checks between atomic steps; does not preempt in-flight work"}
+                    }}
+                }
+            }
+        }
+    })
+}
+
+fn openapi_demand_backfill_schema() -> Value {
+    let query = openapi_demand_query_schema();
+    let controls = &query["properties"]["materialization"]["properties"];
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "batch_limit":{"type":"integer","minimum":1,"nullable":true,"description":"Compatibility alias for budget.batch_limit; conflicting values are rejected"},
+        "scope":controls["scope"],
+        "budget":controls["budget"],
+        "action":{"type":"string","enum":["step","pause","resume"],"default":"step"},
+        "order":{"type":"string","enum":["forward","reverse"],"default":"forward","description":"Requested work order; signed causal/atomic closure can constrain execution order"}
+    }})
+}
+
+fn openapi_demand_budget_response() -> Value {
+    json!({"description":"The authenticated whole-object byte unit or signed atomic row unit exceeds the supplied budget. Required minima are returned without silently exceeding the limit. Integration validation is pending; these budgets do not guarantee CPU time or peak RSS.",
+    "content":{"application/json":{"schema":{"type":"object","properties":{
+        "error":{"type":"string"},
+        "details":{"type":"object","properties":{
+            "code":{"type":"string","description":"Budget-specific error code"},
+            "required_min_rows":{"type":"integer","minimum":1,"description":"Minimum rows for an indivisible signed update, when the row budget is insufficient"},
+            "required_min_bytes":{"type":"integer","minimum":0},
+            "supplied_max_bytes":{"type":"integer","minimum":0},
+            "max_supported_bytes":{"type":"integer","minimum":0}
+        }}
+    }}}}})
 }
 
 fn openapi_view_query_parameters(

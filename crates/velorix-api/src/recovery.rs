@@ -6,6 +6,67 @@ pub(super) struct StandingRuntimeBackfillReplayOutcome {
     pub(super) remaining_batches: usize,
 }
 
+/// Proof that one immutable source publication's staged bytes were verified
+/// against both the captured metadata identity and its decoded envelope.
+/// This is deliberately neither serializable nor constructible from a request.
+#[derive(Clone, Debug)]
+pub(super) struct ValidatedRelationPublication {
+    relation: IngestSourceRelationIdentityV1,
+    stream_id: String,
+    partition_id: u32,
+    publication: RelationIngestPublicationRefV1,
+}
+
+impl ValidatedRelationPublication {
+    fn new(artifact: &demand_source::DemandSourceArtifact) -> Self {
+        Self {
+            relation: artifact.relation.clone(),
+            stream_id: artifact.stream_id.clone(),
+            partition_id: artifact.partition_id,
+            publication: artifact.publication.clone(),
+        }
+    }
+
+    pub(super) fn matches(
+        &self,
+        relation: &IngestSourceRelationIdentityV1,
+        stream_id: &str,
+        partition_id: u32,
+        publication: &RelationIngestPublicationRefV1,
+    ) -> bool {
+        &self.relation == relation
+            && self.stream_id == stream_id
+            && self.partition_id == partition_id
+            && &self.publication == publication
+    }
+}
+
+pub(super) fn validate_demand_source_payload(
+    artifact: &demand_source::DemandSourceArtifact,
+    bytes: bytes::Bytes,
+) -> Result<(IngestEnvelope, ValidatedRelationPublication), ApiError> {
+    if stable_bytes_hash(&bytes) != artifact.publication.object_digest
+        || artifact.publication.object_digest != artifact.publication.payload_digest
+    {
+        return Err(ApiError::bad_request(
+            "source object length or digest mismatch",
+        ));
+    }
+    let envelope = IngestEnvelope::decode(bytes).map_err(ApiError::bad_request)?;
+    let header = envelope.header();
+    if header.relation_id != artifact.relation.relation_id
+        || header.relation_version != artifact.relation.relation_version
+        || header.schema_fingerprint != artifact.relation.schema_fingerprint
+        || header.stream_id != artifact.stream_id
+        || header.partition_id != artifact.partition_id
+        || header.start_offset_inclusive != artifact.publication.start_offset_inclusive
+        || header.end_offset_exclusive != artifact.publication.end_offset_exclusive
+    {
+        return Err(ApiError::bad_request("source envelope identity mismatch"));
+    }
+    Ok((envelope, ValidatedRelationPublication::new(artifact)))
+}
+
 /// Rebuilds the one explicitly supported legacy single-key checkpoint shape
 /// from an immutable authoritative relation-wide source cut. This path is
 /// startup-only and is never used by ordinary recovery/backfill.
@@ -408,12 +469,13 @@ async fn legacy_rebuild_batches_and_coverage(
     Ok((input_batches, replay_checkpoints, coverage))
 }
 
-pub(super) async fn replay_committed_ingest_into_standing_runtime(
+/// The caller holds the view operation lock through restore and replay.
+pub(super) async fn replay_committed_ingest_into_standing_runtime_locked(
     state: &ApiState,
     active: &ActiveMaterializedView,
     replay_plan: &StandingRuntimeReplayPlan,
 ) -> Result<(), ApiError> {
-    replay_committed_ingest_into_standing_runtime_limited(
+    replay_committed_ingest_into_standing_runtime_limited_locked(
         state,
         active,
         replay_plan,
@@ -426,6 +488,53 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime(
 }
 
 pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    replay_plan: &StandingRuntimeReplayPlan,
+    batch_limit: Option<usize>,
+    range: Option<&BackfillRangeRequest>,
+    scope: Option<&BackfillScopeRequest>,
+) -> Result<StandingRuntimeBackfillReplayOutcome, ApiError> {
+    let Some(identity) = active_standing_runtime_identity(active) else {
+        return Ok(StandingRuntimeBackfillReplayOutcome::default());
+    };
+    let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
+    let _operation_guard = operation_lock.lock().await;
+    replay_committed_ingest_into_standing_runtime_limited_locked(
+        state,
+        active,
+        replay_plan,
+        batch_limit,
+        range,
+        scope,
+    )
+    .await
+}
+
+fn replay_committed_ingest_into_standing_runtime_limited_locked<'a>(
+    state: &'a ApiState,
+    active: &'a ActiveMaterializedView,
+    replay_plan: &'a StandingRuntimeReplayPlan,
+    batch_limit: Option<usize>,
+    range: Option<&'a BackfillRangeRequest>,
+    scope: Option<&'a BackfillScopeRequest>,
+) -> impl std::future::Future<Output = Result<StandingRuntimeBackfillReplayOutcome, ApiError>> + Send + 'a
+{
+    // Replay includes checkpoint publication. Heap-own its future once at the
+    // shared boundary instead of embedding it in each ingest caller's future.
+    Box::pin(
+        replay_committed_ingest_into_standing_runtime_limited_locked_inner(
+            state,
+            active,
+            replay_plan,
+            batch_limit,
+            range,
+            scope,
+        ),
+    )
+}
+
+async fn replay_committed_ingest_into_standing_runtime_limited_locked_inner(
     state: &ApiState,
     active: &ActiveMaterializedView,
     replay_plan: &StandingRuntimeReplayPlan,
@@ -450,11 +559,10 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
     if let Some(scope) = scope {
         validate_backfill_scope(scope)?;
     }
-    let operation_lock = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
-    let _operation_guard = operation_lock.lock().await;
     let Some(runtime) = state.standing_runtime(identity, &active.spec.view_id)? else {
         return Ok(StandingRuntimeBackfillReplayOutcome::default());
     };
+    let mut replay_lease = None;
     let replay_plan =
         match read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
         {
@@ -463,7 +571,8 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             }
             None => replay_plan.clone(),
         };
-    let batches = read_replay_ingest_batches(state, active, &replay_plan, range).await?;
+    let batches =
+        read_replay_ingest_batches_with_coverage(state, active, &replay_plan, range, true).await?;
 
     let mut outcome = StandingRuntimeBackfillReplayOutcome::default();
     let coalesce_replay = range.is_none() && scope.is_none();
@@ -532,6 +641,16 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             batches: envelope.record_batches().map_err(ApiError::bad_request)?,
         };
 
+        // Restoring an already caught-up checkpoint is read-only. Acquire a
+        // writer lease only once an uncovered, selected input will be applied.
+        let lease = match replay_lease.as_ref() {
+            Some(lease) => lease,
+            None => replay_lease.insert(
+                owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id)
+                    .await?,
+            ),
+        };
+
         if coalesce_replay {
             coalesced_idempotency_parts.push(format!(
                 "{}:{}:{}-{}",
@@ -551,9 +670,8 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
             ));
             coalesced_input_batches.push(input_batch);
         } else {
-            let owner = state
-                .acquire_standing_runtime_owner(identity, &active.spec.view_id)
-                .await?;
+            lease.ensure_owned()?;
+            let owner = lease.owner.clone();
             let idempotency_key = EpochIdempotencyKey::new(format!(
                 "{}:{}:{}-{}",
                 descriptor.stream_id,
@@ -578,6 +696,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
                     return Err(error);
                 }
             };
+            lease.ensure_owned()?;
             if let Err(error) = persist_standing_runtime_checkpoint(
                 state,
                 &active.spec.view_id,
@@ -594,6 +713,7 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
                     )],
                     owner,
                 )
+                .with_owner_renewal(Arc::clone(&lease.failure))
                 .with_event_time_state(apply_result.staged_event_time_state.clone())
                 .with_published_relation(published_relation_binding_for_active_view(active)?),
                 None,
@@ -608,9 +728,11 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
     }
 
     if !coalesced_input_batches.is_empty() {
-        let owner = state
-            .acquire_standing_runtime_owner(identity, &active.spec.view_id)
-            .await?;
+        let lease = replay_lease.as_ref().ok_or_else(|| {
+            ApiError::internal("selected replay input is missing its owner lease")
+        })?;
+        lease.ensure_owned()?;
+        let owner = lease.owner.clone();
         let idempotency_hash = stable_bytes_hash(coalesced_idempotency_parts.join("|").as_bytes());
         let idempotency_key = EpochIdempotencyKey::new(format!(
             "{}:coalesced-replay:{idempotency_hash}",
@@ -633,12 +755,14 @@ pub(super) async fn replay_committed_ingest_into_standing_runtime_limited(
                 return Err(error);
             }
         };
+        lease.ensure_owned()?;
         if let Err(error) = persist_standing_runtime_checkpoint(
             state,
             &active.spec.view_id,
             &apply_result.checkpoint,
             &apply_result.output_deltas,
             StandingRuntimeCheckpointPersistContext::new(None, coalesced_replay_checkpoints, owner)
+                .with_owner_renewal(Arc::clone(&lease.failure))
                 .with_event_time_state(apply_result.staged_event_time_state.clone())
                 .with_published_relation(published_relation_binding_for_active_view(active)?),
             None,
@@ -724,6 +848,54 @@ pub(super) async fn committed_backfill_progress(
     state: &ApiState,
     active: &ActiveMaterializedView,
 ) -> Result<BackfillProgressResponse, ApiError> {
+    if active
+        .runtime
+        .as_ref()
+        .is_some_and(view_has_published_view_inputs)
+    {
+        let identity = active_standing_runtime_identity(active)
+            .ok_or_else(|| ApiError::bad_request("consumer identity missing"))?;
+        let record =
+            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
+        if let Some(progress) = record
+            .as_ref()
+            .and_then(|record| record.published_input_bootstrap.as_ref())
+        {
+            progress.validate().map_err(meta_error_to_api)?;
+            let mut total = 0usize;
+            let mut remaining = 0usize;
+            for input in &progress.inputs {
+                total = total
+                    .checked_add(usize::try_from(input.total_pages).map_err(ApiError::bad_request)?)
+                    .ok_or_else(|| ApiError::bad_request("bootstrap progress overflow"))?;
+                remaining = remaining
+                    .checked_add(
+                        usize::try_from(input.total_pages - input.next_page_index)
+                            .map_err(ApiError::bad_request)?,
+                    )
+                    .ok_or_else(|| ApiError::bad_request("bootstrap progress overflow"))?;
+            }
+            if remaining > 0 {
+                return Ok(backfill_progress_response(total, remaining));
+            }
+        } else if record.is_none() {
+            // Page totals are intentionally not loaded by declaration/status.
+            return Ok(backfill_progress_response(1, 1));
+        }
+        let mut total = 0usize;
+        if let Some(record) = &record {
+            for input in consumer_direct_view_inputs(active, record)? {
+                total += read_producer_deltas_after_bootstrap_cursor(
+                    state,
+                    &input.published_relation,
+                    &input.cursor,
+                )
+                .await?
+                .len();
+            }
+        }
+        return Ok(backfill_progress_response(total, total));
+    }
     if active.spec.input_relations.is_empty() {
         return Ok(backfill_progress_response(0, 0));
     }
@@ -737,16 +909,39 @@ pub(super) async fn committed_backfill_progress(
         }
         None => StandingRuntimeReplayPlan::default(),
     };
-    let empty_replay_plan;
-    let read_plan = if state.authoritative_relation_ingest_enabled() {
-        &replay_plan
-    } else {
-        // Progress counts all committed canonical batches; replay coverage is
-        // applied below when computing `remaining`.
-        empty_replay_plan = StandingRuntimeReplayPlan::default();
-        &empty_replay_plan
-    };
-    let batches = read_replay_ingest_batches(state, active, read_plan, None).await?;
+    if !state.authoritative_relation_ingest_enabled() {
+        let ingest_log =
+            IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
+                .map_err(ApiError::internal)?;
+        let admissions = ingest_log
+            .list_committed_admission_metadata()
+            .await
+            .map_err(ApiError::internal)?;
+        let mut total = 0usize;
+        let mut remaining = 0usize;
+        for admission in admissions {
+            if !active.spec.input_relations.iter().any(|input| {
+                admission.relation_id == input.relation_id
+                    && admission.relation_version == input.relation_version
+                    && admission.schema_fingerprint == input.schema_fingerprint
+            }) {
+                continue;
+            }
+            total += 1;
+            if !replay_plan_covers_replayed_batch(
+                &replay_plan,
+                &admission.relation_id,
+                &admission.relation_version,
+                &admission.stream_id,
+                admission.partition_id,
+                admission.end_offset_exclusive,
+            ) {
+                remaining += 1;
+            }
+        }
+        return Ok(backfill_progress_response(total, remaining));
+    }
+    let batches = read_replay_ingest_batches(state, active, &replay_plan, None).await?;
     let mut total = 0usize;
     let mut remaining = 0usize;
     for batch in batches {
@@ -832,6 +1027,16 @@ pub(super) async fn read_replay_ingest_batches(
     replay_plan: &StandingRuntimeReplayPlan,
     range: Option<&BackfillRangeRequest>,
 ) -> Result<Vec<IngestBatch>, ApiError> {
+    read_replay_ingest_batches_with_coverage(state, active, replay_plan, range, false).await
+}
+
+pub(super) async fn read_replay_ingest_batches_with_coverage(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    replay_plan: &StandingRuntimeReplayPlan,
+    range: Option<&BackfillRangeRequest>,
+    skip_covered: bool,
+) -> Result<Vec<IngestBatch>, ApiError> {
     if !state.authoritative_relation_ingest_enabled() {
         let ingest_log =
             IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
@@ -847,6 +1052,69 @@ pub(super) async fn read_replay_ingest_batches(
         ));
     };
     let mut keys = BTreeSet::new();
+    // A new view has no replay frontier yet. Discover committed partitions
+    // from metadata, never from object listings or fabricated stream names.
+    let source_relations = active
+        .spec
+        .input_relations
+        .iter()
+        .filter(|input| {
+            !active.runtime.as_ref().is_some_and(|runtime| {
+                runtime.input_bindings.iter().any(|binding| {
+            matches!(binding, StandingInputBindingV1::PublishedView { published_relation, .. }
+                if published_relation.relation.relation_id == input.relation_id
+                    && published_relation.relation.relation_version == input.relation_version)
+        })
+            })
+        })
+        .map(|input| IngestSourceRelationIdentityV1 {
+            relation_id: input.relation_id.clone(),
+            relation_version: input.relation_version.clone(),
+            relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+            schema_fingerprint: input.schema_fingerprint.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !source_relations.is_empty() {
+        let config = state.relation_ingest_config.as_ref().ok_or_else(|| {
+            ApiError::service_unavailable(
+                "authoritative relation ingest configuration is unavailable",
+            )
+        })?;
+        let cuts = meta_store
+            .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+                namespace: config.namespace.clone(),
+                relations: source_relations.clone(),
+            })
+            .await
+            .map_err(meta_error_to_api)?;
+        if cuts.len() != source_relations.len() {
+            return Err(ApiError::service_unavailable(
+                "authoritative replay source cut count mismatch",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for cut in cuts {
+            if !source_relations.contains(&cut.relation)
+                || !seen.insert(cut.relation.relation_id.clone())
+                || cut.cut.schema_version != RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1
+                || cut.cut.namespace != config.namespace
+                || cut.cut.relation_id != cut.relation.relation_id
+            {
+                return Err(ApiError::service_unavailable(
+                    "authoritative replay source cut identity mismatch",
+                ));
+            }
+            for partition in cut.cut.partitions {
+                keys.insert((
+                    cut.relation.relation_id.clone(),
+                    cut.relation.relation_version.clone(),
+                    cut.relation.schema_fingerprint.clone(),
+                    partition.stream_id,
+                    partition.partition_id,
+                ));
+            }
+        }
+    }
     for checkpoint in &replay_plan.replay_checkpoints {
         let Some(relation_id) = checkpoint.relation_id.as_deref() else {
             return Err(ApiError::bad_request(
@@ -904,6 +1172,15 @@ pub(super) async fn read_replay_ingest_batches(
         }
     }
     let mut batches = Vec::new();
+    // Published-view offsets are producer commit epochs, not physical source
+    // partitions. They are replayed only through validated DAG cursor commits.
+    keys.retain(|(id, version, fingerprint, _, _)| {
+        source_relations.iter().any(|source| {
+            source.relation_id == *id
+                && source.relation_version == *version
+                && source.schema_fingerprint == *fingerprint
+        })
+    });
     for (relation_id, relation_version, schema_fingerprint, stream_id, partition_id) in keys {
         if stream_id.is_empty() {
             continue;
@@ -956,14 +1233,45 @@ pub(super) async fn read_replay_ingest_batches(
                 "authoritative relation catalog identity does not match active view input `{relation_id}`"
             )));
         }
-        let Some(partition) = cut.partitions.into_iter().find(|partition| {
-            partition.stream_id == stream_id && partition.partition_id == partition_id
-        }) else {
+        let [partition] = cut.partitions.as_slice() else {
+            return Err(ApiError::service_unavailable(
+                "authoritative partition source cut must contain exactly one partition",
+            ));
+        };
+        if partition.stream_id != stream_id || partition.partition_id != partition_id {
             return Err(ApiError::service_unavailable(format!(
                 "authoritative relation source cut is missing {relation_id}/{stream_id}/p={partition_id}"
             )));
-        };
-        for publication in partition.publications {
+        }
+        // Validate the complete metadata chain even when no payload needs replay.
+        let mut frontier = partition.base_offset_inclusive;
+        for publication in &partition.publications {
+            validate_replay_publication_metadata(&stream_id, partition_id, publication)?;
+            if publication.start_offset_inclusive != frontier {
+                return Err(ApiError::service_unavailable(
+                    "authoritative source cut contains a gap or overlap",
+                ));
+            }
+            frontier = publication.end_offset_exclusive;
+        }
+        if frontier != partition.committed_offset_exclusive {
+            return Err(ApiError::service_unavailable(
+                "authoritative source cut frontier is inconsistent",
+            ));
+        }
+        for publication in &partition.publications {
+            if skip_covered
+                && replay_plan_covers_replayed_batch(
+                    replay_plan,
+                    &relation_id,
+                    &relation_version,
+                    &stream_id,
+                    partition_id,
+                    publication.end_offset_exclusive,
+                )
+            {
+                continue;
+            }
             let batch = validate_relation_publication_ref(
                 state,
                 &relation_id,
@@ -971,7 +1279,7 @@ pub(super) async fn read_replay_ingest_batches(
                 &input.schema_fingerprint,
                 &stream_id,
                 partition_id,
-                &publication,
+                publication,
             )
             .await?;
             batches.push(batch);
@@ -986,6 +1294,41 @@ pub(super) async fn read_replay_ingest_batches(
         )
     });
     Ok(batches)
+}
+
+fn validate_replay_publication_metadata(
+    stream_id: &str,
+    partition_id: u32,
+    publication: &RelationIngestPublicationRefV1,
+) -> Result<(), ApiError> {
+    let (_, parts) =
+        ObjectKey::parse_ingest_staging(&publication.object_key).map_err(ApiError::bad_request)?;
+    let batch_key = ObjectKey::ingest_batch(
+        stream_id,
+        partition_id,
+        publication.start_offset_inclusive,
+        publication.end_offset_exclusive,
+    )
+    .map_err(ApiError::bad_request)?;
+    let valid_digest = publication
+        .object_digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if publication.end_offset_exclusive <= publication.start_offset_inclusive
+        || parts.stream_id != stream_id
+        || parts.partition_id != partition_id
+        || parts.start_offset_inclusive != publication.start_offset_inclusive
+        || parts.end_offset_exclusive != publication.end_offset_exclusive
+        || publication.request_id != parts.staging_id
+        || publication.batch_key != batch_key.as_str()
+        || !valid_digest
+        || publication.object_digest != publication.payload_digest
+    {
+        return Err(ApiError::bad_request(
+            "authoritative publication metadata identity or range is invalid",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates one committed relation publication all the way through its
@@ -1013,13 +1356,17 @@ pub(super) async fn validate_relation_publication_ref(
     let ingest_log =
         IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
             .map_err(ApiError::internal)?;
+    if publication.object_digest != publication.payload_digest {
+        return Err(ApiError::bad_request(
+            "authoritative publication metadata identity or range is invalid",
+        ));
+    }
     let payload = ingest_log
         .read_staging(&publication.object_key, &publication.object_digest)
         .await
         .map_err(ApiError::internal)?;
-    let batch = IngestBatch::from_validated_envelope(payload).map_err(ApiError::bad_request)?;
-    let envelope =
-        IngestEnvelope::decode(batch.payload().clone()).map_err(ApiError::bad_request)?;
+    let (batch, envelope) = IngestBatch::from_validated_envelope_with_envelope(payload)
+        .map_err(ApiError::bad_request)?;
     let header = envelope.header();
     if header.relation_id != relation_id
         || header.relation_version != relation_version
@@ -1028,8 +1375,6 @@ pub(super) async fn validate_relation_publication_ref(
         || header.partition_id != partition_id
         || header.start_offset_inclusive != publication.start_offset_inclusive
         || header.end_offset_exclusive != publication.end_offset_exclusive
-        || stable_bytes_hash(batch.payload().as_ref()) != publication.payload_digest
-        || publication.object_digest != publication.payload_digest
         || publication.request_id != staging_parts.staging_id
         || publication.batch_key != expected_batch_key.as_str()
         || staging_parts.stream_id != stream_id

@@ -5009,11 +5009,12 @@ fn runtime_materializes_computed_filter_project_view() {
 
 #[test]
 fn runtime_materializes_filter_project_case_over_bool_predicate() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = device_status_flag_output_schema();
-    let sql = "select device_id, case when enabled = true then 1 else 0 end as enabled_flag from device_status";
-    let identity = standing_identity_with_view(sql, "device_enabled_flags");
+    let output_schema = item_status_flag_output_schema();
+    let sql =
+        "select key, case when flag = true then 1 else 0 end as enabled_flag from item_status";
+    let identity = standing_identity_with_view(sql, "item_enabled_flags");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -5031,30 +5032,31 @@ fn runtime_materializes_filter_project_case_over_bool_predicate() {
                 encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
-                stream_id: "device-status-stream".to_string(),
+                stream_id: "item-status-stream".to_string(),
                 partition_id: 0,
                 schema_fingerprint: catalog.schema_fingerprint.to_string(),
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 101, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 101, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_device_enabled_flags_page(runtime.as_ref(), 1, &[("device-a", 1), ("device-b", 0)]);
+    assert_item_enabled_flags_page(runtime.as_ref(), 1, &[("item-a", 1), ("item-b", 0)]);
 }
 
 #[test]
 fn runtime_rejects_filter_project_case_bool_predicate_non_bool_literal() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = device_status_flag_output_schema();
-    let sql = "select device_id, case when enabled = true then 1 else 0 end as enabled_flag from device_status";
-    let identity = standing_identity_with_view(sql, "device_enabled_flags");
+    let output_schema = item_status_flag_output_schema();
+    let sql =
+        "select key, case when flag = true then 1 else 0 end as enabled_flag from item_status";
+    let identity = standing_identity_with_view(sql, "item_enabled_flags");
     let mut logical_plan =
         lower_supported_filter_project_sql_to_logical_plan(sql, &catalog, &output_schema).unwrap();
     {
@@ -13436,11 +13438,12 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
 
 #[test]
 fn runtime_materializes_latest_bool_by_key_and_restores_state() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true group by all";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql =
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true group by all";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13464,20 +13467,16 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", true)]);
 
     let checkpoint = runtime.checkpoint().unwrap();
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
@@ -13495,28 +13494,24 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
                 start_offset_inclusive: 3,
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 105, 1),
-                    ("device-b", false, 120, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 105, 1),
+                    ("item-b", false, 120, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        restored.as_ref(),
-        2,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(restored.as_ref(), 2, &[("item-a", true), ("item-b", true)]);
 }
 
 #[test]
 fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13540,11 +13535,11 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-a", true, 100, i64::MAX)])],
+                batches: vec![item_status_batch(&[("item-a", true, 100, i64::MAX)])],
             }],
         )
         .unwrap();
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
     let checkpoint_before = runtime.checkpoint().unwrap();
     let checkpoint_bytes_before = checkpoint_before
         .state_payload
@@ -13557,7 +13552,7 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
     let output_frontiers_before = checkpoint_before.output_frontiers.clone();
     let payload_before: Value = serde_json::from_str(&checkpoint_bytes_before).unwrap();
 
-    // device-b mutates LatestByKey state before the same device-a
+    // item-b mutates LatestByKey state before the same item-a
     // key/order/value overflows i64::MAX + 1.
     let error = runtime
         .apply_changes(
@@ -13573,9 +13568,9 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-b", false, 200, 1),
-                    ("device-a", true, 100, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-b", false, 200, 1),
+                    ("item-a", true, 100, 1),
                 ])],
             }],
         )
@@ -13619,7 +13614,7 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
         payload_after_failure["applied_epochs"],
         payload_before["applied_epochs"]
     );
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 
     let retry = runtime
         .apply_changes(
@@ -13635,16 +13630,12 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-b", false, 200, 1)])],
+                batches: vec![item_status_batch(&[("item-b", false, 200, 1)])],
             }],
         )
         .unwrap();
     assert_eq!(retry.output_deltas.len(), 1);
-    assert_latest_status_page(
-        runtime.as_ref(),
-        2,
-        &[("device-a", true), ("device-b", false)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-a", true), ("item-b", false)]);
     let checkpoint_after_retry = runtime.checkpoint().unwrap();
     let duplicate = runtime
         .apply_changes(
@@ -13659,11 +13650,11 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
 
 #[test]
 fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13687,9 +13678,9 @@ fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 200, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 200, 1),
                 ])],
             }],
         )
@@ -13709,7 +13700,7 @@ fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-c", true, 300, 1)])],
+                batches: vec![item_status_batch(&[("item-c", true, 300, 1)])],
             }],
         )
         .unwrap();
@@ -13718,25 +13709,25 @@ fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
     assert_eq!(
         second.output_deltas[0].delta.net_rows().unwrap(),
         vec![DeltaRecord::new(
-            DeltaKey::from_json(json!("device-c")),
-            DeltaValue::from_json(json!({ "enabled": true })),
+            DeltaKey::from_json(json!("item-c")),
+            DeltaValue::from_json(json!({ "flag": true })),
             1,
         )]
     );
     assert_latest_status_page(
         runtime.as_ref(),
         2,
-        &[("device-a", true), ("device-b", false), ("device-c", true)],
+        &[("item-a", true), ("item-b", false), ("item-c", true)],
     );
 }
 
 #[test]
 fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13760,17 +13751,17 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, i64::MAX),
-                    ("device-b", false, 200, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, i64::MAX),
+                    ("item-b", false, 200, 1),
                 ])],
             }],
         )
         .unwrap();
     let checkpoint_before = runtime.checkpoint().unwrap();
 
-    // Retracting device-b first removes its only key/order/value entry and
-    // prunes the outer key. The later device-a addition then overflows.
+    // Retracting item-b first removes its only key/order/value entry and
+    // prunes the outer key. The later item-a addition then overflows.
     let error = runtime
         .apply_changes(
             2,
@@ -13785,9 +13776,9 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-b", false, 200, -1),
-                    ("device-a", true, 100, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-b", false, 200, -1),
+                    ("item-a", true, 100, 1),
                 ])],
             }],
         )
@@ -13797,11 +13788,7 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
         "overflow must fail the epoch closed: {error}"
     );
     assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before);
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", false)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", false)]);
 
     let retry = runtime
         .apply_changes(
@@ -13817,12 +13804,12 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-b", false, 200, -1)])],
+                batches: vec![item_status_batch(&[("item-b", false, 200, -1)])],
             }],
         )
         .unwrap();
     assert_eq!(retry.output_deltas.len(), 1);
-    assert_latest_status_page(runtime.as_ref(), 2, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-a", true)]);
     let checkpoint_after_retry = runtime.checkpoint().unwrap();
     let duplicate = runtime
         .apply_changes(
@@ -13837,11 +13824,12 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
 
 #[test]
 fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true group by all";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql =
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true group by all";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13865,9 +13853,9 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
@@ -13889,11 +13877,11 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
 
 #[test]
 fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_min(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_min(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13917,21 +13905,17 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", false, 80, 1),
-                    ("device-b", true, 70, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", false, 80, 1),
+                    ("item-b", true, 70, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", true)]);
 
     runtime
         .apply_changes(
@@ -13947,28 +13931,24 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
                 start_offset_inclusive: 4,
                 end_offset_exclusive: 6,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 90, 1),
-                    ("device-b", false, 120, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 90, 1),
+                    ("item-b", false, 120, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        2,
-        &[("device-a", false), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-a", false), ("item-b", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13992,30 +13972,26 @@ fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 110, 1),
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 120, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 110, 1),
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 120, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status where event_time > 95 group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status where ts > 95 group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14039,27 +14015,27 @@ fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates()
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 110, 1),
-                    ("device-a", true, 100, 1),
-                    ("device-b", true, 90, 1),
-                    ("device-c", false, 120, 1),
-                    ("device-c", true, 80, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 110, 1),
+                    ("item-a", true, 100, 1),
+                    ("item-b", true, 90, 1),
+                    ("item-c", false, 120, 1),
+                    ("item-c", true, 80, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_cte_source_filters() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "with status_source as (select * from device_status where event_time > 95) select device_id, arg_max(enabled, event_time) as enabled from status_source where enabled = true group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "with status_source as (select * from item_status where ts > 95) select key, arg_max(flag, ts) as flag from status_source where flag = true group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14083,25 +14059,25 @@ fn runtime_materializes_latest_by_key_cte_source_filters() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_derived_table_source_filters() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select s.device_id, arg_max(s.enabled, s.event_time) as enabled from (select * from device_status where event_time > 95) s where s.enabled = true group by s.device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select s.key, arg_max(s.flag, s.ts) as flag from (select * from item_status where ts > 95) s where s.flag = true group by s.key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14125,25 +14101,25 @@ fn runtime_materializes_latest_by_key_derived_table_source_filters() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device_id desc limit 1";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key order by key desc limit 1";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14167,15 +14143,15 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 110, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 110, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", false)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-b", false)]);
 
     let checkpoint = runtime.checkpoint().unwrap();
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
@@ -14193,21 +14169,21 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-c", true, 120, 1)])],
+                batches: vec![item_status_batch(&[("item-c", true, 120, 1)])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(restored.as_ref(), 2, &[("device-c", true)]);
+    assert_latest_status_page(restored.as_ref(), 2, &[("item-c", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device_id desc limit 1 offset 1";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key order by key desc limit 1 offset 1";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14231,15 +14207,15 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 110, 1),
-                    ("device-c", true, 120, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 110, 1),
+                    ("item-c", true, 120, 1),
                 ])],
             }],
         )
         .unwrap();
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", false)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-b", false)]);
 
     runtime
         .apply_changes(
@@ -14255,20 +14231,20 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
                 start_offset_inclusive: 3,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-d", false, 130, 1)])],
+                batches: vec![item_status_batch(&[("item-d", false, 130, 1)])],
             }],
         )
         .unwrap();
-    assert_latest_status_page(runtime.as_ref(), 2, &[("device-c", true)]);
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-c", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled, event_time) desc limit 1";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(flag, ts) desc limit 1";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14292,15 +14268,15 @@ fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 100, 1),
-                    ("device-b", true, 110, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 100, 1),
+                    ("item-b", true, 110, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-b", true)]);
 }
 
 #[test]
@@ -17566,7 +17542,7 @@ fn assert_latest_status_page(
             ScopedViewId {
                 tenant_id: "tenant-a".to_string(),
                 program_id: "program-purchases".to_string(),
-                view_id: "latest_device_status".to_string(),
+                view_id: "latest_item_status".to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -17577,25 +17553,25 @@ fn assert_latest_status_page(
         .unwrap();
 
     let batch = &page.batches[0];
-    let device_ids = batch
+    let keys = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    let enabled = batch
+    let flag = batch
         .column(1)
         .as_any()
         .downcast_ref::<BooleanArray>()
         .unwrap();
 
     assert_eq!(batch.num_rows(), expected.len());
-    for (index, (device_id, is_enabled)) in expected.iter().enumerate() {
-        assert_eq!(device_ids.value(index), *device_id);
-        assert_eq!(enabled.value(index), *is_enabled);
+    for (index, (key, is_enabled)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
+        assert_eq!(flag.value(index), *is_enabled);
     }
 }
 
-fn assert_device_enabled_flags_page(
+fn assert_item_enabled_flags_page(
     runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
     epoch: u64,
     expected: &[(&str, i64)],
@@ -17605,7 +17581,7 @@ fn assert_device_enabled_flags_page(
             ScopedViewId {
                 tenant_id: "tenant-a".to_string(),
                 program_id: "program-purchases".to_string(),
-                view_id: "device_enabled_flags".to_string(),
+                view_id: "item_enabled_flags".to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -17616,7 +17592,7 @@ fn assert_device_enabled_flags_page(
         .unwrap();
 
     let batch = &page.batches[0];
-    let device_ids = batch
+    let keys = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
@@ -17628,8 +17604,8 @@ fn assert_device_enabled_flags_page(
         .unwrap();
 
     assert_eq!(batch.num_rows(), expected.len());
-    for (index, (device_id, enabled_flag)) in expected.iter().enumerate() {
-        assert_eq!(device_ids.value(index), *device_id);
+    for (index, (key, enabled_flag)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
         assert_eq!(flags.value(index), *enabled_flag);
     }
 }
@@ -18118,15 +18094,15 @@ fn accounts_catalog_with_user_id_key() -> VelorixRelationCatalogV1 {
     catalog
 }
 
-fn device_status_catalog() -> VelorixRelationCatalogV1 {
+fn item_status_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
-        relation_id: "device_status".to_string(),
-        relation_name: "device_status".to_string(),
+        relation_id: "item_status".to_string(),
+        relation_name: "item_status".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
         columns: vec![
             RelationColumnV1 {
-                column_id: "device_id".to_string(),
-                name: "device_id".to_string(),
+                column_id: "key".to_string(),
+                name: "key".to_string(),
                 logical_type: VelorixLogicalTypeV1::Utf8,
                 physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
                 nullable: false,
@@ -18134,8 +18110,8 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::PrimaryKey,
             },
             RelationColumnV1 {
-                column_id: "enabled".to_string(),
-                name: "enabled".to_string(),
+                column_id: "flag".to_string(),
+                name: "flag".to_string(),
                 logical_type: VelorixLogicalTypeV1::Bool,
                 physical_arrow_type: ArrowPhysicalTypeV1::Boolean,
                 nullable: false,
@@ -18143,8 +18119,8 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Value,
             },
             RelationColumnV1 {
-                column_id: "event_time".to_string(),
-                name: "event_time".to_string(),
+                column_id: "ts".to_string(),
+                name: "ts".to_string(),
                 logical_type: VelorixLogicalTypeV1::Int64,
                 physical_arrow_type: ArrowPhysicalTypeV1::Int64,
                 nullable: false,
@@ -18161,10 +18137,10 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Weight,
             },
         ],
-        primary_key_column_ids: vec!["device_id".to_string()],
+        primary_key_column_ids: vec!["key".to_string()],
         weight_column_id: "delta".to_string(),
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
-        event_time_column_id: Some("event_time".to_string()),
+        event_time_column_id: Some("ts".to_string()),
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
@@ -18174,11 +18150,11 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
         datafusion_registration: DataFusionRegistrationV1 {
-            name: "device_status".to_string(),
+            name: "item_status".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
         incremental_relation: IncrementalRelationBindingV1 {
-            relation_id: "device_status".to_string(),
+            relation_id: "item_status".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
@@ -19234,38 +19210,38 @@ fn purchases_window_stats_output_schema() -> RelationSchema {
     }
 }
 
-fn latest_device_status_output_schema() -> RelationSchema {
+fn latest_item_status_output_schema() -> RelationSchema {
     RelationSchema {
-        relation_id: "latest_device_status".to_string(),
-        relation_name: "latest_device_status".to_string(),
+        relation_id: "latest_item_status".to_string(),
+        relation_name: "latest_item_status".to_string(),
         relation_version: "v1".to_string(),
         schema_fingerprint:
             "sha256:0000000000000000000000000000000000000000000000000000000000000007".to_string(),
         columns: vec![
             ColumnSchema {
-                name: "device_id".to_string(),
+                name: "key".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: false,
             },
             ColumnSchema {
-                name: "enabled".to_string(),
+                name: "flag".to_string(),
                 data_type: SqlDataType::Bool,
                 nullable: false,
             },
         ],
-        primary_key: vec!["device_id".to_string()],
+        primary_key: vec!["key".to_string()],
     }
 }
 
-fn device_status_flag_output_schema() -> RelationSchema {
+fn item_status_flag_output_schema() -> RelationSchema {
     RelationSchema {
-        relation_id: "device_enabled_flags".to_string(),
-        relation_name: "device_enabled_flags".to_string(),
+        relation_id: "item_enabled_flags".to_string(),
+        relation_name: "item_enabled_flags".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
-        schema_fingerprint: "device-status-flag-v1".to_string(),
+        schema_fingerprint: "item-status-flag-v1".to_string(),
         columns: vec![
             ColumnSchema {
-                name: "device_id".to_string(),
+                name: "key".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: false,
             },
@@ -19275,7 +19251,7 @@ fn device_status_flag_output_schema() -> RelationSchema {
                 nullable: false,
             },
         ],
-        primary_key: vec!["device_id".to_string()],
+        primary_key: vec!["key".to_string()],
     }
 }
 
@@ -19750,29 +19726,23 @@ fn row_number_logical_plan(
     logical_plan
 }
 
-fn device_status_batch(rows: &[(&str, bool, i64, i64)]) -> RecordBatch {
+fn item_status_batch(rows: &[(&str, bool, i64, i64)]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("device_id", DataType::Utf8, false),
-            Field::new("enabled", DataType::Boolean, false),
-            Field::new("event_time", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("ts", DataType::Int64, false),
             Field::new("delta", DataType::Int64, false),
         ])),
         vec![
             Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(device_id, _, _, _)| *device_id)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|(key, _, _, _)| *key).collect::<Vec<_>>(),
             )),
             Arc::new(BooleanArray::from(
-                rows.iter()
-                    .map(|(_, enabled, _, _)| *enabled)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|(_, flag, _, _)| *flag).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
-                rows.iter()
-                    .map(|(_, _, event_time, _)| *event_time)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|(_, _, ts, _)| *ts).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
                 rows.iter()

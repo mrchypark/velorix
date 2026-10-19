@@ -274,6 +274,7 @@ fn checkpoint_pointer(epoch: u64, hash_char: char) -> StandingRuntimeCheckpointP
         plan_hash: String::new(),
         coverage_hash: String::new(),
         input_coverage: None,
+        published_input_bootstrap: None,
         previous_checkpoint_key: String::new(),
         previous_manifest_hash: String::new(),
     }

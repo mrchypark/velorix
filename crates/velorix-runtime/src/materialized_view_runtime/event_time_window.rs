@@ -1,4 +1,218 @@
 use super::*;
+use velorix_core::processed_spans::ProcessedSpans;
+use velorix_core::standing_program::DemandFrontierMode;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DemandPartitionCoverage {
+    relation_id: String,
+    relation_version: String,
+    stream_id: String,
+    partition_id: u32,
+    spans: ProcessedSpans,
+}
+
+impl DemandPartitionCoverage {
+    fn matches(&self, input: &RelationInputBatch) -> bool {
+        self.relation_id == input.relation_id
+            && self.relation_version == input.relation_version
+            && self.stream_id == input.stream_id
+            && self.partition_id == input.partition_id
+    }
+
+    fn frontier(&self) -> RelationFrontier {
+        RelationFrontier {
+            relation_id: self.relation_id.clone(),
+            relation_version: self.relation_version.clone(),
+            stream_id: self.stream_id.clone(),
+            partition_id: self.partition_id,
+            committed_offset_exclusive: self.spans.contiguous_frontier(),
+        }
+    }
+}
+
+fn prefix_coverage(
+    frontiers: &[RelationFrontier],
+) -> Result<Vec<DemandPartitionCoverage>, StandingProgramRuntimeError> {
+    frontiers
+        .iter()
+        .map(|frontier| {
+            Ok(DemandPartitionCoverage {
+                relation_id: frontier.relation_id.clone(),
+                relation_version: frontier.relation_version.clone(),
+                stream_id: frontier.stream_id.clone(),
+                partition_id: frontier.partition_id,
+                spans: ProcessedSpans::from_prefix(
+                    frontier.committed_offset_exclusive,
+                    frontier.committed_offset_exclusive,
+                )
+                .map_err(|_| invalid_checkpoint())?,
+            })
+        })
+        .collect()
+}
+
+fn sparse_frontiers(coverage: &[DemandPartitionCoverage]) -> Vec<RelationFrontier> {
+    let mut frontiers: Vec<_> = coverage
+        .iter()
+        .map(DemandPartitionCoverage::frontier)
+        .collect();
+    frontiers.sort_by(|a, b| {
+        (
+            &a.relation_id,
+            &a.relation_version,
+            &a.stream_id,
+            a.partition_id,
+        )
+            .cmp(&(
+                &b.relation_id,
+                &b.relation_version,
+                &b.stream_id,
+                b.partition_id,
+            ))
+    });
+    frontiers
+}
+
+fn cover_input(
+    coverage: &mut Vec<DemandPartitionCoverage>,
+    input: &RelationInputBatch,
+) -> Result<(), StandingProgramRuntimeError> {
+    if input.end_offset_exclusive < input.start_offset_inclusive {
+        return Err(invalid_runtime_state());
+    }
+    let index = match coverage.iter().position(|entry| entry.matches(input)) {
+        Some(index) => index,
+        None => {
+            coverage.push(DemandPartitionCoverage {
+                relation_id: input.relation_id.clone(),
+                relation_version: input.relation_version.clone(),
+                stream_id: input.stream_id.clone(),
+                partition_id: input.partition_id,
+                spans: ProcessedSpans::new(0),
+            });
+            coverage.len() - 1
+        }
+    };
+    let spans = &mut coverage[index].spans;
+    if input.end_offset_exclusive > spans.rows_total() {
+        *spans = ProcessedSpans::from_spans(input.end_offset_exclusive, spans.as_spans())
+            .map_err(|_| invalid_runtime_state())?;
+    }
+    if input.start_offset_inclusive < input.end_offset_exclusive {
+        spans
+            .insert(input.start_offset_inclusive, input.end_offset_exclusive)
+            .map_err(|_| invalid_runtime_state())?;
+    }
+    Ok(())
+}
+
+fn uncovered_inputs(
+    coverage: &[DemandPartitionCoverage],
+    inputs: &[RelationInputBatch],
+) -> Result<Vec<RelationInputBatch>, StandingProgramRuntimeError> {
+    let mut coverage = coverage.to_vec();
+    let mut result = Vec::new();
+    for input in inputs {
+        let rows = input.batches.iter().try_fold(0u64, |total, batch| {
+            total
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(invalid_runtime_state)
+        })?;
+        if input
+            .end_offset_exclusive
+            .checked_sub(input.start_offset_inclusive)
+            != Some(rows)
+        {
+            return Err(event_time_state_error("demand_source_slice_identity"));
+        }
+        if rows == 0 {
+            result.push(input.clone());
+            cover_input(&mut coverage, input)?;
+            continue;
+        }
+        let previous = coverage.iter().find(|entry| entry.matches(input));
+        let spans = ProcessedSpans::from_spans(
+            input
+                .end_offset_exclusive
+                .max(previous.map_or(0, |entry| entry.spans.rows_total())),
+            previous.map_or_else(Vec::new, |entry| entry.spans.as_spans()),
+        )
+        .map_err(|_| invalid_runtime_state())?;
+        for [start, end] in spans.unprocessed_runs() {
+            let start = start.max(input.start_offset_inclusive);
+            let end = end.min(input.end_offset_exclusive);
+            if start >= end {
+                continue;
+            }
+            let mut selected = input.clone();
+            selected.start_offset_inclusive = start;
+            selected.end_offset_exclusive = end;
+            selected.batches.clear();
+            let mut base = input.start_offset_inclusive;
+            for batch in &input.batches {
+                let next = base
+                    .checked_add(batch.num_rows() as u64)
+                    .ok_or_else(invalid_runtime_state)?;
+                let lo = base.max(start);
+                let hi = next.min(end);
+                if lo < hi {
+                    selected.batches.push(batch.slice(
+                        usize::try_from(lo - base).map_err(|_| invalid_runtime_state())?,
+                        usize::try_from(hi - lo).map_err(|_| invalid_runtime_state())?,
+                    ));
+                }
+                base = next;
+            }
+            result.push(selected);
+        }
+        cover_input(&mut coverage, input)?;
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeferredDemandFrontiers {
+    replay_id: String,
+    input_frontiers: Vec<RelationFrontier>,
+    input_event_time_frontiers: Vec<InputEventTimeFrontier>,
+    output_readiness: Vec<InputEventTimeFrontier>,
+    #[serde(default)]
+    coverage: Vec<DemandPartitionCoverage>,
+}
+
+fn event_frontier_covers(next: &InputEventTimeFrontier, prior: &InputEventTimeFrontier) -> bool {
+    next.relation_id == prior.relation_id
+        && next.relation_version == prior.relation_version
+        && next.schema_fingerprint == prior.schema_fingerprint
+        && next.stream_id == prior.stream_id
+        && next.partition_id == prior.partition_id
+        && next.event_time_column_id == prior.event_time_column_id
+        && next.watermark_ns >= prior.watermark_ns
+        && next.max_observed_event_time_ns >= prior.max_observed_event_time_ns
+}
+
+fn merge_demand_watermark(
+    frontiers: &mut Vec<InputEventTimeFrontier>,
+    input: &RelationInputBatch,
+) -> Result<(), StandingProgramRuntimeError> {
+    let mut single = Vec::new();
+    advance_input_event_time_frontier(&mut single, input)?;
+    let Some(incoming) = single.pop() else {
+        return Ok(());
+    };
+    if frontiers
+        .iter()
+        .any(|prior| event_frontier_covers(prior, &incoming))
+    {
+        return Ok(());
+    }
+    // A later authenticated publication may arrive before an older one. Only
+    // dominating evidence advances the private watermark; incomparable values
+    // still fail the ordinary monotonicity validator.
+    advance_input_event_time_frontier(frontiers, input)
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -28,9 +242,106 @@ pub struct TumblingEventTimeAggregateRuntime {
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
     applied_epochs: BTreeMap<String, LogicalEpoch>,
     logical_epoch: LogicalEpoch,
+    deferred_demand: Option<DeferredDemandFrontiers>,
+    demand_mode: Option<DemandFrontierMode>,
 }
 
 impl TumblingEventTimeAggregateRuntime {
+    fn validate_demand_frontiers(
+        &self,
+        pending: &DeferredDemandFrontiers,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        if pending.replay_id.trim().is_empty() {
+            return Err(invalid_checkpoint());
+        }
+        let derived = sparse_frontiers(&pending.coverage);
+        let mut identities = BTreeSet::new();
+        if derived.len() != pending.input_frontiers.len()
+            || derived
+                .iter()
+                .any(|frontier| !pending.input_frontiers.contains(frontier))
+            || pending.coverage.iter().any(|entry| {
+                !identities.insert((
+                    entry.relation_id.as_str(),
+                    entry.relation_version.as_str(),
+                    entry.stream_id.as_str(),
+                    entry.partition_id,
+                ))
+            })
+        {
+            return Err(event_time_state_error("demand_sparse_frontier_mismatch"));
+        }
+        // Validate metadata without serializing or copying accumulator state.
+        let mut checkpoint = RuntimeCheckpoint {
+            identity: self.identity.clone(),
+            logical_epoch: self.logical_epoch,
+            input_frontiers: pending.input_frontiers.clone(),
+            input_event_time_frontiers: pending.output_readiness.clone(),
+            output_frontiers: self
+                .identity
+                .view_ids
+                .iter()
+                .map(|view_id| ViewFrontier {
+                    view_id: view_id.clone(),
+                    committed_epoch: self.logical_epoch,
+                })
+                .collect(),
+            checkpoint_codec_identity: self.identity.checkpoint_codec_identity.clone(),
+            state_root: DurableStateRoot {
+                object_key: String::new(),
+                content_hash: String::new(),
+            },
+            state_payload: None,
+            output_manifest_refs: Vec::new(),
+            owner_epoch: None,
+            input_coverage: None,
+            causal_cut: None,
+        };
+        validate_checkpoint_frontiers_for_schemas(
+            &checkpoint,
+            std::slice::from_ref(&self.input_schema),
+        )?;
+        validate_input_event_time_frontiers_for_catalogs(
+            &checkpoint,
+            std::slice::from_ref(&self.catalog),
+        )?;
+        checkpoint.input_event_time_frontiers = pending.input_event_time_frontiers.clone();
+        validate_input_event_time_frontiers_for_catalogs(
+            &checkpoint,
+            std::slice::from_ref(&self.catalog),
+        )?;
+        for prior in &self.input_frontiers {
+            if !pending.input_frontiers.iter().any(|next| {
+                next.relation_id == prior.relation_id
+                    && next.relation_version == prior.relation_version
+                    && next.stream_id == prior.stream_id
+                    && next.partition_id == prior.partition_id
+                    && next.committed_offset_exclusive >= prior.committed_offset_exclusive
+            }) {
+                return Err(invalid_checkpoint());
+            }
+        }
+        for prior in &self.input_event_time_frontiers {
+            if !pending.output_readiness.is_empty()
+                && !pending
+                    .output_readiness
+                    .iter()
+                    .any(|next| event_frontier_covers(next, prior))
+            {
+                return Err(event_time_state_error("demand_readiness_regression"));
+            }
+        }
+        if self.input_event_time_frontiers.iter().any(|prior| {
+            !pending
+                .input_event_time_frontiers
+                .iter()
+                .any(|next| event_frontier_covers(next, prior))
+        }) {
+            return Err(event_time_state_error("demand_replay_watermark_regression"));
+        }
+        Ok(())
+    }
+
     pub fn new_with_logical_plan(
         identity: StandingProgramIdentity,
         catalog: VelorixRelationCatalogV1,
@@ -95,6 +406,8 @@ impl TumblingEventTimeAggregateRuntime {
             input_event_time_frontiers: Vec::new(),
             applied_epochs: BTreeMap::new(),
             logical_epoch: 0,
+            deferred_demand: None,
+            demand_mode: None,
         })
     }
 
@@ -184,14 +497,32 @@ impl TumblingEventTimeAggregateRuntime {
     }
 
     fn input_is_committed(&self, input: &RelationInputBatch) -> bool {
+        if let Some(pending) = &self.deferred_demand {
+            return input.start_offset_inclusive <= input.end_offset_exclusive
+                && pending
+                    .coverage
+                    .iter()
+                    .find(|entry| entry.matches(input))
+                    .is_some_and(|entry| {
+                        entry.spans.as_spans().iter().any(|[start, end]| {
+                            *start <= input.start_offset_inclusive
+                                && *end >= input.end_offset_exclusive
+                        })
+                    });
+        }
         input.start_offset_inclusive <= input.end_offset_exclusive
-            && self.input_frontiers.iter().any(|frontier| {
-                frontier.relation_id == input.relation_id
-                    && frontier.relation_version == input.relation_version
-                    && frontier.stream_id == input.stream_id
-                    && frontier.partition_id == input.partition_id
-                    && input.end_offset_exclusive <= frontier.committed_offset_exclusive
-            })
+            && self
+                .deferred_demand
+                .as_ref()
+                .map_or(&self.input_frontiers, |pending| &pending.input_frontiers)
+                .iter()
+                .any(|frontier| {
+                    frontier.relation_id == input.relation_id
+                        && frontier.relation_version == input.relation_version
+                        && frontier.stream_id == input.stream_id
+                        && frontier.partition_id == input.partition_id
+                        && input.end_offset_exclusive <= frontier.committed_offset_exclusive
+                })
     }
 
     fn validate_hydrated_row(
@@ -238,12 +569,22 @@ impl TumblingEventTimeAggregateRuntime {
         undo: &TumblingEpochUndoLog,
         watermark: Option<i64>,
     ) -> Result<DeltaBatch, StandingProgramRuntimeError> {
-        let affected = correction_affected_windows(
+        let mut affected = correction_affected_windows(
             undo.rows.keys().cloned(),
             &self.windows_by_end,
             min_event_time_watermark(&self.input_event_time_frontiers),
             watermark,
         );
+        // A newly discovered partition may lower speculative readiness. Retract
+        // output beyond that bound without rewinding any committed watermark.
+        if self.deferred_demand.is_some() {
+            for key in self.correction_output.keys() {
+                let (_, end) = window_key_bounds(key)?;
+                if watermark.is_none_or(|bound| end > bound) {
+                    affected.insert(key.clone());
+                }
+            }
+        }
         let selected = TumblingWindowState {
             rows: affected
                 .iter()
@@ -326,6 +667,7 @@ impl TumblingEventTimeAggregateRuntime {
             logical_plan: self.logical_plan.clone(),
             input_frontiers: self.input_frontiers.clone(),
             input_event_time_frontiers: self.input_event_time_frontiers.clone(),
+            deferred_demand: self.deferred_demand.clone(),
             state: TumblingWindowState {
                 rows: self
                     .state
@@ -373,6 +715,12 @@ impl TumblingEventTimeAggregateRuntime {
         {
             return Err(invalid_checkpoint());
         }
+        if payload.deferred_demand.is_some()
+            && stable_bytes_hash(state_payload.payload.as_bytes())
+                != checkpoint.state_root.content_hash
+        {
+            return Err(invalid_checkpoint());
+        }
         validate_tumbling_supported_schemas(
             &payload.catalog,
             &payload.input_schema,
@@ -388,6 +736,18 @@ impl TumblingEventTimeAggregateRuntime {
                 return Err(invalid_checkpoint());
             }
             let watermark = min_event_time_watermark(&payload.input_event_time_frontiers);
+            let output_watermark = finalization_frontier(
+                payload.plan.late_row_policy,
+                min_event_time_watermark(
+                    payload
+                        .deferred_demand
+                        .as_ref()
+                        .filter(|pending| !pending.output_readiness.is_empty())
+                        .map_or(&payload.input_event_time_frontiers, |pending| {
+                            &pending.output_readiness
+                        }),
+                ),
+            );
             let cutoff = watermark.map(|watermark| watermark.saturating_sub(horizon_ns));
             match payload.cold_state_version {
                 None if payload.cold_state_refs.is_empty()
@@ -437,10 +797,11 @@ impl TumblingEventTimeAggregateRuntime {
                     return Err(invalid_checkpoint());
                 }
             }
-            let expected =
-                payload
-                    .state
-                    .closed_delta(&payload.plan, &payload.output_schema, watermark)?;
+            let expected = payload.state.closed_delta(
+                &payload.plan,
+                &payload.output_schema,
+                output_watermark,
+            )?;
             let expected: BTreeMap<String, DeltaRecord> = expected
                 .records()
                 .iter()
@@ -463,7 +824,7 @@ impl TumblingEventTimeAggregateRuntime {
                         .iter()
                         .any(|aggregate| !value.contains_key(&aggregate.output_column_id))
                     || output.insert(key.clone(), record).is_some()
-                    || watermark.is_none_or(|watermark| end > watermark)
+                    || output_watermark.is_none_or(|watermark| end > watermark)
                     || (!payload.state.rows.contains_key(&key)
                         && !payload.cold_state_refs.contains_key(&key)
                         && !payload
@@ -577,6 +938,111 @@ fn validate_correction_state_row(
 }
 
 impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
+    fn apply_demand_changes_delta_only(
+        &mut self,
+        logical_epoch: LogicalEpoch,
+        idempotency_key: EpochIdempotencyKey,
+        input_changes: Vec<RelationInputBatch>,
+        mode: DemandFrontierMode,
+    ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        if self.demand_mode.is_some() {
+            return Err(invalid_runtime_state());
+        }
+        // Duplicate epochs use normal epoch identity checks and never install a
+        // different frontier merely because the caller retries with a new mode.
+        if self.applied_epochs.contains_key(idempotency_key.as_str()) {
+            return self.apply_changes_delta_only(logical_epoch, idempotency_key, input_changes);
+        }
+        let before = self.deferred_demand.clone();
+        match &mode {
+            DemandFrontierMode::Defer {
+                replay_id,
+                output_readiness,
+            } => {
+                let mut pending = before.clone().unwrap_or_else(|| DeferredDemandFrontiers {
+                    replay_id: replay_id.clone(),
+                    input_frontiers: self.input_frontiers.clone(),
+                    input_event_time_frontiers: self.input_event_time_frontiers.clone(),
+                    output_readiness: Vec::new(),
+                    coverage: Vec::new(),
+                });
+                if before.is_none() {
+                    pending.coverage = prefix_coverage(&pending.input_frontiers)?;
+                }
+                if pending.replay_id != *replay_id
+                    || (!output_readiness.is_empty()
+                        && pending.output_readiness.iter().any(|prior| {
+                            !output_readiness
+                                .iter()
+                                .any(|next| event_frontier_covers(next, prior))
+                        }))
+                {
+                    return Err(event_time_state_error(
+                        "demand_replay_identity_or_readiness_changed",
+                    ));
+                }
+                if !output_readiness.is_empty() {
+                    pending.output_readiness = output_readiness.clone();
+                }
+                self.validate_demand_frontiers(&pending)?;
+                self.deferred_demand = Some(pending);
+            }
+            DemandFrontierMode::Install {
+                replay_id,
+                input_frontiers,
+                input_event_time_frontiers,
+            } => {
+                // Empty genesis/already-installed retries can install only the
+                // exact committed frontiers; absence never proves new offsets.
+                let pending = before.clone().unwrap_or_else(|| DeferredDemandFrontiers {
+                    replay_id: replay_id.clone(),
+                    input_frontiers: self.input_frontiers.clone(),
+                    input_event_time_frontiers: self.input_event_time_frontiers.clone(),
+                    output_readiness: Vec::new(),
+                    coverage: Vec::new(),
+                });
+                let mut pending = pending;
+                if before.is_none() {
+                    pending.coverage = prefix_coverage(&pending.input_frontiers)?;
+                }
+                self.validate_demand_frontiers(&pending)?;
+                if !input_changes.is_empty()
+                    || pending.replay_id != *replay_id
+                    || pending
+                        .coverage
+                        .iter()
+                        .any(|entry| !entry.spans.is_complete())
+                    || pending.input_frontiers.len() != input_frontiers.len()
+                    || pending
+                        .input_frontiers
+                        .iter()
+                        .any(|frontier| !input_frontiers.contains(frontier))
+                    || pending.input_event_time_frontiers.len() != input_event_time_frontiers.len()
+                    || pending
+                        .input_event_time_frontiers
+                        .iter()
+                        .any(|frontier| !input_event_time_frontiers.contains(frontier))
+                    || pending.output_readiness.iter().any(|prior| {
+                        !input_event_time_frontiers
+                            .iter()
+                            .any(|next| event_frontier_covers(next, prior))
+                    })
+                {
+                    return Err(event_time_state_error(
+                        "demand_install_incomplete_frontiers",
+                    ));
+                }
+            }
+        }
+        self.demand_mode = Some(mode);
+        let result = self.apply_changes_delta_only(logical_epoch, idempotency_key, input_changes);
+        self.demand_mode = None;
+        if result.is_err() {
+            self.deferred_demand = before;
+        }
+        result
+    }
+
     fn program_identity(&self) -> &StandingProgramIdentity {
         &self.identity
     }
@@ -598,10 +1064,17 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
         inputs: &[RelationInputBatch],
     ) -> Result<Vec<EventTimeStateRequest>, StandingProgramRuntimeError> {
         self.validate_event_time_corrections(inputs)?;
+        let selected;
+        let inputs = if let Some(pending) = &self.deferred_demand {
+            selected = uncovered_inputs(&pending.coverage, inputs)?;
+            selected.as_slice()
+        } else {
+            inputs
+        };
         if self.correction_horizon().is_none() {
             return Ok(Vec::new());
         }
-        let key_column = catalog_primary_key_column(&self.catalog)?;
+        let key_column = catalog_column_by_id(&self.catalog, &self.plan.group_key_column_id)?;
         let value_column = catalog_column_by_id(&self.catalog, &self.plan.sum_value_column_id)?;
         let event_column = catalog_column_by_id(&self.catalog, &self.plan.event_time_column_id)?;
         let weight_column = catalog_column_by_id(
@@ -877,6 +1350,13 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
         if self.correction_horizon().is_none() {
             return Ok(());
         }
+        let selected;
+        let inputs = if let Some(pending) = &self.deferred_demand {
+            selected = uncovered_inputs(&pending.coverage, inputs)?;
+            selected.as_slice()
+        } else {
+            inputs
+        };
         let watermark = min_event_time_watermark(&self.input_event_time_frontiers);
         let mut candidate_frontiers = self.input_event_time_frontiers.clone();
         let column = catalog_column_by_id(&self.catalog, &self.plan.event_time_column_id)?;
@@ -887,14 +1367,9 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
                 "tumbling_event_time_input_relation",
             )?;
             published_input_empty_delta(input, &self.catalog)?;
-            if input.start_offset_inclusive <= input.end_offset_exclusive
-                && self.input_frontiers.iter().any(|frontier| {
-                    frontier.relation_id == input.relation_id
-                        && frontier.relation_version == input.relation_version
-                        && frontier.stream_id == input.stream_id
-                        && frontier.partition_id == input.partition_id
-                        && input.end_offset_exclusive <= frontier.committed_offset_exclusive
-                })
+            if self.input_is_committed(input)
+                && (self.demand_mode.is_none()
+                    || input.batches.iter().any(|batch| batch.num_rows() > 0))
             {
                 continue;
             }
@@ -905,7 +1380,11 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
                     field: "tumbling_event_time_input_batch",
                 });
             }
-            advance_input_event_time_frontier(&mut candidate_frontiers, input)?;
+            if self.deferred_demand.is_some() {
+                merge_demand_watermark(&mut candidate_frontiers, input)?;
+            } else {
+                advance_input_event_time_frontier(&mut candidate_frontiers, input)?;
+            }
             for batch in &input.batches {
                 let index = batch_column_index(batch, &column.name)?;
                 for row in 0..batch.num_rows() {
@@ -960,6 +1439,18 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             });
         }
 
+        if self.deferred_demand.is_some() && self.demand_mode.is_none() {
+            return Err(event_time_state_error(
+                "demand_replay_requires_explicit_mode",
+            ));
+        }
+
+        let input_changes = if let Some(pending) = &self.deferred_demand {
+            uncovered_inputs(&pending.coverage, &input_changes)?
+        } else {
+            input_changes
+        };
+
         self.validate_event_time_corrections(&input_changes)?;
         if !self.event_time_state_requests(&input_changes)?.is_empty() {
             return Err(event_time_state_error(
@@ -968,11 +1459,43 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
         }
         let mut undo = TumblingEpochUndoLog::default();
         let mut next_output = None;
+        let mut next_coverage = self
+            .deferred_demand
+            .as_ref()
+            .map_or_else(Vec::new, |pending| pending.coverage.clone());
         let result = (|| {
-            let mut next_frontiers = self.input_frontiers.clone();
-            let mut next_event_time_frontiers = self.input_event_time_frontiers.clone();
+            let mut next_frontiers = self.deferred_demand.as_ref().map_or_else(
+                || self.input_frontiers.clone(),
+                |pending| pending.input_frontiers.clone(),
+            );
+            let mut next_event_time_frontiers = self.deferred_demand.as_ref().map_or_else(
+                || self.input_event_time_frontiers.clone(),
+                |pending| pending.input_event_time_frontiers.clone(),
+            );
             for input in input_changes {
-                if self.correction_horizon().is_some() && self.input_is_committed(&input) {
+                if self.demand_mode.is_some() {
+                    let rows = input.batches.iter().try_fold(0u64, |total, batch| {
+                        total
+                            .checked_add(batch.num_rows() as u64)
+                            .ok_or_else(invalid_runtime_state)
+                    })?;
+                    if input
+                        .end_offset_exclusive
+                        .checked_sub(input.start_offset_inclusive)
+                        != Some(rows)
+                        || input.event_time_watermark.as_ref().is_none_or(|watermark| {
+                            watermark.stream_id != input.stream_id
+                                || watermark.partition_id != input.partition_id
+                        })
+                    {
+                        return Err(event_time_state_error("demand_source_slice_identity"));
+                    }
+                }
+                if (self.correction_horizon().is_some() || self.demand_mode.is_some())
+                    && self.input_is_committed(&input)
+                    && (self.demand_mode.is_none()
+                        || input.batches.iter().any(|batch| batch.num_rows() > 0))
+                {
                     continue;
                 }
                 validate_input_matches_schema(
@@ -989,13 +1512,35 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
                     &input,
                     None,
                 )?;
-                advance_input_frontier(&mut next_frontiers, &input)?;
-                advance_input_event_time_frontier(&mut next_event_time_frontiers, &input)?;
+                if self.deferred_demand.is_some() {
+                    cover_input(&mut next_coverage, &input)?;
+                    next_frontiers = sparse_frontiers(&next_coverage);
+                    merge_demand_watermark(&mut next_event_time_frontiers, &input)?;
+                } else {
+                    advance_input_frontier(&mut next_frontiers, &input)?;
+                    advance_input_event_time_frontier(&mut next_event_time_frontiers, &input)?;
+                }
+            }
+            if let Some(pending) = &self.deferred_demand {
+                let mut candidate = pending.clone();
+                candidate.input_frontiers = next_frontiers.clone();
+                candidate.input_event_time_frontiers = next_event_time_frontiers.clone();
+                candidate.coverage = next_coverage.clone();
+                self.validate_demand_frontiers(&candidate)?;
             }
             // The watermark publishes closed windows; late corrections do not rewind it.
             let effective_watermark = finalization_frontier(
                 self.plan.late_row_policy,
-                min_event_time_watermark(&next_event_time_frontiers),
+                min_event_time_watermark(match (&self.demand_mode, &self.deferred_demand) {
+                    (Some(DemandFrontierMode::Defer { .. }), Some(pending)) => {
+                        if pending.output_readiness.is_empty() {
+                            &self.input_event_time_frontiers
+                        } else {
+                            &pending.output_readiness
+                        }
+                    }
+                    _ => &next_event_time_frontiers,
+                }),
             );
             if self.correction_horizon().is_some() {
                 for key in undo.rows.keys() {
@@ -1083,14 +1628,27 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             })
         })();
         match result {
-            Ok(commit) => {
+            Ok(mut commit) => {
                 if self.correction_horizon().is_some() {
                     self.commit_correction(&undo, &commit.output_deltas[0].delta);
                 } else {
                     self.published_output = next_output.expect("successful epoch stages output");
                 }
-                self.input_frontiers = commit.input_frontiers.clone();
-                self.input_event_time_frontiers = commit.input_event_time_frontiers.clone();
+                if matches!(self.demand_mode, Some(DemandFrontierMode::Defer { .. })) {
+                    let pending = self
+                        .deferred_demand
+                        .as_mut()
+                        .expect("deferred demand initialized");
+                    pending.input_frontiers = commit.input_frontiers.clone();
+                    pending.input_event_time_frontiers = commit.input_event_time_frontiers.clone();
+                    pending.coverage = next_coverage;
+                    commit.input_frontiers = self.input_frontiers.clone();
+                    commit.input_event_time_frontiers = self.input_event_time_frontiers.clone();
+                } else {
+                    self.input_frontiers = commit.input_frontiers.clone();
+                    self.input_event_time_frontiers = commit.input_event_time_frontiers.clone();
+                    self.deferred_demand = None;
+                }
                 self.applied_epochs
                     .insert(idempotency_key_text, logical_epoch);
                 retain_recent_applied_epochs(&mut self.applied_epochs);
@@ -1234,7 +1792,7 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
                     .insert(key.clone());
             }
         }
-        Ok(Self {
+        let runtime = Self {
             identity: checkpoint.identity,
             catalog: payload.catalog,
             input_schema: payload.input_schema,
@@ -1253,16 +1811,543 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             cold_state_refs: payload.cold_state_refs,
             legacy_replay_before_ns: payload.legacy_replay_before_ns,
             input_frontiers: checkpoint.input_frontiers,
+            deferred_demand: payload.deferred_demand,
+            demand_mode: None,
             input_event_time_frontiers: checkpoint.input_event_time_frontiers,
             applied_epochs,
             logical_epoch: checkpoint.logical_epoch,
-        })
+        };
+        if let Some(pending) = &runtime.deferred_demand {
+            runtime.validate_demand_frontiers(pending)?;
+        }
+        Ok(runtime)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use velorix_core::standing_program::InputEventTimeWatermark;
+
+    fn demand_runtime() -> TumblingEventTimeAggregateRuntime {
+        use velorix_core::relation::*;
+        use velorix_core::standing_program::{BuiltinRuntimeIdentity, NativeCodePolicy};
+        use velorix_core::view_contract::ColumnSchema;
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "events".into(),
+            relation_name: "events".into(),
+            relation_version: "v1".into(),
+            columns: ["entity", "amount", "event_time", "weight"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| RelationColumnV1 {
+                    column_id: (*name).into(),
+                    name: (*name).into(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: index as u32,
+                    semantic_role: match index {
+                        0 => RelationSemanticRoleV1::PrimaryKey,
+                        2 => RelationSemanticRoleV1::EventTime,
+                        3 => RelationSemanticRoleV1::Weight,
+                        _ => RelationSemanticRoleV1::Metadata,
+                    },
+                })
+                .collect(),
+            primary_key_column_ids: vec!["entity".into()],
+            weight_column_id: "weight".into(),
+            allowed_operations: vec![RelationOperationV1::Insert],
+            event_time_column_id: Some("event_time".into()),
+        };
+        let fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+        let catalog = VelorixRelationCatalogV1 {
+            relation_source: VelorixRelationSourceV1::SourceRelation,
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                name: "events".into(),
+                mode: DataFusionRegistrationModeV1::Table,
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "events".into(),
+                schema_fingerprint: fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.into(),
+            },
+        };
+        let output = RelationSchema {
+            relation_id: "windows".into(),
+            relation_name: "windows".into(),
+            relation_version: "v1".into(),
+            schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
+            columns: ["entity", "window_start", "window_end", "total", "n"]
+                .iter()
+                .map(|name| ColumnSchema {
+                    name: (*name).into(),
+                    data_type: SqlDataType::Int64,
+                    nullable: false,
+                })
+                .collect(),
+            primary_key: vec!["entity".into(), "window_start".into(), "window_end".into()],
+        };
+        let sql = "select entity, window_start, window_end, sum(amount) as total, count(*) as n from tumble(events, event_time, interval '1 second') group by entity, window_start, window_end";
+        let policy = Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 2_000_000_000,
+        });
+        let plan =
+            validate_supported_tumbling_window_sql_with_policy(sql, &catalog, policy).unwrap();
+        let logical = lower_supported_tumbling_window_sql_to_logical_plan_with_policy(
+            sql, &catalog, &output, policy,
+        )
+        .unwrap();
+        let identity = StandingProgramIdentity {
+            tenant_id: "test".into(),
+            program_id: "deferred-window".into(),
+            view_ids: vec!["windows".into()],
+            sql_hash: stable_bytes_hash(sql.as_bytes()),
+            input_catalog_hash: format!("sha256:{}", "1".repeat(64)),
+            output_schema_hash: output.schema_fingerprint.clone(),
+            planner_identity: "velorix-logical-view-planner@1".into(),
+            builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+                name: CRATE_NAME.into(),
+                version: "0.1.0".into(),
+            }],
+            runtime_capabilities: vec!["materialized-view-runtime-v1".into()],
+            runtime_compatibility: "velorix-materialized-view-runtime-v1".into(),
+            checkpoint_codec_identity: "velorix-standing-program-checkpoint-v1".into(),
+            native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+        };
+        TumblingEventTimeAggregateRuntime::new_with_logical_plan(
+            identity,
+            catalog.clone(),
+            catalog_input_relation_schema(&catalog).unwrap(),
+            output,
+            sql.into(),
+            plan,
+            logical,
+        )
+        .unwrap()
+    }
+
+    fn demand_input(
+        runtime: &TumblingEventTimeAggregateRuntime,
+        start: u64,
+        amount: i64,
+        watermark: i64,
+    ) -> RelationInputBatch {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(
+                ["entity", "amount", "event_time", "weight"]
+                    .iter()
+                    .map(|name| Field::new(*name, DataType::Int64, false))
+                    .collect::<Vec<_>>(),
+            )),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![amount])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        RelationInputBatch {
+            relation_id: "events".into(),
+            relation_version: "v1".into(),
+            schema_fingerprint: runtime.catalog.schema_fingerprint.to_string(),
+            stream_id: "stream".into(),
+            partition_id: 0,
+            start_offset_inclusive: start,
+            end_offset_exclusive: start + 1,
+            event_time_watermark: Some(InputEventTimeWatermark {
+                stream_id: "stream".into(),
+                partition_id: 0,
+                event_time_column_id: "event_time".into(),
+                max_observed_event_time_ns: watermark,
+                watermark_ns: watermark,
+            }),
+            encoding: RelationInputEncodingV1::SourceRelationV1,
+            batches: vec![batch],
+        }
+    }
+
+    fn readiness(
+        runtime: &TumblingEventTimeAggregateRuntime,
+        watermark: i64,
+    ) -> Vec<InputEventTimeFrontier> {
+        let mut frontiers = Vec::new();
+        advance_input_event_time_frontier(&mut frontiers, &demand_input(runtime, 0, 1, watermark))
+            .unwrap();
+        frontiers
+    }
+
+    #[test]
+    fn deferred_slices_restore_deduplicate_and_install_without_reapplying() {
+        let mut runtime = demand_runtime();
+        let ready = readiness(&runtime, 10_000_000_000);
+        let mode = DemandFrontierMode::Defer {
+            replay_id: "generation-1".into(),
+            output_readiness: ready.clone(),
+        };
+        let input = demand_input(&runtime, 0, 7, 10_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                1,
+                EpochIdempotencyKey::new("slice-1").unwrap(),
+                vec![input.clone()],
+                mode.clone(),
+            )
+            .unwrap();
+        let checkpoint = runtime.checkpoint().unwrap();
+        assert!(checkpoint.input_frontiers.is_empty());
+        assert!(checkpoint.input_event_time_frontiers.is_empty());
+        assert_eq!(runtime.snapshot_output().records().len(), 1);
+        let output = runtime.snapshot_output().into_owned();
+        let mut runtime = TumblingEventTimeAggregateRuntime::restore(checkpoint).unwrap();
+        runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("slice-1-retry").unwrap(),
+                vec![input],
+                mode.clone(),
+            )
+            .unwrap();
+        assert_eq!(runtime.snapshot_output().records(), output.records());
+        // Speculative readiness must not advance the committed retention frontier.
+        assert!(runtime.export_event_time_state().unwrap().is_empty());
+        let second = demand_input(&runtime, 1, 5, 10_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                3,
+                EpochIdempotencyKey::new("slice-2").unwrap(),
+                vec![second],
+                mode,
+            )
+            .unwrap();
+        let pending = runtime.deferred_demand.clone().unwrap();
+        let before = runtime.snapshot_output().into_owned();
+        let bad_install = DemandFrontierMode::Install {
+            replay_id: "generation-1".into(),
+            input_frontiers: Vec::new(),
+            input_event_time_frontiers: ready.clone(),
+        };
+        assert!(runtime
+            .apply_demand_changes_delta_only(
+                4,
+                EpochIdempotencyKey::new("bad-install").unwrap(),
+                vec![],
+                bad_install
+            )
+            .is_err());
+        let mode = DemandFrontierMode::Install {
+            replay_id: "generation-1".into(),
+            input_frontiers: pending.input_frontiers,
+            input_event_time_frontiers: pending.input_event_time_frontiers,
+        };
+        runtime
+            .apply_demand_changes_delta_only(
+                4,
+                EpochIdempotencyKey::new("install").unwrap(),
+                vec![],
+                mode,
+            )
+            .unwrap();
+        assert_eq!(runtime.snapshot_output().records(), before.records());
+        let checkpoint = runtime.checkpoint().unwrap();
+        assert_eq!(checkpoint.input_frontiers[0].committed_offset_exclusive, 2);
+        assert_eq!(checkpoint.input_event_time_frontiers, ready);
+        assert!(runtime.deferred_demand.is_none());
+        // The 2s horizon controls hot-state retention, not admission of old
+        // positive events. W=10s makes this [0s,1s) accumulator cold-eligible.
+        let cold = runtime.export_event_time_state().unwrap();
+        assert_eq!(cold.len(), 1);
+        let references = vec![cold[0].reference.clone()];
+        runtime.stage_event_time_state(&references).unwrap();
+        runtime.acknowledge_event_time_state(&references).unwrap();
+        assert!(runtime.state.rows.is_empty());
+        let mut runtime =
+            TumblingEventTimeAggregateRuntime::restore(runtime.checkpoint().unwrap()).unwrap();
+        let late = demand_input(&runtime, 2, 9, 10_000_000_000);
+        let requests = runtime
+            .event_time_state_requests(std::slice::from_ref(&late))
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reference.as_ref(), Some(&cold[0].reference));
+        runtime
+            .hydrate_event_time_state(&requests[0], &cold[0].payload)
+            .unwrap();
+        runtime
+            .apply_changes(
+                5,
+                EpochIdempotencyKey::new("late").unwrap(),
+                vec![late.clone()],
+            )
+            .unwrap();
+        let output = runtime.snapshot_output().into_owned();
+        let batch = materialized_tumbling_delta_to_record_batch(
+            &runtime.output_schema,
+            &output,
+            &runtime.plan.aggregate_outputs,
+        )
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        for (name, expected) in [("total", 21), ("n", 3)] {
+            let column = batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(column.value(0), expected);
+        }
+        let checkpoint = runtime.checkpoint().unwrap();
+        assert_eq!(checkpoint.input_frontiers[0].committed_offset_exclusive, 3);
+        assert_eq!(checkpoint.input_event_time_frontiers, ready);
+        let mut restored = TumblingEventTimeAggregateRuntime::restore(checkpoint).unwrap();
+        assert_eq!(restored.snapshot_output().records(), output.records());
+        restored
+            .apply_changes(
+                6,
+                EpochIdempotencyKey::new("late-retry").unwrap(),
+                vec![late],
+            )
+            .unwrap();
+        assert_eq!(restored.snapshot_output().records(), output.records());
+    }
+
+    #[test]
+    fn deferred_readiness_extends_and_empty_watermark_unit_survives_restore() {
+        let mut runtime = demand_runtime();
+        let ready = readiness(&runtime, 1_000_000_000);
+        let first = demand_input(&runtime, 0, 7, 1_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                1,
+                EpochIdempotencyKey::new("first").unwrap(),
+                vec![first],
+                DemandFrontierMode::Defer {
+                    replay_id: "generation-1".into(),
+                    output_readiness: ready,
+                },
+            )
+            .unwrap();
+        let mut empty = demand_input(&runtime, 1, 0, 2_000_000_000);
+        empty.end_offset_exclusive = 1;
+        empty.batches.clear();
+        let ready = readiness(&runtime, 2_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("empty").unwrap(),
+                vec![empty],
+                DemandFrontierMode::Defer {
+                    replay_id: "generation-1".into(),
+                    output_readiness: ready.clone(),
+                },
+            )
+            .unwrap();
+        let restored =
+            TumblingEventTimeAggregateRuntime::restore(runtime.checkpoint().unwrap()).unwrap();
+        let pending = restored.deferred_demand.unwrap();
+        assert_eq!(pending.input_frontiers[0].committed_offset_exclusive, 1);
+        assert_eq!(pending.input_event_time_frontiers, ready);
+    }
+
+    #[test]
+    fn empty_readiness_defers_output_until_exact_install() {
+        let mut runtime = demand_runtime();
+        let input = demand_input(&runtime, 0, 7, 2_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                1,
+                EpochIdempotencyKey::new("bounded").unwrap(),
+                vec![input],
+                DemandFrontierMode::Defer {
+                    replay_id: "generation-1".into(),
+                    output_readiness: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(runtime.snapshot_output().records().is_empty());
+        let mut runtime =
+            TumblingEventTimeAggregateRuntime::restore(runtime.checkpoint().unwrap()).unwrap();
+        let pending = runtime.deferred_demand.clone().unwrap();
+        let mut wrong = pending.input_event_time_frontiers.clone();
+        wrong[0].watermark_ns += 1;
+        wrong[0].max_observed_event_time_ns += 1;
+        assert!(runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("fabricated").unwrap(),
+                vec![],
+                DemandFrontierMode::Install {
+                    replay_id: "generation-1".into(),
+                    input_frontiers: pending.input_frontiers.clone(),
+                    input_event_time_frontiers: wrong
+                }
+            )
+            .is_err());
+        assert!(runtime.input_frontiers.is_empty());
+        runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("finish").unwrap(),
+                vec![],
+                DemandFrontierMode::Install {
+                    replay_id: "generation-1".into(),
+                    input_frontiers: pending.input_frontiers,
+                    input_event_time_frontiers: pending.input_event_time_frontiers,
+                },
+            )
+            .unwrap();
+        assert_eq!(runtime.snapshot_output().records().len(), 1);
+        assert_eq!(runtime.input_frontiers[0].committed_offset_exclusive, 1);
+        TumblingEventTimeAggregateRuntime::restore(runtime.checkpoint().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sparse_b_before_a_overlap_restart_and_install_require_no_holes() {
+        let mut runtime = demand_runtime();
+        let ready = readiness(&runtime, 3_000_000_000);
+        let mode = DemandFrontierMode::Defer {
+            replay_id: "sparse-generation".into(),
+            output_readiness: ready.clone(),
+        };
+        let b = demand_input(&runtime, 1, 5, 3_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                1,
+                EpochIdempotencyKey::new("b-first").unwrap(),
+                vec![b.clone()],
+                mode.clone(),
+            )
+            .unwrap();
+        let pending = runtime.deferred_demand.clone().unwrap();
+        assert_eq!(pending.input_frontiers[0].committed_offset_exclusive, 0);
+        assert_eq!(pending.coverage[0].spans.as_spans(), vec![[1, 2]]);
+        let mut target = pending.input_frontiers.clone();
+        target[0].committed_offset_exclusive = 2;
+        let before = runtime.checkpoint().unwrap();
+        assert!(runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("hole").unwrap(),
+                vec![],
+                DemandFrontierMode::Install {
+                    replay_id: "sparse-generation".into(),
+                    input_frontiers: target.clone(),
+                    input_event_time_frontiers: ready.clone()
+                }
+            )
+            .is_err());
+        assert_eq!(runtime.checkpoint().unwrap(), before);
+        let mut runtime = TumblingEventTimeAggregateRuntime::restore(before).unwrap();
+        // A has older authenticated watermark evidence. Overlap B must not be
+        // counted twice, even when both ranges arrive in one request after restart.
+        let a = demand_input(&runtime, 0, 7, 1_000_000_000);
+        let mut overlap = a;
+        overlap.end_offset_exclusive = 2;
+        overlap.batches.extend(b.batches.clone());
+        runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("a-overlap-b").unwrap(),
+                vec![overlap],
+                mode.clone(),
+            )
+            .unwrap();
+        let output = runtime.snapshot_output().into_owned();
+        assert_eq!(
+            runtime.deferred_demand.as_ref().unwrap().coverage[0]
+                .spans
+                .as_spans(),
+            vec![[0, 2]]
+        );
+        assert_eq!(output.records().len(), 1);
+        assert_eq!(
+            output.records()[0].value.as_json().get("total"),
+            Some(&serde_json::json!(12))
+        );
+        runtime
+            .apply_demand_changes_delta_only(
+                3,
+                EpochIdempotencyKey::new("b-retry").unwrap(),
+                vec![b],
+                mode,
+            )
+            .unwrap();
+        assert_eq!(runtime.snapshot_output().records(), output.records());
+        runtime
+            .apply_demand_changes_delta_only(
+                4,
+                EpochIdempotencyKey::new("complete-sparse").unwrap(),
+                vec![],
+                DemandFrontierMode::Install {
+                    replay_id: "sparse-generation".into(),
+                    input_frontiers: target,
+                    input_event_time_frontiers: ready,
+                },
+            )
+            .unwrap();
+        assert_eq!(runtime.snapshot_output().records(), output.records());
+        assert_eq!(runtime.input_frontiers[0].committed_offset_exclusive, 2);
+        TumblingEventTimeAggregateRuntime::restore(runtime.checkpoint().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sparse_cut_extension_preserves_existing_spans_and_rollback() {
+        let mut runtime = demand_runtime();
+        let ready = readiness(&runtime, 2_000_000_000);
+        let mode = DemandFrontierMode::Defer {
+            replay_id: "extend".into(),
+            output_readiness: ready.clone(),
+        };
+        let first = demand_input(&runtime, 0, 7, 1_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                1,
+                EpochIdempotencyKey::new("prefix").unwrap(),
+                vec![first],
+                mode.clone(),
+            )
+            .unwrap();
+        let later = demand_input(&runtime, 3, 9, 2_000_000_000);
+        runtime
+            .apply_demand_changes_delta_only(
+                2,
+                EpochIdempotencyKey::new("later").unwrap(),
+                vec![later],
+                mode.clone(),
+            )
+            .unwrap();
+        let checkpoint = runtime.checkpoint().unwrap();
+        let pending = runtime.deferred_demand.as_ref().unwrap();
+        assert_eq!(pending.coverage[0].spans.rows_total(), 4);
+        assert_eq!(pending.coverage[0].spans.as_spans(), vec![[0, 1], [3, 4]]);
+        assert_eq!(pending.input_frontiers[0].committed_offset_exclusive, 1);
+        let mut bad = demand_input(&runtime, 1, 3, 2_000_000_000);
+        bad.end_offset_exclusive = 3; // one supplied row cannot prove two offsets
+        assert!(runtime
+            .apply_demand_changes_delta_only(
+                3,
+                EpochIdempotencyKey::new("bad-length").unwrap(),
+                vec![bad],
+                mode
+            )
+            .is_err());
+        assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
+        let mut corrupted = checkpoint;
+        let payload = corrupted.state_payload.as_mut().unwrap();
+        let mut json: Value = serde_json::from_str(&payload.payload).unwrap();
+        json["deferred_demand"]["coverage"] = serde_json::json!([]);
+        payload.payload = serde_json::to_string(&json).unwrap();
+        corrupted.state_root.content_hash = stable_bytes_hash(payload.payload.as_bytes());
+        assert!(TumblingEventTimeAggregateRuntime::restore(corrupted).is_err());
+    }
 
     #[test]
     fn correction_selection_visits_only_touched_and_newly_closed_windows() {

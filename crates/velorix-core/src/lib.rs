@@ -9,6 +9,7 @@ pub mod engine;
 pub mod native_operator;
 pub mod operator;
 pub mod operator_contract;
+pub mod processed_spans;
 pub mod query;
 pub mod relation;
 pub mod resource_policy;

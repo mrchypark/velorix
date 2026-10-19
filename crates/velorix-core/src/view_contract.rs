@@ -103,7 +103,10 @@ pub enum StandingInputBindingV1 {
         producer_program_id: String,
         published_relation: PublishedRelationBindingV1,
         graph_revision: u64,
-        bootstrap_cursor: CausalViewCursorV1,
+        /// Absent at declaration when no authoritative producer snapshot exists.
+        /// Execution must capture and persist a real cursor before runtime creation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bootstrap_cursor: Option<CausalViewCursorV1>,
     },
 }
 /// Durable view-on-view dependency edge, persisted alongside the consumer's
@@ -573,6 +576,23 @@ fn published_column_type(
     }
 }
 impl StandingInputBindingV1 {
+    /// Declaration validation permits deferred inputs; runtime construction does not.
+    pub fn validate_for_execution(&self) -> Result<(), ViewContractError> {
+        self.validate()?;
+        if matches!(
+            self,
+            Self::PublishedView {
+                bootstrap_cursor: None,
+                ..
+            }
+        ) {
+            return Err(ViewContractError::InvalidField {
+                field: "input_binding.published_view.bootstrap_cursor",
+            });
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ViewContractError> {
         match self {
             StandingInputBindingV1::Source {
@@ -615,23 +635,25 @@ impl StandingInputBindingV1 {
                 // generation, and output stream. A format-valid cursor that
                 // points at a different producer would let a consumer read
                 // the wrong commit lineage.
-                if bootstrap_cursor.input_edge != *edge_id
-                    || bootstrap_cursor.producer_tenant_id != *producer_tenant_id
-                    || bootstrap_cursor.producer_program_id != *producer_program_id
-                    || bootstrap_cursor.producer_view_id != published_relation.producer_view_id
-                    || bootstrap_cursor.producer_generation
-                        != published_relation.producer_view_generation
-                    || bootstrap_cursor.output_stream != published_relation.output_stream_id
-                {
-                    return Err(ViewContractError::InvalidField {
-                        field: "input_binding.published_view.bootstrap_cursor",
-                    });
+                if let Some(bootstrap_cursor) = bootstrap_cursor {
+                    if bootstrap_cursor.input_edge != *edge_id
+                        || bootstrap_cursor.producer_tenant_id != *producer_tenant_id
+                        || bootstrap_cursor.producer_program_id != *producer_program_id
+                        || bootstrap_cursor.producer_view_id != published_relation.producer_view_id
+                        || bootstrap_cursor.producer_generation
+                            != published_relation.producer_view_generation
+                        || bootstrap_cursor.output_stream != published_relation.output_stream_id
+                    {
+                        return Err(ViewContractError::InvalidField {
+                            field: "input_binding.published_view.bootstrap_cursor",
+                        });
+                    }
+                    bootstrap_cursor
+                        .validate()
+                        .map_err(|_| ViewContractError::InvalidField {
+                            field: "input_binding.published_view.bootstrap_cursor",
+                        })?;
                 }
-                bootstrap_cursor
-                    .validate()
-                    .map_err(|_| ViewContractError::InvalidField {
-                        field: "input_binding.published_view.bootstrap_cursor",
-                    })?;
                 let expected_edge_id = view_dependency_edge_id(
                     producer_tenant_id,
                     producer_program_id,
@@ -1181,47 +1203,47 @@ mod tests {
     #[test]
     fn view_spec_hash_uses_path_safe_namespaced_hex() {
         let spec = StandingViewSpec {
-            view_id: "device_status_latest".to_string(),
-            sql: "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id".to_string(),
+            view_id: "item_status_latest".to_string(),
+            sql: "select key, arg_max(flag, ts) as flag from item_status group by key".to_string(),
             dialect: SqlDialect::VelorixSql,
             source_kind: SqlSourceKind::StandingView,
             input_relations: vec![RelationSchema {
-                relation_id: "device_status".to_string(),
-                relation_name: "device_status".to_string(),
+                relation_id: "item_status".to_string(),
+                relation_name: "item_status".to_string(),
                 relation_version: "2026-05-24.v1".to_string(),
                 schema_fingerprint: format!("sha256:{}", "1".repeat(64)),
                 columns: vec![
                     ColumnSchema {
-                        name: "device_id".to_string(),
+                        name: "key".to_string(),
                         data_type: SqlDataType::Utf8,
                         nullable: false,
                     },
                     ColumnSchema {
-                        name: "enabled".to_string(),
+                        name: "flag".to_string(),
                         data_type: SqlDataType::Bool,
                         nullable: false,
                     },
                 ],
-                primary_key: vec!["device_id".to_string()],
+                primary_key: vec!["key".to_string()],
             }],
             output_relations: vec![RelationSchema {
-                relation_id: "device_status_latest".to_string(),
-                relation_name: "device_status_latest".to_string(),
+                relation_id: "item_status_latest".to_string(),
+                relation_name: "item_status_latest".to_string(),
                 relation_version: "v1".to_string(),
                 schema_fingerprint: format!("sha256:{}", "2".repeat(64)),
                 columns: vec![
                     ColumnSchema {
-                        name: "device_id".to_string(),
+                        name: "key".to_string(),
                         data_type: SqlDataType::Utf8,
                         nullable: false,
                     },
                     ColumnSchema {
-                        name: "enabled".to_string(),
+                        name: "flag".to_string(),
                         data_type: SqlDataType::Bool,
                         nullable: false,
                     },
                 ],
-                primary_key: vec!["device_id".to_string()],
+                primary_key: vec!["key".to_string()],
             }],
             shape: StandingViewShape {
                 is_materialized: true,
@@ -1334,9 +1356,29 @@ mod tests {
             producer_program_id: "filtered_orders".to_string(),
             published_relation: binding,
             graph_revision: 3,
-            bootstrap_cursor: sample_cursor(),
+            bootstrap_cursor: Some(sample_cursor()),
         };
         input.validate().unwrap();
+        input.validate_for_execution().unwrap();
+        let old_wire = serde_json::to_value(&input).unwrap();
+        assert!(old_wire["bootstrap_cursor"].is_object());
+        let mut deferred = input.clone();
+        if let StandingInputBindingV1::PublishedView {
+            bootstrap_cursor, ..
+        } = &mut deferred
+        {
+            *bootstrap_cursor = None;
+        }
+        deferred.validate().unwrap();
+        assert!(deferred.validate_for_execution().is_err());
+        let wire = serde_json::to_value(&deferred).unwrap();
+        assert!(wire.get("bootstrap_cursor").is_none());
+        let restored: StandingInputBindingV1 = serde_json::from_value(wire).unwrap();
+        assert_eq!(deferred, restored);
+        assert_eq!(
+            input.input_catalog_hash().unwrap(),
+            deferred.input_catalog_hash().unwrap()
+        );
         let mut stale = input.clone();
         if let StandingInputBindingV1::PublishedView {
             published_relation, ..
@@ -1350,7 +1392,7 @@ mod tests {
             bootstrap_cursor, ..
         } = &mut wrong_cursor
         {
-            bootstrap_cursor.commit_digest = "not-a-sha256".to_string();
+            bootstrap_cursor.as_mut().unwrap().commit_digest = "not-a-sha256".to_string();
         }
         assert_eq!(
             wrong_cursor.validate(),
@@ -1386,7 +1428,7 @@ mod tests {
                 bootstrap_cursor, ..
             } = &mut scope_mismatch
             {
-                mutate(bootstrap_cursor);
+                mutate(bootstrap_cursor.as_mut().unwrap());
             }
             assert_eq!(
                 scope_mismatch.validate(),
@@ -1423,7 +1465,7 @@ mod tests {
             producer_program_id: "filtered_orders".to_string(),
             published_relation: binding,
             graph_revision: 3,
-            bootstrap_cursor: sample_cursor(),
+            bootstrap_cursor: Some(sample_cursor()),
         };
         let base = input.input_catalog_hash().unwrap();
         let mut generation = input.clone();

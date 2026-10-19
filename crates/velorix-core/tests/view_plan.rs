@@ -49,6 +49,224 @@ use velorix_core::{
 };
 
 #[test]
+fn keyless_count_star_needs_no_numeric_payload_and_sum_has_singleton_identity() {
+    let mut catalog = scores_with_category_catalog();
+    catalog.relation_schema.primary_key_column_ids.clear();
+    catalog
+        .relation_schema
+        .columns
+        .retain(|column| column.column_id != "score");
+    for (ordinal, column) in catalog.relation_schema.columns.iter_mut().enumerate() {
+        column.ordinal = ordinal as u32;
+        if column.column_id == "user_id" {
+            column.column_id = "observed_day".into();
+            column.name = "observed_day".into();
+            column.logical_type = VelorixLogicalTypeV1::Date;
+            column.physical_arrow_type = ArrowPhysicalTypeV1::Date32;
+            column.nullable = true;
+            column.semantic_role = RelationSemanticRoleV1::Metadata;
+        }
+    }
+    refresh_catalog_fingerprint(&mut catalog);
+    let count = validate_supported_view_sql(
+        "select observed_day, category, count(*) as occurrences from scores group by observed_day, category",
+        &catalog,
+    )
+    .unwrap();
+    assert_eq!(count.sum_value_column_id, "observed_day");
+    assert!(count.aggregate_outputs[0].input_column_id.is_none());
+    assert!(matches!(
+        count.aggregate_output_identity,
+        Some(SupportedAggregateOutputIdentity::GroupKey { .. })
+    ));
+    for (logical_type, physical_arrow_type) in [
+        (VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::Utf8),
+        (
+            VelorixLogicalTypeV1::Timestamp { timezone: None },
+            ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None },
+        ),
+    ] {
+        catalog.relation_schema.columns[0].logical_type = logical_type;
+        catalog.relation_schema.columns[0].physical_arrow_type = physical_arrow_type;
+        refresh_catalog_fingerprint(&mut catalog);
+        let count = validate_supported_view_sql(
+            "select observed_day, category, count(*) as occurrences from scores group by observed_day, category",
+            &catalog,
+        ).unwrap();
+        assert_eq!(count.sum_value_column_id, "observed_day");
+        assert!(count.aggregate_outputs[0].input_column_id.is_none());
+    }
+
+    let mut catalog = scores_catalog();
+    catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into();
+    catalog.relation_schema.primary_key_column_ids.clear();
+    catalog.relation_schema.columns[0].semantic_role = RelationSemanticRoleV1::Metadata;
+    catalog.relation_schema.columns[1].logical_type = VelorixLogicalTypeV1::Float64;
+    catalog.relation_schema.columns[1].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
+    catalog.relation_schema.columns[1].nullable = true;
+    refresh_catalog_fingerprint(&mut catalog);
+    let mut output = scores_projection_output_schema();
+    output.primary_key.clear();
+    output.columns = vec![ColumnSchema {
+        name: "total".into(),
+        data_type: SqlDataType::Float64,
+        nullable: true,
+    }];
+    let logical = lower_supported_view_sql_to_logical_plan(
+        "select sum(score) as total from scores",
+        &catalog,
+        &output,
+    )
+    .unwrap();
+    let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &logical.execution else {
+        panic!("expected aggregate execution");
+    };
+    assert_eq!(
+        plan.aggregate_output_identity,
+        Some(SupportedAggregateOutputIdentity::Singleton)
+    );
+    assert!(logical.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::Aggregate { group_keys, .. } if group_keys.is_empty()
+    )));
+    validate_logical_view_plan(&logical).unwrap();
+}
+
+#[test]
+fn singleton_value_aggregate_schema_is_nullable_even_for_nonnull_input() {
+    let mut catalog = scores_catalog();
+    catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into();
+    catalog.relation_schema.primary_key_column_ids.clear();
+    catalog.relation_schema.columns[0].semantic_role = RelationSemanticRoleV1::Metadata;
+    refresh_catalog_fingerprint(&mut catalog);
+    for function in ["sum", "min", "max", "avg"] {
+        let sql = format!("select {function}(score) as result from scores");
+        let plan = validate_supported_view_sql(&sql, &catalog).unwrap();
+        let columns =
+            velorix_core::view_plan::supported_singleton_aggregate_output_columns(&plan, &catalog)
+                .unwrap();
+        assert!(columns[0].nullable);
+        assert_eq!(
+            columns[0].data_type,
+            if function == "avg" {
+                SqlDataType::Float64
+            } else {
+                SqlDataType::Int64
+            }
+        );
+        let mut output = scores_projection_output_schema();
+        output.primary_key.clear();
+        output.columns = columns;
+        lower_supported_view_sql_to_logical_plan(&sql, &catalog, &output).unwrap();
+        output.columns[0].nullable = false;
+        assert!(lower_supported_view_sql_to_logical_plan(&sql, &catalog, &output).is_err());
+        output.columns[0].nullable = true;
+        output.primary_key = vec!["result".into()];
+        assert!(lower_supported_view_sql_to_logical_plan(&sql, &catalog, &output).is_err());
+    }
+}
+
+#[test]
+fn keyless_aggregate_uses_nullable_compound_groups_and_mixed_values() {
+    let mut catalog = scores_with_adjustment_catalog();
+    catalog.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into();
+    catalog.relation_schema.primary_key_column_ids.clear();
+    let entity = &mut catalog.relation_schema.columns[0];
+    entity.column_id = "entity".into();
+    entity.name = "entity".into();
+    entity.nullable = true;
+    entity.semantic_role = RelationSemanticRoleV1::Metadata;
+    let metric = &mut catalog.relation_schema.columns[1];
+    metric.physical_arrow_type = ArrowPhysicalTypeV1::Float64;
+    metric.logical_type = VelorixLogicalTypeV1::Float64;
+    metric.nullable = true;
+    let day = &mut catalog.relation_schema.columns[2];
+    day.column_id = "observed_day".into();
+    day.name = "observed_day".into();
+    day.physical_arrow_type = ArrowPhysicalTypeV1::Date32;
+    day.logical_type = VelorixLogicalTypeV1::Date;
+    day.nullable = true;
+    day.semantic_role = RelationSemanticRoleV1::Metadata;
+    let ordinal = catalog.relation_schema.columns.len() as u32;
+    catalog.relation_schema.columns.push(RelationColumnV1 {
+        column_id: "quantity".into(),
+        name: "quantity".into(),
+        logical_type: VelorixLogicalTypeV1::Int64,
+        physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+        nullable: true,
+        ordinal,
+        semantic_role: RelationSemanticRoleV1::Value,
+    });
+    refresh_catalog_fingerprint(&mut catalog);
+    let before = catalog.clone();
+    let sql = "select observed_day, entity, avg(score) as mean, count(*) as samples, count(quantity) as measured, min(quantity) as smallest, sum(quantity) as total, approx_quantile(score, 0.5) as median from scores group by observed_day, entity";
+    let plan = validate_supported_view_sql(sql, &catalog).unwrap();
+    let Some(SupportedAggregateOutputIdentity::GroupKey { group_keys }) =
+        &plan.aggregate_output_identity
+    else {
+        panic!("bag aggregation requires explicit group identity");
+    };
+    assert_eq!(group_keys.len(), 2);
+    assert_eq!(
+        group_keys[0].input_column_id.as_deref(),
+        Some("observed_day")
+    );
+    assert_eq!(group_keys[1].input_column_id.as_deref(), Some("entity"));
+    assert_eq!(plan.group_key_column_id, "observed_day");
+    assert_eq!(plan.aggregate_outputs.len(), 6);
+    assert_eq!(catalog, before);
+
+    let single = validate_supported_view_sql(
+        "select entity, approx_quantile(score, 0.5) as median from scores group by entity",
+        &catalog,
+    )
+    .unwrap();
+    assert!(matches!(
+        single.aggregate_output_identity,
+        Some(SupportedAggregateOutputIdentity::GroupKey { .. })
+    ));
+    assert!(validate_supported_view_sql(
+        "select entity, approx_quantile(score, 1.5) as median from scores group by entity",
+        &catalog,
+    )
+    .is_err());
+}
+
+#[test]
+fn typed_join_projection_requires_bag_schema_and_outer_nullability() {
+    use velorix_core::view_plan::lower_supported_typed_join_project_sql_to_logical_plan;
+
+    let catalogs = vec![scores_catalog(), accounts_catalog()];
+    // The right column may be NULL and repeated; its position proves no key.
+    let sql = "select a.account_id as matched_id from scores s left join accounts a on s.user_id = a.account_id";
+    let mut output = scores_projection_output_schema();
+    output.primary_key.clear();
+    output.columns = vec![ColumnSchema {
+        name: "matched_id".into(),
+        data_type: SqlDataType::Utf8,
+        nullable: true,
+    }];
+    let plan = lower_supported_typed_join_project_sql_to_logical_plan(sql, &catalogs, &output)
+        .expect("nullable first projection is a valid bag");
+    validate_logical_view_plan(&plan).unwrap();
+
+    output.primary_key = vec!["matched_id".into()];
+    assert!(
+        lower_supported_typed_join_project_sql_to_logical_plan(sql, &catalogs, &output).is_err()
+    );
+    output.primary_key.clear();
+    output.columns[0].nullable = false;
+    assert!(
+        lower_supported_typed_join_project_sql_to_logical_plan(sql, &catalogs, &output).is_err()
+    );
+    output.columns[0].nullable = true;
+    output.columns[0].data_type = SqlDataType::Int64;
+    assert!(
+        lower_supported_typed_join_project_sql_to_logical_plan(sql, &catalogs, &output).is_err()
+    );
+}
+
+#[test]
 fn correlated_exists_and_not_exists_lower_to_generic_semi_anti_join_nodes() {
     let catalogs = vec![scores_catalog(), accounts_catalog()];
     let output = scores_projection_output_schema();
@@ -497,9 +715,38 @@ fn global_count_lowers_with_explicit_singleton_output_identity() {
     assert!(aggregate_contract.outputs[0].candidate_keys.is_empty());
     validate_logical_view_plan(&logical).unwrap();
 
+    // score is nonnullable, so COUNT(score) is normalized to COUNT(*).
+    for (expression, data_type, nullable) in [
+        ("count(score)", SqlDataType::Int64, false),
+        ("sum(score)", SqlDataType::Int64, true),
+        ("min(score)", SqlDataType::Int64, true),
+        ("max(score)", SqlDataType::Int64, true),
+        ("avg(score)", SqlDataType::Float64, true),
+    ] {
+        let sql = format!("select {expression} as result from scores");
+        let mut output = output_schema.clone();
+        output.columns = vec![ColumnSchema {
+            name: "result".into(),
+            data_type,
+            nullable,
+        }];
+        let logical = lower_supported_view_sql_to_logical_plan(&sql, &catalog, &output)
+            .unwrap_or_else(|error| panic!("expected admission for `{sql}`: {error}"));
+        let VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } = &logical.execution else {
+            panic!("expected aggregate execution");
+        };
+        assert_eq!(
+            plan.aggregate_output_identity,
+            Some(SupportedAggregateOutputIdentity::Singleton)
+        );
+        validate_logical_view_plan(&logical).unwrap();
+    }
+
     for sql in [
-        "select sum(score) as sum from scores",
         "select count(*) as count from scores group by grouping sets (())",
+        "select sum(score + 1) as total from scores",
+        "select sum(score) as total, count(*) as count from scores",
+        "select sum(score) filter (where score > 0) as total from scores",
     ] {
         let result = validate_supported_view_sql(sql, &catalog);
         assert!(
@@ -4988,11 +5235,11 @@ fn two_input_join_sql_accepts_count_distinct_only_projection() {
 
 #[test]
 fn latest_by_key_sql_lowers_to_project_and_latest_nodes() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true and event_time > 0 group by device_id",
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true and ts > 0 group by key",
         std::slice::from_ref(&catalog),
         &output_schema,
     )
@@ -5002,9 +5249,9 @@ fn latest_by_key_sql_lowers_to_project_and_latest_nodes() {
     let VelorixLogicalViewExecutionV1::LatestByKey { plan: supported } = &plan.execution else {
         panic!("expected latest-by-key runtime execution");
     };
-    assert_eq!(supported.key_column_id, "device_id");
-    assert_eq!(supported.value_column_id, "enabled");
-    assert_eq!(supported.ordering_column_id, "event_time");
+    assert_eq!(supported.key_column_id, "key");
+    assert_eq!(supported.value_column_id, "flag");
+    assert_eq!(supported.ordering_column_id, "ts");
     assert_eq!(
         supported
             .predicate_expr
@@ -5034,11 +5281,11 @@ fn latest_by_key_sql_lowers_to_project_and_latest_nodes() {
 
 #[test]
 fn latest_by_key_sql_admits_or_where_without_fake_filter_node() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true or event_time = 110 group by device_id",
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true or ts = 110 group by key",
         std::slice::from_ref(&catalog),
         &output_schema,
     )
@@ -5060,30 +5307,30 @@ fn latest_by_key_sql_admits_or_where_without_fake_filter_node() {
 
 #[test]
 fn latest_by_key_fixture_sql_accepts_arg_max_shape() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
 
     let plan = validate_supported_latest_by_key_sql(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true group by device_id",
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true group by key",
         &catalog,
     )
     .unwrap();
 
-    assert_eq!(plan.input_relation_id, "device_status");
-    assert_eq!(plan.key_column_id, "device_id");
-    assert_eq!(plan.value_column_id, "enabled");
-    assert_eq!(plan.ordering_column_id, "event_time");
-    assert_eq!(plan.output_value_column_id, "enabled");
+    assert_eq!(plan.input_relation_id, "item_status");
+    assert_eq!(plan.key_column_id, "key");
+    assert_eq!(plan.value_column_id, "flag");
+    assert_eq!(plan.ordering_column_id, "ts");
+    assert_eq!(plan.output_value_column_id, "flag");
     assert!(plan.predicate_expr.is_some());
 }
 
 #[test]
 fn latest_by_key_sql_rejects_nullable_ordering_column() {
-    let mut catalog = device_status_catalog();
+    let mut catalog = item_status_catalog();
     catalog
         .relation_schema
         .columns
         .iter_mut()
-        .find(|column| column.column_id == "event_time")
+        .find(|column| column.column_id == "ts")
         .unwrap()
         .nullable = true;
     let schema_fingerprint =
@@ -5092,7 +5339,7 @@ fn latest_by_key_sql_rejects_nullable_ordering_column() {
     catalog.incremental_relation.schema_fingerprint = schema_fingerprint;
 
     let error = validate_supported_latest_by_key_sql(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id",
+        "select key, arg_max(flag, ts) as flag from item_status group by key",
         &catalog,
     )
     .unwrap_err();
@@ -5103,29 +5350,29 @@ fn latest_by_key_sql_rejects_nullable_ordering_column() {
 
 #[test]
 fn latest_by_key_fixture_sql_accepts_arg_min_shape() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
 
     let plan = validate_supported_latest_by_key_sql(
-        "select device_id, arg_min(enabled, event_time) as enabled from device_status group by device_id",
+        "select key, arg_min(flag, ts) as flag from item_status group by key",
         &catalog,
     )
     .unwrap();
 
     assert_eq!(plan.function, LogicalPlanLatestByKeyFunctionV1::ArgMin);
-    assert_eq!(plan.input_relation_id, "device_status");
-    assert_eq!(plan.key_column_id, "device_id");
-    assert_eq!(plan.value_column_id, "enabled");
-    assert_eq!(plan.ordering_column_id, "event_time");
-    assert_eq!(plan.output_value_column_id, "enabled");
+    assert_eq!(plan.input_relation_id, "item_status");
+    assert_eq!(plan.key_column_id, "key");
+    assert_eq!(plan.value_column_id, "flag");
+    assert_eq!(plan.ordering_column_id, "ts");
+    assert_eq!(plan.output_value_column_id, "flag");
 }
 
 #[test]
 fn latest_by_key_fixture_sql_accepts_arg_max_filter_predicate() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status group by device_id",
+        "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status group by key",
         &catalog,
         &output_schema,
     )
@@ -5140,18 +5387,18 @@ fn latest_by_key_fixture_sql_accepts_arg_max_filter_predicate() {
         .expect("arg_max FILTER should lower to latest input predicate")
         .leaf_predicates();
     assert_eq!(predicates.len(), 1);
-    assert_eq!(predicates[0].column_id, "enabled");
+    assert_eq!(predicates[0].column_id, "flag");
     assert_eq!(predicates[0].op, PredicateOp::Eq);
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_fixture_sql_combines_where_and_arg_max_filter_predicates() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status where event_time > 95 group by device_id",
+        "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status where ts > 95 group by key",
         &catalog,
         &output_schema,
     )
@@ -5168,20 +5415,20 @@ fn latest_by_key_fixture_sql_combines_where_and_arg_max_filter_predicates() {
     assert_eq!(predicates.len(), 2);
     assert!(predicates
         .iter()
-        .any(|predicate| predicate.column_id == "event_time" && predicate.op == PredicateOp::Gt));
+        .any(|predicate| predicate.column_id == "ts" && predicate.op == PredicateOp::Gt));
     assert!(predicates
         .iter()
-        .any(|predicate| predicate.column_id == "enabled" && predicate.op == PredicateOp::Eq));
+        .any(|predicate| predicate.column_id == "flag" && predicate.op == PredicateOp::Eq));
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_accepts_identity_cte_source_filters() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "with status_source as (select * from device_status where event_time > 95) select device_id, arg_max(enabled, event_time) as enabled from status_source where enabled = true group by device_id",
+        "with status_source as (select * from item_status where ts > 95) select key, arg_max(flag, ts) as flag from status_source where flag = true group by key",
         &catalog,
         &output_schema,
     )
@@ -5198,20 +5445,20 @@ fn latest_by_key_sql_accepts_identity_cte_source_filters() {
     assert_eq!(predicates.len(), 2);
     assert!(predicates
         .iter()
-        .any(|predicate| predicate.column_id == "event_time" && predicate.op == PredicateOp::Gt));
+        .any(|predicate| predicate.column_id == "ts" && predicate.op == PredicateOp::Gt));
     assert!(predicates
         .iter()
-        .any(|predicate| predicate.column_id == "enabled" && predicate.op == PredicateOp::Eq));
+        .any(|predicate| predicate.column_id == "flag" && predicate.op == PredicateOp::Eq));
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_accepts_derived_table_source_filters() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select s.device_id, arg_max(s.enabled, s.event_time) as enabled from (select * from device_status where event_time > 95) s where s.enabled = true group by s.device_id",
+        "select s.key, arg_max(s.flag, s.ts) as flag from (select * from item_status where ts > 95) s where s.flag = true group by s.key",
         &catalog,
         &output_schema,
     )
@@ -5228,26 +5475,26 @@ fn latest_by_key_sql_accepts_derived_table_source_filters() {
     assert_eq!(predicates.len(), 2);
     assert!(predicates
         .iter()
-        .any(|predicate| predicate.column_id == "event_time" && predicate.op == PredicateOp::Gt));
+        .any(|predicate| predicate.column_id == "ts" && predicate.op == PredicateOp::Gt));
     assert!(predicates
         .iter()
-        .any(|predicate| predicate.column_id == "enabled" && predicate.op == PredicateOp::Eq));
+        .any(|predicate| predicate.column_id == "flag" && predicate.op == PredicateOp::Eq));
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_accepts_inner_source_alias_filters() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let cte_plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "with status_source as (select * from device_status src where src.event_time > 95) select device_id, arg_max(enabled, event_time) as enabled from status_source where enabled = true group by device_id",
+        "with status_source as (select * from item_status src where src.ts > 95) select key, arg_max(flag, ts) as flag from status_source where flag = true group by key",
         &catalog,
         &output_schema,
     )
     .unwrap();
     let derived_plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select s.device_id, arg_max(s.enabled, s.event_time) as enabled from (select * from device_status src where src.event_time > 95) s where s.enabled = true group by s.device_id",
+        "select s.key, arg_max(s.flag, s.ts) as flag from (select * from item_status src where src.ts > 95) s where s.flag = true group by s.key",
         &catalog,
         &output_schema,
     )
@@ -5263,30 +5510,30 @@ fn latest_by_key_sql_accepts_inner_source_alias_filters() {
             .expect("source and outer filters should lower")
             .leaf_predicates();
         assert_eq!(predicates.len(), 2);
-        assert!(predicates.iter().any(
-            |predicate| predicate.column_id == "event_time" && predicate.op == PredicateOp::Gt
-        ));
         assert!(predicates
             .iter()
-            .any(|predicate| predicate.column_id == "enabled" && predicate.op == PredicateOp::Eq));
+            .any(|predicate| predicate.column_id == "ts" && predicate.op == PredicateOp::Gt));
+        assert!(predicates
+            .iter()
+            .any(|predicate| predicate.column_id == "flag" && predicate.op == PredicateOp::Eq));
         validate_logical_view_plan(&plan).unwrap();
     }
 }
 
 #[test]
 fn latest_by_key_fixture_sql_accepts_relation_alias_qualified_columns() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
 
     let plan = validate_supported_latest_by_key_sql(
-        "select d.device_id as device, arg_max(d.enabled, d.event_time) as enabled from device_status as d where d.enabled = true group by d.device_id",
+        "select d.key as item, arg_max(d.flag, d.ts) as flag from item_status as d where d.flag = true group by d.key",
         &catalog,
     )
     .unwrap();
 
-    assert_eq!(plan.key_column_id, "device_id");
-    assert_eq!(plan.output_key_column_id, "device");
-    assert_eq!(plan.value_column_id, "enabled");
-    assert_eq!(plan.ordering_column_id, "event_time");
+    assert_eq!(plan.key_column_id, "key");
+    assert_eq!(plan.output_key_column_id, "item");
+    assert_eq!(plan.value_column_id, "flag");
+    assert_eq!(plan.ordering_column_id, "ts");
     assert_eq!(
         plan.predicate_expr
             .as_ref()
@@ -5299,13 +5546,13 @@ fn latest_by_key_fixture_sql_accepts_relation_alias_qualified_columns() {
 
 #[test]
 fn latest_by_key_sql_accepts_group_by_projected_key_alias() {
-    let catalog = device_status_catalog();
-    let mut output_schema = latest_device_status_output_schema();
-    output_schema.columns[0].name = "device".to_string();
-    output_schema.primary_key = vec!["device".to_string()];
+    let catalog = item_status_catalog();
+    let mut output_schema = latest_item_status_output_schema();
+    output_schema.columns[0].name = "item".to_string();
+    output_schema.primary_key = vec!["item".to_string()];
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id as device, arg_max(enabled, event_time) as enabled from device_status group by device",
+        "select key as item, arg_max(flag, ts) as flag from item_status group by item",
         &catalog,
         &output_schema,
     )
@@ -5314,18 +5561,18 @@ fn latest_by_key_sql_accepts_group_by_projected_key_alias() {
     let VelorixLogicalViewExecutionV1::LatestByKey { plan: supported } = &plan.execution else {
         panic!("expected latest-by-key runtime execution");
     };
-    assert_eq!(supported.key_column_id, "device_id");
-    assert_eq!(supported.output_key_column_id, "device");
+    assert_eq!(supported.key_column_id, "key");
+    assert_eq!(supported.output_key_column_id, "item");
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_accepts_group_by_first_projection_ordinal() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by 1",
         &catalog,
         &output_schema,
     )
@@ -5334,18 +5581,18 @@ fn latest_by_key_sql_accepts_group_by_first_projection_ordinal() {
     let VelorixLogicalViewExecutionV1::LatestByKey { plan: supported } = &plan.execution else {
         panic!("expected latest-by-key runtime execution");
     };
-    assert_eq!(supported.key_column_id, "device_id");
-    assert_eq!(supported.output_key_column_id, "device_id");
+    assert_eq!(supported.key_column_id, "key");
+    assert_eq!(supported.output_key_column_id, "key");
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_accepts_group_by_all() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by all",
+        "select key, arg_max(flag, ts) as flag from item_status group by all",
         &catalog,
         &output_schema,
     )
@@ -5354,18 +5601,18 @@ fn latest_by_key_sql_accepts_group_by_all() {
     let VelorixLogicalViewExecutionV1::LatestByKey { plan: supported } = &plan.execution else {
         panic!("expected latest-by-key runtime execution");
     };
-    assert_eq!(supported.key_column_id, "device_id");
-    assert_eq!(supported.output_key_column_id, "device_id");
+    assert_eq!(supported.key_column_id, "key");
+    assert_eq!(supported.output_key_column_id, "key");
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_accepts_trailing_order_by_without_changing_materialization() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device_id",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by key",
         &catalog,
         &output_schema,
     )
@@ -5379,11 +5626,11 @@ fn latest_by_key_sql_accepts_trailing_order_by_without_changing_materialization(
 
 #[test]
 fn latest_by_key_sql_lowers_order_by_limit_top_k() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device_id desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by key desc limit 1",
         &catalog,
         &output_schema,
     )
@@ -5399,7 +5646,7 @@ fn latest_by_key_sql_lowers_order_by_limit_top_k() {
             top_k.limit,
             top_k.offset
         )),
-        Some(("device_id", true, 1, 0))
+        Some(("key", true, 1, 0))
     );
     assert!(plan.nodes.iter().any(|node| matches!(
         node,
@@ -5409,17 +5656,17 @@ fn latest_by_key_sql_lowers_order_by_limit_top_k() {
             limit: 1,
             offset: 0,
             ..
-        } if order_by.column_id == "device_id"
+        } if order_by.column_id == "key"
     )));
 }
 
 #[test]
 fn latest_by_key_sql_lowers_order_by_limit_offset_top_k() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by enabled desc limit 2 offset 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by flag desc limit 2 offset 1",
         &catalog,
         &output_schema,
     )
@@ -5435,7 +5682,7 @@ fn latest_by_key_sql_lowers_order_by_limit_offset_top_k() {
             top_k.limit,
             top_k.offset
         )),
-        Some(("enabled", true, 2, 1))
+        Some(("flag", true, 2, 1))
     );
     assert!(plan.nodes.iter().any(|node| matches!(
         node,
@@ -5445,18 +5692,18 @@ fn latest_by_key_sql_lowers_order_by_limit_offset_top_k() {
             limit: 2,
             offset: 1,
             ..
-        } if order_by.column_id == "enabled"
+        } if order_by.column_id == "flag"
     )));
     validate_logical_view_plan(&plan).unwrap();
 }
 
 #[test]
 fn latest_by_key_sql_lowers_value_alias_order_by_limit_top_k() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by enabled desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by flag desc limit 1",
         &catalog,
         &output_schema,
     )
@@ -5470,17 +5717,17 @@ fn latest_by_key_sql_lowers_value_alias_order_by_limit_top_k() {
             .top_k
             .as_ref()
             .map(|top_k| top_k.order_output_column_id.as_str()),
-        Some("enabled")
+        Some("flag")
     );
 }
 
 #[test]
 fn latest_by_key_sql_binds_order_by_arg_max_function_to_projected_top_k_output() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled, event_time) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(flag, ts) desc limit 1",
         &catalog,
         &output_schema,
     )
@@ -5494,17 +5741,17 @@ fn latest_by_key_sql_binds_order_by_arg_max_function_to_projected_top_k_output()
             .top_k
             .as_ref()
             .map(|top_k| top_k.order_output_column_id.as_str()),
-        Some("enabled")
+        Some("flag")
     );
 }
 
 #[test]
 fn latest_by_key_sql_binds_qualified_order_by_arg_max_function_to_projected_top_k_output() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select d.device_id, arg_max(d.enabled, d.event_time) as enabled from device_status as d group by d.device_id order by arg_max(d.enabled, d.event_time) desc limit 1",
+        "select d.key, arg_max(d.flag, d.ts) as flag from item_status as d group by d.key order by arg_max(d.flag, d.ts) desc limit 1",
         &catalog,
         &output_schema,
     )
@@ -5518,17 +5765,17 @@ fn latest_by_key_sql_binds_qualified_order_by_arg_max_function_to_projected_top_
             .top_k
             .as_ref()
             .map(|top_k| top_k.order_output_column_id.as_str()),
-        Some("enabled")
+        Some("flag")
     );
 }
 
 #[test]
 fn latest_by_key_sql_binds_order_by_arg_min_function_to_projected_top_k_output() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
 
     let plan = lower_supported_latest_by_key_sql_to_logical_plan(
-        "select device_id, arg_min(enabled, event_time) as enabled from device_status group by device_id order by arg_min(enabled, event_time) desc limit 1",
+        "select key, arg_min(flag, ts) as flag from item_status group by key order by arg_min(flag, ts) desc limit 1",
         &catalog,
         &output_schema,
     )
@@ -5542,24 +5789,24 @@ fn latest_by_key_sql_binds_order_by_arg_min_function_to_projected_top_k_output()
             .top_k
             .as_ref()
             .map(|top_k| top_k.order_output_column_id.as_str()),
-        Some("enabled")
+        Some("flag")
     );
 }
 
 #[test]
 fn latest_by_key_sql_rejects_invalid_order_by_latest_function_top_k() {
-    let catalog = device_status_catalog();
-    let output_schema = latest_device_status_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = latest_item_status_output_schema();
     let cases = [
-        "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status group by device_id order by arg_max(enabled, event_time) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled, event_time) filter (where enabled = true) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(device_id, event_time) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled, device_id) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(not enabled, event_time) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(distinct enabled, event_time) desc limit 1",
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_min(enabled, event_time) desc limit 1",
-        "select device_id, arg_min(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled, event_time) desc limit 1",
+        "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status group by key order by arg_max(flag, ts) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(flag, ts) filter (where flag = true) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(key, ts) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(flag, key) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(not flag, ts) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(flag) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(distinct flag, ts) desc limit 1",
+        "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_min(flag, ts) desc limit 1",
+        "select key, arg_min(flag, ts) as flag from item_status group by key order by arg_max(flag, ts) desc limit 1",
     ];
 
     for sql in cases {
@@ -5573,7 +5820,7 @@ fn latest_by_key_sql_rejects_invalid_order_by_latest_function_top_k() {
 
 #[test]
 fn latest_by_key_sql_uses_arg_max_columns_without_value_role_cardinality() {
-    let mut catalog = device_status_catalog();
+    let mut catalog = item_status_catalog();
     catalog.relation_schema.columns.push(RelationColumnV1 {
         column_id: "debug_score".to_string(),
         name: "debug_score".to_string(),
@@ -5588,13 +5835,13 @@ fn latest_by_key_sql_uses_arg_max_columns_without_value_role_cardinality() {
     catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
 
     let plan = validate_supported_latest_by_key_sql(
-        "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id",
+        "select key, arg_max(flag, ts) as flag from item_status group by key",
         &catalog,
     )
     .unwrap();
 
-    assert_eq!(plan.value_column_id, "enabled");
-    assert_eq!(plan.ordering_column_id, "event_time");
+    assert_eq!(plan.value_column_id, "flag");
+    assert_eq!(plan.ordering_column_id, "ts");
 }
 
 #[test]
@@ -8616,38 +8863,38 @@ fn purchases_window_stats_output_schema() -> RelationSchema {
     }
 }
 
-fn latest_device_status_output_schema() -> RelationSchema {
+fn latest_item_status_output_schema() -> RelationSchema {
     RelationSchema {
-        relation_id: "latest_device_status".to_string(),
-        relation_name: "latest_device_status".to_string(),
+        relation_id: "latest_item_status".to_string(),
+        relation_name: "latest_item_status".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
         schema_fingerprint:
             "sha256:0000000000000000000000000000000000000000000000000000000000000007".to_string(),
         columns: vec![
             ColumnSchema {
-                name: "device_id".to_string(),
+                name: "key".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: false,
             },
             ColumnSchema {
-                name: "enabled".to_string(),
+                name: "flag".to_string(),
                 data_type: SqlDataType::Bool,
                 nullable: false,
             },
         ],
-        primary_key: vec!["device_id".to_string()],
+        primary_key: vec!["key".to_string()],
     }
 }
 
-fn device_status_flag_output_schema() -> RelationSchema {
+fn item_status_flag_output_schema() -> RelationSchema {
     RelationSchema {
-        relation_id: "device_enabled_flags".to_string(),
-        relation_name: "device_enabled_flags".to_string(),
+        relation_id: "item_enabled_flags".to_string(),
+        relation_name: "item_enabled_flags".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
-        schema_fingerprint: "device-status-flag-v1".to_string(),
+        schema_fingerprint: "item-status-flag-v1".to_string(),
         columns: vec![
             ColumnSchema {
-                name: "device_id".to_string(),
+                name: "key".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: false,
             },
@@ -8657,7 +8904,7 @@ fn device_status_flag_output_schema() -> RelationSchema {
                 nullable: false,
             },
         ],
-        primary_key: vec!["device_id".to_string()],
+        primary_key: vec!["key".to_string()],
     }
 }
 
@@ -9034,11 +9281,11 @@ fn filter_project_sql_rejects_non_int64_expression_vs_expression_predicate() {
 
 #[test]
 fn filter_project_sql_accepts_case_projection_over_bool_predicate() {
-    let catalog = device_status_catalog();
-    let output_schema = device_status_flag_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = item_status_flag_output_schema();
 
     let plan = lower_supported_filter_project_sql_to_logical_plan(
-        "select device_id, case when enabled = true then 1 else 0 end as enabled_flag from device_status",
+        "select key, case when flag = true then 1 else 0 end as enabled_flag from item_status",
         &catalog,
         &output_schema,
     )
@@ -9050,7 +9297,7 @@ fn filter_project_sql_accepts_case_projection_over_bool_predicate() {
     let [projection] = supported.value_columns.as_slice() else {
         panic!("expected one projection");
     };
-    assert_eq!(projection.input_column_id, "enabled");
+    assert_eq!(projection.input_column_id, "flag");
     assert_eq!(projection.output_column_id, "enabled_flag");
     let Some(SupportedProjectionExpr::CaseInt64 { predicate, .. }) = &projection.expression else {
         panic!("expected CASE projection expression");
@@ -9059,7 +9306,7 @@ fn filter_project_sql_accepts_case_projection_over_bool_predicate() {
     let [predicate] = predicates.as_slice() else {
         panic!("expected one CASE predicate");
     };
-    assert_eq!(predicate.column_id, "enabled");
+    assert_eq!(predicate.column_id, "flag");
     assert_eq!(predicate.op, PredicateOp::Eq);
     assert_eq!(predicate.literal, json!(true));
     validate_logical_view_plan(&plan).unwrap();
@@ -9067,12 +9314,12 @@ fn filter_project_sql_accepts_case_projection_over_bool_predicate() {
 
 #[test]
 fn filter_project_sql_rejects_case_bool_predicate_non_bool_literals() {
-    let catalog = device_status_catalog();
-    let output_schema = device_status_flag_output_schema();
+    let catalog = item_status_catalog();
+    let output_schema = item_status_flag_output_schema();
 
     for sql in [
-        "select device_id, case when enabled = 1 then 1 else 0 end as enabled_flag from device_status",
-        "select device_id, case when enabled = 'true' then 1 else 0 end as enabled_flag from device_status",
+        "select key, case when flag = 1 then 1 else 0 end as enabled_flag from item_status",
+        "select key, case when flag = 'true' then 1 else 0 end as enabled_flag from item_status",
     ] {
         let error =
             lower_supported_filter_project_sql_to_logical_plan(sql, &catalog, &output_schema)
@@ -10689,9 +10936,9 @@ fn unsupported_join_sql_families_fail_closed_without_logical_plan_fallback() {
 
     let scores = scores_catalog();
     let accounts = accounts_catalog();
-    let device_status = device_status_catalog();
-    let catalogs = [scores, accounts, device_status];
-    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id join device_status d on d.device_id = a.account_id group by a.account_id";
+    let item_status = item_status_catalog();
+    let catalogs = [scores, accounts, item_status];
+    let sql = "select a.account_id, sum(s.score) as sum, count(*) as count from scores s join accounts a on s.user_id = a.account_id join item_status d on d.key = a.account_id group by a.account_id";
     let error = lower_supported_sql_to_logical_plan(sql, &catalogs, &output_schema).unwrap_err();
 
     assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
@@ -11487,15 +11734,15 @@ fn self_join_count_output_schema() -> RelationSchema {
     }
 }
 
-fn device_status_catalog() -> VelorixRelationCatalogV1 {
+fn item_status_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
-        relation_id: "device_status".to_string(),
-        relation_name: "device_status".to_string(),
+        relation_id: "item_status".to_string(),
+        relation_name: "item_status".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
         columns: vec![
             RelationColumnV1 {
-                column_id: "device_id".to_string(),
-                name: "device_id".to_string(),
+                column_id: "key".to_string(),
+                name: "key".to_string(),
                 logical_type: VelorixLogicalTypeV1::Utf8,
                 physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
                 nullable: false,
@@ -11503,8 +11750,8 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::PrimaryKey,
             },
             RelationColumnV1 {
-                column_id: "enabled".to_string(),
-                name: "enabled".to_string(),
+                column_id: "flag".to_string(),
+                name: "flag".to_string(),
                 logical_type: VelorixLogicalTypeV1::Bool,
                 physical_arrow_type: ArrowPhysicalTypeV1::Boolean,
                 nullable: false,
@@ -11512,8 +11759,8 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Value,
             },
             RelationColumnV1 {
-                column_id: "event_time".to_string(),
-                name: "event_time".to_string(),
+                column_id: "ts".to_string(),
+                name: "ts".to_string(),
                 logical_type: VelorixLogicalTypeV1::Int64,
                 physical_arrow_type: ArrowPhysicalTypeV1::Int64,
                 nullable: false,
@@ -11530,10 +11777,10 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Weight,
             },
         ],
-        primary_key_column_ids: vec!["device_id".to_string()],
+        primary_key_column_ids: vec!["key".to_string()],
         weight_column_id: "delta".to_string(),
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
-        event_time_column_id: Some("event_time".to_string()),
+        event_time_column_id: Some("ts".to_string()),
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
@@ -11543,11 +11790,11 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
         datafusion_registration: DataFusionRegistrationV1 {
-            name: "device_status".to_string(),
+            name: "item_status".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
         incremental_relation: IncrementalRelationBindingV1 {
-            relation_id: "device_status".to_string(),
+            relation_id: "item_status".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
@@ -11683,6 +11930,41 @@ fn exit_gate_no_lossy_implicit_conversion_across_type_surfaces() {
     .unwrap();
     assert_eq!(plan.value_columns.len(), 1);
     assert_eq!(plan.typed_value_columns.len(), 1);
+}
+
+#[test]
+fn typed_json_and_float_admission_roundtrips_and_rejects_invalid_paths() {
+    use velorix_core::view_plan::{RuntimeScalarTypeV1, SupportedFilterProjectPlan};
+    let catalog = scores_catalog();
+    let sql = "select user_id, json_valid(user_id) as valid, try_cast(json_extract_string(user_id, '$.active_p') as double) as power, greatest(-try_cast(json_extract_string(user_id, '$.active_p') as double), 0) / 60 as charge, round(coalesce(nullif(score * 1.0, 0), 0.0), 2) as normalized from scores";
+    let plan = validate_supported_filter_project_sql(sql, &catalog).unwrap();
+    assert_eq!(plan.typed_value_columns.len(), 4);
+    assert_eq!(
+        plan.typed_value_columns[1].program.root.result_type,
+        RuntimeScalarTypeV1::Float64
+    );
+    assert!(plan.typed_value_columns[1].program.root.nullable);
+    assert!(!plan.typed_value_columns[2].program.root.nullable);
+    assert!(!plan.typed_value_columns[3].program.root.nullable);
+    let restored: SupportedFilterProjectPlan =
+        serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert_eq!(restored, plan);
+    for expr in [
+        "json_extract_string(user_id, '$[*]')",
+        "json_extract_string(user_id, '$.a[0]')",
+        "json_extract_string(user_id, score)",
+        "round(score * 1.0, 309)",
+        "round(score * 1.0, score)",
+    ] {
+        assert!(
+            validate_supported_filter_project_sql(
+                &format!("select user_id, {expr} as value from scores"),
+                &catalog
+            )
+            .is_err(),
+            "{expr}"
+        );
+    }
 }
 
 #[test]
@@ -12321,6 +12603,29 @@ fn correction_policy_requires_positive_hot_retention_and_fixed_windows_only() {
 }
 
 #[test]
+fn generic_tumbling_group_key_does_not_require_source_primary_key() {
+    let mut schema = purchases_event_time_catalog().relation_schema;
+    schema.primary_key_column_ids.clear();
+    for column in &mut schema.columns {
+        if column.semantic_role == RelationSemanticRoleV1::PrimaryKey {
+            column.semantic_role = RelationSemanticRoleV1::Value;
+        }
+    }
+    let catalog = VelorixRelationCatalogV1::from_relation_schema(
+        schema,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
+    )
+    .unwrap();
+    let sql = "select p.user_id as account, window_start, window_end, sum(p.amount) as total, count(*) as n from tumble(purchases, event_time, interval '60 seconds') as p group by p.user_id, window_start, window_end";
+    let plan = validate_supported_tumbling_window_sql(sql, &catalog).unwrap();
+    assert_eq!(plan.group_key_column_id, "user_id");
+    assert_eq!(plan.output_key_column_id, "account");
+    assert_eq!(plan.aggregate_outputs.len(), 2);
+    let wrong_group = sql.replace("group by p.user_id", "group by p.amount");
+    assert!(validate_supported_tumbling_window_sql(&wrong_group, &catalog).is_err());
+}
+
+#[test]
 fn correction_policy_lowering_preserves_sql_identity_and_absent_policy() {
     use velorix_core::view_plan::{
         lower_supported_tumbling_window_sql_to_logical_plan_with_policy, LateRowPolicy,
@@ -12380,4 +12685,39 @@ fn correction_policy_lowering_preserves_sql_identity_and_absent_policy() {
     let decoded: VelorixLogicalViewPlanV1 = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded, corrected);
     validate_logical_view_plan(&decoded).unwrap();
+}
+
+#[test]
+fn metric_nullable_numeric_multi_input_aggregate_admission() {
+    let mut catalog = scores_with_adjustment_catalog();
+    for column in &mut catalog.relation_schema.columns {
+        if column.column_id == "score" {
+            column.nullable = true;
+        }
+        if column.column_id == "user_id_adjustment" {
+            column.nullable = true;
+            column.physical_arrow_type = ArrowPhysicalTypeV1::Float64;
+            column.logical_type = VelorixLogicalTypeV1::Float64;
+        }
+    }
+    refresh_catalog_fingerprint(&mut catalog);
+    let sql = "select user_id, avg(score) as score_mean, min(score) as score_min, count(score) as score_count, avg(user_id_adjustment) as adjustment_mean, sum(user_id_adjustment) as adjustment_total from scores group by user_id";
+    let plan = validate_supported_view_sql(sql, &catalog).unwrap();
+    assert_eq!(plan.aggregate_outputs.len(), 5);
+    assert_eq!(
+        plan,
+        serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn metric_float_approx_quantile_per_output_filter_admission() {
+    let mut catalog = scores_catalog();
+    catalog.relation_schema.columns[1].nullable = true;
+    catalog.relation_schema.columns[1].physical_arrow_type = ArrowPhysicalTypeV1::Float64;
+    catalog.relation_schema.columns[1].logical_type = VelorixLogicalTypeV1::Float64;
+    refresh_catalog_fingerprint(&mut catalog);
+    let sql = "select user_id, approx_quantile(score, 0.5) filter (where user_id = 'eligible') as eligible_rate, approx_quantile(score, 0.5) as full_rate from scores group by user_id";
+    let plan = validate_supported_view_sql(sql, &catalog).unwrap();
+    assert_eq!(plan.aggregate_filter_exprs.len(), 1);
 }

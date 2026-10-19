@@ -81,7 +81,7 @@ use velorix_core::{
         SupportedSemiAntiJoinProjectPlanV1, SupportedThreeInputInnerJoinCountPlanV1,
         SupportedTopKPlan, SupportedTumblingWindowPlan, SupportedViewPlan, TypedExprKindV1,
         TypedExprNodeV1, TypedExprProgramV1, VelorixLogicalViewExecutionV1,
-        VelorixLogicalViewPlanV1, WindowNavigationFunctionV1,
+        VelorixLogicalViewPlanNodeV1, VelorixLogicalViewPlanV1, WindowNavigationFunctionV1,
         COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1, LEFT_JOIN_INPUT_INSTANCE_ID_V1,
         RIGHT_JOIN_INPUT_INSTANCE_ID_V1, THREE_INPUT_LEGACY_SQL_ENCOUNTER_JOIN_ORDER_V1,
         THREE_INPUT_ROOT_FIXED_RIGHT_RELATION_ID_JOIN_ORDER_V1,
@@ -101,8 +101,10 @@ mod interval_join;
 mod latest_by_key;
 mod output;
 mod recursive_fixpoint;
+mod resource_limits;
 mod scalar_aggregate_filter;
 mod semi_anti_join;
+mod set_ops;
 mod single_key_aggregate;
 mod temporal_join;
 mod three_input_join;
@@ -115,6 +117,7 @@ pub use filter_project::FilterProjectRuntime;
 pub use interval_join::IntervalJoinRuntime;
 pub use latest_by_key::LatestByKeyRuntime;
 pub use recursive_fixpoint::RecursiveFixpointRuntime;
+pub use resource_limits::RuntimeResourceLimits;
 pub use semi_anti_join::TwoInputSemiAntiJoinRuntime;
 pub use single_key_aggregate::SingleKeySumCountRuntime;
 pub use temporal_join::TemporalJoinRuntime;
@@ -196,10 +199,43 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
     input_schemas: &[RelationSchema],
     output_schemas: &[RelationSchema],
 ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    create_standing_runtime_with_logical_plan_and_catalogs_with_limits(
+        identity,
+        catalogs,
+        logical_plan,
+        input_schemas,
+        output_schemas,
+        RuntimeResourceLimits::default(),
+    )
+}
+
+pub fn create_standing_runtime_with_logical_plan_and_catalogs_with_limits(
+    identity: &StandingProgramIdentity,
+    catalogs: &[VelorixRelationCatalogV1],
+    logical_plan: VelorixLogicalViewPlanV1,
+    input_schemas: &[RelationSchema],
+    output_schemas: &[RelationSchema],
+    limits: RuntimeResourceLimits,
+) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    limits.validate().map_err(|error| error.to_string())?;
     let output_schema =
         only_schema(output_schemas, "output_schemas").map_err(|error| error.to_string())?;
     let sql = logical_plan.view_sql.clone();
     match &logical_plan.execution {
+        VelorixLogicalViewExecutionV1::TypedMap { .. }
+        | VelorixLogicalViewExecutionV1::Series { .. }
+        | VelorixLogicalViewExecutionV1::UnionAll { .. } => {
+            set_ops::SetOpsRuntime::new_with_limits(
+                identity.clone(),
+                catalogs.to_vec(),
+                input_schemas.to_vec(),
+                output_schema.clone(),
+                logical_plan,
+                limits,
+            )
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string())
+        }
         VelorixLogicalViewExecutionV1::SingleKeySumCount { plan } => {
             let [catalog] = catalogs else {
                 return Err(
@@ -207,7 +243,7 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
                         .to_string(),
                 );
             };
-            SingleKeySumCountRuntime::new_with_logical_plan(
+            SingleKeySumCountRuntime::new_with_logical_plan_and_limits(
                 identity.clone(),
                 catalog.clone(),
                 only_schema(input_schemas, "input_schemas").map_err(|error| error.to_string())?,
@@ -215,6 +251,7 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
                 sql,
                 plan.clone(),
                 logical_plan,
+                limits,
             )
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
@@ -307,6 +344,17 @@ pub fn create_standing_runtime_with_logical_plan_and_catalogs(
             )
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string())
+        }
+        VelorixLogicalViewExecutionV1::OrderedWindows { plan } => {
+            crate::materialized_view_runtime::analytic_window_frame::OrderedWindowRuntime::new_with_logical_plan_and_limits(
+                identity.clone(), catalogs.first().ok_or_else(|| "ordered windows require one catalog".to_string())?.clone(),
+                only_schema(input_schemas, "input_schemas").map_err(|error| error.to_string())?.clone(), output_schema.clone(), logical_plan.view_sql.clone(), *plan.clone(), logical_plan, limits,
+            ).map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>).map_err(|error| error.to_string())
+        }
+        VelorixLogicalViewExecutionV1::TypedJoinProject { plan } => {
+            crate::materialized_view_runtime::two_input_join::TypedJoinProjectRuntime::new_with_logical_plan_and_limits(
+                identity.clone(), catalogs.to_vec(), input_schemas.to_vec(), output_schema.clone(), logical_plan.view_sql.clone(), *plan.clone(), logical_plan, limits,
+            ).map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>).map_err(|error| error.to_string())
         }
         VelorixLogicalViewExecutionV1::AnalyticWindowFrames { plan } => {
             crate::materialized_view_runtime::analytic_window_frame::AnalyticWindowFrameRuntime::new_with_logical_plan(
@@ -475,17 +523,6 @@ pub fn materialized_delta_to_page(
         && !looks_like_default_sum_count_output(output_schema)
     {
         materialized_generic_delta_page_batch(output_schema, published_output, logical_epoch, page)?
-    } else if looks_like_tumbling_window_output(output_schema, aggregate_outputs) {
-        let Some(aggregate_outputs) = aggregate_outputs else {
-            return Err(invalid_runtime_state());
-        };
-        materialized_tumbling_delta_page_batch(
-            output_schema,
-            published_output,
-            aggregate_outputs,
-            logical_epoch,
-            page,
-        )?
     } else {
         materialized_delta_page_batch(
             output_schema,
@@ -511,23 +548,56 @@ fn looks_like_default_sum_count_output(output_schema: &RelationSchema) -> bool {
     )
 }
 
-fn looks_like_tumbling_window_output(
-    output_schema: &RelationSchema,
-    aggregate_outputs: Option<&[SupportedAggregateOutput]>,
-) -> bool {
-    let Some(aggregate_outputs) = aggregate_outputs else {
-        return false;
-    };
-    output_schema.columns.len() == aggregate_outputs.len() + 3
+fn reject_removed_runtime_kind(kind: Option<&str>) -> Result<(), StandingProgramRuntimeError> {
+    if matches!(
+        kind,
+        Some(
+            "native_projection_v1"
+                | "native_windowed_fact_v1"
+                | "native_rollup_v1"
+                | "native_native_rollup_v1"
+        )
+    ) {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "unsupported legacy specialized runtime checkpoint; rebuild derived data with generic views",
+        });
+    }
+    Ok(())
 }
 
 pub fn restore_standing_runtime(
     checkpoint: RuntimeCheckpoint,
 ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    restore_standing_runtime_with_limits(checkpoint, RuntimeResourceLimits::default())
+}
+
+pub fn restore_standing_runtime_with_limits(
+    checkpoint: RuntimeCheckpoint,
+    limits: RuntimeResourceLimits,
+) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+    limits.validate().map_err(|error| error.to_string())?;
     // Validate checkpoint payload size to prevent excessive memory allocation
     // during recovery. This bounds recovery time and RSS.
     if let Some(payload) = &checkpoint.state_payload {
-        checkpoint_common::validate_checkpoint_size(&payload.payload).map_err(|e| e.to_string())?;
+        limits
+            .validate_checkpoint(&payload.payload)
+            .map_err(|e| e.to_string())?;
+    }
+    let runtime_kind = checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|value| {
+            value
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    reject_removed_runtime_kind(runtime_kind.as_deref()).map_err(|error| error.to_string())?;
+    if runtime_kind.as_deref() == Some(set_ops::RUNTIME_KIND) {
+        return set_ops::SetOpsRuntime::restore_with_limits(checkpoint, limits)
+            .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+            .map_err(|error| error.to_string());
     }
     if checkpoint_has_filter_project_payload(&checkpoint) {
         return FilterProjectRuntime::restore(checkpoint)
@@ -543,6 +613,24 @@ pub fn restore_standing_runtime(
         return crate::materialized_view_runtime::analytic_window_frame::AnalyticWindowFrameRuntime::restore(checkpoint)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
+    }
+    if checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
+        .and_then(|value| value.get("runtime_kind").cloned())
+        .is_some_and(|kind| kind == "ordered_window")
+    {
+        return crate::materialized_view_runtime::analytic_window_frame::OrderedWindowRuntime::restore_with_limits(checkpoint, limits).map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>).map_err(|error| error.to_string());
+    }
+    if crate::materialized_view_runtime::two_input_join::checkpoint_has_typed_join_project_payload(
+        &checkpoint,
+    ) {
+        return crate::materialized_view_runtime::two_input_join::TypedJoinProjectRuntime::restore_with_limits(
+            checkpoint, limits,
+        )
+        .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
+        .map_err(|error| error.to_string());
     }
     if checkpoint_has_scalar_aggregate_filter_payload(&checkpoint) {
         return ScalarAggregateFilterRuntimeAlias::restore(checkpoint)
@@ -600,7 +688,7 @@ pub fn restore_standing_runtime(
             .map_err(|error| error.to_string());
     }
     if checkpoint_has_single_key_sum_count_payload(&checkpoint) {
-        return SingleKeySumCountRuntime::restore(checkpoint)
+        return SingleKeySumCountRuntime::restore_with_limits(checkpoint, limits)
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
@@ -939,6 +1027,8 @@ struct TumblingWindowCheckpointPayload {
     input_frontiers: Vec<RelationFrontier>,
     #[serde(default)]
     input_event_time_frontiers: Vec<InputEventTimeFrontier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deferred_demand: Option<event_time_window::DeferredDemandFrontiers>,
     state: TumblingWindowState,
     #[serde(default)]
     cold_state_version: Option<u32>,
@@ -1733,14 +1823,33 @@ fn aggregate_group_input_delta_batch(
     if let Some(empty_delta) = published_input_empty_delta(input, catalog)? {
         return Ok(empty_delta);
     }
-    if plan.aggregate_output_identity.is_none() {
+    if plan.aggregate_output_identity.is_none()
+        && !plan.aggregate_outputs.iter().any(|output| {
+            matches!(
+                output.function,
+                LogicalPlanAggregateFunctionV1::ArgMax { .. }
+            )
+        })
+    {
         return single_key_input_delta_batch(catalog, plan, input);
     }
-    let primary_key = catalog_primary_key_column(catalog)?.column_id.clone();
+    let anchor = plan.group_key_column_id.clone();
     let mut value_column_ids = supported_view_plan_aggregate_outputs(plan)
         .into_iter()
         .filter_map(|aggregate| aggregate.input_column_id)
         .collect::<BTreeSet<_>>();
+    for aggregate in &plan.aggregate_outputs {
+        if let LogicalPlanAggregateFunctionV1::ArgMax {
+            ordering_column_ordinal,
+        } = aggregate.function
+        {
+            value_column_ids.insert(
+                single_key_aggregate::arg_max_order_column(catalog, ordering_column_ordinal)?
+                    .column_id
+                    .clone(),
+            );
+        }
+    }
     for key in supported_view_plan_group_keys(plan) {
         if let Some(column_id) = key.input_column_id {
             value_column_ids.insert(column_id);
@@ -1749,16 +1858,21 @@ fn aggregate_group_input_delta_batch(
             value_column_ids.extend(projection_expr_column_ids(&expression));
         }
     }
-    value_column_ids.remove(&primary_key);
+    value_column_ids.remove(&anchor);
+    // A bag's physical anchor is an ordinary nullable source column, not a PK.
+    // Keep the existing adapter for keyed inputs, including its wider type support.
+    if catalog.relation_schema.primary_key_column_ids.len() != 1 {
+        return single_key_aggregate::bag_input_delta(catalog, plan, input, &value_column_ids);
+    }
     if value_column_ids.is_empty() {
-        value_column_ids.insert(plan.sum_value_column_id.clone());
+        return single_key_aggregate::bag_input_delta(catalog, plan, input, &value_column_ids);
     }
     arrow_record_batches_to_key_multi_value_delta_batch(
         catalog,
         &input.relation_id,
         &input.relation_version,
         &input.schema_fingerprint,
-        std::slice::from_ref(&primary_key),
+        std::slice::from_ref(&anchor),
         &value_column_ids.into_iter().collect::<Vec<_>>(),
         &input.batches,
     )
@@ -1775,7 +1889,7 @@ fn rekey_delta_batch_for_aggregate_group(
     if plan.aggregate_output_identity.is_none() {
         return Ok(delta.clone());
     }
-    let primary_key = catalog_primary_key_column(catalog)?.column_id.clone();
+    let anchor = plan.group_key_column_id.clone();
     let group_keys = supported_view_plan_group_keys(plan);
     let mut records = Vec::with_capacity(delta.records().len());
     for record in delta.records() {
@@ -1785,7 +1899,7 @@ fn rekey_delta_batch_for_aggregate_group(
             .as_object()
             .cloned()
             .ok_or_else(invalid_runtime_state)?;
-        input.insert(primary_key.clone(), record.key.as_json().clone());
+        input.insert(anchor.clone(), record.key.as_json().clone());
         let values = group_keys
             .iter()
             .map(|key| {
@@ -1815,7 +1929,7 @@ fn rekey_delta_batch_for_aggregate_group(
         };
         records.push(DeltaRecord::new(
             DeltaKey::from_json(key),
-            record.value.clone(),
+            DeltaValue::from_json(Value::Object(input)),
             record.weight,
         ));
     }
@@ -1842,15 +1956,12 @@ fn publish_aggregate_state(
     let value = match rows.as_slice() {
         [] => {
             let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
-            let [count] = aggregate_outputs.as_slice() else {
-                return Err(invalid_runtime_state());
-            };
-            let mut value = Map::new();
-            value.insert(
-                count.output_column_id.clone(),
-                Value::Number(JsonNumber::from(0)),
+            let empty = DeltaRecord::new(
+                DeltaKey::from_json(singleton_aggregate_key("state")),
+                DeltaValue::from_json(Value::Null),
+                1,
             );
-            DeltaValue::from_json(Value::Object(value))
+            zeroed_filtered_aggregate_record(&empty, &aggregate_outputs, true).value
         }
         [row] if row.weight == 1 => row.value.clone(),
         _ => return Err(invalid_runtime_state()),
@@ -2619,6 +2730,7 @@ fn validate_join_plan_matches_catalogs(
                 | LogicalPlanAggregateFunctionV1::Avg
                 | LogicalPlanAggregateFunctionV1::Min
                 | LogicalPlanAggregateFunctionV1::Max
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
         ) {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "generic_join_view_plan.aggregate_filter_exprs",
@@ -3089,6 +3201,13 @@ fn validate_supported_schemas(
         // nullable aggregate metadata, so accept either nullability here.
         if column.name != aggregate.output_column_id
             || column.data_type != aggregate_output_sql_type(catalog, aggregate)?
+            || (supported_view_plan_is_singleton(plan)
+                && !matches!(
+                    aggregate.function,
+                    LogicalPlanAggregateFunctionV1::Count
+                        | LogicalPlanAggregateFunctionV1::CountDistinct
+                )
+                && !column.nullable)
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "output_schema",
@@ -3531,7 +3650,7 @@ fn validate_tumbling_supported_schemas(
             field: "output_schema.columns",
         });
     };
-    let key_column = catalog_primary_key_column(catalog)?;
+    let key_column = catalog_column_by_id(catalog, &plan.group_key_column_id)?;
     let event_time_column = catalog_column_by_id(catalog, &plan.event_time_column_id)?;
     let value_column = catalog_column_by_id(catalog, &plan.sum_value_column_id)?;
     let Some(declared_event_time_column_id) = &catalog.relation_schema.event_time_column_id else {
@@ -3598,6 +3717,17 @@ fn validate_tumbling_supported_schemas(
     if !matches!(value_column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "tumbling_window_plan.value_column",
+        });
+    }
+    if plan.aggregate_outputs.iter().any(|output| {
+        matches!(
+            output.function,
+            LogicalPlanAggregateFunctionV1::ArgMax { .. }
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
+        )
+    }) {
+        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+            field: "tumbling_window_plan.arg_max",
         });
     }
     if let Some(predicate_expr) = &plan.predicate_expr {
@@ -3724,7 +3854,12 @@ fn validate_plan_matches_catalog(
     catalog: &VelorixRelationCatalogV1,
 ) -> Result<(), StandingProgramRuntimeError> {
     if plan.input_relation_id != catalog.relation_schema.relation_id
-        || plan.group_key_column_id != catalog_primary_key_column(catalog)?.column_id
+        || plan.group_key_column_id == catalog.relation_schema.weight_column_id
+        || catalog_column(catalog, &plan.group_key_column_id).is_err()
+        || (catalog.relation_schema.primary_key_column_ids.len() == 1
+            && plan.group_key_column_id != catalog_primary_key_column(catalog)?.column_id)
+        || (catalog.relation_schema.primary_key_column_ids.len() != 1
+            && plan.aggregate_output_identity.is_none())
     {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "generic_view_plan",
@@ -3735,22 +3870,6 @@ fn validate_plan_matches_catalog(
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
             field: "generic_view_plan.group_keys",
         });
-    }
-    if supported_view_plan_is_singleton(plan) {
-        let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
-        let [count] = aggregate_outputs.as_slice() else {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "generic_view_plan.singleton",
-            });
-        };
-        if count.function != LogicalPlanAggregateFunctionV1::Count
-            || count.input_column_id.is_some()
-            || count.input_expression.is_some()
-        {
-            return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                field: "generic_view_plan.singleton",
-            });
-        }
     }
     let mut output_ids = BTreeSet::new();
     for key in &group_keys {
@@ -3827,18 +3946,16 @@ fn validate_plan_matches_catalog(
                 if single_key_count_only_input_column(plan).is_none()
                     && single_key_count_distinct_input_column(plan).is_none()
                     && input_column_id != &plan.sum_value_column_id
-                {
-                    let nullable_count_distinct = column.nullable
-                        && output.function == LogicalPlanAggregateFunctionV1::CountDistinct;
-                    if multi_input_column_ids.is_none()
+                    && (multi_input_column_ids.is_none()
                         || column.column_id == catalog.relation_schema.weight_column_id
-                        || (column.nullable && !nullable_count_distinct)
-                        || column.physical_arrow_type != ArrowPhysicalTypeV1::Int64
-                    {
-                        return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
-                            field: "generic_view_plan.aggregate_outputs",
-                        });
-                    }
+                        || !matches!(
+                            column.physical_arrow_type,
+                            ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+                        ))
+                {
+                    return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                        field: "generic_view_plan.aggregate_outputs",
+                    });
                 }
             } else if input_column_id != &plan.sum_value_column_id {
                 if multi_input_column_ids.is_none() {
@@ -3848,8 +3965,10 @@ fn validate_plan_matches_catalog(
                 }
                 let column = catalog_column(catalog, input_column_id)?;
                 if column.column_id == catalog.relation_schema.weight_column_id
-                    || column.nullable
-                    || column.physical_arrow_type != ArrowPhysicalTypeV1::Int64
+                    || !matches!(
+                        column.physical_arrow_type,
+                        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+                    )
                 {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "generic_view_plan.aggregate_outputs",
@@ -3865,7 +3984,7 @@ fn validate_plan_matches_catalog(
             "generic_view_plan.predicate.column",
             &mut |column_id| {
                 let column = catalog_column(catalog, column_id)?;
-                if column.column_id != catalog_primary_key_column(catalog)?.column_id
+                if column.column_id != plan.group_key_column_id
                     && column.column_id != plan.sum_value_column_id
                 {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -3877,7 +3996,7 @@ fn validate_plan_matches_catalog(
         )?;
     } else if let Some(predicate) = &plan.predicate {
         let column = catalog_column(catalog, &predicate.column_id)?;
-        if column.column_id != catalog_primary_key_column(catalog)?.column_id
+        if column.column_id != plan.group_key_column_id
             && column.column_id != plan.sum_value_column_id
         {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -3902,11 +4021,8 @@ fn validate_plan_matches_catalog(
                 | LogicalPlanAggregateFunctionV1::Avg
                 | LogicalPlanAggregateFunctionV1::Min
                 | LogicalPlanAggregateFunctionV1::Max
-        ) || output
-            .input_column_id
-            .as_ref()
-            .is_some_and(|input_column_id| input_column_id != &plan.sum_value_column_id)
-        {
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
+        ) {
             return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                 field: "generic_view_plan.aggregate_filter_exprs",
             });
@@ -3917,8 +4033,10 @@ fn validate_plan_matches_catalog(
             "generic_view_plan.aggregate_filter_exprs",
             &mut |column_id| {
                 let column = catalog_column(catalog, column_id)?;
-                if column.column_id != catalog_primary_key_column(catalog)?.column_id
+                if column.column_id != plan.group_key_column_id
                     && column.column_id != plan.sum_value_column_id
+                    && !(plan.aggregate_output_identity.is_some()
+                        && single_key_retains_predicate_column(plan, column_id))
                 {
                     return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                         field: "generic_view_plan.aggregate_filter_exprs",
@@ -4005,6 +4123,13 @@ fn single_key_plan_uses_runtime_aggregate_state(
     catalog: &VelorixRelationCatalogV1,
 ) -> bool {
     plan.aggregate_output_identity.is_some()
+        || plan.aggregate_outputs.iter().any(|output| {
+            matches!(
+                output.function,
+                LogicalPlanAggregateFunctionV1::ArgMax { .. }
+                    | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
+            )
+        })
         || single_key_multi_input_column_ids(plan).is_some()
         || !plan.aggregate_filter_exprs.is_empty()
         || supported_view_plan_aggregate_outputs(plan)
@@ -4016,7 +4141,10 @@ fn single_key_plan_uses_runtime_aggregate_state(
                         .columns
                         .iter()
                         .find(|column| column.column_id == *column_id)
-                        .is_some_and(|column| column.nullable)
+                        .is_some_and(|column| {
+                            column.nullable
+                                || column.physical_arrow_type == ArrowPhysicalTypeV1::Float64
+                        })
                 })
             })
         || supported_view_plan_aggregate_outputs(plan)
@@ -4103,6 +4231,20 @@ fn catalog_column<'a>(
         })
 }
 
+fn single_key_retains_predicate_column(plan: &SupportedViewPlan, column_id: &str) -> bool {
+    supported_view_plan_aggregate_outputs(plan)
+        .iter()
+        .any(|aggregate| aggregate.input_column_id.as_deref() == Some(column_id))
+        || supported_view_plan_group_keys(plan).iter().any(|key| {
+            key.input_column_id.as_deref() == Some(column_id)
+                || key.expression.as_ref().is_some_and(|expression| {
+                    projection_expr_column_ids(expression)
+                        .iter()
+                        .any(|id| id == column_id)
+                })
+        })
+}
+
 fn predicate_matches_record(
     predicate: &RowPredicate,
     catalog: &VelorixRelationCatalogV1,
@@ -4110,9 +4252,17 @@ fn predicate_matches_record(
     record: &DeltaRecord,
 ) -> Result<bool, StandingProgramRuntimeError> {
     let column = catalog_column(catalog, &predicate.column_id)?;
-    let actual = if column.column_id == catalog_primary_key_column(catalog)?.column_id {
-        record.key.as_json()
-    } else if column.column_id == plan.sum_value_column_id {
+    let actual = if column.column_id == plan.group_key_column_id {
+        record
+            .value
+            .as_json()
+            .as_object()
+            .and_then(|value| value.get(&column.column_id))
+            .unwrap_or(record.key.as_json())
+    } else if column.column_id == plan.sum_value_column_id
+        || (plan.aggregate_output_identity.is_some()
+            && single_key_retains_predicate_column(plan, &column.column_id))
+    {
         input_record_column_value(record, &column.column_id)
     } else {
         return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -4145,15 +4295,20 @@ fn predicate_expr_matches_record(
             comparison_op,
             literal,
         } => {
-            let mut input = Map::new();
-            input.insert(
-                catalog_primary_key_column(catalog)?.column_id.clone(),
-                record.key.as_json().clone(),
-            );
-            input.insert(
-                plan.sum_value_column_id.clone(),
-                input_record_column_value(record, &plan.sum_value_column_id).clone(),
-            );
+            let mut input = record
+                .value
+                .as_json()
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            input
+                .entry(plan.group_key_column_id.clone())
+                .or_insert_with(|| record.key.as_json().clone());
+            input
+                .entry(plan.sum_value_column_id.clone())
+                .or_insert_with(|| {
+                    input_record_column_value(record, &plan.sum_value_column_id).clone()
+                });
             scalar_int64_comparison_matches_input(left, *comparison_op, literal, &input, catalog)
         }
         RowPredicateExpr::ScalarInt64ExpressionComparison { .. } => {
@@ -4250,12 +4405,49 @@ fn apply_filtered_single_key_aggregate_delta(
                         | LogicalPlanAggregateFunctionV1::Max
                         | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
                         | LogicalPlanAggregateFunctionV1::PercentileCont { .. }
+                        | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
                 ) || (aggregate.function == LogicalPlanAggregateFunctionV1::Count
                     && aggregate.input_column_id.is_some()))
             {
                 continue;
             }
             let update = match aggregate.function {
+                LogicalPlanAggregateFunctionV1::ArgMax {
+                    ordering_column_ordinal,
+                } => {
+                    let Some(value) = single_key_aggregate::arg_max_input(
+                        aggregate,
+                        ordering_column_ordinal,
+                        plan,
+                        catalog,
+                        record,
+                    )?
+                    else {
+                        continue;
+                    };
+                    FilteredAggregateUpdate::Multiset {
+                        aggregate: aggregate.clone(),
+                        value,
+                    }
+                }
+                LogicalPlanAggregateFunctionV1::Sum
+                    if aggregate.input_column_id.as_ref().is_some_and(|id| {
+                        catalog.relation_schema.columns.iter().any(|column| {
+                            column.column_id == *id
+                                && column.physical_arrow_type == ArrowPhysicalTypeV1::Float64
+                        })
+                    }) =>
+                {
+                    FilteredAggregateUpdate::Avg {
+                        aggregate: aggregate.clone(),
+                        amount: aggregate_input_f64_value(
+                            aggregate,
+                            plan.sum_value_column_id.as_str(),
+                            record,
+                            catalog,
+                        )?,
+                    }
+                }
                 LogicalPlanAggregateFunctionV1::Sum => FilteredAggregateUpdate::AddI64 {
                     aggregate: aggregate.clone(),
                     delta: aggregate_input_i64_value(
@@ -4300,15 +4492,16 @@ fn apply_filtered_single_key_aggregate_delta(
                 LogicalPlanAggregateFunctionV1::Min
                 | LogicalPlanAggregateFunctionV1::Max
                 | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
-                | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
+                | LogicalPlanAggregateFunctionV1::PercentileCont { .. }
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
                     FilteredAggregateUpdate::Multiset {
                         aggregate: aggregate.clone(),
-                        value: Value::Number(JsonNumber::from(aggregate_input_i64_value(
+                        value: aggregate_input_value(
                             aggregate,
                             plan.sum_value_column_id.as_str(),
                             record,
                             catalog,
-                        )?)),
+                        )?,
                     }
                 }
             };
@@ -4338,6 +4531,18 @@ fn apply_filtered_single_key_aggregate_delta(
                     aggregate,
                     value: multiset_value,
                 } => {
+                    if matches!(
+                        aggregate.function,
+                        LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
+                    ) {
+                        single_key_aggregate::update_approx_quantile_values(
+                            &mut row_value,
+                            &aggregate.output_column_id,
+                            &multiset_value,
+                            record.weight,
+                        )?;
+                        continue;
+                    }
                     update_filtered_multiset_value(
                         &mut row_value,
                         &aggregate.output_column_id,
@@ -4371,6 +4576,16 @@ fn apply_filtered_single_key_aggregate_delta(
                     }
                 }
                 FilteredAggregateUpdate::Avg { aggregate, amount } => {
+                    if aggregate.function == LogicalPlanAggregateFunctionV1::Sum
+                        && !row_value
+                            .get(&aggregate.output_column_id)
+                            .is_some_and(Value::is_object)
+                    {
+                        row_value.insert(
+                            aggregate.output_column_id.clone(),
+                            zeroed_filtered_avg_value(),
+                        );
+                    }
                     update_filtered_avg_value(
                         &mut row_value,
                         &aggregate.output_column_id,
@@ -4386,6 +4601,27 @@ fn apply_filtered_single_key_aggregate_delta(
         }
     }
 
+    for key in before_rows.keys() {
+        if let Some(row) = rows.get_mut(key) {
+            let mut value = row
+                .value
+                .as_json()
+                .as_object()
+                .cloned()
+                .ok_or_else(invalid_runtime_state)?;
+            for aggregate in &aggregate_outputs {
+                if let LogicalPlanAggregateFunctionV1::ApproxQuantile { percentile } =
+                    aggregate.function
+                {
+                    let state = value
+                        .get_mut(&aggregate.output_column_id)
+                        .ok_or_else(invalid_runtime_state)?;
+                    single_key_aggregate::rebuild_approx_quantile(state, percentile)?;
+                }
+            }
+            row.value = DeltaValue::from_json(Value::Object(value));
+        }
+    }
     let mut output = Vec::new();
     for (key, before) in before_rows {
         let after = rows.get(&key).cloned();
@@ -4527,6 +4763,14 @@ fn validate_group_input_count_state(
             .ok_or_else(invalid_checkpoint)?;
         for aggregate in supported_view_plan_aggregate_outputs(plan) {
             project_aggregate_value(value, &aggregate).map_err(|_| invalid_checkpoint())?;
+            if let LogicalPlanAggregateFunctionV1::ApproxQuantile { percentile } =
+                aggregate.function
+            {
+                let state = value
+                    .get(&aggregate.output_column_id)
+                    .ok_or_else(invalid_checkpoint)?;
+                single_key_aggregate::validate_approx_quantile_checkpoint(state, percentile)?;
+            }
         }
         if !state_keys.insert(key) {
             return Err(invalid_checkpoint());
@@ -4553,7 +4797,15 @@ fn validate_single_key_aggregate_group_key(
     if group_keys.len() == 1 {
         let group_key = &group_keys[0];
         let expected_type = if let Some(column_id) = &group_key.input_column_id {
-            sql_type_from_catalog_column(catalog_column(catalog, column_id)?)?
+            let column = catalog_column(catalog, column_id)?;
+            if key.is_null() {
+                return if column.nullable {
+                    Ok(())
+                } else {
+                    Err(invalid_checkpoint())
+                };
+            }
+            sql_type_from_catalog_column(column)?
         } else {
             SqlDataType::Int64
         };
@@ -4568,7 +4820,14 @@ fn validate_single_key_aggregate_group_key(
             .get(&group_key.output_column_id)
             .ok_or_else(invalid_checkpoint)?;
         let expected_type = if let Some(column_id) = &group_key.input_column_id {
-            sql_type_from_catalog_column(catalog_column(catalog, column_id)?)?
+            let column = catalog_column(catalog, column_id)?;
+            if value.is_null() {
+                if !column.nullable {
+                    return Err(invalid_checkpoint());
+                }
+                continue;
+            }
+            sql_type_from_catalog_column(column)?
         } else {
             SqlDataType::Int64
         };
@@ -4704,6 +4963,10 @@ fn apply_filtered_join_aggregate_delta(
             }
             let input_value = join_aggregate_input_value(aggregate, plan, catalogs, record)?;
             let update = match aggregate.function {
+                LogicalPlanAggregateFunctionV1::ArgMax { .. }
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
+                    return Err(invalid_runtime_state())
+                }
                 LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
                 | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
                     FilteredAggregateUpdate::Multiset {
@@ -4902,6 +5165,10 @@ fn zeroed_filtered_aggregate_record(
     let mut value = serde_json::Map::new();
     for aggregate in aggregate_outputs {
         let initial = match aggregate.function {
+            LogicalPlanAggregateFunctionV1::ApproxQuantile { percentile } => {
+                single_key_aggregate::zeroed_approx_quantile(percentile)
+            }
+            LogicalPlanAggregateFunctionV1::ArgMax { .. } => Value::Array(Vec::new()),
             LogicalPlanAggregateFunctionV1::CountDistinct => Value::Array(Vec::new()),
             LogicalPlanAggregateFunctionV1::Avg => zeroed_filtered_avg_value(),
             LogicalPlanAggregateFunctionV1::Sum if track_sum_qualifying_count => {
@@ -4943,6 +5210,26 @@ fn filtered_aggregate_record_is_live(
         return Ok(group_row_count > 0);
     }
     for aggregate in aggregate_outputs {
+        if let Some(state) = value
+            .get(&aggregate.output_column_id)
+            .and_then(Value::as_object)
+        {
+            if state
+                .get("values")
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.is_empty())
+            {
+                return Ok(true);
+            }
+            if state
+                .get("count")
+                .and_then(Value::as_i64)
+                .is_some_and(|count| count > 0)
+            {
+                return Ok(true);
+            }
+            continue;
+        }
         match aggregate.function {
             LogicalPlanAggregateFunctionV1::CountDistinct => {
                 if value
@@ -4966,6 +5253,7 @@ fn filtered_aggregate_record_is_live(
             }
             LogicalPlanAggregateFunctionV1::Min
             | LogicalPlanAggregateFunctionV1::Max
+            | LogicalPlanAggregateFunctionV1::ArgMax { .. }
             | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
             | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {
                 if value
@@ -5137,6 +5425,9 @@ fn update_filtered_avg_value(
         .get("count")
         .and_then(Value::as_i64)
         .ok_or_else(invalid_runtime_state)?;
+    if !amount.is_finite() {
+        return Err(invalid_runtime_state());
+    }
     let next_sum = sum + amount * weight as f64;
     if !next_sum.is_finite() {
         return Err(invalid_runtime_state());
@@ -5149,7 +5440,7 @@ fn update_filtered_avg_value(
     }
     row.insert(
         output_column_id.to_string(),
-        filtered_avg_value(next_sum, next_count)?,
+        filtered_avg_value(if next_count == 0 { 0.0 } else { next_sum }, next_count)?,
     );
     Ok(())
 }
@@ -7182,6 +7473,10 @@ fn tumbling_project_aggregate_value(
     aggregate: &SupportedAggregateOutput,
 ) -> Value {
     match aggregate.function {
+        LogicalPlanAggregateFunctionV1::ArgMax { .. }
+        | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
+            unreachable!("aggregate is rejected by window admission and restore")
+        }
         LogicalPlanAggregateFunctionV1::Sum | LogicalPlanAggregateFunctionV1::Count => {
             Value::Number(JsonNumber::from(
                 row.values
@@ -7296,7 +7591,7 @@ fn apply_tumbling_input(
         });
     }
     let current_watermark = current_partition_watermark(current_event_time_frontiers, input);
-    let key_column = catalog_primary_key_column(catalog)?;
+    let key_column = catalog_column_by_id(catalog, &plan.group_key_column_id)?;
     let value_column = catalog_column_by_id(catalog, &plan.sum_value_column_id)?;
     let event_time_column = catalog_column_by_id(catalog, &plan.event_time_column_id)?;
     let weight_column = catalog_column_by_id(catalog, &catalog.relation_schema.weight_column_id)?;
@@ -7699,6 +7994,10 @@ fn apply_window_row_update(
             continue;
         }
         match aggregate.function {
+            LogicalPlanAggregateFunctionV1::ArgMax { .. }
+            | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
+                return Err(invalid_runtime_state())
+            }
             LogicalPlanAggregateFunctionV1::Sum => {
                 let Some(amount) = window_aggregate_input_amount(
                     aggregate,
@@ -8715,6 +9014,19 @@ fn aggregate_value_mode_for_plan(
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedViewPlan,
 ) -> Result<AggregateValueMode, StandingProgramRuntimeError> {
+    if supported_view_plan_aggregate_outputs(plan)
+        .iter()
+        .all(|output| {
+            matches!(
+                output.function,
+                LogicalPlanAggregateFunctionV1::Count
+                    | LogicalPlanAggregateFunctionV1::CountDistinct
+            )
+        })
+    {
+        // COUNT does not perform arithmetic on its source column.
+        return Ok(AggregateValueMode::Integer);
+    }
     aggregate_value_mode_for_column_id(catalog, &plan.sum_value_column_id)
 }
 
@@ -8763,6 +9075,8 @@ fn aggregate_value_mode_for_column_id(
 ) -> Result<AggregateValueMode, StandingProgramRuntimeError> {
     match &catalog_column(catalog, column_id)?.physical_arrow_type {
         ArrowPhysicalTypeV1::Int64 => Ok(AggregateValueMode::Integer),
+        // Float plans use generic accumulators; this kernel only tracks epochs.
+        ArrowPhysicalTypeV1::Float64 => Ok(AggregateValueMode::Integer),
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => {
             Ok(AggregateValueMode::Decimal128 {
                 precision: *precision,
@@ -8781,6 +9095,7 @@ fn aggregate_sum_sql_type_for_column_id(
 ) -> Result<SqlDataType, StandingProgramRuntimeError> {
     match &catalog_column(catalog, column_id)?.physical_arrow_type {
         ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Int64),
+        ArrowPhysicalTypeV1::Float64 => Ok(SqlDataType::Float64),
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => Ok(SqlDataType::Decimal {
             precision: *precision,
             scale: *scale,
@@ -8796,6 +9111,29 @@ fn aggregate_output_sql_type(
     output: &SupportedAggregateOutput,
 ) -> Result<SqlDataType, StandingProgramRuntimeError> {
     match output.function {
+        LogicalPlanAggregateFunctionV1::ApproxQuantile { percentile } => {
+            let column_id = output
+                .input_column_id
+                .as_ref()
+                .ok_or_else(invalid_runtime_state)?;
+            if !percentile.is_finite()
+                || !(0.0..=1.0).contains(&percentile)
+                || !matches!(
+                    catalog_column(catalog, column_id)?.physical_arrow_type,
+                    ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+                )
+            {
+                return Err(invalid_runtime_state());
+            }
+            Ok(SqlDataType::Float64)
+        }
+        LogicalPlanAggregateFunctionV1::ArgMax { .. } => {
+            let column_id = output
+                .input_column_id
+                .as_ref()
+                .ok_or_else(invalid_runtime_state)?;
+            aggregate_sum_sql_type_for_column_id(catalog, column_id)
+        }
         LogicalPlanAggregateFunctionV1::Sum => {
             if output.input_expression.is_some() {
                 return Ok(SqlDataType::Int64);
@@ -8817,9 +9155,9 @@ fn aggregate_output_sql_type(
                 });
             };
             match &catalog_column(catalog, column_id)?.physical_arrow_type {
-                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. } => {
-                    Ok(SqlDataType::Float64)
-                }
+                ArrowPhysicalTypeV1::Int64
+                | ArrowPhysicalTypeV1::Float64
+                | ArrowPhysicalTypeV1::Decimal128 { .. } => Ok(SqlDataType::Float64),
                 _ => Err(StandingProgramRuntimeError::InvalidProgramIdentity {
                     field: "generic_view_plan.aggregate_outputs.avg",
                 }),
@@ -9313,7 +9651,37 @@ fn project_aggregate_value(
     aggregate: &SupportedAggregateOutput,
 ) -> Result<Value, StandingProgramRuntimeError> {
     match aggregate.function {
+        LogicalPlanAggregateFunctionV1::ApproxQuantile { percentile } => {
+            let state = value
+                .get(&aggregate.output_column_id)
+                .ok_or_else(invalid_runtime_state)?;
+            single_key_aggregate::project_approx_quantile(state, percentile)
+        }
+        LogicalPlanAggregateFunctionV1::ArgMax { .. } => {
+            match value.get(&aggregate.output_column_id) {
+                Some(Value::Array(values)) => single_key_aggregate::project_arg_max(values),
+                Some(projected) => Ok(projected.clone()),
+                None => Err(invalid_runtime_state()),
+            }
+        }
         LogicalPlanAggregateFunctionV1::Sum => {
+            if let Some(state) = value
+                .get(&aggregate.output_column_id)
+                .and_then(Value::as_object)
+            {
+                let count = state
+                    .get("count")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(invalid_runtime_state)?;
+                if count < 0 {
+                    return Err(invalid_runtime_state());
+                }
+                return if count == 0 {
+                    Ok(Value::Null)
+                } else {
+                    state.get("sum").cloned().ok_or_else(invalid_runtime_state)
+                };
+            }
             let qualifying_count = value
                 .get(&single_key_sum_qualifying_count_key(
                     &aggregate.output_column_id,
@@ -9488,7 +9856,7 @@ fn project_filtered_avg_value(value: &Value) -> Result<Option<Value>, StandingPr
 }
 
 fn multiset_i64_extreme(values: &[Value], max: bool) -> Result<Value, StandingProgramRuntimeError> {
-    let mut selected: Option<i64> = None;
+    let mut selected: Option<Value> = None;
     for entry in values {
         let entry = entry.as_object().ok_or_else(invalid_runtime_state)?;
         let weight = entry
@@ -9498,20 +9866,27 @@ fn multiset_i64_extreme(values: &[Value], max: bool) -> Result<Value, StandingPr
         if weight <= 0 {
             continue;
         }
-        let candidate = entry
-            .get("value")
-            .and_then(Value::as_i64)
-            .ok_or_else(invalid_runtime_state)?;
-        selected = Some(match selected {
-            Some(current) if max => current.max(candidate),
-            Some(current) => current.min(candidate),
-            None => candidate,
-        });
+        let candidate = entry.get("value").ok_or_else(invalid_runtime_state)?;
+        let candidate_number = aggregate_sum_as_f64(candidate)?;
+        let replace = match selected.as_ref() {
+            Some(current) => {
+                let ordering = match (candidate.as_i64(), current.as_i64()) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    _ => candidate_number.total_cmp(&aggregate_sum_as_f64(current)?),
+                };
+                if max {
+                    ordering.is_gt()
+                } else {
+                    ordering.is_lt()
+                }
+            }
+            None => true,
+        };
+        if replace {
+            selected = Some(candidate.clone());
+        }
     }
-    Ok(selected
-        .map(JsonNumber::from)
-        .map(Value::Number)
-        .unwrap_or(Value::Null))
+    Ok(selected.unwrap_or(Value::Null))
 }
 
 fn aggregate_sum_as_f64(value: &Value) -> Result<f64, StandingProgramRuntimeError> {
@@ -9519,8 +9894,9 @@ fn aggregate_sum_as_f64(value: &Value) -> Result<f64, StandingProgramRuntimeErro
         return Ok(value as f64);
     }
     value
-        .as_str()
-        .and_then(|value| value.parse::<f64>().ok())
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite())
         .ok_or_else(invalid_runtime_state)
 }
 
@@ -9858,4 +10234,196 @@ fn percentile_value(
         }
         _ => Err(invalid_runtime_state()),
     }
+}
+
+/// Recovers already-materialized bag output from its compact,
+/// integrity-checked checkpoint for durable publication and consumer bootstrap.
+pub fn bag_checkpoint_published_output(
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<Option<DeltaBatch>, StandingProgramRuntimeError> {
+    bag_checkpoint_published_output_with_limits(checkpoint, RuntimeResourceLimits::default())
+}
+
+pub fn bag_checkpoint_published_output_with_limits(
+    checkpoint: &RuntimeCheckpoint,
+    limits: RuntimeResourceLimits,
+) -> Result<Option<DeltaBatch>, StandingProgramRuntimeError> {
+    limits.validate()?;
+    let payload = checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok());
+    let kind = payload
+        .as_ref()
+        .and_then(|payload| payload.get("runtime_kind"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    reject_removed_runtime_kind(kind.as_deref())?;
+    if kind.as_deref() == Some("typed_join_project_v1") {
+        return two_input_join::TypedJoinProjectRuntime::restore_with_limits(
+            checkpoint.clone(),
+            limits,
+        )
+        .map(|runtime| Some(runtime.materialized_delta()));
+    }
+    if kind.as_deref() == Some(set_ops::RUNTIME_KIND) {
+        return set_ops::SetOpsRuntime::restore_with_limits(checkpoint.clone(), limits)
+            .map(|runtime| Some(runtime.into_materialized_delta()));
+    }
+    // Every other family publishes its checkpoint `published_output` directly.
+    // A payload that does not bind a valid schema/batch keeps the silent legacy
+    // JSON path instead of turning the validation failure into an error.
+    Ok(generic_checkpoint_published_output(payload.as_ref()))
+}
+
+/// The generic extraction rule shared by every non-specialized family: a
+/// checkpoint state payload that binds an `output_schema` and a positive-weight
+/// `published_output` yields that output for native Arrow publication. Any
+/// schema or batch validation failure returns `None` so the legacy JSON path is
+/// used.
+fn generic_checkpoint_published_output(payload: Option<&Value>) -> Option<DeltaBatch> {
+    let payload = payload?;
+    match payload.get("runtime_kind").and_then(Value::as_str)? {
+        "single_key_sum_count" => {}
+        "ordered_window"
+            if payload
+                .pointer("/plan/schema_version")
+                .and_then(Value::as_u64)
+                .is_some_and(|version| version >= 2) => {}
+        // ordered_window v1 stores a scalar key in the legacy key-first layout.
+        _ => return None,
+    }
+    let schema: RelationSchema =
+        serde_json::from_value(payload.get("output_schema")?.clone()).ok()?;
+    if schema.columns.is_empty() || schema.schema_fingerprint.is_empty() {
+        return None;
+    }
+    let output: DeltaBatch =
+        serde_json::from_value(payload.get("published_output")?.clone()).ok()?;
+    // Native publication chunks the consolidated rows; retractions (negative
+    // net weight) and overflow cannot be represented and fall back to JSON.
+    let rows = output.net_rows().ok()?;
+    if rows.iter().any(|row| row.weight <= 0) {
+        return None;
+    }
+    Some(output)
+}
+
+/// Converts a validated stored page of at most 512 logical BAG rows.
+/// The metadata-bound schema is explicit; no retained checkpoint is decoded.
+/// Records must have positive weights and strictly increasing (key, value)
+/// order. A weighted pair may occur independently in adjacent stored pages.
+pub fn materialized_bag_canonical_batch(
+    schema: &RelationSchema,
+    rows: &DeltaBatch,
+) -> Result<RecordBatch, StandingProgramRuntimeError> {
+    output::materialized_bag_canonical_batch(schema, rows)
+}
+
+pub fn materialized_delta_to_page_with_checkpoint(
+    schema: &RelationSchema,
+    output: &DeltaBatch,
+    view: ScopedViewId,
+    epoch: u64,
+    page: SnapshotPageRequest,
+    aggregates: Option<&[SupportedAggregateOutput]>,
+    checkpoint: &RuntimeCheckpoint,
+) -> Result<MaterializedViewPage, StandingProgramRuntimeError> {
+    let payload = checkpoint
+        .state_payload
+        .as_ref()
+        .map(|state| serde_json::from_str::<Value>(&state.payload))
+        .transpose()
+        .map_err(|_| invalid_checkpoint())?;
+    let kind = payload
+        .as_ref()
+        .and_then(|state| state.get("runtime_kind"))
+        .and_then(Value::as_str);
+    reject_removed_runtime_kind(kind)?;
+    let ordered = if kind == Some("ordered_window") {
+        Some(
+            serde_json::from_value::<velorix_core::view_plan::SupportedOrderedWindowPlanV1>(
+                payload
+                    .as_ref()
+                    .and_then(|state| state.get("plan"))
+                    .cloned()
+                    .ok_or_else(invalid_checkpoint)?,
+            )
+            .map_err(|_| invalid_checkpoint())?,
+        )
+    } else {
+        None
+    };
+    if ordered
+        .as_ref()
+        .is_some_and(|plan| !matches!(plan.schema_version, 1..=3))
+    {
+        return Err(invalid_checkpoint());
+    }
+    if matches!(kind, Some(set_ops::RUNTIME_KIND | "typed_join_project_v1"))
+        || ordered
+            .as_ref()
+            .is_some_and(|plan| plan.schema_version >= 2)
+    {
+        let (batch, next_page_token) =
+            output::materialized_bag_delta_page_batch(schema, output, epoch, page)?;
+        return Ok(MaterializedViewPage {
+            view,
+            logical_epoch: epoch,
+            schema_fingerprint: schema.schema_fingerprint.clone(),
+            batches: vec![batch],
+            next_page_token,
+        });
+    }
+    if let Some(plan) = ordered {
+        // Legacy v1 stores a scalar key separately from named values, while
+        // SELECT may place that key anywhere in the published schema.
+        let mut key_first = schema.clone();
+        let index = key_first
+            .columns
+            .iter()
+            .position(|column| column.name == plan.output_key_column_id)
+            .ok_or_else(invalid_checkpoint)?;
+        let key = key_first.columns.remove(index);
+        key_first.columns.insert(0, key);
+        let (batch, next_page_token) =
+            materialized_generic_delta_page_batch(&key_first, output, epoch, page)?;
+        let indices = schema
+            .columns
+            .iter()
+            .map(|column| {
+                batch
+                    .schema()
+                    .index_of(&column.name)
+                    .map_err(|_| invalid_runtime_state())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch = batch
+            .project(&indices)
+            .map_err(|_| invalid_runtime_state())?;
+        return Ok(MaterializedViewPage {
+            view,
+            logical_epoch: epoch,
+            schema_fingerprint: schema.schema_fingerprint.clone(),
+            batches: vec![batch],
+            next_page_token,
+        });
+    }
+    if kind == Some(TUMBLING_WINDOW_RUNTIME_KIND) {
+        let (batch, next_page_token) = materialized_tumbling_delta_page_batch(
+            schema,
+            output,
+            aggregates.ok_or_else(invalid_checkpoint)?,
+            epoch,
+            page,
+        )?;
+        return Ok(MaterializedViewPage {
+            view,
+            logical_epoch: epoch,
+            schema_fingerprint: schema.schema_fingerprint.clone(),
+            batches: vec![batch],
+            next_page_token,
+        });
+    }
+    materialized_delta_to_page(schema, output, view, epoch, page, aggregates)
 }

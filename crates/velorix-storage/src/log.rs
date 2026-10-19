@@ -388,7 +388,9 @@ pub enum IngestLogError {
     },
     #[error("ingest staging object `{0}` was not found")]
     MissingIngestStagingObject(ObjectKey),
-    #[error("ingest staging object `{object_key}` requires conditional create, but the object store does not support PutMode::Create: {reason}")]
+    #[error(
+        "ingest staging object `{object_key}` requires conditional create, but the object store does not support PutMode::Create: {reason}"
+    )]
     IngestStagingConditionalCreateUnsupported {
         object_key: ObjectKey,
         reason: String,
@@ -409,7 +411,9 @@ pub enum IngestLogError {
     MalformedIngestAdmissionExpiryDecision { key: String, reason: String },
     #[error("malformed durable ingest admission index transition `{key}`: {reason}")]
     MalformedIngestAdmissionIndexTransition { key: String, reason: String },
-    #[error("ingest admission expiry decision `{expiry_decision_key}` already exists with a different body")]
+    #[error(
+        "ingest admission expiry decision `{expiry_decision_key}` already exists with a different body"
+    )]
     IngestAdmissionExpiryDecisionConflict { expiry_decision_key: ObjectKey },
     #[error(
         "cannot expire committed ingest admission `{admission_record_key}` for batch `{batch_key}`"
@@ -2659,6 +2663,43 @@ impl IngestLog {
         Ok(batches)
     }
 
+    /// Lists committed admission metadata for progress reporting without reading
+    /// Arrow payloads. Replay still validates the complete envelope independently.
+    pub async fn list_committed_admission_metadata(
+        &self,
+    ) -> Result<Vec<DurableIngestAdmissionRecordV1>, IngestLogError> {
+        let committed = self.list_committed().await?;
+        let mut admissions = HashMap::new();
+        for record in self.list_admission_records().await? {
+            if admissions
+                .insert(record.batch_key.clone(), record.clone())
+                .is_some()
+            {
+                return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                    key: record.admission_record_key.to_string(),
+                    reason: "duplicate admission metadata for committed batch".into(),
+                });
+            }
+        }
+        committed
+            .into_iter()
+            .map(|descriptor| {
+                let record = admissions.remove(&descriptor.object_key).ok_or_else(|| {
+                    IngestLogError::MissingIngestAdmissionRecord {
+                        batch_key: descriptor.object_key.clone(),
+                    }
+                })?;
+                if record.descriptor()? != descriptor {
+                    return Err(IngestLogError::MalformedIngestAdmissionRecord {
+                        key: record.admission_record_key.to_string(),
+                        reason: "committed descriptor differs from admission metadata".into(),
+                    });
+                }
+                Ok(record)
+            })
+            .collect()
+    }
+
     /// Replays committed V1 Arrow IPC ingest envelopes only when each replayed
     /// batch is backed by matching durable admission evidence. This is the
     /// checked production recovery path; bootstrap/local recovery remains on
@@ -3391,6 +3432,15 @@ impl IngestBatch {
     /// paths that still need to pass unchecked opaque bytes through the storage
     /// log while runtime replay is being rewritten.
     pub fn from_validated_envelope(payload: Bytes) -> Result<Self, IngestLogError> {
+        Self::from_validated_envelope_with_envelope(payload).map(|(batch, _)| batch)
+    }
+
+    /// Constructs a batch and returns the already decoded envelope so callers
+    /// that need both do not parse and authenticate the same immutable bytes
+    /// twice.
+    pub fn from_validated_envelope_with_envelope(
+        payload: Bytes,
+    ) -> Result<(Self, IngestEnvelope), IngestLogError> {
         let envelope = IngestEnvelope::decode(payload.clone())?;
         let header = envelope.header();
         let object_key = ObjectKey::ingest_batch(
@@ -3409,10 +3459,13 @@ impl IngestBatch {
 
         envelope.validate_descriptor(&descriptor)?;
 
-        Ok(Self {
-            descriptor,
-            payload,
-        })
+        Ok((
+            Self {
+                descriptor,
+                payload,
+            },
+            envelope,
+        ))
     }
 
     pub fn descriptor(&self) -> IngestBatchDescriptor {

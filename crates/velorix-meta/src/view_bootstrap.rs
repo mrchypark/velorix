@@ -38,7 +38,9 @@ pub struct BeginViewDependencyEdgeV1 {
     pub key_descriptor_hash: String,
     pub delta_codec_identity: String,
     pub frontier_kind: String,
-    pub bootstrap_cursor: CausalViewCursorV1,
+    /// None retains a declared edge; first fenced checkpoint progress pins its cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_cursor: Option<CausalViewCursorV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -167,11 +169,22 @@ impl BeginViewBootstrapRequest {
                     value: edge.producer_generation,
                 });
             }
-            edge.bootstrap_cursor
-                .validate()
-                .map_err(|_| MetaStoreError::EmptyField {
+            if let Some(cursor) = &edge.bootstrap_cursor {
+                cursor.validate().map_err(|_| MetaStoreError::EmptyField {
                     field: "view_inputs.bootstrap_cursor",
                 })?;
+                if cursor.input_edge != edge.edge_id
+                    || cursor.producer_tenant_id != self.tenant_id
+                    || cursor.producer_program_id != edge.producer_program_id
+                    || cursor.producer_view_id != edge.producer_view_id
+                    || cursor.producer_generation != edge.producer_generation
+                    || cursor.output_stream != edge.output_stream_id
+                {
+                    return Err(MetaStoreError::EmptyField {
+                        field: "view_inputs.bootstrap_cursor.identity",
+                    });
+                }
+            }
             if !seen_edges.insert(edge.edge_id.as_str()) {
                 return Err(MetaStoreError::DuplicateSourceCutRelation {
                     relation_id: edge.edge_id.clone(),
@@ -273,9 +286,8 @@ pub(crate) fn checkpoint_covers_source_cut(
     let Some(coverage) = checkpoint.input_coverage.as_ref() else {
         return false;
     };
-    if coverage.input_catalog_epoch < cut.input_catalog_epoch {
-        return false;
-    }
+    // Unrelated source ingests also advance the global catalog epoch. Exact
+    // relation identity and partition coverage below establish completeness.
     cut.relations.iter().all(|cut_relation| {
         coverage.relations.iter().any(|covered_relation| {
             covered_relation.relation_id == cut_relation.relation.relation_id
@@ -404,7 +416,8 @@ mod tests {
             bootstrap_generation: 6,
             plan_hash: "sha256:plan".to_string(),
             coverage_hash,
-            input_coverage: Some(coverage),
+        input_coverage: Some(coverage),
+        published_input_bootstrap: None,
             previous_checkpoint_key: String::new(),
             previous_manifest_hash: String::new(),
         }
@@ -417,13 +430,6 @@ mod tests {
         assert!(checkpoint_covers_source_cut(&valid, &required));
 
         let mut cases = Vec::new();
-        let mut candidate = valid.clone();
-        candidate
-            .input_coverage
-            .as_mut()
-            .unwrap()
-            .input_catalog_epoch = 6;
-        cases.push(candidate);
         let mut candidate = valid.clone();
         candidate.input_coverage.as_mut().unwrap().relations[0].relation_generation = 1;
         cases.push(candidate);
@@ -453,6 +459,16 @@ mod tests {
         for candidate in cases {
             assert!(!checkpoint_covers_source_cut(&candidate, &required));
         }
+    }
+
+    #[test]
+    fn unrelated_catalog_epoch_does_not_invalidate_covered_source_cut() {
+        let valid = pointer();
+        let mut required = cut();
+        required.input_catalog_epoch += 100;
+        assert!(checkpoint_covers_source_cut(&valid, &required));
+        required.relations[0].partitions[0].committed_offset_exclusive += 1;
+        assert!(!checkpoint_covers_source_cut(&valid, &required));
     }
 
     #[test]
