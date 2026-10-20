@@ -27836,7 +27836,7 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
             .0
             .to_string();
         reference["state_root"]["content_hash"] = json!(hash);
-        reference["state_root"]["object_key"] = json!(format!("{prefix}/{hash}"));
+        reference["state_root"]["object_key"] = json!(format!("{prefix}/{hash}.arrow"));
         let text = serde_json::to_string(&checkpoint_payload).unwrap();
         altered.state_root.content_hash = stable_bytes_hash(text.as_bytes());
         altered.state_payload.as_mut().unwrap().payload = text;

@@ -24,7 +24,10 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
     )
     .await
     .unwrap();
-    let state = state.with_materialized_read_cache(Arc::new(cache));
+    let state = state
+        .with_materialized_read_cache(Arc::new(cache))
+        .with_standing_runtime_state_fragment_bytes(4096)
+        .unwrap();
     let checkpoint_record = test_runtime_checkpoint(Vec::new());
     let checkpoint = test_checkpoint_key(&checkpoint_record);
     let body = serde_json::to_vec(&test_checkpoint_record(&checkpoint, checkpoint_record)).unwrap();
@@ -48,6 +51,37 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
             .filter(|p| p.as_str() == checkpoint_path.as_ref())
             .count(),
         1
+    );
+
+    let checkpoint_state = test_runtime_checkpoint(Vec::new());
+    let (arrow_key, arrow_record) = standing_runtime_state_payload_record_for_checkpoint(
+        &checkpoint_state,
+        "purchases_by_user",
+    )
+    .unwrap();
+    persist_standing_runtime_state_payload(&state, &arrow_key, &arrow_record)
+        .await
+        .unwrap();
+    counts.clear();
+    for _ in 0..2 {
+        let bytes = checkpoint_publication::read_object_bytes_bounded(
+            &state,
+            &ObjectPath::from(arrow_key.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(bytes.starts_with(&[255; 4]));
+        assert_eq!(
+            checkpoint_arrow::decode(&bytes, state.max_standing_runtime_state_payload_bytes)
+                .unwrap(),
+            arrow_record
+        );
+    }
+    assert_eq!(
+        counts.get_paths(),
+        vec![arrow_key.as_str().to_string()],
+        "warm Arrow state read must reuse verified bytes"
     );
 
     let fragment_body = b"fragment bytes".to_vec();
@@ -79,7 +113,7 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
     }
     assert_eq!(counts.get_paths(), vec![fragment.to_string()]);
 
-    let payload = "m".repeat(state.max_standing_runtime_state_fragment_bytes + 1);
+    let payload = json!({"retained": synthetic_state_text(64 * 1024)}).to_string();
     let payload_hash = stable_bytes_hash(payload.as_bytes());
     let root = ObjectKey::standing_runtime_state_payload(
         "tenant",
@@ -116,7 +150,7 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
             checkpoint_fragments::read_bounded(&state, &root_path, 64 * 1024)
                 .await
                 .unwrap()
-                .starts_with(b"{\"schema_version\":1")
+                .starts_with(b"{\"schema_version\":2")
         );
     }
     assert_eq!(counts.get_paths(), vec![root_path.to_string()]);

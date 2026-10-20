@@ -2645,8 +2645,10 @@ async fn standing_runtime_checkpoint_persistence_writes_state_object_and_strips_
         .bytes()
         .await
         .unwrap();
-    let state_record: StandingRuntimeStatePayloadRecord =
-        serde_json::from_slice(&state_bytes).unwrap();
+    assert!(serde_json::from_slice::<Value>(&state_bytes).is_err());
+    let state_record =
+        checkpoint_arrow::decode(&state_bytes, state.max_standing_runtime_state_payload_bytes)
+            .unwrap();
     validate_standing_runtime_state_payload_record(&state_key, &state_record).unwrap();
     assert_eq!(Some(state_record.payload), expected_payload);
 }
@@ -3368,7 +3370,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_corr
         .store
         .put(
             &Path::from(state_key.as_str()),
-            bytes::Bytes::from(serde_json::to_vec(&corrupt_record).unwrap()).into(),
+            bytes::Bytes::from(checkpoint_arrow::encode(&corrupt_record).unwrap()).into(),
         )
         .await
         .unwrap();
@@ -3378,7 +3380,8 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_corr
             .await
             .unwrap_err();
 
-    assert!(format!("{error:?}").contains("standing runtime state payload key/body mismatch"));
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(format!("{error:?}").contains("invalid Arrow/ZSTD checkpoint body"));
 }
 
 #[test]
@@ -13574,7 +13577,16 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
     let state_payload = legacy_record.checkpoint.state_payload.as_mut().unwrap();
     state_payload.payload = payload;
     legacy_record.checkpoint.state_root.content_hash = content_hash.clone();
-    legacy_record.checkpoint.state_root.object_key = "legacy-inline-state".to_string();
+    let (legacy_state_key, legacy_state_record) =
+        standing_runtime_state_payload_record_for_checkpoint(
+            &legacy_record.checkpoint,
+            "legacy_rebuild_scores",
+        )
+        .unwrap();
+    persist_standing_runtime_state_payload(&state, &legacy_state_key, &legacy_state_record)
+        .await
+        .unwrap();
+    legacy_record.checkpoint.state_root.object_key = legacy_state_key.as_str().to_string();
     legacy_record.checkpoint_key = ObjectKey::standing_runtime_checkpoint(
         &legacy_record.checkpoint.identity.tenant_id,
         &legacy_record.checkpoint.identity.program_id,
@@ -13595,6 +13607,8 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
         synthetic_restore.contains("legacy_single_key_group_counts_missing"),
         "{synthetic_restore}"
     );
+    // The runtime schema is old, but its durable body uses the sole Arrow codec.
+    legacy_record.checkpoint.state_payload = None;
     store
         .put(
             &Path::from(legacy_checkpoint_object.as_str()),
@@ -13665,7 +13679,12 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
             .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
             .await
     });
-    guard_race.reached.notified().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        guard_race.reached.notified(),
+    )
+    .await
+    .expect("legacy rebuild must reach guarded publication");
 
     // Commit a real new source batch after the captured cut but before the
     // guarded checkpoint publication. The migration must fail closed, leaving
@@ -19327,6 +19346,19 @@ fn standing_runtime_budget_rejects_oversized_state_payload() {
     assert!(error.to_string().contains("checkpoint state payload size"));
 }
 
+fn synthetic_state_text(bytes: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+    let mut random = 0x1234_5678_9abc_def0u64;
+    (0..bytes)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            ALPHABET[(random >> 58) as usize] as char
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn generic_state_fragments_preserve_hash_restore_and_reject_corruption() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -19336,7 +19368,7 @@ async fn generic_state_fragments_preserve_hash_restore_and_reject_corruption() {
     let mut checkpoint = test_runtime_checkpoint(Vec::new());
     let payload = json!({
         "runtime_kind": "generic_set_ops_v1",
-        "retained": "x".repeat(10 * 1024 * 1024),
+        "retained": synthetic_state_text(10 * 1024 * 1024),
     })
     .to_string();
     checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
@@ -19352,10 +19384,10 @@ async fn generic_state_fragments_preserve_hash_restore_and_reject_corruption() {
             .unwrap();
     assert_eq!(
         checkpoint_fragments::durable_state_object_count(
-            record.payload.payload.len(),
+            checkpoint_arrow::encode(&record).unwrap().len(),
             state.max_standing_runtime_state_fragment_bytes
         ),
-        4
+        3
     );
     persist_standing_runtime_state_payload(&state, &key, &record)
         .await
@@ -22725,6 +22757,23 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
             .await
             .unwrap()
             .unwrap();
+    let body_key = &checkpoint.checkpoint.state_root.object_key;
+    assert!(body_key.ends_with(".state-payload.arrow"));
+    let body = store
+        .get(&Path::from(body_key.clone()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert!(
+        body.starts_with(&[255; 4]),
+        "restart must use the Arrow state body"
+    );
+    let decoded =
+        checkpoint_arrow::decode(&body, restarted.max_standing_runtime_state_payload_bytes)
+            .unwrap();
+    assert_eq!(Some(decoded.payload), checkpoint.checkpoint.state_payload);
     let payload: Value = serde_json::from_str(
         &checkpoint
             .checkpoint
@@ -22746,6 +22795,18 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         .1;
     let alice_path = Path::from(alice_ref["state_root"]["object_key"].as_str().unwrap());
     let saved = store.get(&alice_path).await.unwrap().bytes().await.unwrap();
+    assert!(alice_path.as_ref().ends_with(".arrow"));
+    assert!(
+        saved.starts_with(&[255; 4]),
+        "retained correction state must also use Arrow"
+    );
+    let archived: EventTimeStateRef = serde_json::from_value(alice_ref.clone()).unwrap();
+    checkpoint_arrow::decode_retained_state(
+        &saved,
+        &archived,
+        restarted.max_standing_runtime_state_payload_bytes,
+    )
+    .unwrap();
     let router = app(restarted.clone());
     let late = batch(
         4,
@@ -22781,10 +22842,7 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         .unwrap();
     let corrupt = call_json(&router, Method::POST, "/v1/ingest", late.clone()).await;
     assert_eq!(corrupt.0, StatusCode::BAD_REQUEST, "{corrupt:?}");
-    assert!(corrupt.1["error"]
-        .as_str()
-        .unwrap()
-        .contains("digest mismatch"));
+    assert!(corrupt.1["error"].as_str().unwrap().contains("Arrow/ZSTD"));
     store.put(&alice_path, saved.into()).await.unwrap();
     if migrate {
         let mut old = checkpoint.checkpoint.clone();

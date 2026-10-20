@@ -1,7 +1,7 @@
 use super::*;
 use futures::StreamExt;
 
-const MANIFEST_KIND: &str = "standing_runtime_state_fragments_v1";
+const MANIFEST_KIND: &str = "standing_runtime_state_fragments_v2";
 
 pub(super) fn durable_state_object_count(payload_bytes: usize, limit: usize) -> usize {
     if payload_bytes > limit {
@@ -29,6 +29,7 @@ struct FragmentManifest {
     schema_version: u16,
     record_kind: String,
     byte_count: usize,
+    state_bytes: usize,
     header: StandingRuntimeStatePayloadRecord,
     fragments: Vec<FragmentRef>,
     fragment_bytes: usize,
@@ -45,6 +46,9 @@ pub(super) fn validate_manifest(
     key: &ObjectKey,
     bytes: &[u8],
 ) -> Result<Option<usize>, ApiError> {
+    if bytes.starts_with(&[255; 4]) {
+        return Ok(None);
+    }
     let tag: KindTag = serde_json::from_slice(bytes).map_err(ApiError::bad_request)?;
     if tag.record_kind != MANIFEST_KIND {
         return Ok(None);
@@ -56,8 +60,11 @@ pub(super) fn validate_manifest(
     }
     let manifest: FragmentManifest =
         serde_json::from_slice(bytes).map_err(ApiError::bad_request)?;
-    if manifest.schema_version != 1
-        || manifest.byte_count > state.max_standing_runtime_state_payload_bytes
+    if manifest.schema_version != 2
+        || manifest.state_bytes > state.max_standing_runtime_state_payload_bytes
+        || manifest.state_bytes == 0
+        || manifest.byte_count
+            > checkpoint_arrow::encoded_limit(state.max_standing_runtime_state_payload_bytes)
         || manifest.byte_count == 0
         || !manifest.header.payload.payload.is_empty()
         || manifest.fragments.is_empty()
@@ -224,10 +231,21 @@ async fn put_exact(state: &ApiState, path: &ObjectPath, bytes: Vec<u8>) -> Resul
     }
 }
 
+#[cfg(test)]
 pub(super) async fn persist_fragments(
     state: &ApiState,
     key: &ObjectKey,
     record: &StandingRuntimeStatePayloadRecord,
+) -> Result<bool, ApiError> {
+    let bytes = checkpoint_arrow::encode(record)?;
+    persist_encoded_fragments(state, key, record, &bytes).await
+}
+
+pub(super) async fn persist_encoded_fragments(
+    state: &ApiState,
+    key: &ObjectKey,
+    record: &StandingRuntimeStatePayloadRecord,
+    bytes: &[u8],
 ) -> Result<bool, ApiError> {
     if record.payload.payload.len() > state.max_standing_runtime_state_payload_bytes {
         return Err(ApiError::payload_too_large(
@@ -235,17 +253,11 @@ pub(super) async fn persist_fragments(
         ));
     }
     let fragment_bytes = state.max_standing_runtime_state_fragment_bytes;
-    if record.payload.payload.len() <= fragment_bytes {
+    if bytes.len() <= fragment_bytes {
         return Ok(false);
     }
     let mut fragments = Vec::new();
-    for (ordinal, bytes) in record
-        .payload
-        .payload
-        .as_bytes()
-        .chunks(fragment_bytes)
-        .enumerate()
-    {
+    for (ordinal, bytes) in bytes.chunks(fragment_bytes).enumerate() {
         let content_hash = stable_bytes_hash(bytes);
         put_exact(
             state,
@@ -261,9 +273,10 @@ pub(super) async fn persist_fragments(
     let mut header = record.clone();
     header.payload.payload.clear();
     let manifest = FragmentManifest {
-        schema_version: 1,
+        schema_version: 2,
         record_kind: MANIFEST_KIND.to_string(),
-        byte_count: record.payload.payload.len(),
+        byte_count: bytes.len(),
+        state_bytes: record.payload.payload.len(),
         header,
         fragments,
         fragment_bytes,
@@ -286,7 +299,7 @@ pub(super) async fn hydrate_fragments(
     if validate_manifest(state, key, bytes)?.is_none() {
         return Ok(None);
     }
-    let mut manifest: FragmentManifest =
+    let manifest: FragmentManifest =
         serde_json::from_slice(bytes).map_err(ApiError::bad_request)?;
     let mut payload = Vec::with_capacity(manifest.byte_count);
     for (ordinal, fragment) in manifest.fragments.iter().enumerate() {
@@ -311,11 +324,22 @@ pub(super) async fn hydrate_fragments(
         }
         payload.extend_from_slice(&bytes);
     }
-    manifest.header.payload.payload = String::from_utf8(payload).map_err(ApiError::bad_request)?;
     let key = key.clone();
+    let max_state_bytes = state.max_standing_runtime_state_payload_bytes;
     tokio::task::spawn_blocking(move || {
-        validate_standing_runtime_state_payload_record(&key, &manifest.header)?;
-        Ok(Some(manifest.header))
+        let mut restored = checkpoint_arrow::decode(&payload, max_state_bytes)?;
+        if restored.payload.payload.len() != manifest.state_bytes {
+            return Err(ApiError::bad_request(
+                "checkpoint restored state length mismatch",
+            ));
+        }
+        let body = std::mem::take(&mut restored.payload.payload);
+        if manifest.header != restored {
+            return Err(ApiError::bad_request("checkpoint fragment header mismatch"));
+        }
+        restored.payload.payload = body;
+        validate_standing_runtime_state_payload_record(&key, &restored)?;
+        Ok(Some(restored))
     })
     .await
     .map_err(ApiError::internal)?

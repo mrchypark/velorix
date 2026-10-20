@@ -425,7 +425,7 @@ impl ObjectKey {
         let hash = parse_sha256_hash_segment(state_content_hash)?;
 
         Ok(Self(format!(
-            "v1/standing-runtime-state-payloads/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.state-payload.json"
+            "v1/standing-runtime-state-payloads/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.state-payload.arrow"
         )))
     }
 
@@ -1098,7 +1098,7 @@ fn parse_standing_runtime_state_payload_parts(
     validate_segment("view_id", view_id)?;
     let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
     let hash = state_payload_file
-        .strip_suffix(".state-payload.json")
+        .strip_suffix(".state-payload.arrow")
         .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
     validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
 
@@ -1768,7 +1768,7 @@ mod tests {
 
         assert_eq!(
             state_payload.as_str(),
-            "v1/standing-runtime-state-payloads/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.state-payload.json"
+            "v1/standing-runtime-state-payloads/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.state-payload.arrow"
         );
         assert_eq!(state_payload, restarted);
         assert_eq!(

@@ -2122,6 +2122,17 @@ pub(super) async fn legacy_materialized_page(
     })?;
     let mut bounded = state.clone();
     bounded.store = store.clone();
+    // Compressed state can be much larger than its fetched bytes. Enforce the
+    // query memory allowance on the decoded body before Arrow allocates it.
+    if let Some(memory_bytes) = policy.memory_limit_bytes {
+        bounded.max_standing_runtime_state_payload_bytes = bounded
+            .max_standing_runtime_state_payload_bytes
+            // Reserve the Arrow expansion bound (48x), runtime representation
+            // allowance (16x), and fixed IPC metadata overhead together.
+            .min(
+                usize::try_from(memory_bytes.saturating_sub(16 * 1024) / 64).unwrap_or(usize::MAX),
+            );
+    }
     let cache_hit_store = store.clone();
     bounded.materialized_read_cache_hit_accountant = Some(Arc::new(move |path, bytes| {
         let path = ObjectPath::from(path.to_string());

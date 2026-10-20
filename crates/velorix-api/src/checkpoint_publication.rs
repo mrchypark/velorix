@@ -331,12 +331,9 @@ async fn persist_standing_runtime_checkpoint_inner(
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_output_delta");
     }
-    persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
-        .await?;
-    write_summary.state_payload_writes = checkpoint_fragments::durable_state_object_count(
-        state_payload_record.payload.payload.len(),
-        state.max_standing_runtime_state_fragment_bytes,
-    );
+    write_summary.state_payload_writes =
+        persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
+            .await?;
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_state_payload");
     }
@@ -1558,15 +1555,25 @@ pub(super) async fn persist_standing_runtime_state_payload(
     state: &ApiState,
     state_payload_key: &ObjectKey,
     record: &StandingRuntimeStatePayloadRecord,
-) -> Result<(), ApiError> {
-    if checkpoint_fragments::persist_fragments(state, state_payload_key, record).await? {
-        return Ok(());
+) -> Result<usize, ApiError> {
+    validate_standing_runtime_state_payload_record(state_payload_key, record)?;
+    if record.payload.payload.len() > state.max_standing_runtime_state_payload_bytes {
+        return Err(ApiError::payload_too_large(
+            "checkpoint exceeds configured total state byte limit",
+        ));
     }
-    let record = record.clone();
-    let bytes = tokio::task::spawn_blocking(move || serde_json::to_vec(&record))
+    let encoding_record = record.clone();
+    let bytes = tokio::task::spawn_blocking(move || checkpoint_arrow::encode(&encoding_record))
         .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)??;
+    if checkpoint_fragments::persist_encoded_fragments(state, state_payload_key, record, &bytes)
+        .await?
+    {
+        return Ok(checkpoint_fragments::durable_state_object_count(
+            bytes.len(),
+            state.max_standing_runtime_state_fragment_bytes,
+        ));
+    }
     let path = ObjectPath::from(state_payload_key.as_str());
     let result = state
         .store
@@ -1577,7 +1584,7 @@ pub(super) async fn persist_standing_runtime_state_payload(
         )
         .await;
     match result {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(1),
         Err(object_store::Error::AlreadyExists { .. }) => {
             let existing = state
                 .store
@@ -1588,7 +1595,7 @@ pub(super) async fn persist_standing_runtime_state_payload(
                 .await
                 .map_err(ApiError::internal)?;
             if existing.as_ref() == bytes.as_slice() {
-                Ok(())
+                Ok(1)
             } else {
                 Err(ApiError::conflict(format!(
                     "standing runtime state payload conflict at {}",
@@ -3004,11 +3011,8 @@ pub(super) async fn hydrate_standing_runtime_checkpoint_state_payload(
     let state_root_key = record.checkpoint.state_root.object_key.clone();
     let parsed_state_key = ObjectKey::parse_standing_runtime_state_payload(state_root_key.clone());
     let Ok((state_payload_key, parts)) = parsed_state_key else {
-        if record.checkpoint.state_payload.is_some() {
-            return Ok(());
-        }
         return Err(ApiError::bad_request(format!(
-            "standing runtime checkpoint for view `{}` is missing durable state payload root",
+            "standing runtime checkpoint for view `{}` requires an Arrow/ZSTD durable state root",
             record.view_id
         )));
     };
@@ -3025,18 +3029,23 @@ pub(super) async fn hydrate_standing_runtime_checkpoint_state_payload(
             record.view_id
         )));
     }
-    let bytes =
-        read_object_bytes_bounded(state, &ObjectPath::from(state_payload_key.as_str()), None)
-            .await?;
+    let bytes = read_object_bytes_bounded(
+        state,
+        &ObjectPath::from(state_payload_key.as_str()),
+        Some(
+            checkpoint_arrow::encoded_limit(state.max_standing_runtime_state_payload_bytes) as u64,
+        ),
+    )
+    .await?;
     let state_payload_record =
         match checkpoint_fragments::hydrate_fragments(state, &state_payload_key, &bytes).await? {
             // Native hydration already validated the assembled immutable payload.
             Some(record) => record,
             None => {
                 let validation_key = state_payload_key.clone();
+                let max_state_bytes = state.max_standing_runtime_state_payload_bytes;
                 tokio::task::spawn_blocking(move || {
-                    let record: StandingRuntimeStatePayloadRecord =
-                        serde_json::from_slice(&bytes).map_err(ApiError::bad_request)?;
+                    let record = checkpoint_arrow::decode(&bytes, max_state_bytes)?;
                     validate_standing_runtime_state_payload_record(&validation_key, &record)?;
                     Ok::<_, ApiError>(record)
                 })
@@ -3481,7 +3490,12 @@ fn checkpoint_read_cache_key(
         output_id,
         object_path: raw.to_string(),
         content_hash,
-        codec: "checkpoint-json".into(),
+        codec: if raw.ends_with(".checkpoint.json") {
+            "checkpoint-json"
+        } else {
+            "checkpoint-arrow-zstd-v1"
+        }
+        .into(),
         checkpoint_epoch,
         root_hash: String::new(),
     })
@@ -3500,14 +3514,16 @@ fn checkpoint_cache_bytes_match(
     {
         return stable_bytes_hash(bytes) == content_hash;
     }
-    if path.ends_with(".state-payload.json") {
-        if serde_json::from_slice::<StandingRuntimeStatePayloadRecord>(bytes)
-            .ok()
-            .is_some_and(|record| {
-                stable_bytes_hash(record.payload.payload.as_bytes()) == content_hash
-            })
+    if path.ends_with(".state-payload.arrow") {
+        if let Ok(record) =
+            checkpoint_arrow::decode(bytes, state.max_standing_runtime_state_payload_bytes)
         {
-            return true;
+            return ObjectKey::parse_standing_runtime_state_payload(path.to_string()).is_ok_and(
+                |(key, _)| {
+                    validate_standing_runtime_state_payload_record(&key, &record).is_ok()
+                        && record.state_content_hash == content_hash
+                },
+            );
         }
         return ObjectKey::parse_standing_runtime_state_payload(path.to_string())
             .ok()

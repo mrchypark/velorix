@@ -217,8 +217,9 @@ output; it must not substitute the latest checkpoint during a legacy fallback.
 Raw native page tokens remain bound to their output root and epoch.
 
 Arrow output pages are distinct from recovery state. Runtime checkpoint state
-bodies and their fragment manifests still use JSON; caching their bytes does
-not convert that state to an Arrow or compressed checkpoint format.
+bodies use a separate typed Arrow IPC codec with ZSTD level 3. Checkpoint
+descriptors and fragment manifests contain JSON metadata, without an embedded
+state body. See [the state codec contract](../architecture/checkpoint-state-arrow-v1.md).
 
 ## Synthetic validation
 

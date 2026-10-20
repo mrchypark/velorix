@@ -3150,12 +3150,7 @@ pub(crate) mod tests {
             source_kind: "standing_runtime_checkpoint_state_payload".into(),
             payload: checkpoint.state_payload.clone().unwrap(),
         };
-        state
-            .store
-            .put(
-                &ObjectPath::from(state_key.as_str()),
-                bytes::Bytes::from(serde_json::to_vec(&state_record).unwrap()).into(),
-            )
+        persist_standing_runtime_state_payload(&state, &state_key, &state_record)
             .await
             .unwrap();
         for (key, page) in &publication.page_records {

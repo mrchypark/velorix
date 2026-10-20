@@ -158,6 +158,7 @@ use velorix_runtime::{
     },
 };
 
+mod checkpoint_arrow;
 mod checkpoint_fragments;
 mod checkpoint_publication;
 mod cold_window_state;
@@ -565,7 +566,7 @@ fn move_legacy_key(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct StandingRuntimeStatePayloadRecord {
     schema_version: u16,

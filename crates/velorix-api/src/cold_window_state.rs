@@ -30,30 +30,11 @@ pub(super) async fn prepare_event_time_state(
     };
     for request in requests {
         if let Some(reference) = &request.reference {
-            let path = validate_event_time_state_reference(reference)?;
-            let bytes = state
-                .store
-                .get(&path)
-                .await
-                .map_err(|error| {
-                    ApiError::service_unavailable(format!(
-                        "retained window state unavailable at {}: {error}",
-                        reference.state_root.object_key
-                    ))
-                })?
-                .bytes()
-                .await
-                .map_err(ApiError::internal)?;
-            if stable_bytes_hash(&bytes) != reference.state_root.content_hash {
-                return Err(ApiError::bad_request(
-                    "retained window state digest mismatch",
-                ));
-            }
-            let payload = std::str::from_utf8(&bytes).map_err(ApiError::bad_request)?;
+            let payload = read_retained_state(state, reference).await?;
             runtime
                 .lock()
                 .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?
-                .hydrate_event_time_state(&request, payload)
+                .hydrate_event_time_state(&request, &payload)
                 .map_err(ApiError::bad_request)?;
         } else {
             runtime
@@ -77,7 +58,8 @@ pub(super) async fn prepare_event_time_state(
 fn validate_event_time_state_reference(
     reference: &EventTimeStateRef,
 ) -> Result<ObjectPath, ApiError> {
-    if reference.window_key.is_empty()
+    if !reference.state_root.object_key.ends_with(".arrow")
+        || reference.window_key.is_empty()
         || !reference
             .state_root
             .content_hash
@@ -98,6 +80,70 @@ fn validate_event_time_state_reference(
         ));
     }
     Ok(path)
+}
+
+async fn read_retained_state(
+    state: &ApiState,
+    reference: &EventTimeStateRef,
+) -> Result<String, ApiError> {
+    let path = validate_event_time_state_reference(reference)?;
+    let decoded = std::sync::Mutex::new(None);
+    let validate = |bytes: &[u8]| {
+        let payload = checkpoint_arrow::decode_retained_state(
+            bytes,
+            reference,
+            state.max_standing_runtime_state_payload_bytes,
+        )?;
+        *decoded.lock().map_err(ApiError::internal)? = Some(payload);
+        Ok::<_, ApiError>(())
+    };
+    let fetch = || async {
+        checkpoint_publication::read_object_bytes_bounded(
+            state,
+            &path,
+            Some(
+                checkpoint_arrow::encoded_limit(state.max_standing_runtime_state_payload_bytes)
+                    as u64,
+            ),
+        )
+        .await
+        .map_err(|error| {
+            if error.status == StatusCode::INTERNAL_SERVER_ERROR {
+                ApiError::service_unavailable(format!(
+                    "retained window state unavailable at {}: {error}",
+                    reference.state_root.object_key
+                ))
+            } else {
+                error
+            }
+        })
+    };
+    if let Some(cache) = &state.materialized_read_cache {
+        cache
+            .read_through(
+                materialized_read_cache::MaterializedReadCacheKey {
+                    store_id: state.materialized_read_cache_store_id().into(),
+                    namespace: state.materialized_read_cache_namespace().into(),
+                    tenant_id: String::new(),
+                    program_id: String::new(),
+                    output_id: reference.window_key.clone(),
+                    object_path: path.to_string(),
+                    content_hash: reference.state_root.content_hash.clone(),
+                    codec: "checkpoint-retained-arrow-zstd-v1".into(),
+                    root_hash: reference.state_root.content_hash.clone(),
+                    checkpoint_epoch: reference.logical_epoch,
+                },
+                fetch,
+                validate,
+            )
+            .await?;
+    } else {
+        validate(&fetch().await?)?;
+    }
+    decoded
+        .into_inner()
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad_request("retained Arrow state was not decoded"))
 }
 
 pub(super) async fn persist_event_time_state(
@@ -141,11 +187,22 @@ pub(super) async fn persist_event_time_state_object(
             "retained window state export digest mismatch",
         ));
     }
+    if object.payload.len() > state.max_standing_runtime_state_payload_bytes {
+        return Err(ApiError::payload_too_large(
+            "retained state exceeds logical state byte limit",
+        ));
+    }
+    let encoding = object.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        checkpoint_arrow::encode_retained_state(&encoding.reference, &encoding.payload)
+    })
+    .await
+    .map_err(ApiError::internal)??;
     match state
         .store
         .put_opts(
             &path,
-            bytes::Bytes::from(object.payload.clone()).into(),
+            bytes::Bytes::from(bytes.clone()).into(),
             PutMode::Create.into(),
         )
         .await
@@ -160,7 +217,7 @@ pub(super) async fn persist_event_time_state_object(
                 .bytes()
                 .await
                 .map_err(ApiError::retryable_materialization_io)?;
-            if existing.as_ref() != object.payload.as_bytes() {
+            if existing.as_ref() != bytes.as_slice() {
                 return Err(ApiError::conflict(format!(
                     "retained window state conflict at {path}"
                 )));
@@ -369,4 +426,71 @@ async fn retained_event_time_inputs(
         }
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_arrow_state_reuses_verified_cache_and_rejects_foreign_reference() {
+        let counts = crate::tests::ObjectStoreAccessCounts::default();
+        let store: Arc<dyn ObjectStore> = Arc::new(crate::tests::CountingObjectStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            counts.clone(),
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            materialized_read_cache::MaterializedReadCache::open(
+                materialized_read_cache::MaterializedReadCacheConfig {
+                    directory: directory.path().into(),
+                    memory_bytes: 64 * 1024,
+                    disk_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let state = crate::tests::test_api_state_with_store(store, "retained-cache-owner", false)
+            .await
+            .with_materialized_read_cache(cache.clone());
+        let payload = json!({"state":{"values":[7,null,3.5]},"logical_epoch":1}).to_string();
+        let hash = stable_bytes_hash(payload.as_bytes());
+        let object = EventTimeStateObject {
+            reference: EventTimeStateRef {
+                window_key: "synthetic-window".into(),
+                logical_epoch: 1,
+                state_root: velorix_core::standing_program::DurableStateRoot {
+                    object_key: format!(
+                        "v1/state/materialized-view-runtime/synthetic/windows/entry/1/{hash}.arrow"
+                    ),
+                    content_hash: hash,
+                },
+            },
+            payload,
+        };
+        persist_event_time_state_object(&state, &object)
+            .await
+            .unwrap();
+        persist_event_time_state_object(&state, &object)
+            .await
+            .unwrap();
+        counts.clear();
+        for _ in 0..2 {
+            assert_eq!(
+                read_retained_state(&state, &object.reference)
+                    .await
+                    .unwrap(),
+                object.payload
+            );
+        }
+        assert_eq!(
+            counts.get_paths(),
+            vec![object.reference.state_root.object_key.clone()]
+        );
+        let mut foreign = object.reference.clone();
+        foreign.window_key = "another-window".into();
+        assert!(read_retained_state(&state, &foreign).await.is_err());
+        cache.close().await.unwrap();
+    }
 }

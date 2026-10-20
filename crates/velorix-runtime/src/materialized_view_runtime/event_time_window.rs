@@ -439,7 +439,7 @@ impl TumblingEventTimeAggregateRuntime {
     fn cold_object_key(binding: &str, reference: &EventTimeStateRef) -> String {
         // ponytail: cold objects bypass legacy GC; require retained-checkpoint ref traversal before reclamation.
         format!(
-            "v1/state/materialized-view-runtime/{binding}/windows/{}/{}/{}",
+            "v1/state/materialized-view-runtime/{binding}/windows/{}/{}/{}.arrow",
             stable_bytes_hash(reference.window_key.as_bytes()),
             reference.logical_epoch,
             reference.state_root.content_hash,
