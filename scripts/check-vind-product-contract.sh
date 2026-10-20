@@ -2918,8 +2918,8 @@ checks["standalone REST join smoke proves two-relation materialized query"] = (
     and os.access(repo_root / "scripts" / "smoke-vind-rest-join.sh", os.X_OK)
     and "VELORIX_JOIN_REST_API_SMOKE_ATTACH" in rest_join_smoke
     and "join-rest-api-smoke.json" in rest_join_smoke
-    and "rest_join_records_" in rest_join_smoke
-    and "rest_join_items_" in rest_join_smoke
+    and "rest_join_left_" in rest_join_smoke
+    and "rest_join_right_" in rest_join_smoke
     and "inputRelationRefs" in rest_join_smoke
     and "join " in rest_join_smoke
     and "VELORIX_API_URL/v1/relations" in rest_join_smoke

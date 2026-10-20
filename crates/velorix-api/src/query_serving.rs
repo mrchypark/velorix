@@ -1948,12 +1948,11 @@ impl LegacyQueryStore {
         }
         usage.bytes = usage.bytes.saturating_add(bytes);
         if let Some(path) = path {
+            // Scan files are output pages, as in the native reader. State
+            // hydration remains charged against requests and bytes.
             if path
                 .as_ref()
                 .starts_with("v1/standing-runtime-output-pages/")
-                || path
-                    .as_ref()
-                    .starts_with("v1/standing-runtime-state-payloads/")
             {
                 usage.files.insert(path.to_string());
             }
@@ -2162,6 +2161,11 @@ pub(super) async fn legacy_materialized_page(
             }
             standing_runtime_published_output_from_manifest_page(&bounded, &manifest).await?
         } else {
+            // A checkpoint-only publication has one logical output source.
+            // Hydration is metadata for a paged publication, but here the
+            // checkpoint itself supplies the scanned rows.
+            store.usage.lock().unwrap().files.insert(record.checkpoint_key.clone());
+            store.charge(None, 0, false).map_err(ApiError::bad_request)?;
             serde_json::from_value(
                 standing_runtime_checkpoint_published_output(&record.checkpoint)
                     .ok_or_else(|| ApiError::conflict("materialized output is unavailable"))?,

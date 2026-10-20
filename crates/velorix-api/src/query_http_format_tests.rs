@@ -96,7 +96,7 @@ async fn http_default_arrow_and_explicit_json_cover_raw_template_empty_and_polic
     let uri = "/v1/views/purchases_by_user/query";
     for body in [
         json!({"sql":"SELECT * FROM purchases_by_user WHERE id='m'"}),
-        json!({"parameters":{"map_id":"m"}}),
+        json!({"parameters":{"record_id":"m"}}),
     ] {
         let default = request(&router, Method::POST, uri, body.clone(), None).await;
         let batches = arrow_batches(&default);

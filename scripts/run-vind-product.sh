@@ -33,7 +33,11 @@ preserve_state="${VELORIX_VIND_PRESERVE_STATE:-0}"
 api_image="${VELORIX_API_IMAGE:-velorix-api:product-${run_id}}"
 api_image_digest="${VELORIX_API_IMAGE_DIGEST:-}"
 build_api_image="${VELORIX_BUILD_API_IMAGE:-1}"
-api_authoritative_relation_ingest="${VELORIX_API_AUTHORITATIVE_RELATION_INGEST:-0}"
+api_authoritative_relation_ingest="${VELORIX_API_AUTHORITATIVE_RELATION_INGEST:-1}"
+case "$api_authoritative_relation_ingest" in
+  true) api_authoritative_relation_ingest=1 ;;
+  false) api_authoritative_relation_ingest=0 ;;
+esac
 relation_ingest_owner_id="${VELORIX_RELATION_INGEST_OWNER_ID:-velorix-api-${namespace}}"
 operator_id="${VELORIX_OPERATOR_ID:-velorix-api}"
 relation_ingest_probe_prefix="${VELORIX_RELATION_INGEST_PROBE_PREFIX:-v1/api-probes/${operator_id}}"
@@ -44,7 +48,23 @@ meta_image="${VELORIX_META_IMAGE:-velorix-meta:product-${run_id}}"
 meta_image_digest="${VELORIX_META_IMAGE_DIGEST:-}"
 build_meta_image="${VELORIX_BUILD_META_IMAGE:-1}"
 meta_mode="${VELORIX_META_MODE:-development}"
-meta_backend="${VELORIX_META_BACKEND:-memory}"
+meta_endpoint="${VELORIX_META_GRPC_ENDPOINT:-}"
+meta_external=0
+if [ "$api_authoritative_relation_ingest" = 1 ] || [ -n "$meta_endpoint" ]; then
+  meta_external=1
+fi
+if [ "$meta_external" = 1 ]; then
+  meta_backend="${VELORIX_META_BACKEND:-rhiza-kv}"
+else
+  meta_backend="${VELORIX_META_BACKEND:-memory}"
+  meta_endpoint="http://velorix-meta:9090"
+fi
+managed_smoke_default=1
+managed_auto_smoke_default=auto
+if [ "$meta_external" = 1 ]; then
+  managed_smoke_default=0
+  managed_auto_smoke_default=0
+fi
 meta_development_allow_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK:-0}"
 meta_development_allow_remote_non_loopback="${VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK:-0}"
 ingest_writer_image="${VELORIX_INGEST_WRITER_IMAGE:-velorix-ingest-writer:product-${run_id}}"
@@ -53,9 +73,9 @@ build_ingest_writer_image="${VELORIX_BUILD_INGEST_WRITER_IMAGE:-1}"
 image_pull_secret="${VELORIX_IMAGE_PULL_SECRET:-}"
 docker_build_no_cache="${VELORIX_DOCKER_BUILD_NO_CACHE:-0}"
 load_existing_images="${VELORIX_LOAD_EXISTING_IMAGES:-0}"
-ingest_writer_smoke="${VELORIX_INGEST_WRITER_SMOKE:-1}"
-multi_replica_fencing_smoke="${VELORIX_MULTI_REPLICA_FENCING_SMOKE:-1}"
-standing_runtime_failover_smoke="${VELORIX_STANDING_RUNTIME_FAILOVER_SMOKE:-auto}"
+ingest_writer_smoke="${VELORIX_INGEST_WRITER_SMOKE:-${managed_smoke_default}}"
+multi_replica_fencing_smoke="${VELORIX_MULTI_REPLICA_FENCING_SMOKE:-${managed_smoke_default}}"
+standing_runtime_failover_smoke="${VELORIX_STANDING_RUNTIME_FAILOVER_SMOKE:-${managed_auto_smoke_default}}"
 object_store_mode="${VELORIX_OBJECT_STORE_MODE:-versitygw}"
 object_store_local_development_authority="${VELORIX_OBJECT_STORE_LOCAL_DEVELOPMENT_AUTHORITY:-0}"
 external_s3_validate="${VELORIX_EXTERNAL_S3_VALIDATE:-1}"
@@ -67,12 +87,16 @@ api_tls_enabled="${VELORIX_API_TLS_ENABLED:-1}"
 api_tls_local_port="${VELORIX_API_TLS_LOCAL_PORT:-8443}"
 hold_port_forward="${VELORIX_API_HOLD_PORT_FORWARD:-1}"
 final_owner_aware_attach="${VELORIX_API_FINAL_OWNER_AWARE_ATTACH:-1}"
-product_smoke="${VELORIX_VIND_PRODUCT_SMOKE:-1}"
-rest_api_smoke="${VELORIX_VIND_REST_API_SMOKE:-auto}"
-product_completion_report="${VELORIX_VIND_PRODUCT_COMPLETION_REPORT:-auto}"
+product_smoke="${VELORIX_VIND_PRODUCT_SMOKE:-${managed_smoke_default}}"
+rest_api_smoke="${VELORIX_VIND_REST_API_SMOKE:-${managed_auto_smoke_default}}"
+product_completion_report="${VELORIX_VIND_PRODUCT_COMPLETION_REPORT:-${managed_auto_smoke_default}}"
 product_evidence_level="${VELORIX_PRODUCT_EVIDENCE_LEVEL:-local-vind-only}"
 api_replica_count="${VELORIX_API_REPLICA_COUNT:-1}"
-standing_runtime_fencing="${VELORIX_STANDING_RUNTIME_FENCING:-unsafe-dev-only}"
+if [ "$meta_external" = 1 ]; then
+  standing_runtime_fencing="${VELORIX_STANDING_RUNTIME_FENCING:-logical-fencing}"
+else
+  standing_runtime_fencing="${VELORIX_STANDING_RUNTIME_FENCING:-unsafe-dev-only}"
+fi
 standing_runtime_owner_ttl_ms="${VELORIX_STANDING_RUNTIME_OWNER_TTL_MS:-5000}"
 output_compaction_interval_epochs="${VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS:-0}"
 output_dir="${VELORIX_VIND_PRODUCT_DIR:-target/velorix-product}"
@@ -231,7 +255,13 @@ Main overrides:
   VELORIX_VIND_PRESERVE_STATE=0
   VELORIX_VIND_CLEANUP=1
   VELORIX_API_IMAGE=velorix-api:product
-  VELORIX_API_AUTHORITATIVE_RELATION_INGEST=0  # set 1 with a metadata authority; legacy mode remains the default
+  VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1  # default; explicit 0 or false selects Legacy
+  VELORIX_META_GRPC_ENDPOINT=https://<existing-rhiza-meta>:9090  # required by default; no Meta is deployed
+  VELORIX_META_BEARER_TOKEN=<existing-meta-token>
+  VELORIX_META_TLS_CA_FILE=<local-ca.pem>
+  VELORIX_META_TLS_CLIENT_CERT_FILE=<local-client.pem>
+  VELORIX_META_TLS_CLIENT_KEY_FILE=<local-client-key.pem>
+  VELORIX_META_TLS_DOMAIN_NAME=<meta-certificate-dns-name>
   VELORIX_RELATION_INGEST_OWNER_ID=velorix-api-<namespace>  # deterministic for ephemeral namespaces; required for preserved/shared state
   VELORIX_RELATION_INGEST_PROBE_PREFIX=v1/api-probes/velorix-api
   VELORIX_AUTHORITY_NAMESPACE=<namespace>
@@ -243,7 +273,7 @@ Main overrides:
   VELORIX_META_MODE=development
   VELORIX_META_DEVELOPMENT_ALLOW_NON_LOOPBACK=0  # set 1 only for ephemeral local-development Versity Gateway + durable authenticated Meta
   VELORIX_META_DEVELOPMENT_ALLOW_REMOTE_NON_LOOPBACK=0  # set 1 only for a restricted existing remote context ephemeral test
-  VELORIX_META_BACKEND=memory
+  VELORIX_META_BACKEND=rhiza-kv  # external default; memory only with explicit Legacy
   VELORIX_INGEST_WRITER_IMAGE=velorix-ingest-writer:product
   VELORIX_INGEST_WRITER_IMAGE_DIGEST=<required sha256 digest when externally pulling the ingest-writer image>
   VELORIX_BUILD_INGEST_WRITER_IMAGE=1
@@ -297,6 +327,82 @@ if [ "$#" -ne 0 ]; then
   usage >&2
   exit 64
 fi
+
+validate_external_meta_config() {
+  [ "$meta_external" = 1 ] || return 0
+  if [ "$meta_enabled" != 1 ] || [ "$meta_backend" != rhiza-kv ]; then
+    echo "external Meta requires VELORIX_META_ENABLED=1 and VELORIX_META_BACKEND=rhiza-kv" >&2
+    return 64
+  fi
+  if [[ ! "$meta_endpoint" =~ ^https://[a-zA-Z0-9][a-zA-Z0-9.-]*:[0-9]+/?$ ]]; then
+    echo "VELORIX_META_GRPC_ENDPOINT must be an explicit https://host:port for existing Rhiza Meta" >&2
+    return 64
+  fi
+  if [ -z "$meta_bearer_token" ] || [[ "$meta_bearer_token" == *[!a-zA-Z0-9._~+/=-]* ]]; then
+    echo "external Meta requires the existing nonempty header-safe VELORIX_META_BEARER_TOKEN" >&2
+    return 64
+  fi
+  local path
+  for path in "${VELORIX_META_TLS_CA_FILE:-}" "${VELORIX_META_TLS_CLIENT_CERT_FILE:-}" "${VELORIX_META_TLS_CLIENT_KEY_FILE:-}"; do
+    if [ ! -r "$path" ] || [ ! -s "$path" ]; then
+      echo "external Meta requires readable nonempty VELORIX_META_TLS_CA_FILE, CLIENT_CERT_FILE and CLIENT_KEY_FILE" >&2
+      return 64
+    fi
+  done
+  if [[ ! "${VELORIX_META_TLS_DOMAIN_NAME:-}" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
+    echo "external Meta requires VELORIX_META_TLS_DOMAIN_NAME" >&2
+    return 64
+  fi
+  if [[ ! "$relation_ingest_owner_id" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] \
+    || [[ "$relation_ingest_owner_id" == pod-* ]] \
+    || [ "$relation_ingest_owner_id" = random ] || [ "$relation_ingest_owner_id" = ephemeral ] \
+    || [ "$relation_ingest_owner_id" = pod ]; then
+    echo "external Meta requires a stable deployment VELORIX_RELATION_INGEST_OWNER_ID" >&2
+    return 64
+  fi
+  if [ "$standing_runtime_fencing" != logical-fencing ] && [ "$standing_runtime_fencing" != required ]; then
+    echo "external Meta requires logical-fencing or required standing-runtime fencing" >&2
+    return 64
+  fi
+  if [ "$ingest_writer_smoke" != 0 ] || [ "$multi_replica_fencing_smoke" != 0 ] \
+    || [ "$standing_runtime_failover_smoke" != 0 ] || [ "$product_smoke" != 0 ] \
+    || [ "$rest_api_smoke" != 0 ] || [ "$product_completion_report" != 0 ]; then
+    echo "external Meta launch does not run managed-Meta/data-mutating smoke suites; run those separately in an isolated namespace" >&2
+    return 64
+  fi
+  if [ "$meta_development_allow_non_loopback" != 0 ] || [ "$meta_development_allow_remote_non_loopback" != 0 ]; then
+    echo "external Meta uses mTLS; managed-Meta plaintext overrides are not applicable" >&2
+    return 64
+  fi
+}
+
+validate_external_meta_readyz() {
+  jq -er --arg endpoint "$meta_endpoint" --arg auth "$api_auth_mode" \
+    --arg fencing "$standing_runtime_fencing" --arg mode "$api_authoritative_relation_ingest" '
+    . as $r | .metadata_store.standing_runtime_fencing as $c |
+    select(.status == "ready" and .api_auth.mode == $auth and .admin_auth.mode == $auth) |
+    select(.relation_ingest.authoritative == ($mode == "1")) |
+    select(.relation_ingest.mode == (if $mode == "1" then "authoritative" else "legacy" end)) |
+    select(.metadata_store.configured == true and .metadata_store.endpoint == $endpoint) |
+    select($c.backend_name == "rhiza-kv" and $c.capability_schema_version == 2 and $c.control_plane_auth_enforced == true) |
+    select(.standing_runtime_fencing_mode == $fencing and .standing_runtime_fencing_required == true) |
+    select(all(["linearizable_owner_lease", "durable_monotonic_owner_epoch",
+      "owner_validated_checkpoint_publish", "publish_checks_owner_and_latest_atomically",
+      "publish_rejects_expired_owner", "latest_read_linearizable", "publish_rejects_scope_mismatch",
+      "multi_writer_fencing_safe"][]; $c[.] == true)) |
+    select($c.lease_authority_kind == "raft_replicated_time") |
+    select($c.lease_expiry_semantics == "operation_driven_logical" or $c.lease_expiry_semantics == "backend_wall_clock_ttl") |
+    select($fencing != "required" or (
+      all(["authoritative_backend_time", "bounded_wall_clock_failover", "production_bounded_failover_safe",
+        "production_multi_writer_safe"][]; $c[.] == true) and
+      ($c.failover_time_bound_ms | type == "number" and . > 0) and
+      $c.backend_time_source_kind == "raft_replicated_authority_time")) |
+    select(.object_store.schema_version == 1 and .object_store.artifact_catalog.conditional_update == true) |
+    select(.object_store.authoritative_namespace_count | type == "number" and floor == . and . > 0) |
+    [$auth, .object_store.authoritative_namespace_count, 1, .relation_ingest.mode,
+      (.relation_ingest.authoritative | tostring)] | @tsv
+  ' "$1"
+}
 
 write_public_evidence() {
   local path="$1"
@@ -439,6 +545,8 @@ if [ "${VELORIX_EVIDENCE_REDACT_ONLY:-0}" = "1" ]; then
   exit $?
 fi
 
+validate_external_meta_config
+
 if [ "$preserve_state" = "1" ] || [ -n "${VELORIX_S3_PREFIX+x}" ]; then
   if [ -z "${VELORIX_K8S_NAMESPACE+x}" ]; then
     echo "VELORIX_K8S_NAMESPACE must be explicit when preserving or sharing state" >&2
@@ -462,6 +570,9 @@ require docker
 require kubectl
 require python3
 require vcluster
+if [ "$meta_external" = 1 ]; then
+  require jq
+fi
 
 preflight_docker_daemon() {
   local output
@@ -1090,7 +1201,7 @@ if [ "$image_load_mode" = "none" ]; then
     api_image="$(immutable_image_reference "$api_image" "$api_image_digest")"
     api_image_pull_policy="IfNotPresent"
   fi
-  if [ "$meta_enabled" = "1" ] && [ "$build_meta_image" = "0" ]; then
+  if [ "$meta_enabled" = "1" ] && [ "$meta_external" = 0 ] && [ "$build_meta_image" = "0" ]; then
     if [ -z "$meta_image_digest" ] && [[ "$meta_image" == *@sha256:* ]]; then
       meta_image_digest="${meta_image##*@}"
     fi
@@ -1491,6 +1602,9 @@ fi
 
 case "$meta_backend" in
   memory | in-memory | oss | object-store) ;;
+  rhiza-kv)
+    [ "$meta_external" = 1 ] || { echo "Rhiza Meta must be supplied externally" >&2; exit 64; }
+    ;;
   hiqlite)
     echo "VELORIX_META_BACKEND=hiqlite was removed; Velorix deployments use the Rhiza KV metadata authority (scripts/run-rhiza-kv-k8s-gate.sh) or the durable object-store authority (oss)" >&2
     exit 64
@@ -1528,8 +1642,10 @@ if [ "$meta_mode" = "production" ] || [ "$meta_mode" = "prod" ]; then
     echo "Meta development non-loopback opt-ins require VELORIX_META_MODE=development" >&2
     exit 64
   fi
-  echo "VELORIX_META_MODE=production is unsupported by this local runner until validated transport configuration exists" >&2
-  exit 64
+  if [ "$meta_external" = 0 ]; then
+    echo "VELORIX_META_MODE=production is unsupported by this local runner until validated transport configuration exists" >&2
+    exit 64
+  fi
 fi
 if [ "$ingest_writer_smoke" = "1" ] \
   && { [ "$meta_enabled" != "1" ] || [ "$meta_backend" = "memory" ] || [ "$meta_backend" = "in-memory" ]; }; then
@@ -1565,7 +1681,7 @@ case "$output_compaction_interval_epochs" in
     ;;
 esac
 
-if [ "$meta_enabled" = "1" ] && [ -z "$meta_bearer_token" ]; then
+if [ "$meta_enabled" = "1" ] && [ "$meta_external" = 0 ] && [ -z "$meta_bearer_token" ]; then
   meta_bearer_token="$(
     python3 - <<'PY'
 import secrets
@@ -6238,6 +6354,19 @@ with open(path, "w", encoding="utf-8") as f:
     f.write("\n")
 PY
   chmod 600 "${output_dir}/product-evidence.json"
+  if [ "$meta_external" = 1 ]; then
+    jq --arg endpoint "$meta_endpoint" '
+      del(.deployed_images["velorix-meta"]) |
+      .metadata_store.external = true |
+      .metadata_store.endpoint = $endpoint |
+      .metadata_store.lifecycle_managed = false |
+      .metadata_store.meta_s3_prefix = null |
+      .metadata_store.recovery_validation = "UNVERIFIED" |
+      .product_complete = false |
+      .product_complete_blockers += ["external Rhiza deployment/recovery and workload validation are not performed by this launch"]
+    ' "${output_dir}/product-evidence.json" >"${output_dir}/product-evidence.external.tmp"
+    mv "${output_dir}/product-evidence.external.tmp" "${output_dir}/product-evidence.json"
+  fi
 }
 
 assert_product_complete_evidence() {
@@ -6325,7 +6454,7 @@ else
   fi
 fi
 
-if [ "$meta_enabled" = "1" ]; then
+if [ "$meta_enabled" = "1" ] && [ "$meta_external" = 0 ]; then
   if [ "$build_meta_image" = "1" ]; then
     echo "building ${meta_image}"
     DOCKER_BUILDKIT=1 docker build "${docker_build_args[@]}" -f Dockerfile.meta -t "$meta_image" .
@@ -6343,7 +6472,7 @@ fi
 if [ -z "$api_image_digest" ]; then
   api_image_digest="$(resolve_local_image_digest "$api_image")"
 fi
-if [ "$meta_enabled" = "1" ] && [ -z "$meta_image_digest" ]; then
+if [ "$meta_enabled" = "1" ] && [ "$meta_external" = 0 ] && [ -z "$meta_image_digest" ]; then
   meta_image_digest="$(resolve_local_image_digest "$meta_image")"
 fi
 
@@ -6670,18 +6799,23 @@ fi
 run_external_s3_validation_job
 api_meta_env=""
 if [ "$meta_enabled" = "1" ]; then
+  meta_auth_secret_name=velorix-meta-auth
+  if [ "$meta_external" = 1 ]; then
+    meta_auth_secret_name=velorix-api-meta-auth
+  fi
   meta_bearer_token_b64="$(base64_value "$meta_bearer_token")"
   cat <<EOF | kubectl --context "$context" apply -f -
 apiVersion: v1
 kind: Secret
 metadata:
-  name: velorix-meta-auth
+  name: ${meta_auth_secret_name}
   namespace: ${namespace}
 type: Opaque
 data:
   bearer-token: ${meta_bearer_token_b64}
 EOF
 
+  if [ "$meta_external" = 0 ]; then
   cat >"${output_dir}/velorix-meta.yaml" <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -6825,14 +6959,15 @@ EOF
       "$meta_pods_file"
   )"
   run_meta_smoke_job
+  fi
 
-  api_meta_env="$(cat <<'EOF'
+  api_meta_env="$(cat <<EOF
             - name: VELORIX_META_GRPC_ENDPOINT
-              value: "http://velorix-meta:9090"
+              value: "${meta_endpoint}"
             - name: VELORIX_META_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: velorix-meta-auth
+                  name: ${meta_auth_secret_name}
                   key: bearer-token
 EOF
   )"
@@ -6879,6 +7014,37 @@ EOF
 EOF
 )"
 fi
+
+configure_external_meta_client() {
+  [ "$meta_external" = 1 ] || return 0
+  kubectl --context "$context" -n "$namespace" create secret generic velorix-api-meta-client-tls \
+    --from-file=ca.pem="$VELORIX_META_TLS_CA_FILE" \
+    --from-file=client.pem="$VELORIX_META_TLS_CLIENT_CERT_FILE" \
+    --from-file=client-key.pem="$VELORIX_META_TLS_CLIENT_KEY_FILE" \
+    --dry-run=client -o yaml | kubectl --context "$context" apply -f -
+  api_meta_env="${api_meta_env}
+            - name: VELORIX_META_TLS_CA_FILE
+              value: /var/run/velorix-meta-client-tls/ca.pem
+            - name: VELORIX_META_TLS_CLIENT_CERT_FILE
+              value: /var/run/velorix-meta-client-tls/client.pem
+            - name: VELORIX_META_TLS_CLIENT_KEY_FILE
+              value: /var/run/velorix-meta-client-tls/client-key.pem
+            - name: VELORIX_META_TLS_DOMAIN_NAME
+              value: \"${VELORIX_META_TLS_DOMAIN_NAME}\""
+  if [ -z "$api_tls_volume_mounts" ]; then
+    api_tls_volume_mounts="          volumeMounts:"
+    api_tls_volumes="      volumes:"
+  fi
+  api_tls_volume_mounts="${api_tls_volume_mounts}
+            - name: meta-client-tls
+              mountPath: /var/run/velorix-meta-client-tls
+              readOnly: true"
+  api_tls_volumes="${api_tls_volumes}
+        - name: meta-client-tls
+          secret:
+            secretName: velorix-api-meta-client-tls"
+}
+configure_external_meta_client
 
 cat >"${output_dir}/velorix-api.yaml" <<EOF
 apiVersion: apps/v1
@@ -7054,6 +7220,12 @@ curl -fsS "http://127.0.0.1:${api_local_port}/readyz" | tee "${output_dir}/ready
 api_readyz_unauthenticated=1
 readyz_validation_output="${output_dir}/readyz-validation.tsv"
 readyz_validation_error="${output_dir}/readyz-validation.error"
+if [ "$meta_external" = 1 ]; then
+  if ! validate_external_meta_readyz "${output_dir}/readyz.json" >"$readyz_validation_output" 2>"$readyz_validation_error"; then
+    echo "external Rhiza Meta readiness/capability validation failed; refusing fallback" >&2
+    exit 1
+  fi
+else
 if ! python3 - "${output_dir}/readyz.json" "$meta_enabled" "$meta_backend" "$standing_runtime_fencing" "$api_auth_mode" "$api_authoritative_relation_ingest" >"$readyz_validation_output" 2>"$readyz_validation_error" <<'PY'
 import json
 import sys
@@ -7178,6 +7350,7 @@ then
   chmod 600 "$readyz_validation_output" "$readyz_validation_error"
   echo "API readyz capability validation failed; private diagnostics were retained" >&2
   exit 1
+fi
 fi
 chmod 600 "$readyz_validation_output" "$readyz_validation_error"
 if [ "$api_authoritative_relation_ingest" = "1" ]; then

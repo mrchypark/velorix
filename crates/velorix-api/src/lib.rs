@@ -201,12 +201,14 @@ fn validate_native_family_spec_config(path: Option<&std::ffi::OsStr>) -> anyhow:
     Ok(())
 }
 
+pub type MaterializedReadCacheHitAccountant =
+    Arc<dyn Fn(&str, u64) -> Result<(), ApiError> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn ObjectStore>,
     materialized_read_cache: Option<Arc<materialized_read_cache::MaterializedReadCache>>,
-    materialized_read_cache_hit_accountant:
-        Option<Arc<dyn Fn(&str, u64) -> Result<(), ApiError> + Send + Sync>>,
+    materialized_read_cache_hit_accountant: Option<MaterializedReadCacheHitAccountant>,
     materialized_read_cache_store_id: String,
     capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
     ingest_writer: Arc<DeployedIngestWriterRuntime<ObjectStoreAuthorityRef>>,

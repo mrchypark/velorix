@@ -13,8 +13,8 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 bytes = { workspace = true }
-foyer = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
+foyer = { workspace = true, features = ["serde"] }
 object_store = { workspace = true, features = ["aws"] }
 percent-encoding = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
@@ -33,4 +33,3 @@ tempfile = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
 tower = { workspace = true, features = ["util"] }
-velorix-meta = { path = "../velorix-meta" }

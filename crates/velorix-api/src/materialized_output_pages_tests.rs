@@ -225,9 +225,7 @@ async fn materialized_public_runtime_normalizes_filter_projection_group_and_two_
             "SELECT * FROM grouped_output WHERE key_col='k1'"
         )
         .await,
-        vec![
-            json!({"key_col":"k1","total":16,"count":2,"minimum":6,"maximum":10,"average":8.0})
-        ]
+        vec![json!({"key_col":"k1","total":16,"count":2,"minimum":6,"maximum":10,"average":8.0})]
     );
     assert_eq!(
         request_rows(&router, "joined_output", "SELECT * FROM joined_output").await,
@@ -580,10 +578,7 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
     activate(&router, "copied_output").await;
     let first = call_json(&router, Method::POST, uri, json!({"max_rows":1})).await;
     assert_eq!(first.0, StatusCode::OK, "{}", first.1);
-    assert_eq!(
-        first.1["rows"],
-        json!([{"key_col":"k1","amount":10}])
-    );
+    assert_eq!(first.1["rows"], json!([{"key_col":"k1","amount":10}]));
     let request = json!({"max_rows":2,"page_token":first.1["next_page_token"],"committed_epoch":first.1["logical_epoch"]});
     let rest = call_json(&router, Method::POST, uri, request.clone()).await;
     assert_eq!(rest.0, StatusCode::OK, "{}", rest.1);

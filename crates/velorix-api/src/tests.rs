@@ -25,6 +25,7 @@ use std::{
 };
 use tokio::sync::Notify;
 use tower::ServiceExt as _;
+use velorix_control::meta_admin as meta;
 use velorix_control::meta_admin::{
     CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest, InMemoryMetaStore,
     IngestSourceRelationIdentityV1, ViewBootstrapLifecycleV1,
@@ -38,7 +39,6 @@ use velorix_core::{
         RuntimeCheckpointStatePayload, ViewFrontier,
     },
 };
-use velorix_meta as meta;
 
 fn template_result_schema() -> RelationSchema {
     RelationSchema {
@@ -1439,17 +1439,15 @@ async fn profile_preserved_authoritative_cursor_checkpoint(root: &std::path::Pat
         panic!("isolated metadata owner");
     };
     assert_eq!(
-        meta.publish_standing_runtime_checkpoint(
-            velorix_meta::PublishStandingRuntimeCheckpointRequest {
-                expected_previous: None,
-                candidate: pointer.clone(),
-                owner: standing_runtime_owner_token_from_claim(&owner),
-                expected_relation_source_cuts: None,
-            }
-        )
+        meta.publish_standing_runtime_checkpoint(meta::PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: pointer.clone(),
+            owner: standing_runtime_owner_token_from_claim(&owner),
+            expected_relation_source_cuts: None,
+        })
         .await
         .unwrap(),
-        velorix_meta::PublishStandingRuntimeCheckpointOutcome::Published
+        meta::PublishStandingRuntimeCheckpointOutcome::Published
     );
     let state = test_api_state_with_store(store, "isolated-cursor-profile", false)
         .await
@@ -13082,7 +13080,7 @@ impl MetaStore for DurableCapabilityMetaStore {
     async fn capture_ingest_source_cut(
         &self,
         request: CaptureIngestSourceCutRequest,
-    ) -> Result<velorix_meta::IngestSourceCutV1, MetaStoreError> {
+    ) -> Result<meta::IngestSourceCutV1, MetaStoreError> {
         self.inner.capture_ingest_source_cut(request).await
     }
 
@@ -14060,15 +14058,13 @@ async fn backfill_owner_renewal_grpc_survives_blocked_origin_executor() {
                 tokio::time::timeout(
                     Duration::from_secs(5),
                     tonic::transport::Server::builder()
-                        .add_service(
-                            velorix_meta::proto::velorix_meta_server::VelorixMetaServer::new(
-                                velorix_meta::MetaGrpcService::with_bearer_token(
-                                    velorix_meta::InMemoryMetaStore::default(),
-                                    "lease-test-token",
-                                )
-                                .unwrap(),
-                            ),
-                        )
+                        .add_service(meta::proto::velorix_meta_server::VelorixMetaServer::new(
+                            meta::MetaGrpcService::with_bearer_token(
+                                meta::InMemoryMetaStore::default(),
+                                "lease-test-token",
+                            )
+                            .unwrap(),
+                        ))
                         .serve_with_incoming_shutdown(
                             tokio_stream::wrappers::TcpListenerStream::new(listener),
                             async {
@@ -14082,7 +14078,7 @@ async fn backfill_owner_renewal_grpc_survives_blocked_origin_executor() {
             });
     });
     let meta = Arc::new(
-        velorix_meta::GrpcMetaStore::connect_with_bearer_token(
+        meta::GrpcMetaStore::connect_with_bearer_token(
             endpoint.recv().unwrap(),
             "lease-test-token",
         )
@@ -14121,7 +14117,7 @@ async fn backfill_owner_renewal_grpc_survives_blocked_origin_executor() {
 
 #[tokio::test]
 async fn backfill_owner_renewal_survives_blocked_executor_and_fences_takeover() {
-    let meta = Arc::new(velorix_meta::InMemoryMetaStore::default());
+    let meta = Arc::new(meta::InMemoryMetaStore::default());
     let state = test_api_state_with_store(Arc::new(InMemory::new()), "lease-owner-a", false)
         .await
         .with_meta_store(meta.clone())
@@ -14171,7 +14167,7 @@ async fn backfill_owner_renewal_survives_blocked_executor_and_fences_takeover() 
     ));
     let checkpoint_key = test_checkpoint_key(&checkpoint);
     let candidate = test_checkpoint_pointer(&checkpoint_key, &checkpoint);
-    let publish = velorix_meta::PublishStandingRuntimeCheckpointRequest {
+    let publish = meta::PublishStandingRuntimeCheckpointRequest {
         expected_previous: None,
         candidate: candidate.clone(),
         owner: original.clone(),
@@ -14181,13 +14177,13 @@ async fn backfill_owner_renewal_survives_blocked_executor_and_fences_takeover() 
         meta.publish_standing_runtime_checkpoint(publish.clone())
             .await
             .unwrap(),
-        velorix_meta::PublishStandingRuntimeCheckpointOutcome::Published
+        meta::PublishStandingRuntimeCheckpointOutcome::Published
     );
     assert_eq!(
         meta.publish_standing_runtime_checkpoint(publish.clone())
             .await
             .unwrap(),
-        velorix_meta::PublishStandingRuntimeCheckpointOutcome::Duplicate
+        meta::PublishStandingRuntimeCheckpointOutcome::Duplicate
     );
     drop(lease);
     std::thread::sleep(Duration::from_millis(150));
@@ -14382,7 +14378,7 @@ async fn backfill_progress_counts_weighted_batches_across_packed_epochs_without_
     ));
     let state = test_api_state_with_store(store, "weighted-progress-owner", false)
         .await
-        .with_meta_store(Arc::new(velorix_meta::InMemoryMetaStore::default()))
+        .with_meta_store(Arc::new(meta::InMemoryMetaStore::default()))
         .with_experimental_advanced_view_features(true);
     let router = app(state.clone());
     let registered = call_json(

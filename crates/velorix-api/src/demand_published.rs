@@ -361,7 +361,7 @@ pub(super) async fn capture_demand_published_artifacts(
                 {
                     return Err(invalid("published manifest/header binding mismatch"));
                 }
-                if materialized_output_pages::is_bag_codec(&manifest.output_encoding) {
+                if materialized_output_pages::is_materialized_codec(&manifest.output_encoding) {
                     let schema: RelationSchema =
                         serde_json::from_value(manifest.published_output["schema"].clone())
                             .map_err(ApiError::bad_request)?;
@@ -517,7 +517,7 @@ async fn load_page(
     {
         return Err(invalid("published page binding mismatch"));
     }
-    if materialized_output_pages::is_bag_codec(&manifest.output_encoding) {
+    if materialized_output_pages::is_materialized_codec(&manifest.output_encoding) {
         materialized_output_pages::validate_page_binding(manifest, &page)
     } else {
         // Current aggregate/ordered codec is one whole snapshot page. It must
@@ -578,7 +578,7 @@ pub(super) async fn load_demand_published_artifact(
                 }
                 let key =
                     velorix_core::delta::encode_kv_ordered(row.key.as_json(), row.value.as_json());
-                if materialized_output_pages::is_bag_codec(&manifest.output_encoding)
+                if materialized_output_pages::is_materialized_codec(&manifest.output_encoding)
                     && last.as_ref().is_some_and(|p| p > &key)
                 {
                     return Err(invalid("published page order mismatch"));

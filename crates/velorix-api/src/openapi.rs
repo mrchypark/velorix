@@ -892,7 +892,10 @@ mod openapi_spec_verification {
         // Finding 2: the parameterized backfill path with GET and POST.
         let backfill = &spec["paths"]["/v1/views/{view_id}/backfill"];
         assert!(backfill["get"].is_object(), "backfill GET missing: {spec}");
-        assert!(backfill["post"].is_object(), "backfill POST missing: {spec}");
+        assert!(
+            backfill["post"].is_object(),
+            "backfill POST missing: {spec}"
+        );
         assert_eq!(
             backfill["post"]["responses"]["202"]["content"]["application/json"]["schema"]
                 ["properties"]["materialization"]["properties"]["complete"]["type"],

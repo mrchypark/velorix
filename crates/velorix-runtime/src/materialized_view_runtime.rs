@@ -10343,6 +10343,29 @@ pub fn materialized_delta_to_page_with_checkpoint(
         .map(|state| serde_json::from_str::<Value>(&state.payload))
         .transpose()
         .map_err(|_| invalid_checkpoint())?;
+    materialized_delta_to_page_with_payload(
+        schema,
+        output,
+        view,
+        epoch,
+        page,
+        aggregates,
+        payload.as_ref(),
+    )
+}
+
+/// Convert bounded output using a checkpoint payload parsed once by the caller.
+/// The conversion uses only runtime kind and projection metadata; it does not
+/// restore or mutate the checkpoint's runtime state.
+pub fn materialized_delta_to_page_with_payload(
+    schema: &RelationSchema,
+    output: &DeltaBatch,
+    view: ScopedViewId,
+    epoch: u64,
+    page: SnapshotPageRequest,
+    aggregates: Option<&[SupportedAggregateOutput]>,
+    payload: Option<&Value>,
+) -> Result<MaterializedViewPage, StandingProgramRuntimeError> {
     let kind = payload
         .as_ref()
         .and_then(|state| state.get("runtime_kind"))

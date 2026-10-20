@@ -91,6 +91,17 @@ const PAGE_ROWS: usize = 512;
 // 1KiB/ref preflight bounds page expansion before any page bodies are allocated.
 const MAX_INDEX_BYTES: usize = DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES;
 const MAX_PAGES: usize = MAX_INDEX_BYTES / 1024;
+pub(super) fn fits_page_index(output: &DeltaBatch) -> Result<bool, ApiError> {
+    let total = output
+        .net_rows()
+        .map_err(ApiError::bad_request)?
+        .iter()
+        .try_fold(0usize, |total, row| {
+            let weight = usize::try_from(row.weight).map_err(ApiError::bad_request)?;
+            total.checked_add(weight).ok_or_else(invalid)
+        })?;
+    Ok(total.div_ceil(PAGE_ROWS).max(1) <= MAX_PAGES)
+}
 const SOURCE: &str = "standing_runtime_checkpoint_published_output";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -349,7 +360,7 @@ pub(super) fn checkpoint_publication(
             let copies = 1;
             let mut part = row.clone();
             part.weight = 1;
-            let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
+            let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_payload(
                 &schema,
                 &DeltaBatch::from_records([part]),
                 ScopedViewId {
@@ -363,7 +374,7 @@ pub(super) fn checkpoint_publication(
                     ..Default::default()
                 },
                 aggregates.as_deref(),
-                checkpoint,
+                Some(&payload),
             )
             .map_err(ApiError::bad_request)?;
             let mut converted = Vec::new();
@@ -1706,15 +1717,58 @@ async fn query_bound_selected_policy_at_pointer(
     captured_pointer: Option<StandingRuntimeCheckpointPointer>,
     selected_row_offset: Option<usize>,
 ) -> Result<Option<MaterializedViewPage>, ApiError> {
-    let Some(meta) = &state.meta_store else {
-        return Ok(None);
-    };
+    let pinned = captured_pointer.is_some();
+    let mut discovery_requests = 0;
+    let mut discovered_bytes = None;
     let pointer = match captured_pointer {
         Some(pointer) => Some(pointer),
-        None => meta
-            .read_standing_runtime_checkpoint(&identity.tenant_id, &identity.program_id, view_id)
-            .await
-            .map_err(meta_error_to_api)?,
+        None => match &state.meta_store {
+            Some(meta) => meta
+                .read_standing_runtime_checkpoint(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?,
+            None => {
+                let Some((path, _)) = discover_checkpoint_head(
+                    state,
+                    identity,
+                    view_id,
+                    policy,
+                    &mut discovery_requests,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                charge_request(policy, &mut discovery_requests)?;
+                let budget = policy
+                    .max_scan_bytes
+                    .unwrap_or(u64::MAX)
+                    .min(policy.memory_limit_bytes.unwrap_or(u64::MAX) / 16)
+                    .min(16 * 1024 * 1024);
+                let bytes = super::checkpoint_publication::read_object_bytes_bounded(
+                    state,
+                    &ObjectPath::from(path.clone()),
+                    Some(budget),
+                )
+                .await?;
+                let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
+                    .map_err(ApiError::bad_request)?;
+                if record.checkpoint_key.is_empty() {
+                    record.checkpoint_key = path.clone();
+                }
+                if record.checkpoint_key != path {
+                    return Err(invalid());
+                }
+                let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+                validate_standing_runtime_checkpoint_record(identity, view_id, &pointer, &record)?;
+                discovered_bytes = Some(bytes);
+                Some(pointer)
+            }
+        },
     };
     let Some(pointer) = pointer else {
         return Ok(None);
@@ -1741,38 +1795,42 @@ async fn query_bound_selected_policy_at_pointer(
     // The checkpoint record is one object request against the read budget.
     // Charge it before the fetch so a restrictive policy is rejected before
     // any output page is read.
-    let mut metadata_requests = 0usize;
-    charge_request(policy, &mut metadata_requests)?;
-    let bytes = read_query_metadata(
-        state,
-        super::materialized_read_cache::MaterializedReadCacheKey {
-            store_id: state.materialized_read_cache_store_id().into(),
-            namespace: state.materialized_read_cache_namespace().into(),
-            tenant_id: identity.tenant_id.clone(),
-            program_id: identity.program_id.clone(),
-            output_id: output_id.into(),
-            object_path: pointer.checkpoint_key.clone(),
-            content_hash: pointer.manifest_hash.clone(),
-            codec: "standing-runtime-checkpoint-json".into(),
-            root_hash: pointer.content_hash.clone(),
-            checkpoint_epoch: pointer.logical_epoch,
-        },
-        metadata_budget(0)
-            .map(|n| n.min(16 * 1024 * 1024))
-            .or(Some(16 * 1024 * 1024)),
-        |bytes| {
-            if stable_bytes_hash(bytes) != pointer.manifest_hash {
-                return Err(invalid());
-            }
-            let mut record = standing_runtime_checkpoint_record_from_slice(bytes)
-                .map_err(ApiError::bad_request)?;
-            if record.checkpoint_key.is_empty() {
-                record.checkpoint_key = pointer.checkpoint_key.clone();
-            }
-            validate_standing_runtime_checkpoint_record(identity, view_id, &pointer, &record)
-        },
-    )
-    .await?;
+    let mut metadata_requests = discovery_requests;
+    let bytes = if let Some(bytes) = discovered_bytes {
+        bytes
+    } else {
+        charge_request(policy, &mut metadata_requests)?;
+        read_query_metadata(
+            state,
+            super::materialized_read_cache::MaterializedReadCacheKey {
+                store_id: state.materialized_read_cache_store_id().into(),
+                namespace: state.materialized_read_cache_namespace().into(),
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                output_id: output_id.into(),
+                object_path: pointer.checkpoint_key.clone(),
+                content_hash: pointer.manifest_hash.clone(),
+                codec: "standing-runtime-checkpoint-json".into(),
+                root_hash: pointer.content_hash.clone(),
+                checkpoint_epoch: pointer.logical_epoch,
+            },
+            metadata_budget(0)
+                .map(|n| n.min(16 * 1024 * 1024))
+                .or(Some(16 * 1024 * 1024)),
+            |bytes| {
+                if stable_bytes_hash(bytes) != pointer.manifest_hash {
+                    return Err(invalid());
+                }
+                let mut record = standing_runtime_checkpoint_record_from_slice(bytes)
+                    .map_err(ApiError::bad_request)?;
+                if record.checkpoint_key.is_empty() {
+                    record.checkpoint_key = pointer.checkpoint_key.clone();
+                }
+                validate_standing_runtime_checkpoint_record(identity, view_id, &pointer, &record)
+            },
+        )
+        .await?
+    };
     if bytes.len() > 16 * 1024 * 1024 || stable_bytes_hash(&bytes) != pointer.manifest_hash {
         return Err(invalid());
     }
@@ -1799,6 +1857,9 @@ async fn query_bound_selected_policy_at_pointer(
         // The already-consumed metadata budget travels with the delegation so
         // the legacy reader cannot re-spend the same allowance.
         let Some(path) = matching.next() else {
+            if pinned {
+                return Ok(None);
+            }
             return super::query_serving::legacy_materialized_page(
                 state,
                 view_id,
@@ -1852,7 +1913,12 @@ async fn query_bound_selected_policy_at_pointer(
         )?;
         manifest
     };
-    if !is_bag_codec(&manifest.output_encoding) {
+    if !is_materialized_codec(&manifest.output_encoding) {
+        // A signed continuation must use the supplied immutable record, never
+        // the legacy reader that resolves the latest head again.
+        if pinned {
+            return Ok(None);
+        }
         return super::query_serving::legacy_materialized_page(
             state,
             view_id,
@@ -1946,6 +2012,11 @@ async fn query_bound_selected_policy_at_pointer(
     if offset > selected_count {
         return Err(invalid());
     }
+    let canonical_batch = if is_bag_codec(&manifest.output_encoding) {
+        velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch
+    } else {
+        velorix_runtime::materialized_view_runtime::materialized_canonical_output_batch
+    };
     let end = offset
         .saturating_add(if filter.is_some() {
             selected_count
@@ -1973,7 +2044,7 @@ async fn query_bound_selected_policy_at_pointer(
         }
         candidate_start = stop;
     }
-    let required_object_requests = files.checked_add(2).ok_or_else(invalid)?;
+    let required_object_requests = files.checked_add(metadata_requests).ok_or_else(invalid)?;
     let exceeds_scan_files = policy.max_scan_files.is_some_and(|max| files > max);
     let exceeds_object_requests = policy
         .max_object_requests
@@ -1998,6 +2069,7 @@ async fn query_bound_selected_policy_at_pointer(
             retryable_materialization: false,
         });
     }
+    metadata_requests = required_object_requests;
     for (page_ref, candidate) in manifest.pages.iter().zip(candidates) {
         if !candidate {
             continue;
@@ -2078,11 +2150,8 @@ async fn query_bound_selected_policy_at_pointer(
                     .collect::<Result<Vec<_>, _>>()?;
                 RecordBatch::try_new(batch.schema(), columns).map_err(ApiError::bad_request)?
             } else {
-                velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
-                    schema,
-                    &DeltaBatch::from_records(selected),
-                )
-                .map_err(ApiError::bad_request)?
+                canonical_batch(schema, &DeltaBatch::from_records(selected))
+                    .map_err(ApiError::bad_request)?
             };
             retained_bytes = retained_bytes
                 .checked_add(batch.get_array_memory_size() as u64)
@@ -2103,23 +2172,39 @@ async fn query_bound_selected_policy_at_pointer(
         }
     }
     if batches.is_empty() {
-        batches.push(
-            velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
-                schema,
-                &DeltaBatch::default(),
-            )
-            .map_err(ApiError::bad_request)?,
-        );
+        batches
+            .push(canonical_batch(schema, &DeltaBatch::default()).map_err(ApiError::bad_request)?);
     }
     // The descriptor and selected pages describe one exact head, never a mixture.
-    let current = meta
-        .read_standing_runtime_checkpoint(&identity.tenant_id, &identity.program_id, view_id)
-        .await
-        .map_err(meta_error_to_api)?;
-    if current.as_ref() != Some(&pointer) {
-        return Err(ApiError::conflict(
-            "materialized output head changed during paging",
-        ));
+    if !pinned {
+        if let Some(meta) = &state.meta_store {
+            let current = meta
+                .read_standing_runtime_checkpoint(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?;
+            if current.as_ref() != Some(&pointer) {
+                return Err(ApiError::conflict(
+                    "materialized output head changed during paging",
+                ));
+            }
+        } else {
+            let current =
+                discover_checkpoint_head(state, identity, view_id, policy, &mut metadata_requests)
+                    .await?;
+            if current.is_none_or(|(path, parts)| {
+                path != pointer.checkpoint_key
+                    || parts.logical_epoch != pointer.logical_epoch
+                    || parts.content_hash != pointer.content_hash
+            }) {
+                return Err(ApiError::conflict(
+                    "materialized output head changed during paging",
+                ));
+            }
+        }
     }
     let next_page_token = if end < selected_count {
         Some(
@@ -2154,8 +2239,8 @@ async fn query_bound_selected_policy_at_pointer(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use velorix_control::meta_admin::InMemoryMetaStore;
     use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
-    use velorix_meta::InMemoryMetaStore;
 
     fn fixture() -> (RuntimeCheckpoint, RelationSchema) {
         let schema = RelationSchema {
@@ -2609,10 +2694,10 @@ pub(crate) mod tests {
         };
         let api = MaterializedViewApiMetadata {
             sql_template: Some(
-                "SELECT * FROM purchases_by_user WHERE id={{context.params.map_id}}".into(),
+                "SELECT * FROM purchases_by_user WHERE id={{context.params.record_id}}".into(),
             ),
             request: vec![serde_json::from_value(
-                json!({"fieldName":"map_id","fieldIn":"query","type":"string"}),
+                json!({"fieldName":"record_id","fieldIn":"query","type":"string"}),
             )
             .unwrap()],
             ..Default::default()
@@ -2636,12 +2721,14 @@ pub(crate) mod tests {
                 view_id: spec.view_id.clone(),
                 plan_hash: "sha256:query-fixture".into(),
                 view_spec_json: serde_json::to_vec(&spec).unwrap(),
-                relations: vec![velorix_meta::IngestSourceRelationIdentityV1 {
-                    relation_id: "input".into(),
-                    relation_version: schema.relation_version.clone(),
-                    relation_generation: 1,
-                    schema_fingerprint: schema.schema_fingerprint.clone(),
-                }],
+                relations: vec![
+                    velorix_control::meta_admin::IngestSourceRelationIdentityV1 {
+                        relation_id: "input".into(),
+                        relation_version: schema.relation_version.clone(),
+                        relation_generation: 1,
+                        schema_fingerprint: schema.schema_fingerprint.clone(),
+                    },
+                ],
                 view_inputs: vec![],
                 expected_graph_revision: 0,
             })
@@ -2674,7 +2761,7 @@ pub(crate) mod tests {
                 20,
                 1,
             ),
-            (json!({"parameters":{"map_id":"m"}}), 20, 1),
+            (json!({"parameters":{"record_id":"m"}}), 20, 1),
             (
                 json!({"sql":"SELECT count(*) AS n FROM purchases_by_user WHERE power>=1"}),
                 1,
@@ -3467,7 +3554,7 @@ pub(crate) mod tests {
             output_id: schema.relation_id.clone(),
             object_path: reference.page_key.clone(),
             content_hash: reference.page_content_hash.clone(),
-            codec: CODEC.into(),
+            codec: reference.output_encoding.clone(),
             root_hash: p.manifest_record.output_content_hash.clone(),
             checkpoint_epoch: checkpoint.logical_epoch,
         };
@@ -3818,7 +3905,7 @@ pub(crate) mod tests {
             DeltaBatch::from_records([row(json!(1.), 1)]),
         )
         .unwrap();
-        assert_eq!(legacy.manifest_record.output_encoding, LEGACY_CODEC);
+        assert_eq!(legacy.manifest_record.output_encoding, BAG_LEGACY_CODEC);
         assert!(legacy
             .manifest_record
             .published_output

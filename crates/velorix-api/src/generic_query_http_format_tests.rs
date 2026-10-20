@@ -224,8 +224,14 @@ async fn generic_http_formats_cover_materialized_filter_group_join_raw_and_templ
         assert_eq!(wire_rows(&arrow).len(), 1);
         assert_eq!(wire_rows(&arrow), wire_rows(&json));
     }
-    let empty = wire_query(&router, Method::POST, "/v1/views/format_group/query",
-        json!({"sql":"SELECT key_col AS renamed FROM format_group WHERE key_col='missing'"}), None).await;
+    let empty = wire_query(
+        &router,
+        Method::POST,
+        "/v1/views/format_group/query",
+        json!({"sql":"SELECT key_col AS renamed FROM format_group WHERE key_col='missing'"}),
+        None,
+    )
+    .await;
     assert!(wire_rows(&empty).is_empty());
     let reader = StreamReader::try_new(Cursor::new(&empty.2), None).unwrap();
     assert_eq!(reader.schema().field(0).name(), "renamed");
@@ -753,10 +759,13 @@ async fn install_legacy_checkpoint(
     .unwrap();
     record.checkpoint_key = key.as_str().into();
     record.checkpoint.output_manifest_refs.clear();
-    let publication =
-        standing_runtime_output_manifest_record_for_checkpoint(&record.checkpoint, view, &key)
-            .unwrap()
-            .unwrap();
+    let publication = standing_runtime_output_publication(
+        &record.checkpoint,
+        view,
+        &key,
+        standing_runtime_checkpoint_published_output(&record.checkpoint).unwrap(),
+    )
+    .unwrap();
     if checkpoint_only {
         match state
             .store
@@ -907,12 +916,6 @@ async fn legacy_http_source_budgets_apply_with_cache_disabled_and_warmed() {
                             accept,
                         )
                         .await;
-                        eprintln!(
-                            "DIAG co={checkpoint_only} cached={cached} policy={index} method={method} accept={accept:?} status={} paths={:?} body={:?}",
-                            result.0,
-                            counts.get_paths(),
-                            String::from_utf8_lossy(&result.2).chars().take(160).collect::<String>()
-                        );
                         assert_eq!(
                             result.0,
                             StatusCode::BAD_REQUEST,

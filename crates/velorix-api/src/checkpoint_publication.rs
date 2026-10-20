@@ -1622,12 +1622,16 @@ pub(super) fn standing_runtime_output_manifest_record_for_checkpoint_with_limits
     limits: velorix_runtime::materialized_view_runtime::RuntimeResourceLimits,
     allow_generic_native: bool,
 ) -> Result<Option<StandingRuntimeOutputPublication>, ApiError> {
-    if let Some(output) =
+    let bag_output =
         velorix_runtime::materialized_view_runtime::bag_checkpoint_published_output_with_limits(
             checkpoint, limits,
         )
-        .map_err(|error| ApiError::internal(error.to_string()))?
-    {
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let has_bag_output = bag_output.is_some();
+    if let Some(output) = bag_output {
+        if !materialized_output_pages::fits_page_index(&output)? {
+            return Ok(None);
+        }
         // The existing native families can select their pages from the
         // checkpoint record; the generic families require the authoritative
         // pointer reader. Without it they keep the legacy JSON publication.
@@ -1646,6 +1650,13 @@ pub(super) fn standing_runtime_output_manifest_record_for_checkpoint_with_limits
                 Err(error) => return Err(error),
             }
         }
+    }
+    if !has_bag_output && materialized_output_pages::supports_checkpoint(checkpoint) {
+        return materialized_output_pages::checkpoint_publication(
+            checkpoint,
+            view_id,
+            checkpoint_key,
+        );
     }
     let Some(published_output) =
         standing_runtime_checkpoint_published_output_with_limits(checkpoint, limits)

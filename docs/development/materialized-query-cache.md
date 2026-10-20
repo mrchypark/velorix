@@ -209,6 +209,17 @@ Both formats carry `x-velorix-logical-epoch` and, when applicable,
 can require type or shape adaptation before encoding; raw SQL uses its result
 schema. Compare the actual executed branches when measuring formatter costs.
 
+Demand-view continuation tokens authenticate a specific immutable checkpoint.
+New input and later materialization do not change the rows or logical epoch
+returned by that continuation. A fresh query sees the newer materialized cut.
+The reader verifies the token and checkpoint lineage before reading the pinned
+output; it must not substitute the latest checkpoint during a legacy fallback.
+Raw native page tokens remain bound to their output root and epoch.
+
+Arrow output pages are distinct from recovery state. Runtime checkpoint state
+bodies and their fragment manifests still use JSON; caching their bytes does
+not convert that state to an Arrow or compressed checkpoint format.
+
 ## Synthetic validation
 
 Run the following from the repository root. These are reproduction commands,
