@@ -219,7 +219,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
         read_standing_runtime_output_manifest_record(&state, output_ref, "derived_paged")
             .await
             .unwrap();
-    assert!(native_output_pages::is_native_codec(
+    assert!(materialized_output_pages::is_bag_codec(
         &manifest.output_encoding
     ));
     assert_eq!(

@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn demand_scope_becomes_conservative_native_page_pruning_predicate() {
-    let (_, active) = native_output_pages::tests::public_native_fixture().await;
+    let (_, active) = materialized_output_pages::tests::public_native_fixture().await;
     let schema = active
         .spec
         .output_relations
@@ -58,7 +58,7 @@ async fn demand_scope_becomes_conservative_native_page_pruning_predicate() {
 
 #[tokio::test]
 async fn explicit_materialization_rejects_legacy_and_pinned_queries() {
-    let (mut state, _) = native_output_pages::tests::public_native_fixture().await;
+    let (mut state, _) = materialized_output_pages::tests::public_native_fixture().await;
     let mut request: QueryViewRequest = serde_json::from_value(json!({})).unwrap();
     state.relation_ingest_mode = RelationIngestMode::Legacy;
     assert!(validate_explicit_materialization(&state, &request, false).is_ok());
@@ -87,7 +87,7 @@ async fn explicit_materialization_rejects_legacy_and_pinned_queries() {
 
 #[tokio::test]
 async fn query_response_exhausted_limiter_rejects_before_native_reads_and_holds_through_encoding() {
-    let (mut state, mut active) = native_output_pages::tests::public_native_fixture().await;
+    let (mut state, mut active) = materialized_output_pages::tests::public_native_fixture().await;
     let policy = QueryPolicy {
         max_concurrent_queries: Some(1),
         ..QueryPolicy::default()

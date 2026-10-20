@@ -22,7 +22,7 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         json!({
             "post": {
                 "summary": "Ingest rows into one relation and update active views",
-                "description": "Preferred product ingest path. The relation is selected by the URL path. Demand-managed views refresh on a subsequent query or explicit backfill against the current cut; ingest does not eagerly refresh them. Other active dependent views retain their materialized-ack behavior.",
+                "description": "Preferred product ingest path. The relation is selected by the URL path; successful materialized ack updates all active materialized views that depend on the relation before returning.",
                 "parameters": [{
                     "name": "relation_id",
                     "in": "path",
@@ -55,7 +55,7 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         json!({
             "post": {
                 "summary": "Ingest ordered batches for one or more relations",
-                "description": "Public multi-relation ingest convenience path. It applies submitted batches in request order and is not an atomic multi-relation transaction API. Successful materialized ack durably appends each batch and updates eager dependent views. Demand-managed views instead refresh on subsequent query/backfill at the current cut.",
+                "description": "Public multi-relation ingest convenience path. It applies the submitted relation batches in request order and publishes materialized views at the resulting per-relation frontier vector; it is not an atomic multi-relation transaction API. A successful materialized ack durably appends every batch and updates every active dependent materialized view before returning.",
                 "requestBody": {
                     "required": true,
                     "content": {
@@ -92,42 +92,99 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
             }
         }),
     );
-    paths.insert("/v1/views/{view_id}/query".to_string(), json!({
-        "post": {
-            "summary": "Query materialized output with bounded foreground materialization",
-            "description": "Demand routing is implemented but uncompiled and unverified. Ordinary bound WHERE predicates can infer scope without explicit materialization.scope. Ancestor stages conservatively require full dependency closure. Demand-managed views refresh on query/backfill against the current cut, rather than eagerly on ingest. Explicit epoch and continuation reads retain their pinned-read semantics.",
-            "parameters": [{"name":"view_id", "in":"path", "required":true, "schema":{"type":"string"}}],
-            "requestBody": {"required":true, "content":{"application/json":{"schema":openapi_demand_query_schema()}}},
-            "responses": {
-                "200": {"description":"Complete requested output at its validated cut; Arrow IPC by default or JSON via Accept", "content":{
-                    "application/vnd.apache.arrow.stream":{"schema":{"type":"string","format":"binary"}},
-                    "application/json":{"schema":openapi_query_response_schema(None)}
-                }},
-                "202": {"description":"Materialization is incomplete; this JSON progress response is not a complete query result", "content":{"application/json":{"schema":{"type":"object","properties":{"materialization":{"type":"object","properties":{
-                    "status":{"type":"string"}, "complete":{"type":"boolean"},
-                    "processed_rows":{"type":"integer"}, "read_bytes":{"type":"integer"}, "remaining_rows":{"type":"integer"}, "dependency_mode":{"type":"string"}
-                }}}}}}},
-                "413": openapi_demand_budget_response(),
-                "406": {"description":"No supported query response format is acceptable"}
+    paths.insert(
+        "/v1/views/{view_id}/backfill".to_string(),
+        json!({
+            "get": {
+                "summary": "Read durable backfill progress for one view",
+                "description": "Reports the backfill outcome, lifecycle, materialization coverage, and committed batch progress for the requested view.",
+                "parameters": [{"name":"view_id","in":"path","required":true,"schema":{"type":"string"}}],
+                "responses": {
+                    "200": {
+                        "description": "Backfill status for the requested view",
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_backfill_status_response_schema()
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "summary": "Advance explicit historical backfill",
+                "description": "Steps bounded backfill work, or persists a pause/resume control acknowledgement. A control acknowledgement does not imply materialization completeness. Demand backfill controls require an authoritative demand-managed view.",
+                "parameters": [{"name":"view_id","in":"path","required":true,"schema":{"type":"string"}}],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": openapi_demand_backfill_schema()
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Completed step, or an acknowledged pause/resume control state",
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_demand_materialization_response_schema()
+                            }
+                        }
+                    },
+                    "202": {
+                        "description": "Incomplete, paused, or yielded work; this JSON progress response is not a complete materialization result",
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_demand_materialization_response_schema()
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid backfill request, conflicting batch limits, unsupported demand control, or a non-positive materialization budget",
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_error_response_schema()
+                            }
+                        }
+                    },
+                    "413": openapi_demand_budget_response()
+                }
             }
-        }
-    }));
-    paths.insert("/v1/views/{view_id}/backfill".to_string(), json!({
-        "post": {
-            "summary":"Advance explicit historical backfill",
-            "description":"Implemented but uncompiled and unverified. Does not start automatic background backfill. Step advances bounded work; pause/resume persist control state without starting a worker. Foreground demand can cause explicit work to yield. Ancestors conservatively use full dependency closure.",
-            "parameters":[{"name":"view_id","in":"path","required":true,"schema":{"type":"string"}}],
-            "requestBody":{"required":true,"content":{"application/json":{"schema":openapi_demand_backfill_schema()}}},
-            "responses":{"200":{"description":"Completed step or acknowledged pause/resume; control acknowledgement does not imply materialization completeness"},
-                "202":{"description":"Incomplete, paused, or yielded work; JSON materialization status"},
-                "413":openapi_demand_budget_response()}
-        }
-    }));
+        }),
+    );
     for view in views {
         let response = active_view_response(&view, None)?;
         if !response.query_enabled {
             continue;
         }
+        let query_responses = json!({
+            "200": {
+                "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows",
+                "headers": {
+                    "x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}},
+                    "x-velorix-next-page-token": {"schema": {"type": "string"}}
+                },
+                "content": {
+                    "application/vnd.apache.arrow.stream": {
+                        "schema": {"type": "string", "format": "binary"}
+                    },
+                    "application/json": {
+                        "schema": openapi_query_response_schema(response.response_schema.as_ref())
+                    }
+                }
+            },
+            "202": openapi_demand_incomplete_response(),
+            "400": {
+                "description": "Invalid query request or query parameters",
+                "content": {
+                    "application/json": {
+                        "schema": openapi_error_response_schema()
+                    }
+                }
+            },
+            "406": {"description": "No supported query response format is acceptable"},
+            "413": openapi_demand_budget_response()
+        });
         paths.insert(
             openapi_path_from_query_endpoint(&response.query_endpoint),
             json!({
@@ -151,30 +208,63 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                             && response.sql_template.is_some()),
                         response.url_path.is_none()
                     ),
-                    "responses": {
-                        "200": {
-                            "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows",
-                            "headers": {
-                                "x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}},
-                                "x-velorix-next-page-token": {"schema": {"type": "string"}}
-                            },
-                            "content": {
-                                "application/vnd.apache.arrow.stream": {
-                                    "schema": {"type": "string", "format": "binary"}
-                                },
-                                "application/json": {
-                                    "schema": openapi_query_response_schema(
-                                        response.response_schema.as_ref()
-                                    )
-                                }
+                    "responses": query_responses.clone()
+                },
+                "post": {
+                    "summary": response.description.clone().unwrap_or_else(|| {
+                        format!("Query {}", response.view_id)
+                    }),
+                    "x-velorix-view-id": response.view_id,
+                    "x-velorix-url-path": response.url_path,
+                    "x-velorix-output-relation-id": response.output_relation_id,
+                    "x-velorix-input-relation-id": response.input_relation_id,
+                    "x-velorix-input-relation-version": response.input_relation_version,
+                    "x-velorix-spec-hash": response.spec_hash,
+                    "x-velorix-request": response.request,
+                    "x-velorix-response-schema": response.response_schema,
+                    "x-velorix-sql-template": response.sql_template,
+                    "x-velorix-query-policy-id": response.query_policy_id,
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": openapi_query_request_schema()
                             }
-                        },
-                        "406": {"description": "No supported query response format is acceptable"}
-                    }
+                        }
+                    },
+                    "responses": query_responses
                 }
             }),
         );
         for output in &response.output_relations {
+            let output_query_responses = json!({
+                "200": {
+                    "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows",
+                    "headers": {
+                        "x-velorix-logical-epoch": {"schema": {"type": "integer", "format": "int64"}},
+                        "x-velorix-next-page-token": {"schema": {"type": "string"}}
+                    },
+                    "content": {
+                        "application/vnd.apache.arrow.stream": {
+                            "schema": {"type": "string", "format": "binary"}
+                        },
+                        "application/json": {
+                            "schema": openapi_query_response_schema(None)
+                        }
+                    }
+                },
+                "202": openapi_demand_incomplete_response(),
+                "400": {
+                    "description": "Invalid query request or query parameters",
+                    "content": {
+                        "application/json": {
+                            "schema": openapi_error_response_schema()
+                        }
+                    }
+                },
+                "406": {"description": "No supported query response format is acceptable"},
+                "413": openapi_demand_budget_response()
+            });
             paths.insert(
                 format!(
                     "/v1/views/{}/outputs/{}/query",
@@ -191,14 +281,22 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                             true,
                             true,
                         ),
-                        "responses": { "200": { "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows", "content": {"application/vnd.apache.arrow.stream": {"schema": {"type": "string", "format": "binary"}}, "application/json": {"schema": openapi_query_response_schema(None)}} }, "406": {"description": "No supported query response format is acceptable"} }
+                        "responses": output_query_responses.clone()
                     },
                     "post": {
                         "summary": format!("Query {} output {}", response.view_id, output.relation_id),
                         "x-velorix-view-id": response.view_id,
                         "x-velorix-output-relation-id": output.relation_id,
                         "x-velorix-output-schema-fingerprint": output.schema_fingerprint,
-                        "responses": { "200": { "description": "Arrow IPC stream by default; request Accept: application/json for JSON rows", "content": {"application/vnd.apache.arrow.stream": {"schema": {"type": "string", "format": "binary"}}, "application/json": {"schema": openapi_query_response_schema(None)}} }, "406": {"description": "No supported query response format is acceptable"} }
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": openapi_query_request_schema()
+                                }
+                            }
+                        },
+                        "responses": output_query_responses
                     }
                 }),
             );
@@ -216,56 +314,177 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
     })))
 }
 
-fn openapi_demand_query_schema() -> Value {
-    let defaults = demand_materialization::DemandBudget::default();
+fn openapi_query_request_schema() -> Value {
     json!({
-        "type":"object",
+        "type": "object",
         "properties": {
-            "sql":{"type":"string","nullable":true},
-            "parameters":{"type":"object","additionalProperties":true},
-            "epoch":{"type":"integer","minimum":0,"nullable":true},
-            "page_token":{"type":"string","nullable":true,"description":"Demand query continuation tokens are process-local; restart or another instance rejects the token. Start a new query to reuse durable materialization."},
-            "max_rows":{"type":"integer","minimum":1,"nullable":true,"description":"Output page limit, separate from the materialization inspection budget"},
-            "materialization":{
-                "type":"object","additionalProperties":false,
-                "properties":{
-                    "scope":{"type":"object","nullable":true,"additionalProperties":false,"required":["where"],"properties":{"where":{"type":"string","description":"Predicate over output columns; unknown dependencies require broader computation"}}},
-                    "budget":{"type":"object","additionalProperties":false,"properties":{
-                        "batch_limit":{"type":"integer","minimum":1,"default":defaults.batch_limit},
-                        "max_rows":{"type":"integer","minimum":1,"default":defaults.max_rows,"description":"Inspection row budget; not an output page limit. An indivisible signed update can require a larger atomic unit; HTTP 413 reports details.required_min_rows rather than splitting it unsafely."},
-                        "max_bytes":{"type":"integer","minimum":1,"default":defaults.max_bytes,"description":"Serialized source read cap and post-decode size acceptance limit; not a peak allocation or RSS bound"},
-                        "max_duration_ms":{"type":"integer","minimum":1,"default":defaults.max_duration_ms,"description":"Cooperative checks between atomic steps; does not preempt in-flight work"}
-                    }}
+            "sql": {"type": "string"},
+            "parameters": {"type": "object", "additionalProperties": true},
+            "epoch": {"type": "integer", "minimum": 0},
+            "page_token": {"type": "string"},
+            "max_rows": {"type": "integer", "minimum": 1},
+            "materialization": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "scope": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "where": {"type": "string"}
+                        }
+                    },
+                    "budget": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "batch_limit": {"type": "integer", "minimum": 1},
+                            "max_rows": {"type": "integer", "minimum": 1},
+                            "max_bytes": {"type": "integer", "minimum": 1},
+                            "max_duration_ms": {"type": "integer", "minimum": 1}
+                        }
+                    }
                 }
             }
         }
     })
 }
 
-fn openapi_demand_backfill_schema() -> Value {
-    let query = openapi_demand_query_schema();
-    let controls = &query["properties"]["materialization"]["properties"];
-    json!({"type":"object","additionalProperties":false,"properties":{
-        "batch_limit":{"type":"integer","minimum":1,"nullable":true,"description":"Compatibility alias for budget.batch_limit; conflicting values are rejected"},
-        "scope":controls["scope"],
-        "budget":controls["budget"],
-        "action":{"type":"string","enum":["step","pause","resume"],"default":"step"},
-        "order":{"type":"string","enum":["forward","reverse"],"default":"forward","description":"Requested work order; signed causal/atomic closure can constrain execution order"}
-    }})
+/// Error body shared by every `ApiError` response: `{"error": ..., "details": ...}`.
+fn openapi_error_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "error": {"type": "string"},
+            "details": {"type": "object", "additionalProperties": true}
+        }
+    })
 }
 
+/// Demand materialization progress body returned by demand reads and backfill
+/// steps: `{"materialization": <outcome>}`.
+fn openapi_demand_materialization_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "materialization": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "complete": {"type": "boolean"},
+                    "processed_rows": {"type": "integer"},
+                    "read_bytes": {"type": "integer"},
+                    "remaining_rows": {"type": "integer"},
+                    "dependency_mode": {"type": "string"}
+                }
+            }
+        }
+    })
+}
+
+/// `202` response for a demand read that could not complete materialization
+/// within the requested budget.
+fn openapi_demand_incomplete_response() -> Value {
+    json!({
+        "description": "Materialization is incomplete; this JSON progress response is not a complete query result",
+        "content": {
+            "application/json": {
+                "schema": openapi_demand_materialization_response_schema()
+            }
+        }
+    })
+}
+
+/// `413` response for an authenticated-object or signed atomic unit that
+/// exceeds the supplied materialization budget.
 fn openapi_demand_budget_response() -> Value {
-    json!({"description":"The authenticated whole-object byte unit or signed atomic row unit exceeds the supplied budget. Required minima are returned without silently exceeding the limit. Integration validation is pending; these budgets do not guarantee CPU time or peak RSS.",
-    "content":{"application/json":{"schema":{"type":"object","properties":{
-        "error":{"type":"string"},
-        "details":{"type":"object","properties":{
-            "code":{"type":"string","description":"Budget-specific error code"},
-            "required_min_rows":{"type":"integer","minimum":1,"description":"Minimum rows for an indivisible signed update, when the row budget is insufficient"},
-            "required_min_bytes":{"type":"integer","minimum":0},
-            "supplied_max_bytes":{"type":"integer","minimum":0},
-            "max_supported_bytes":{"type":"integer","minimum":0}
-        }}
-    }}}}})
+    json!({
+        "description": "The authenticated whole-object byte unit or signed atomic row unit exceeds the supplied budget. Required minima are returned without silently exceeding the limit. These budgets do not guarantee CPU time or peak RSS.",
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "error": {"type": "string"},
+                        "details": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "string", "description": "Budget-specific error code"},
+                                "required_min_rows": {"type": "integer", "minimum": 1, "description": "Minimum rows for an indivisible signed update, when the row budget is insufficient"},
+                                "required_min_bytes": {"type": "integer", "minimum": 0},
+                                "supplied_max_bytes": {"type": "integer", "minimum": 0},
+                                "max_supported_bytes": {"type": "integer", "minimum": 0}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Request body for `POST /v1/views/{view_id}/backfill`, matching the
+/// `BackfillViewRequest` wire contract (unknown fields are rejected).
+fn openapi_demand_backfill_schema() -> Value {
+    let query = openapi_query_request_schema();
+    let controls = &query["properties"]["materialization"]["properties"];
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "batch_limit": {"type": "integer", "minimum": 1, "description": "Compatibility alias for budget.batch_limit; conflicting values are rejected"},
+            "scope": controls["scope"],
+            "budget": controls["budget"],
+            "action": {"type": "string", "enum": ["step", "pause", "resume"], "default": "step"},
+            "order": {"type": "string", "enum": ["forward", "reverse"], "default": "forward"}
+        }
+    })
+}
+
+/// Response body for `GET /v1/views/{view_id}/backfill`.
+fn openapi_backfill_status_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "view_id": {"type": "string"},
+            "outcome": {"type": "string"},
+            "mode": {"type": "string"},
+            "lifecycle": {
+                "type": "object",
+                "properties": {
+                    "runtime_engine": {"type": "string"},
+                    "admission_status": {"type": "string", "enum": ["pending", "admitted", "system_error"]},
+                    "deployment_status": {"type": "string", "enum": ["not_required", "not_deployed", "deploying", "running", "failed"]},
+                    "message": {"type": "string"}
+                }
+            },
+            "query_enabled": {"type": "boolean"},
+            "coverage": {
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string"},
+                    "full_view": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string"},
+                            "reason": {"type": "string"}
+                        }
+                    }
+                }
+            },
+            "progress": {
+                "type": "object",
+                "properties": {
+                    "processed_batches": {"type": "integer"},
+                    "remaining_batches": {"type": "integer"},
+                    "total_batches": {"type": "integer"},
+                    "percent": {"type": "number"}
+                }
+            },
+            "applied_batches": {"type": "integer"},
+            "remaining_batches": {"type": "integer"}
+        }
+    })
 }
 
 fn openapi_view_query_parameters(
@@ -582,5 +801,138 @@ fn openapi_scalar_schema(type_name: &str) -> Value {
         "binary_hex" => json!({ "type": "string", "pattern": "^(0[xX])?[0-9a-fA-F]*$" }),
         "json" => json!({}),
         _ => json!({}),
+    }
+}
+
+#[cfg(test)]
+mod openapi_spec_verification {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request};
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    async fn spec() -> Value {
+        let store = Arc::new(InMemory::new());
+        let validated = velorix_control::operator_authority::validate_operator_authority(
+            velorix_control::operator_authority::ObjectStoreAuthorityRef {
+                store_id: "test".to_string(),
+                namespace: "unit".to_string(),
+            },
+            store,
+            "memory",
+            "api-test",
+        )
+        .await
+        .unwrap();
+        let state = ApiState::from_validated_authority_with_ingest_admission_startup(
+            validated,
+            "ignored",
+            "api-test-openapi-spec-owner",
+            false,
+        )
+        .await
+        .unwrap()
+        .with_experimental_advanced_view_features(true)
+        .with_view_bootstrap_meta_store(Arc::new(
+            velorix_control::meta_admin::InMemoryMetaStore::default(),
+        ));
+        let router = crate::app(state);
+        // Register one view so the spec also contains generated view query paths.
+        for uri in [
+            "/v1/relations/scores-default",
+            "/v1/views/scores-positive-default",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::ACCEPT, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{uri}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/openapi.json")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn spec_documents_demand_statuses_backfill_path_and_positive_budgets() {
+        let spec = spec().await;
+
+        // Finding 2: the parameterized backfill path with GET and POST.
+        let backfill = &spec["paths"]["/v1/views/{view_id}/backfill"];
+        assert!(backfill["get"].is_object(), "backfill GET missing: {spec}");
+        assert!(backfill["post"].is_object(), "backfill POST missing: {spec}");
+        assert_eq!(
+            backfill["post"]["responses"]["202"]["content"]["application/json"]["schema"]
+                ["properties"]["materialization"]["properties"]["complete"]["type"],
+            "boolean"
+        );
+        assert!(backfill["post"]["responses"]["413"].is_object());
+        assert!(backfill["post"]["responses"]["400"].is_object());
+
+        // Finding 3: budget minimums are 1.
+        let budget = &spec["paths"]["/v1/views/{view_id}/backfill"]["post"]["requestBody"]
+            ["content"]["application/json"]["schema"]["properties"]["budget"]["properties"];
+        for field in ["batch_limit", "max_rows", "max_bytes", "max_duration_ms"] {
+            assert_eq!(budget[field]["minimum"], 1, "{field} minimum must be 1");
+        }
+
+        // The shared query response map carries 202/413 for every generated
+        // view query path and for output query paths.
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            if !path.ends_with("/query") {
+                continue;
+            }
+            for op in ["get", "post"] {
+                if !item[op].is_object() {
+                    continue;
+                }
+                assert!(
+                    item[op]["responses"]["202"].is_object(),
+                    "{path} {op} missing 202"
+                );
+                assert!(
+                    item[op]["responses"]["413"].is_object(),
+                    "{path} {op} missing 413"
+                );
+                if op == "post" {
+                    assert!(
+                        item[op]["responses"]["400"].is_object(),
+                        "{path} POST missing 400"
+                    );
+                }
+            }
+        }
     }
 }

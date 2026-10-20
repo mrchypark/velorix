@@ -16021,14 +16021,18 @@ fn catalog_primary_key_column(
     let [column_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
         return unsupported("view SQL currently requires exactly one primary key column");
     };
-    catalog
+    let column = catalog
         .relation_schema
         .columns
         .iter()
         .find(|column| &column.column_id == column_id)
         .ok_or_else(|| ViewPlanError::UnsupportedShape {
             reason: "relation catalog primary key column is missing".to_string(),
-        })
+        })?;
+    if !supported_scalar_join_key_atom(&column.physical_arrow_type) {
+        return unsupported("materialized view primary key type is not supported by the runtime");
+    }
+    Ok(column)
 }
 
 /// Find the primary key column name for a published-view relation schema.

@@ -47,7 +47,8 @@ fn arrow_batches(response: &(StatusCode, HeaderMap, bytes::Bytes)) -> Vec<Record
 #[tokio::test]
 async fn http_native_count_without_pruning_reads_complete_input_for_both_codecs() {
     for ipc in [false, true] {
-        let (state, _) = native_output_pages::tests::public_native_fixture_with_codec(ipc).await;
+        let (state, _) =
+            materialized_output_pages::tests::public_native_fixture_with_codec(ipc).await;
         let router = app(state);
         for sql in [
             "SELECT COUNT(*) AS n FROM purchases_by_user",
@@ -84,7 +85,7 @@ async fn http_native_count_without_pruning_reads_complete_input_for_both_codecs(
 
 #[tokio::test]
 async fn http_default_arrow_and_explicit_json_cover_raw_template_empty_and_policy() {
-    let (state, active) = native_output_pages::tests::public_native_fixture().await;
+    let (state, active) = materialized_output_pages::tests::public_native_fixture().await;
     assert_eq!(
         active_view_response(&active, None)
             .unwrap()
@@ -169,7 +170,7 @@ async fn http_default_arrow_and_explicit_json_cover_raw_template_empty_and_polic
 
 #[tokio::test]
 async fn http_direct_page_keeps_epoch_cursor_in_headers_and_arrow_schema() {
-    let (state, _) = native_output_pages::tests::public_native_fixture().await;
+    let (state, _) = materialized_output_pages::tests::public_native_fixture().await;
     let router = app(state);
     let uri = "/v1/views/purchases_by_user/outputs/purchases_by_user/query";
     let first = request(
@@ -234,7 +235,7 @@ async fn direct_http_source_budgets_reject_before_page_reads_in_both_formats() {
         },
     ];
     for (index, policy) in policies.into_iter().enumerate() {
-        let (mut state, _) = native_output_pages::tests::public_native_fixture().await;
+        let (mut state, _) = materialized_output_pages::tests::public_native_fixture().await;
         let policy_id = format!("direct-budget-{index}");
         state
             .query_policy_catalog()
@@ -300,7 +301,7 @@ async fn direct_http_source_budgets_reject_before_page_reads_in_both_formats() {
 
 #[tokio::test]
 async fn default_direct_get_and_post_paginate_within_row_policy_in_both_formats() {
-    let (state, _) = native_output_pages::tests::public_native_fixture().await;
+    let (state, _) = materialized_output_pages::tests::public_native_fixture().await;
     let router = app(state);
     let uri = "/v1/views/purchases_by_user/outputs/purchases_by_user/query";
     for (method, accept) in [
@@ -359,17 +360,18 @@ async fn default_direct_get_and_post_paginate_within_row_policy_in_both_formats(
 
 #[tokio::test]
 async fn filtered_sql_rechecks_fencing_and_evicts_before_reading_cached_pages() {
-    let (mut state, active) = native_output_pages::tests::public_native_fixture().await;
+    let (mut state, active) = materialized_output_pages::tests::public_native_fixture().await;
     let directory = tempfile::tempdir().unwrap();
-    let cache =
-        native_read_cache::NativeReadCache::open(native_read_cache::NativeReadCacheConfig {
+    let cache = materialized_read_cache::MaterializedReadCache::open(
+        materialized_read_cache::MaterializedReadCacheConfig {
             directory: directory.path().join("cache"),
             memory_bytes: 1024 * 1024,
             disk_bytes: 8 * 1024 * 1024,
-        })
-        .await
-        .unwrap();
-    state = state.with_native_read_cache(Arc::new(cache));
+        },
+    )
+    .await
+    .unwrap();
+    state = state.with_materialized_read_cache(Arc::new(cache));
     let counts = crate::tests::ObjectStoreAccessCounts::default();
     state.store = Arc::new(crate::tests::CountingObjectStore::new(
         state.store.clone(),

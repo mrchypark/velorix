@@ -15,15 +15,16 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
     )
     .await;
     let cache_dir = tempfile::tempdir().unwrap();
-    let cache =
-        native_read_cache::NativeReadCache::open(native_read_cache::NativeReadCacheConfig {
+    let cache = materialized_read_cache::MaterializedReadCache::open(
+        materialized_read_cache::MaterializedReadCacheConfig {
             directory: cache_dir.path().join("cache"),
             memory_bytes: 64 * 1024,
             disk_bytes: 8 * 1024 * 1024,
-        })
-        .await
-        .unwrap();
-    let state = state.with_native_read_cache(Arc::new(cache));
+        },
+    )
+    .await
+    .unwrap();
+    let state = state.with_materialized_read_cache(Arc::new(cache));
     let checkpoint_record = test_runtime_checkpoint(Vec::new());
     let checkpoint = test_checkpoint_key(&checkpoint_record);
     let body = serde_json::to_vec(&test_checkpoint_record(&checkpoint, checkpoint_record)).unwrap();

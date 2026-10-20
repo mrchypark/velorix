@@ -361,7 +361,7 @@ pub(super) async fn capture_demand_published_artifacts(
                 {
                     return Err(invalid("published manifest/header binding mismatch"));
                 }
-                if native_output_pages::is_native_codec(&manifest.output_encoding) {
+                if materialized_output_pages::is_bag_codec(&manifest.output_encoding) {
                     let schema: RelationSchema =
                         serde_json::from_value(manifest.published_output["schema"].clone())
                             .map_err(ApiError::bad_request)?;
@@ -502,7 +502,7 @@ async fn load_page(
     budget: &mut ReadBudget,
 ) -> Result<DeltaBatch, ApiError> {
     let bytes = budget.read(state, &reference.page_key).await?;
-    let page = native_output_pages::decode_page(&bytes, &reference.output_encoding)?;
+    let page = materialized_output_pages::decode_page(&bytes, &reference.output_encoding)?;
     let (key, _) = ObjectKey::parse_standing_runtime_output_page(reference.page_key.clone())
         .map_err(ApiError::bad_request)?;
     publication::validate_standing_runtime_output_page_record(&key, &page)?;
@@ -517,8 +517,8 @@ async fn load_page(
     {
         return Err(invalid("published page binding mismatch"));
     }
-    if native_output_pages::is_native_codec(&manifest.output_encoding) {
-        native_output_pages::validate_page_binding(manifest, &page)
+    if materialized_output_pages::is_bag_codec(&manifest.output_encoding) {
+        materialized_output_pages::validate_page_binding(manifest, &page)
     } else {
         // Current aggregate/ordered codec is one whole snapshot page. It must
         // equal the manifest payload; no hydration or assumed small page size.
@@ -578,7 +578,7 @@ pub(super) async fn load_demand_published_artifact(
                 }
                 let key =
                     velorix_core::delta::encode_kv_ordered(row.key.as_json(), row.value.as_json());
-                if native_output_pages::is_native_codec(&manifest.output_encoding)
+                if materialized_output_pages::is_bag_codec(&manifest.output_encoding)
                     && last.as_ref().is_some_and(|p| p > &key)
                 {
                     return Err(invalid("published page order mismatch"));
@@ -677,7 +677,7 @@ pub(super) async fn load_demand_published_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_read_cache::{NativeReadCache, NativeReadCacheConfig};
+    use crate::materialized_read_cache::{MaterializedReadCache, MaterializedReadCacheConfig};
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -719,7 +719,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            NativeReadCache::open(NativeReadCacheConfig {
+            MaterializedReadCache::open(MaterializedReadCacheConfig {
                 directory: directory.path().into(),
                 memory_bytes: 256 * 1024,
                 disk_bytes: 8 * 1024 * 1024,
@@ -727,7 +727,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        state = state.with_native_read_cache(cache.clone());
+        state = state.with_materialized_read_cache(cache.clone());
         budget = ReadBudget {
             supplied: 2 * size,
             used: 0,

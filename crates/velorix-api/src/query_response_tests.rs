@@ -110,6 +110,47 @@ async fn held_query_permit_cannot_bypass_a_stricter_concurrency_policy() {
     assert!(result.unwrap_err().to_string().contains("limiter"));
 }
 
+#[test]
+fn sql_execution_uses_remaining_page_scan_deadline() {
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let policy = QueryPolicy {
+        execution_timeout_ms: Some(2_000),
+        planning_timeout_ms: Some(37),
+        max_concurrent_queries: Some(1),
+        ..QueryPolicy::default()
+    };
+    // A page scan has consumed 1500ms of the shared 2000ms execution budget.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let remaining = remaining_query_execution_policy(policy, Some(deadline)).unwrap();
+    assert!((1..=500).contains(&remaining.execution_timeout_ms.unwrap()));
+    assert_eq!(
+        remaining,
+        QueryPolicy {
+            execution_timeout_ms: remaining.execution_timeout_ms,
+            ..policy
+        }
+    );
+    assert_eq!(remaining.planning_timeout_ms, Some(37));
+    remaining.validate().unwrap();
+
+    let error =
+        remaining_query_execution_policy(policy, Some(Instant::now() - Duration::from_millis(1)))
+            .unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("query execution timeout"));
+
+    let unlimited = QueryPolicy {
+        execution_timeout_ms: None,
+        ..policy
+    };
+    assert_eq!(
+        remaining_query_execution_policy(unlimited, None).unwrap(),
+        unlimited
+    );
+}
+
 #[tokio::test]
 async fn empty_sql_projection_keeps_its_result_schema() {
     let response = typed_response(false);

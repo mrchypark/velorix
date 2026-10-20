@@ -110,7 +110,7 @@ pub(super) async fn read_bounded(
     path: &ObjectPath,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ApiError> {
-    if state.native_read_cache.is_some() {
+    if state.materialized_read_cache.is_some() {
         let bytes =
             checkpoint_publication::read_object_bytes_bounded(state, path, Some(max_bytes as u64))
                 .await?;

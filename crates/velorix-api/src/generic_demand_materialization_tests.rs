@@ -571,6 +571,45 @@ async fn fixture_with_meta(
     (state, router, store, meta, counts)
 }
 
+// A continuation request carries only the page token. The scope that the
+// first request certified must survive that hop, otherwise the continuation
+// recomputes a different scope hash and the server rejects its own token.
+#[tokio::test]
+async fn demand_continuation_keeps_the_certified_scope() {
+    let (_state, router, _store, _meta, _counts) = fixture().await;
+    ingest(
+        &router,
+        0,
+        json!((0..8)
+            .map(|i| json!({"user_id":format!("k{i}"),"score":i,"delta":1}))
+            .collect::<Vec<_>>()),
+    )
+    .await;
+    declare(
+        &router,
+        "scoped_pages",
+        &[("scores", "2026-05-24.v1")],
+        "SELECT user_id, score FROM scores",
+    )
+    .await;
+    let scope = "user_id >= 'k2' AND user_id <= 'k6'";
+    let mut first = demand_body(Some(scope), 64);
+    first["max_rows"] = json!(2);
+    let page = post(&router, "/v1/views/scoped_pages/query", first).await;
+    assert_eq!(page.0, StatusCode::OK, "{page:?}");
+    let token = page.1["next_page_token"]
+        .as_str()
+        .expect("fixture must cross a page boundary")
+        .to_owned();
+    let next = post(
+        &router,
+        "/v1/views/scoped_pages/query",
+        json!({"page_token":token,"max_rows":2}),
+    )
+    .await;
+    assert_eq!(next.0, StatusCode::OK, "{next:?}");
+}
+
 async fn checkpoint(state: &ApiState, view: &str) -> Option<StandingRuntimeCheckpointRecord> {
     let active = state
         .view_registry()

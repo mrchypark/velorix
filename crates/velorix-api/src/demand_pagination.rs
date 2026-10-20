@@ -18,6 +18,11 @@ struct Cursor {
     output_id: String,
     output_schema_hash: String,
     scope_hash: String,
+    /// Canonical scope predicate certified for this continuation. The signed
+    /// cursor carries it so a token-only follow-up request replays the exact
+    /// certified scope instead of re-inferring (and losing) it.
+    #[serde(default)]
+    scope_sql: Option<String>,
     query_hash: String,
     offset: usize,
 }
@@ -53,7 +58,7 @@ pub(super) async fn read_output_record(
     row_range: Option<(usize, usize)>,
     policy: QueryPolicy,
 ) -> Result<(MaterializedViewPage, bool), ApiError> {
-    if let Some(page) = native_output_pages::query_filtered_record(
+    if let Some(page) = materialized_output_pages::query_filtered_record(
         state, active, record, output_id, predicate, row_range, policy,
     )
     .await?
@@ -159,7 +164,7 @@ async fn read_legacy_output_record(
         || manifest.checkpoint_key != record.checkpoint_key
         || manifest.logical_epoch != record.checkpoint.logical_epoch
         || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
-        || native_output_pages::is_native_codec(&manifest.output_encoding)
+        || materialized_output_pages::is_bag_codec(&manifest.output_encoding)
         || manifest.pages.len() != 1
         || manifest.pages[0].page_index != 0
     {
@@ -363,6 +368,16 @@ pub(super) fn is_continuation(token: &str) -> bool {
     token.starts_with(PREFIX)
 }
 
+/// Recover the scope predicate certified by a signed continuation token.
+///
+/// A continuation request carries only the token, so the caller cannot repeat
+/// the original `materialization.scope` predicate. The signed cursor is the
+/// authority for that predicate: the server replays it instead of
+/// re-inferring one, which would otherwise widen the certified result.
+pub(super) fn continuation_scope_sql(token: &str) -> Result<Option<String>, ApiError> {
+    Ok(decode(token)?.scope_sql)
+}
+
 fn decode(token: &str) -> Result<Cursor, ApiError> {
     decode_with_key(token, signing_key()?)
 }
@@ -386,6 +401,32 @@ fn decode_with_key(token: &str, key: &[u8; 32]) -> Result<Cursor, ApiError> {
         return Err(invalid());
     }
     Ok(envelope.cursor)
+}
+
+fn encode_token(cursor: &Cursor) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(cursor).map_err(ApiError::internal)?;
+    let envelope = Envelope {
+        cursor: cursor.clone(),
+        mac: mac(&bytes)?,
+    };
+    let token = format!(
+        "{PREFIX}{}",
+        serde_json::to_string(&envelope).map_err(ApiError::internal)?
+    );
+    if token.len() > MAX_TOKEN_BYTES {
+        return Err(ApiError::bad_request(
+            "certified pagination scope is too large to paginate",
+        ));
+    }
+    Ok(token)
+}
+
+fn ensure_token_fits(cursor: &Cursor) -> Result<(), ApiError> {
+    // Future offsets cannot exceed usize::MAX. Check that largest serialized
+    // offset before the caller executes the query that may return a token.
+    let mut largest_cursor = cursor.clone();
+    largest_cursor.offset = usize::MAX;
+    encode_token(&largest_cursor).map(|_| ())
 }
 
 /// Resolve an authenticated historical checkpoint through its immutable
@@ -414,8 +455,8 @@ pub(super) async fn prepare_page(
             &request.parameters,
             &identity.tenant_id,
             &identity.program_id,
-            state.native_read_cache_store_id(),
-            state.native_read_cache_namespace(),
+            state.materialized_read_cache_store_id(),
+            state.materialized_read_cache_namespace(),
         ))
         .map_err(ApiError::internal)?,
     );
@@ -428,6 +469,12 @@ pub(super) async fn prepare_page(
     }
     let (record, cursor) = if let Some(token) = request.page_token.as_deref() {
         let cursor = decode(token)?;
+        // The signed cursor is the only authority for the certified scope on a
+        // continuation. A caller-supplied scope that disagrees with the
+        // certified one must not silently retarget the pinned result.
+        if scope_sql.is_some() && scope_sql != cursor.scope_sql.as_deref() {
+            return Err(invalid());
+        }
         if cursor.spec_hash != active.spec_hash
             || cursor.output_id != output_id
             || cursor.output_schema_hash != schema.schema_fingerprint
@@ -482,6 +529,7 @@ pub(super) async fn prepare_page(
             output_id: output_id.into(),
             output_schema_hash: schema.schema_fingerprint.clone(),
             scope_hash,
+            scope_sql: scope_sql.map(str::to_owned),
             query_hash,
             offset: 0,
         };
@@ -506,6 +554,7 @@ pub(super) async fn prepare_page(
     {
         return Err(invalid());
     }
+    ensure_token_fits(&cursor)?;
     Ok(PreparedPage {
         record,
         cursor,
@@ -558,15 +607,7 @@ pub(super) fn finish_page(
     result.response.batches = batches;
     if end < total {
         prepared.cursor.offset = end;
-        let bytes = serde_json::to_vec(&prepared.cursor).map_err(ApiError::internal)?;
-        let envelope = Envelope {
-            cursor: prepared.cursor,
-            mac: mac(&bytes)?,
-        };
-        result.response.next_page_token = Some(format!(
-            "{PREFIX}{}",
-            serde_json::to_string(&envelope).map_err(ApiError::internal)?
-        ));
+        result.response.next_page_token = Some(encode_token(&prepared.cursor)?);
     }
     Ok(result)
 }
@@ -601,15 +642,7 @@ pub(super) fn finish_native_page(
             .offset
             .checked_add(rows)
             .ok_or_else(invalid)?;
-        let bytes = serde_json::to_vec(&prepared.cursor).map_err(ApiError::internal)?;
-        let envelope = Envelope {
-            cursor: prepared.cursor,
-            mac: mac(&bytes)?,
-        };
-        result.response.next_page_token = Some(format!(
-            "{PREFIX}{}",
-            serde_json::to_string(&envelope).map_err(ApiError::internal)?
-        ));
+        result.response.next_page_token = Some(encode_token(&prepared.cursor)?);
     }
     Ok(result)
 }
@@ -670,6 +703,7 @@ mod tests {
             output_id: "output".into(),
             output_schema_hash: "schema".into(),
             scope_hash: "scope".into(),
+            scope_sql: Some("user_id >= 'k2'".into()),
             query_hash: "query-and-bindings".into(),
             offset: 1,
         };
@@ -692,6 +726,7 @@ mod tests {
             "checkpoint_key",
             "checkpoint_hash",
             "scope_hash",
+            "scope_sql",
             "query_hash",
             "output_id",
             "output_schema_hash",
@@ -714,6 +749,42 @@ mod tests {
                 .unwrap()
             );
             assert!(decode(&token).is_err(), "tampering {field} must fail");
+        }
+    }
+
+    fn test_cursor(scope_sql: Option<String>) -> Cursor {
+        Cursor {
+            checkpoint_key: "checkpoint/7".into(),
+            checkpoint_hash: "digest".into(),
+            epoch: 7,
+            spec_hash: "spec".into(),
+            output_id: "output".into(),
+            output_schema_hash: "schema".into(),
+            scope_hash: "scope".into(),
+            scope_sql,
+            query_hash: "query-and-bindings".into(),
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn oversized_scope_is_rejected_and_normal_pages_keep_decoding() {
+        let oversized = test_cursor(Some("\\\n".repeat(MAX_TOKEN_BYTES)));
+        let error = ensure_token_fits(&oversized).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("scope is too large to paginate"));
+
+        let mut cursor = test_cursor(Some("user_id >= 'k2'".into()));
+        ensure_token_fits(&cursor).unwrap();
+        let mut next_offset = 0;
+        for expected_offset in [3, 6] {
+            cursor.offset = next_offset + 3;
+            let token = encode_token(&cursor).unwrap();
+            assert!(token.len() <= MAX_TOKEN_BYTES);
+            let decoded = decode(&token).unwrap();
+            assert_eq!(decoded.offset, expected_offset);
+            assert_eq!(decoded.scope_sql.as_deref(), Some("user_id >= 'k2'"));
+            next_offset = decoded.offset;
         }
     }
 }

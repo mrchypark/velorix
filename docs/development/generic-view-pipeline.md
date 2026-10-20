@@ -112,8 +112,8 @@ page without measuring that path. The native paged-output read path does not
 itself require full-state hydration; its selected-page behavior does not
 eliminate the legacy path's preceding checks.
 
-The validation driver currently leaves `NativeReadCache` disabled. Production's
-Foyer-backed cache stores native output metadata and page bytes and validates
+The validation driver currently leaves `MaterializedReadCache` disabled. Production's
+Foyer-backed cache stores materialized output metadata and page bytes and validates
 cache hits; it does not cache the full-state readiness reads above. Enabling that
 existing cache therefore would not remove this readiness cost. Validated cursor
 proofs are request-local, not a cross-request validation cache.

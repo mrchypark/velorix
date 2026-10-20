@@ -38,6 +38,28 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     checkpoint: &RuntimeCheckpoint,
     output_deltas: &[ViewOutputDelta],
     context: StandingRuntimeCheckpointPersistContext,
+    timer: Option<&mut IngestTimer>,
+) -> Result<StandingRuntimeCheckpointWriteSummary, ApiError> {
+    // The publication state machine retains several checkpoint records and
+    // publication descriptors across object-store awaits. Keep that state off
+    // the ingest/recovery caller's stack-backed future.
+    Box::pin(persist_standing_runtime_checkpoint_inner(
+        state,
+        view_id,
+        checkpoint,
+        output_deltas,
+        context,
+        timer,
+    ))
+    .await
+}
+
+async fn persist_standing_runtime_checkpoint_inner(
+    state: &ApiState,
+    view_id: &str,
+    checkpoint: &RuntimeCheckpoint,
+    output_deltas: &[ViewOutputDelta],
+    context: StandingRuntimeCheckpointPersistContext,
     mut timer: Option<&mut IngestTimer>,
 ) -> Result<StandingRuntimeCheckpointWriteSummary, ApiError> {
     let StandingRuntimeCheckpointPersistContext {
@@ -272,6 +294,24 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     })
     .await
     .map_err(ApiError::internal)??;
+    let payload_checkpoint = checkpoint.clone();
+    let payload_view = view_id.to_string();
+    let (state_payload_key, state_payload_record) = tokio::task::spawn_blocking(move || {
+        standing_runtime_state_payload_record_for_checkpoint(&payload_checkpoint, &payload_view)
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
+    // Keep descriptor hydration and validation out of the ingest/recovery caller's future.
+    let existing_legacy_record = Box::pin(read_validated_legacy_checkpoint_record(
+        state,
+        view_id,
+        checkpoint,
+        &checkpoint_key,
+        &output_delta_publications,
+        &state_payload_key,
+    ))
+    .await?;
     let mut write_summary = StandingRuntimeCheckpointWriteSummary {
         output_delta_writes: output_delta_publications.len(),
         state_payload_writes: 1,
@@ -291,13 +331,6 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_output_delta");
     }
-    let payload_checkpoint = checkpoint.clone();
-    let payload_view = view_id.to_string();
-    let (state_payload_key, state_payload_record) = tokio::task::spawn_blocking(move || {
-        standing_runtime_state_payload_record_for_checkpoint(&payload_checkpoint, &payload_view)
-    })
-    .await
-    .map_err(ApiError::internal)??;
     persist_standing_runtime_state_payload(state, &state_payload_key, &state_payload_record)
         .await?;
     write_summary.state_payload_writes = checkpoint_fragments::durable_state_object_count(
@@ -309,7 +342,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     }
     // Demand reads and downstream bootstrap proofs require persisted output
     // even for legacy aggregate codecs.
-    let native_output_publication = if native_output_pages::supports_checkpoint(checkpoint)
+    let native_output_publication = if materialized_output_pages::supports_checkpoint(checkpoint)
         || demand_materialization.is_some()
         || published_relation.is_some()
     {
@@ -332,7 +365,16 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     } else {
         None
     };
-    if let Some(publication) = &native_output_publication {
+    // Replaying a legacy immutable descriptor must retain its original publication refs.
+    // The bag publication wins; the general one is the lazy fallback.
+    let publication = if existing_legacy_record.is_some() {
+        None
+    } else if let Some(publication) = native_output_publication {
+        Some(publication)
+    } else {
+        materialized_output_pages::checkpoint_publication(checkpoint, view_id, &checkpoint_key)?
+    };
+    if let Some(publication) = &publication {
         for (key, page) in &publication.page_records {
             persist_standing_runtime_output_page(state, key, page).await?;
         }
@@ -345,7 +387,7 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     }
     let checkpoint_for_record = standing_runtime_checkpoint_with_durable_publication_refs(
         checkpoint,
-        native_output_publication
+        publication
             .as_ref()
             .map(|publication| &publication.manifest_key),
         &output_delta_publications,
@@ -401,36 +443,47 @@ pub(super) async fn persist_standing_runtime_checkpoint(
     };
     let bytes =
         serde_json::to_vec(&record).map_err(|source| ApiError::internal(source.to_string()))?;
-    let candidate = standing_runtime_checkpoint_pointer_from_record(&record);
-    let checkpoint_path = ObjectPath::from(checkpoint_key.as_str());
-    let result = state
-        .store
-        .put_opts(
-            &checkpoint_path,
-            bytes::Bytes::from(bytes.clone()).into(),
-            PutMode::Create.into(),
-        )
-        .await;
-    match result {
-        Ok(_) => {}
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            let existing = state
-                .store
-                .get(&checkpoint_path)
-                .await
-                .map_err(ApiError::internal)?
-                .bytes()
-                .await
-                .map_err(ApiError::internal)?;
-            if existing.as_ref() != bytes.as_slice() {
-                return Err(ApiError::conflict(format!(
-                    "standing runtime checkpoint conflict at {}",
-                    checkpoint_key.as_str()
-                )));
-            }
+    let candidate = if let Some(existing) = existing_legacy_record {
+        if serde_json::to_value(&existing).map_err(ApiError::internal)?
+            != serde_json::to_value(&record).map_err(ApiError::internal)?
+        {
+            return Err(ApiError::conflict(format!(
+                "standing runtime checkpoint conflict at {}",
+                checkpoint_key.as_str()
+            )));
         }
-        Err(error) => return Err(ApiError::internal(error)),
-    }
+        standing_runtime_checkpoint_pointer_from_record(&existing)
+    } else {
+        let result = state
+            .store
+            .put_opts(
+                &checkpoint_path,
+                bytes::Bytes::from(bytes.clone()).into(),
+                PutMode::Create.into(),
+            )
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = state
+                    .store
+                    .get(&checkpoint_path)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .bytes()
+                    .await
+                    .map_err(ApiError::internal)?;
+                if existing.as_ref() != bytes.as_slice() {
+                    return Err(ApiError::conflict(format!(
+                        "standing runtime checkpoint conflict at {}",
+                        checkpoint_key.as_str()
+                    )));
+                }
+            }
+            Err(error) => return Err(ApiError::internal(error)),
+        }
+        standing_runtime_checkpoint_pointer_from_record(&record)
+    };
     if let Some(timer) = timer.as_mut() {
         timer.mark("checkpoint_record");
     }
@@ -548,6 +601,56 @@ async fn authenticated_demand_retry_output(
         schema_fingerprint: record.schema_fingerprint,
         delta,
     }])
+}
+
+async fn read_validated_legacy_checkpoint_record(
+    state: &ApiState,
+    view_id: &str,
+    checkpoint: &RuntimeCheckpoint,
+    checkpoint_key: &ObjectKey,
+    output_delta_publications: &[StandingRuntimeDeltaPublication],
+    state_payload_key: &ObjectKey,
+) -> Result<Option<StandingRuntimeCheckpointRecord>, ApiError> {
+    let object = match state
+        .store
+        .get(&ObjectPath::from(checkpoint_key.as_str()))
+        .await
+    {
+        Ok(object) => object,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let bytes = collect_object_bytes_bounded(object, Some(16 * 1024 * 1024)).await?;
+    let mut record =
+        standing_runtime_checkpoint_record_from_slice(&bytes).map_err(ApiError::bad_request)?;
+    let pointer = standing_runtime_checkpoint_pointer_from_record(&record);
+    validate_standing_runtime_checkpoint_record(&checkpoint.identity, view_id, &pointer, &record)?;
+    if record.checkpoint_key != checkpoint_key.as_str() {
+        return Err(ApiError::conflict(
+            "standing runtime checkpoint key mismatch",
+        ));
+    }
+    hydrate_standing_runtime_checkpoint_state_payload(state, &mut record).await?;
+    record
+        .checkpoint
+        .validate_identity(&checkpoint.identity)
+        .map_err(ApiError::bad_request)?;
+    validate_standing_runtime_checkpoint_output_manifest_records(state, &record).await?;
+    validate_standing_runtime_checkpoint_replay_frontiers(&record)?;
+    let payload = record.checkpoint.state_payload.take();
+    let legacy_checkpoint = standing_runtime_checkpoint_with_durable_publication_refs(
+        checkpoint,
+        None,
+        output_delta_publications,
+        state_payload_key,
+    );
+    if record.checkpoint == legacy_checkpoint
+        && payload.as_ref() == checkpoint.state_payload.as_ref()
+    {
+        Ok(Some(record))
+    } else {
+        Ok(None)
+    }
 }
 
 fn standing_runtime_checkpoint_with_prior_input_coverage(
@@ -1528,9 +1631,14 @@ pub(super) fn standing_runtime_output_manifest_record_for_checkpoint_with_limits
         // The existing native families can select their pages from the
         // checkpoint record; the generic families require the authoritative
         // pointer reader. Without it they keep the legacy JSON publication.
-        let generic = native_output_pages::generic_checkpoint_family(checkpoint);
+        let generic = materialized_output_pages::generic_checkpoint_family(checkpoint);
         if allow_generic_native || !generic {
-            match native_output_pages::publication(checkpoint, view_id, checkpoint_key, output) {
+            match materialized_output_pages::publication(
+                checkpoint,
+                view_id,
+                checkpoint_key,
+                output,
+            ) {
                 Ok(publication) => return Ok(Some(publication)),
                 // A generic family that cannot become a canonical bag page keeps
                 // the legacy JSON publication instead of failing the commit.
@@ -1640,9 +1748,10 @@ pub(super) async fn persist_standing_runtime_output_page(
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
     let record = record.clone();
-    let bytes = tokio::task::spawn_blocking(move || native_output_pages::encode_page(&record))
-        .await
-        .map_err(ApiError::internal)??;
+    let bytes =
+        tokio::task::spawn_blocking(move || materialized_output_pages::encode_page(&record))
+            .await
+            .map_err(ApiError::internal)??;
     let path = ObjectPath::from(output_page_key.as_str());
     let result = state
         .store
@@ -1683,7 +1792,7 @@ pub(super) async fn put_standing_runtime_output_page(
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
     validate_standing_runtime_output_page_record(output_page_key, record)?;
-    let bytes = native_output_pages::encode_page(record)?;
+    let bytes = materialized_output_pages::encode_page(record)?;
     state
         .store
         .put(
@@ -2115,6 +2224,22 @@ pub(super) fn standing_runtime_checkpoint_published_output_with_limits(
         Err(_) => return None,
         Ok(None) => {}
     }
+    let Some(state_payload) = &checkpoint.state_payload else {
+        return None;
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(&state_payload.payload) else {
+        return None;
+    };
+    payload
+        .get("published_output")
+        .filter(|published_output| !published_output.is_null())
+        .cloned()
+}
+
+/// The published output of a checkpoint, without the runtime expansion limits.
+pub(super) fn standing_runtime_checkpoint_published_output(
+    checkpoint: &RuntimeCheckpoint,
+) -> Option<Value> {
     let Some(state_payload) = &checkpoint.state_payload else {
         return None;
     };
@@ -3095,11 +3220,10 @@ async fn validate_standing_runtime_checkpoint_output_manifest_records_with_delta
             record.checkpoint.logical_epoch,
             &format!("pages_validate_count_{}", manifest.pages.len()),
         );
-        let native_pages = native_output_pages::is_native_codec(&manifest.output_encoding);
-        let mut previous_native_pair = None;
-        let mut previous_native_weight = 0i64;
-        if native_pages {
-            native_output_pages::validate_checkpoint_binding(&manifest, &record.checkpoint)?;
+        let generic = materialized_output_pages::is_materialized_codec(&manifest.output_encoding);
+        let mut previous = None;
+        if generic {
+            materialized_output_pages::validate_checkpoint_binding(&manifest, &record.checkpoint)?;
             if retain_pages {
                 if snapshot_pages.is_some() {
                     return Err(ApiError::bad_request(
@@ -3116,31 +3240,20 @@ async fn validate_standing_runtime_checkpoint_output_manifest_records_with_delta
         for page in &manifest.pages {
             let (_page_key, page_record) =
                 read_standing_runtime_output_page_record(state, page, &record.view_id).await?;
-            if native_pages {
-                let rows = native_output_pages::validate_page_binding(&manifest, &page_record)?;
+            if generic {
+                let rows =
+                    materialized_output_pages::validate_page_binding(&manifest, &page_record)?;
                 for row in rows.records() {
                     let pair = velorix_core::delta::encode_kv_ordered(
                         row.key.as_json(),
                         row.value.as_json(),
                     );
-                    if previous_native_pair
-                        .as_ref()
-                        .is_some_and(|previous| previous > &pair)
-                    {
+                    if previous.as_ref().is_some_and(|last| last > &pair) {
                         return Err(ApiError::bad_request(
-                            "native output pages are not globally ordered",
+                            "materialized pages are not globally ordered",
                         ));
                     }
-                    previous_native_weight = if previous_native_pair.as_ref() == Some(&pair) {
-                        previous_native_weight
-                            .checked_add(row.weight)
-                            .ok_or_else(|| {
-                                ApiError::bad_request("producer snapshot multiplicity overflow")
-                            })?
-                    } else {
-                        row.weight
-                    };
-                    previous_native_pair = Some(pair);
+                    previous = Some(pair);
                 }
                 if let Some(snapshot) = snapshot_pages.as_mut() {
                     snapshot.pages.push(rows);
@@ -3151,8 +3264,7 @@ async fn validate_standing_runtime_checkpoint_output_manifest_records_with_delta
                 || page_record.view_id != record.view_id
                 || page_record.logical_epoch != record.checkpoint.logical_epoch
                 || (page_record.output_content_hash != manifest.output_content_hash
-                    && !(page_record.output_encoding == native_output_pages::CODEC
-                        && page_record.output_content_hash.is_empty()))
+                    && !(generic && page_record.output_content_hash.is_empty()))
             {
                 return Err(ApiError::bad_request(format!(
                     "standing runtime output page body/checkpoint mismatch for `{}/{}/{}`",
@@ -3164,6 +3276,34 @@ async fn validate_standing_runtime_checkpoint_output_manifest_records_with_delta
         }
     }
     Ok((validated_deltas, snapshot_pages))
+}
+
+pub(super) async fn collect_object_bytes_bounded(
+    result: object_store::GetResult,
+    max_bytes: Option<u64>,
+) -> Result<Vec<u8>, ApiError> {
+    use futures::StreamExt;
+    if max_bytes.is_some_and(|limit| result.meta.size > limit) {
+        return Err(ApiError::bad_request(
+            "materialized read exceeds query byte budget",
+        ));
+    }
+    let mut stream = result.into_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ApiError::internal)?;
+        let length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::bad_request("materialized read size overflow"))?;
+        if max_bytes.is_some_and(|limit| length as u64 > limit) {
+            return Err(ApiError::bad_request(
+                "materialized read exceeds query byte budget",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub(super) async fn read_standing_runtime_output_manifest_record(
@@ -3239,7 +3379,7 @@ pub(super) async fn read_standing_runtime_output_page_record_bounded(
     let page = page.clone();
     let view_id = view_id.to_string();
     tokio::task::spawn_blocking(move || {
-        let record = native_output_pages::decode_page(&bytes, &page.output_encoding)?;
+        let record = materialized_output_pages::decode_page(&bytes, &page.output_encoding)?;
         let (key, _) = ObjectKey::parse_standing_runtime_output_page(page.page_key.clone())
             .map_err(ApiError::bad_request)?;
         validate_standing_runtime_output_page_ref(&page, &view_id)?;
@@ -3264,30 +3404,32 @@ pub(super) async fn read_object_bytes_bounded(
     path: &ObjectPath,
     max_bytes: Option<u64>,
 ) -> Result<Vec<u8>, ApiError> {
-    if let Some(cache) = &state.native_read_cache {
+    if let Some(cache) = &state.materialized_read_cache {
         if let Ok(key) = checkpoint_read_cache_key(state, path) {
             let content_hash = key.content_hash.clone();
             let object_path = path.to_string();
-            let bytes = cache
-                .read_through(
-                    key,
-                    || async { read_object_bytes_bounded_uncached(state, path, max_bytes).await },
-                    |bytes| {
-                        if checkpoint_cache_bytes_match(state, &object_path, &content_hash, bytes) {
-                            Ok(())
-                        } else {
-                            Err(ApiError::bad_request(format!(
-                                "checkpoint cache content hash mismatch for `{object_path}`"
-                            )))
-                        }
-                    },
-                )
-                .await?;
-            if max_bytes.is_some_and(|limit| bytes.len() as u64 > limit) {
-                return Err(ApiError::bad_request(
-                    "native read exceeds query scan or memory byte budget",
-                ));
+            let validate = |bytes: &[u8]| {
+                if checkpoint_cache_bytes_match(state, &object_path, &content_hash, bytes) {
+                    Ok(())
+                } else {
+                    Err(ApiError::bad_request(format!(
+                        "checkpoint cache content hash mismatch for `{object_path}`"
+                    )))
+                }
+            };
+            if let Some(bytes) = cache.get(&key, validate).await {
+                if max_bytes.is_some_and(|limit| bytes.len() as u64 > limit) {
+                    return Err(ApiError::bad_request(
+                        "native read exceeds query scan or memory byte budget",
+                    ));
+                }
+                if let Some(account) = &state.materialized_read_cache_hit_accountant {
+                    account(&object_path, bytes.len() as u64)?;
+                }
+                return Ok(bytes);
             }
+            let bytes = read_object_bytes_bounded_uncached(state, path, max_bytes).await?;
+            cache.insert(key, bytes.clone(), validate)?;
             return Ok(bytes);
         }
     }
@@ -3297,7 +3439,7 @@ pub(super) async fn read_object_bytes_bounded(
 fn checkpoint_read_cache_key(
     state: &ApiState,
     path: &ObjectPath,
-) -> Result<native_read_cache::NativeReadCacheKey, ApiError> {
+) -> Result<materialized_read_cache::MaterializedReadCacheKey, ApiError> {
     // shortcut: output manifests/deltas/pages need codec-specific commitments, not checkpoint hashes; revisit with their own validated cache keys.
     // shortcut: LIST discovery and its initial GET lack a fresh pointer commitment; keep them live until authoritative metadata replaces discovery.
     let raw = path.as_ref();
@@ -3320,9 +3462,9 @@ fn checkpoint_read_cache_key(
                 p.logical_epoch,
             )
         };
-    Ok(native_read_cache::NativeReadCacheKey {
-        store_id: state.native_read_cache_store_id().to_string(),
-        namespace: state.native_read_cache_namespace().to_string(),
+    Ok(materialized_read_cache::MaterializedReadCacheKey {
+        store_id: state.materialized_read_cache_store_id().to_string(),
+        namespace: state.materialized_read_cache_namespace().to_string(),
         tenant_id: String::new(),
         program_id: String::new(),
         output_id,
@@ -3372,7 +3514,7 @@ fn checkpoint_cache_bytes_match(
 }
 
 pub(super) async fn cached_checkpoint_size(state: &ApiState, path: &ObjectPath) -> Option<u64> {
-    let cache = state.native_read_cache.as_ref()?;
+    let cache = state.materialized_read_cache.as_ref()?;
     let key = checkpoint_read_cache_key(state, path).ok()?;
     let hash = key.content_hash.clone();
     let object_path = path.to_string();
@@ -3464,8 +3606,8 @@ pub(super) fn validate_standing_runtime_output_manifest_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputManifestRecord,
 ) -> Result<(), ApiError> {
-    if native_output_pages::is_native_codec(&record.output_encoding) {
-        return native_output_pages::validate_manifest(key, record);
+    if materialized_output_pages::is_materialized_codec(&record.output_encoding) {
+        return materialized_output_pages::validate_manifest(key, record);
     }
     let bytes = serde_json::to_vec(&record.published_output)
         .map_err(|source| ApiError::internal(source.to_string()))?;
@@ -3735,7 +3877,7 @@ pub(super) fn validate_standing_runtime_output_page_ref(
     view_id: &str,
 ) -> Result<(), ApiError> {
     if page.output_encoding != "velorix-delta-batch-json-v1"
-        && !native_output_pages::is_native_codec(&page.output_encoding)
+        && !materialized_output_pages::is_materialized_codec(&page.output_encoding)
     {
         return Err(ApiError::bad_request(format!(
             "standing runtime output page codec mismatch for view `{view_id}`"
@@ -3750,8 +3892,8 @@ pub(super) fn validate_standing_runtime_output_page_record(
     key: &ObjectKey,
     record: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
-    if native_output_pages::is_native_codec(&record.output_encoding) {
-        return native_output_pages::validate_page(key, record);
+    if materialized_output_pages::is_materialized_codec(&record.output_encoding) {
+        return materialized_output_pages::validate_page(key, record);
     }
     let bytes = serde_json::to_vec(&record.published_output)
         .map_err(|source| ApiError::internal(source.to_string()))?;

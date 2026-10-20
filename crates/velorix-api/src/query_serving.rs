@@ -457,7 +457,26 @@ async fn query_physical_demand(
             Vec::new(),
         )
     };
-    if demand.scope.is_none() {
+    let continuation_token = request
+        .page_token
+        .as_deref()
+        .filter(|token| demand_pagination::is_continuation(token));
+    if let Some(token) = continuation_token {
+        // A continuation request carries only the signed token. Replay the
+        // scope certified with that token so the next page stays inside the
+        // same certified result instead of re-inferring a different scope.
+        let certified = demand_pagination::continuation_scope_sql(token)?;
+        if demand.scope.is_none() {
+            demand.scope =
+                certified.map(|predicate| demand_materialization::DemandScope { predicate });
+        } else if demand.scope.as_ref().map(|scope| scope.predicate.as_str())
+            != certified.as_deref()
+        {
+            return Err(ApiError::bad_request(
+                "continuation scope does not match the certified demand scope",
+            ));
+        }
+    } else if demand.scope.is_none() {
         demand.scope = demand_query_scope::infer_scope(
             &normalize_view_query_sql(&selector, &output),
             &binds,
@@ -813,50 +832,30 @@ async fn query_active_view_output_batches_certified(
                 &page_request,
             )?;
             let (batches, logical_epoch, next_page_token) = if let Some(sql) = request_sql {
-                let requested_epoch = page_request.committed_epoch;
-                let selector_sql = render_caller_sql_as_parameterized_bound_sql(&sql, &parameters)?;
-                let predicate = native_sql_predicate(
-                    &active,
-                    &output_id,
-                    &normalize_view_query_sql(&selector_sql.sql, &output_id),
-                    &selector_sql.bind_values,
-                );
                 let sql = render_caller_sql_as_bound_sql(&sql, &parameters)?;
+                let bound_sql = BoundViewSql {
+                    sql: normalize_view_query_sql(&sql, &output_id),
+                    bind_values: Vec::new(),
+                };
                 let page_request =
                     page_request_with_query_policy_limit(page_request, query_policy.policy);
-                let page = standing_runtime_sql_page(
+                query_standing_runtime_batches_with_sql(
                     &state,
                     &active,
                     &output_id,
+                    bound_sql,
                     page_request,
-                    predicate.as_ref(),
-                    query_policy.policy,
-                )
-                .await?;
-                validate_standing_runtime_full_snapshot_page(
-                    &active,
-                    &output_id,
-                    &page,
-                    requested_epoch,
-                )?;
-                let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
-                    &output_id,
-                    page.batches,
-                    &normalize_view_query_sql(&sql, &output_id),
-                    &[],
-                    query_policy.policy,
+                    query_policy,
                     &permit,
                 )
-                .await
-                .map_err(ApiError::bad_request)?;
-                (batches, page.logical_epoch, None)
+                .await?
             } else if let Some(sql_template) = api.sql_template.as_deref() {
                 let bound_sql = render_view_sql_template(
                     &normalize_view_query_sql(sql_template, &output_id),
                     &api.request,
                     &parameters,
                 )?;
-                query_standing_runtime_batches_with_template(
+                query_standing_runtime_batches_with_sql(
                     &state,
                     &active,
                     &output_id,
@@ -1136,7 +1135,22 @@ pub(super) async fn activate_authoritative_view_bootstrap(
     }
 }
 
-async fn query_standing_runtime_batches_with_template(
+pub(super) fn remaining_query_execution_policy(
+    mut policy: QueryPolicy,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<QueryPolicy, ApiError> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ApiError::bad_request("query execution timeout exceeded"));
+        }
+        // Keep a positive submillisecond budget valid; timeout_at enforces the exact deadline.
+        policy.execution_timeout_ms = Some((remaining.as_millis() as u64).max(1));
+    }
+    Ok(policy)
+}
+
+async fn query_standing_runtime_batches_with_sql(
     state: &ApiState,
     active: &ActiveMaterializedView,
     output_id: &str,
@@ -1145,30 +1159,43 @@ async fn query_standing_runtime_batches_with_template(
     query_policy: ViewQueryPolicy,
     permit: &QueryExecutionPermit,
 ) -> Result<(Vec<RecordBatch>, u64, Option<String>), ApiError> {
+    let policy = query_policy.policy;
+    let deadline = policy
+        .execution_timeout_ms
+        .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
     let requested_epoch = page_request.committed_epoch;
-    let predicate = native_sql_predicate(active, output_id, &bound_sql.sql, &bound_sql.bind_values);
-    let page = standing_runtime_sql_page(
-        state,
-        active,
-        output_id,
-        page_request,
-        predicate.as_ref(),
-        query_policy.policy,
-    )
-    .await?;
-    validate_standing_runtime_full_snapshot_page(active, output_id, &page, requested_epoch)?;
-    let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
-        output_id,
-        page.batches,
-        &bound_sql.sql,
-        &bound_sql.bind_values,
-        query_policy.policy,
-        permit,
-    )
-    .await
-    .map_err(ApiError::bad_request)?;
+    let predicate =
+        materialized_sql_predicate(active, output_id, &bound_sql.sql, &bound_sql.bind_values);
+    let query = async {
+        let page = standing_runtime_sql_page(
+            state,
+            active,
+            output_id,
+            page_request,
+            predicate.as_ref(),
+            remaining_query_execution_policy(policy, deadline)?,
+        )
+        .await?;
+        validate_standing_runtime_full_snapshot_page(active, output_id, &page, requested_epoch)?;
+        let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
+            output_id,
+            page.batches,
+            &bound_sql.sql,
+            &bound_sql.bind_values,
+            remaining_query_execution_policy(policy, deadline)?,
+            permit,
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
 
-    Ok((batches, page.logical_epoch, None))
+        Ok((batches, page.logical_epoch, None))
+    };
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, query)
+            .await
+            .map_err(|_| ApiError::bad_request("query execution timeout exceeded"))?,
+        None => query.await,
+    }
 }
 
 pub(super) async fn standing_runtime_sql_page(
@@ -1181,9 +1208,9 @@ pub(super) async fn standing_runtime_sql_page(
 ) -> Result<MaterializedViewPage, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
     if let Some(identity) = active_standing_runtime_identity(active) {
-        // Pruning is optional; SQL still needs the complete bounded native input.
+        // Pruning is optional; SQL still needs complete bounded materialized input.
         let predicate = predicate.unwrap_or(&velorix_core::query::PagePredicate::Unknown);
-        if let Some(page) = native_output_pages::query_filtered(
+        if let Some(page) = materialized_output_pages::query_filtered(
             state,
             active,
             identity,
@@ -1197,10 +1224,12 @@ pub(super) async fn standing_runtime_sql_page(
             return Ok(page);
         }
     }
-    standing_runtime_page(state, active, output_id, request, policy).await
+    let mut complete = request;
+    complete.max_rows = None;
+    standing_runtime_page(state, active, output_id, complete, policy).await
 }
 
-fn native_sql_predicate(
+fn materialized_sql_predicate(
     active: &ActiveMaterializedView,
     output_id: &str,
     sql: &str,
@@ -1384,7 +1413,7 @@ pub(super) async fn standing_runtime_page_from_output_manifest(
     page_request: SnapshotPageRequest,
     policy: QueryPolicy,
 ) -> Result<Option<MaterializedViewPage>, ApiError> {
-    if let Some(page) = native_output_pages::query_with_policy(
+    if let Some(page) = materialized_output_pages::query_with_policy(
         state,
         active,
         identity,
@@ -1396,64 +1425,27 @@ pub(super) async fn standing_runtime_page_from_output_manifest(
     {
         return Ok(Some(page));
     }
-    let Some(record) =
-        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
-    else {
-        return Ok(None);
-    };
-    let output_schema = active
+    let schema = active
         .spec
         .output_relations
         .iter()
-        .find(|schema| schema.relation_id == output_id)
-        .ok_or_else(|| {
-            ApiError::conflict(format!(
-                "standing runtime view `{}` has no matching output schema for `{output_id}`",
-                active.spec.view_id
-            ))
-        })?;
-    let Some(manifest) =
-        standing_runtime_checkpoint_output_manifest(state, &record, output_id).await?
-    else {
-        return Ok(None);
-    };
-    if native_output_pages::is_native_codec(&manifest.output_encoding) {
-        return Err(ApiError::service_unavailable(
-            "native paged output requires an authoritative metadata pointer",
-        ));
-    }
-    if manifest.checkpoint_key != record.checkpoint_key
-        || manifest.logical_epoch != record.checkpoint.logical_epoch
-        || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
-    {
-        return Err(ApiError::bad_request(format!(
-            "standing runtime output manifest is not bound to the latest checkpoint for `{}/{}/{}`",
-            identity.tenant_id, identity.program_id, active.spec.view_id
-        )));
-    }
-    let published_output =
-        standing_runtime_published_output_from_manifest_page(state, &manifest).await?;
-    let aggregate_outputs =
-        standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
-    let scoped_view = ScopedViewId {
-        tenant_id: identity.tenant_id.clone(),
-        program_id: identity.program_id.clone(),
-        view_id: output_id.to_string(),
-    };
-    let page =
-        velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
-            output_schema,
-            &published_output,
-            scoped_view,
-            record.checkpoint.logical_epoch,
-            page_request,
-            aggregate_outputs.as_deref(),
-            &record.checkpoint,
-        )
-        .map_err(ApiError::bad_request)?;
-    Ok(Some(page))
+        .find(|s| s.relation_id == output_id)
+        .ok_or_else(|| ApiError::conflict("materialized output schema is unavailable"))?;
+    legacy_materialized_page(
+        state,
+        &active.spec.view_id,
+        identity,
+        output_id,
+        schema,
+        page_request,
+        false,
+        policy,
+        0,
+        0,
+    )
+    .await
+    .map(Some)
 }
-
 pub(super) async fn standing_runtime_checkpoint_output_manifest(
     state: &ApiState,
     record: &StandingRuntimeCheckpointRecord,
@@ -1568,6 +1560,18 @@ pub(super) async fn standing_runtime_published_output_from_manifest_page(
     state: &ApiState,
     manifest: &StandingRuntimeOutputManifestRecord,
 ) -> Result<DeltaBatch, ApiError> {
+    if materialized_output_pages::is_materialized_codec(&manifest.output_encoding) {
+        // IPC pages carry canonical public rows and are bound by the manifest's
+        // page hashes/schema/statistics; their decoded root header may be empty.
+        let mut output = DeltaBatch::default();
+        for page in &manifest.pages {
+            let (_, record) =
+                read_standing_runtime_output_page_record(state, page, &manifest.view_id).await?;
+            let rows = materialized_output_pages::validate_page_binding(manifest, &record)?;
+            output = output.combine(&rows);
+        }
+        return Ok(output);
+    }
     let Some(page) = manifest.pages.iter().find(|page| page.page_index == 0) else {
         return Err(ApiError::bad_request(format!(
             "standing runtime output manifest has no first page for `{}/{}/{}`",
@@ -1900,4 +1904,367 @@ async fn replay_existing_published_commits(
         }
     }
     Ok(outcome)
+}
+
+// Legacy JSON checkpoints still use the established proof/hydration readers.
+// This request-local store bounds their reads before JSON decoding and charges
+// the preceding native-format probe, including warm metadata cache hits.
+#[derive(Clone, Debug)]
+struct LegacyQueryStore {
+    inner: Arc<dyn ObjectStore>,
+    policy: QueryPolicy,
+    usage: Arc<Mutex<LegacyReadUsage>>,
+}
+#[derive(Debug)]
+struct LegacyReadUsage {
+    requests: usize,
+    bytes: u64,
+    files: BTreeSet<String>,
+    exceeded: bool,
+}
+impl std::fmt::Display for LegacyQueryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LegacyQueryStore({})", self.inner)
+    }
+}
+impl LegacyQueryStore {
+    fn failure() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "legacy materialized query",
+            source: Box::new(std::io::Error::other(
+                "legacy materialized read exceeds query source budget",
+            )),
+        }
+    }
+    fn charge(
+        &self,
+        path: Option<&object_store::path::Path>,
+        bytes: u64,
+        request: bool,
+    ) -> object_store::Result<()> {
+        let mut usage = self.usage.lock().unwrap();
+        if request {
+            usage.requests = usage.requests.saturating_add(1);
+        }
+        usage.bytes = usage.bytes.saturating_add(bytes);
+        if let Some(path) = path {
+            if path
+                .as_ref()
+                .starts_with("v1/standing-runtime-output-pages/")
+                || path
+                    .as_ref()
+                    .starts_with("v1/standing-runtime-state-payloads/")
+            {
+                usage.files.insert(path.to_string());
+            }
+        }
+        if self
+            .policy
+            .max_object_requests
+            .is_some_and(|n| usage.requests > n)
+            || self
+                .policy
+                .max_scan_files
+                .is_some_and(|n| usage.files.len() > n)
+            || self.policy.max_scan_bytes.is_some_and(|n| usage.bytes > n)
+            || self
+                .policy
+                .memory_limit_bytes
+                .is_some_and(|n| usage.bytes.saturating_mul(16) > n)
+        {
+            usage.exceeded = true;
+            return Err(Self::failure());
+        }
+        Ok(())
+    }
+}
+#[async_trait::async_trait]
+impl ObjectStore for LegacyQueryStore {
+    async fn put_opts(
+        &self,
+        path: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        path: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, opts).await
+    }
+    async fn get_opts(
+        &self,
+        path: &object_store::path::Path,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        use futures::StreamExt;
+        self.charge(Some(path), 0, true)?;
+        let result = self.inner.get_opts(path, opts).await?;
+        let meta = result.meta.clone();
+        let range = result.range.clone();
+        let attributes = result.attributes.clone();
+        let extensions = result.extensions.clone();
+        // Object metadata rejects oversized bodies before consuming the stream.
+        self.charge(None, range.end.saturating_sub(range.start), false)?;
+        let mut stream = result.into_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            let next = bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(Self::failure)?;
+            if next as u64 > range.end.saturating_sub(range.start) {
+                self.usage.lock().unwrap().exceeded = true;
+                return Err(Self::failure());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(object_store::GetResult {
+            payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::once(
+                async move { Ok(bytes::Bytes::from(bytes)) },
+            ))),
+            meta,
+            range,
+            attributes,
+            extensions,
+        })
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        if let Err(error) = self.charge(None, 0, true) {
+            return Box::pin(futures::stream::once(async move { Err(error) }));
+        }
+        let budget = self.clone();
+        let stream = self.inner.list(prefix);
+        Box::pin(futures::stream::try_unfold(
+            (stream, budget, 0usize),
+            |(mut stream, budget, entries)| async move {
+                use futures::TryStreamExt;
+                // ObjectStore does not expose provider LIST page requests. Charge
+                // each poll conservatively, including the terminating poll.
+                budget.charge(None, 0, true)?;
+                let Some(meta) = stream.try_next().await? else {
+                    return Ok(None);
+                };
+                let entries = entries.saturating_add(1);
+                if entries > DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES / 1024
+                    || meta.location.as_ref().len()
+                        > DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES
+                {
+                    budget.usage.lock().unwrap().exceeded = true;
+                    return Err(Self::failure());
+                }
+                Ok(Some((meta, (stream, budget, entries))))
+            },
+        ))
+    }
+    fn delete_stream(
+        &self,
+        paths: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(paths)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.charge(None, 0, true)?;
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+// The explicit arguments preserve the already charged probe and the admitted
+// output schema without reloading admission metadata or changing SQL semantics.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn legacy_materialized_page(
+    state: &ApiState,
+    view_id: &str,
+    identity: &StandingProgramIdentity,
+    output_id: &str,
+    schema: &RelationSchema,
+    mut request: SnapshotPageRequest,
+    complete_sql: bool,
+    policy: QueryPolicy,
+    metadata_bytes: u64,
+    metadata_requests: usize,
+) -> Result<MaterializedViewPage, ApiError> {
+    if complete_sql {
+        if request.page_token.is_some() {
+            return Err(ApiError::bad_request("SQL cannot use a raw page cursor"));
+        }
+        request.max_rows = None;
+    }
+    let store = Arc::new(LegacyQueryStore {
+        inner: state.store.clone(),
+        policy,
+        usage: Arc::new(Mutex::new(LegacyReadUsage {
+            requests: metadata_requests,
+            bytes: metadata_bytes,
+            files: BTreeSet::new(),
+            exceeded: false,
+        })),
+    });
+    store.charge(None, 0, false).map_err(|_| {
+        ApiError::bad_request("legacy materialized read exceeds query source budget")
+    })?;
+    let mut bounded = state.clone();
+    bounded.store = store.clone();
+    let cache_hit_store = store.clone();
+    bounded.materialized_read_cache_hit_accountant = Some(Arc::new(move |path, bytes| {
+        let path = ObjectPath::from(path.to_string());
+        cache_hit_store
+            .charge(Some(&path), bytes, true)
+            .map_err(ApiError::bad_request)
+    }));
+    let result = async {
+        let expected_head = match &state.meta_store {
+            Some(meta) => meta
+                .read_standing_runtime_checkpoint(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?,
+            None => None,
+        };
+        let record = read_latest_standing_runtime_checkpoint(&bounded, identity, view_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::service_unavailable(format!(
+                    "MATERIALIZATION_LAG: view `{view_id}` is not fully materialized; materialized checkpoint is unavailable"
+                ))
+            })?;
+        let published = if let Some(manifest) =
+            standing_runtime_checkpoint_output_manifest(&bounded, &record, output_id).await?
+        {
+            if manifest.checkpoint_key != record.checkpoint_key
+                || manifest.logical_epoch != record.checkpoint.logical_epoch
+                || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
+            {
+                return Err(ApiError::bad_request(
+                    "legacy manifest is not bound to the current checkpoint",
+                ));
+            }
+            standing_runtime_published_output_from_manifest_page(&bounded, &manifest).await?
+        } else {
+            serde_json::from_value(
+                standing_runtime_checkpoint_published_output(&record.checkpoint)
+                    .ok_or_else(|| ApiError::conflict("materialized output is unavailable"))?,
+            )
+            .map_err(ApiError::bad_request)?
+        };
+        let aggregates =
+            standing_runtime_output_aggregate_outputs_for_checkpoint(&record.checkpoint)?;
+        // Reject BAG expansion before the runtime allocates repeated Arrow rows.
+        let expanded = published.records().iter().try_fold(0u64, |n, row| {
+            let bytes = serde_json::to_vec(row)
+                .map_err(ApiError::bad_request)?
+                .len() as u64;
+            let copies = u64::try_from(row.weight.max(0)).map_err(ApiError::bad_request)?;
+            n.checked_add(bytes.saturating_mul(copies))
+                .ok_or_else(|| ApiError::bad_request("legacy expansion size overflow"))
+        })?;
+        let retained = store.usage.lock().unwrap().bytes.saturating_mul(16);
+        if policy
+            .memory_limit_bytes
+            .is_some_and(|n| retained.saturating_add(expanded.saturating_mul(16)) > n)
+        {
+            return Err(ApiError::bad_request(
+                "legacy materialized expansion exceeds query memory budget",
+            ));
+        }
+        let page =
+            velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
+            schema,
+            &published,
+            ScopedViewId {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: output_id.into(),
+            },
+            record.checkpoint.logical_epoch,
+            request,
+            aggregates.as_deref(),
+            &record.checkpoint,
+        )
+        .map_err(ApiError::bad_request)?;
+        let retained = store.usage.lock().unwrap().bytes.saturating_mul(16);
+        let arrays = page
+            .batches
+            .iter()
+            .try_fold(0u64, |n, b| n.checked_add(b.get_array_memory_size() as u64))
+            .ok_or_else(|| ApiError::bad_request("legacy query memory size overflow"))?;
+        if policy
+            .memory_limit_bytes
+            .is_some_and(|n| retained.saturating_add(arrays) > n)
+        {
+            return Err(ApiError::bad_request(
+                "legacy materialized expansion exceeds query memory budget",
+            ));
+        }
+        // Preserve a single head across descriptor, state and page reads.
+        if let Some(meta) = &state.meta_store {
+            let current = meta
+                .read_standing_runtime_checkpoint(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?;
+            if current != expected_head
+                || current.as_ref().is_none_or(|p| {
+                    p.checkpoint_key != record.checkpoint_key
+                        || p.logical_epoch != record.checkpoint.logical_epoch
+                        || p.content_hash != record.checkpoint.state_root.content_hash
+                })
+            {
+                return Err(ApiError::conflict(
+                    "materialized output head changed during legacy paging",
+                ));
+            }
+        } else {
+            let mut requests = 0;
+            let current = materialized_output_pages::discover_checkpoint_head(
+                &bounded,
+                identity,
+                view_id,
+                QueryPolicy::default(),
+                &mut requests,
+            )
+            .await?;
+            if current.is_none_or(|(path, parts)| {
+                path != record.checkpoint_key
+                    || parts.logical_epoch != record.checkpoint.logical_epoch
+                    || parts.content_hash != record.checkpoint.state_root.content_hash
+            }) {
+                return Err(ApiError::conflict(
+                    "materialized output head changed during legacy paging",
+                ));
+            }
+        }
+        Ok(page)
+    }
+    .await;
+    if store.usage.lock().unwrap().exceeded {
+        return Err(ApiError::bad_request(
+            "legacy materialized read exceeds query source budget",
+        ));
+    }
+    result
 }

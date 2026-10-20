@@ -1,12 +1,90 @@
-//! Materialized bag output pages. These are output-read proofs, not restore proofs.
+//! Materialized output pages. These are output-read proofs, not restore proofs.
 use super::*;
 use velorix_core::delta::encode_kv_ordered;
 use velorix_core::query::{PageComparison, PagePredicate, PageScalar};
 
-pub(super) const CODEC: &str = "velorix-materialized-bag-arrow-pages-v1";
-pub(super) const LEGACY_CODEC: &str = "velorix-materialized-bag-pages-v1";
-pub(super) fn is_native_codec(codec: &str) -> bool {
-    matches!(codec, CODEC | LEGACY_CODEC)
+/// The general materialized output page codec.
+pub(super) const CODEC: &str = "velorix-materialized-arrow-pages-v2";
+/// The generic/demand bag page codec.
+pub(super) const BAG_CODEC: &str = "velorix-materialized-bag-arrow-pages-v1";
+/// The legacy generic/demand bag page codec (JSON pages).
+pub(super) const BAG_LEGACY_CODEC: &str = "velorix-materialized-bag-pages-v1";
+/// The general legacy materialized output codec (JSON pages).
+pub(super) const LEGACY_CODEC: &str = "velorix-delta-batch-json-v1";
+pub(super) fn is_materialized_codec(codec: &str) -> bool {
+    matches!(codec, CODEC | BAG_CODEC | BAG_LEGACY_CODEC)
+}
+pub(super) fn is_bag_codec(codec: &str) -> bool {
+    matches!(codec, BAG_CODEC | BAG_LEGACY_CODEC)
+}
+
+/// The published page identity of one codec.
+///
+/// The general materialized codec and the bag codec are distinct formats, not
+/// aliases: they differ in record kind, schema version, IPC header and the
+/// canonical column extraction order. Everything that writes or validates a
+/// page derives those fields from this table so the two never drift.
+struct CodecSpec {
+    codec: &'static str,
+    schema_version: u16,
+    manifest_kind: &'static str,
+    page_kind: &'static str,
+    ipc_header: &'static str,
+    /// The bag codec binds a family; the general codec has no family binding.
+    bag: bool,
+    /// Arrow codecs encode their pages as Arrow IPC; JSON codecs keep the
+    /// serde payload and hash it as JSON.
+    arrow: bool,
+}
+
+const GENERAL_CODEC_SPEC: CodecSpec = CodecSpec {
+    codec: CODEC,
+    schema_version: 2,
+    manifest_kind: "standing_runtime_materialized_output_manifest_v2",
+    page_kind: "standing_runtime_materialized_output_page_v2",
+    ipc_header: "velorix.materialized.page",
+    bag: false,
+    arrow: true,
+};
+
+const BAG_CODEC_SPEC: CodecSpec = CodecSpec {
+    codec: BAG_CODEC,
+    schema_version: 3,
+    manifest_kind: "standing_runtime_native_output_manifest_v3",
+    page_kind: "standing_runtime_native_output_page_v3",
+    ipc_header: "velorix.native.page",
+    bag: true,
+    arrow: true,
+};
+
+const LEGACY_CODEC_SPEC: CodecSpec = CodecSpec {
+    codec: LEGACY_CODEC,
+    schema_version: 2,
+    manifest_kind: "standing_runtime_materialized_output_manifest_v2",
+    page_kind: "standing_runtime_materialized_output_page_v2",
+    ipc_header: "",
+    bag: false,
+    arrow: false,
+};
+
+const BAG_LEGACY_CODEC_SPEC: CodecSpec = CodecSpec {
+    codec: BAG_LEGACY_CODEC,
+    schema_version: 2,
+    manifest_kind: "standing_runtime_native_output_manifest_v2",
+    page_kind: "standing_runtime_native_output_page_v2",
+    ipc_header: "",
+    bag: true,
+    arrow: false,
+};
+
+fn codec_spec(codec: &str) -> Option<&'static CodecSpec> {
+    match codec {
+        CODEC => Some(&GENERAL_CODEC_SPEC),
+        BAG_CODEC => Some(&BAG_CODEC_SPEC),
+        LEGACY_CODEC => Some(&LEGACY_CODEC_SPEC),
+        BAG_LEGACY_CODEC => Some(&BAG_LEGACY_CODEC_SPEC),
+        _ => None,
+    }
 }
 const PAGE_ROWS: usize = 512;
 // Reuse the API state-body byte budget for the compact index; a conservative
@@ -17,8 +95,11 @@ const SOURCE: &str = "standing_runtime_checkpoint_published_output";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeIndex {
-    family: String,
+struct PageIndex {
+    /// The bag family that owns this output. Absent for the general
+    /// materialized codec, whose pages carry no family binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    family: Option<String>,
     schema: RelationSchema,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     page_stats: Option<Vec<Vec<ColumnStats>>>,
@@ -34,8 +115,11 @@ struct ColumnStats {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeRows {
-    family: String,
+struct PageRows {
+    /// The bag family that owns this output. Absent for the general
+    /// materialized codec, whose pages carry no family binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    family: Option<String>,
     schema_fingerprint: String,
     checkpoint_content_hash: String,
     rows: DeltaBatch,
@@ -58,6 +142,17 @@ fn native_restore_family(family: &str) -> bool {
     matches!(family, "generic_set_ops_v1" | "typed_join_project_v1")
 }
 
+/// The families whose published output is a BAG. The runtime extracts the bag
+/// output for these families, so their checkpoints publish the bag codec and
+/// bind the family name. Every other admitted checkpoint publishes the general
+/// materialized pages, which carry no family binding.
+fn bag_publication_family(family: &str) -> bool {
+    matches!(
+        family,
+        "generic_set_ops_v1" | "typed_join_project_v1" | "ordered_window" | "single_key_sum_count"
+    )
+}
+
 /// The generic extraction rule shared with the runtime: a checkpoint whose
 /// payload binds `output_schema` and `published_output` publishes Arrow pages
 /// regardless of its family name. This keeps a valid generic family from
@@ -71,6 +166,15 @@ fn binds_generic_output(payload: &Value) -> bool {
             .is_some_and(|schema| !schema.is_null())
 }
 
+/// The general materialized output is published from the checkpoint's declared
+/// output schema. A checkpoint without a runtime kind of its own still
+/// publishes the general pages as long as it declares that schema.
+fn binds_output_schema(payload: &Value) -> bool {
+    payload
+        .get("output_schema")
+        .is_some_and(|schema| !schema.is_null())
+}
+
 pub(super) fn supports_checkpoint(checkpoint: &RuntimeCheckpoint) -> bool {
     let Some(payload) = checkpoint
         .state_payload
@@ -79,10 +183,12 @@ pub(super) fn supports_checkpoint(checkpoint: &RuntimeCheckpoint) -> bool {
     else {
         return false;
     };
-    let Some(family) = payload.get("runtime_kind").and_then(Value::as_str) else {
-        return false;
-    };
-    native_restore_family(family) || binds_generic_output(&payload)
+    match payload.get("runtime_kind").and_then(Value::as_str) {
+        Some(family) => native_restore_family(family) || binds_generic_output(&payload),
+        // A general materialized checkpoint declares only the output schema;
+        // it carries no runtime kind of its own.
+        None => binds_output_schema(&payload),
+    }
 }
 
 /// The generic families are served only from an authoritative checkpoint
@@ -101,24 +207,205 @@ pub(super) fn generic_checkpoint_family(checkpoint: &RuntimeCheckpoint) -> bool 
         .is_some_and(|family| !native_restore_family(&family))
 }
 
-fn checkpoint_index(checkpoint: &RuntimeCheckpoint) -> Result<NativeIndex, ApiError> {
+fn checkpoint_index(checkpoint: &RuntimeCheckpoint) -> Result<PageIndex, ApiError> {
     let payload = checkpoint.state_payload.as_ref().ok_or_else(invalid)?;
     let value: Value = serde_json::from_str(&payload.payload).map_err(ApiError::bad_request)?;
-    let family = value
-        .get("runtime_kind")
-        .and_then(Value::as_str)
-        .ok_or_else(invalid)?
-        .to_string();
-    if !native_restore_family(&family) && !binds_generic_output(&value) {
+    let family = value.get("runtime_kind").and_then(Value::as_str);
+    if let Some(family) = family {
+        if !native_restore_family(family) && !binds_generic_output(&value) {
+            return Err(invalid());
+        }
+    } else if !binds_output_schema(&value) {
+        // Without a runtime kind the checkpoint must still declare the output
+        // schema; anything else is not publishable.
         return Err(invalid());
     }
     let schema = serde_json::from_value(value.get("output_schema").cloned().ok_or_else(invalid)?)
         .map_err(ApiError::bad_request)?;
-    Ok(NativeIndex {
-        family,
+    Ok(PageIndex {
+        // Only the bag families bind a family. Every other admitted checkpoint
+        // publishes the general materialized pages, which carry no family.
+        family: family
+            .filter(|family| bag_publication_family(family))
+            .map(str::to_string),
         schema,
         page_stats: None,
     })
+}
+
+fn checkpoint_output_schema(checkpoint: &RuntimeCheckpoint) -> Result<RelationSchema, ApiError> {
+    let payload = checkpoint.state_payload.as_ref().ok_or_else(invalid)?;
+    let value: Value = serde_json::from_str(&payload.payload).map_err(ApiError::bad_request)?;
+    serde_json::from_value(value.get("output_schema").cloned().ok_or_else(invalid)?)
+        .map_err(ApiError::bad_request)
+}
+
+/// Charge one object request against the query policy budget.
+fn charge_request(policy: QueryPolicy, used: &mut usize) -> Result<(), ApiError> {
+    *used = used.checked_add(1).ok_or_else(invalid)?;
+    if policy.max_object_requests.is_some_and(|max| *used > max) {
+        return Err(ApiError::bad_request(
+            "materialized read exceeds object-request budget",
+        ));
+    }
+    Ok(())
+}
+
+/// Find the newest checkpoint of a view when no metadata store is configured.
+pub(super) async fn discover_checkpoint_head(
+    state: &ApiState,
+    identity: &StandingProgramIdentity,
+    view_id: &str,
+    policy: QueryPolicy,
+    requests: &mut usize,
+) -> Result<Option<(String, StandingRuntimeCheckpointKeyParts)>, ApiError> {
+    use futures::TryStreamExt;
+    let prefix = ObjectPath::from(format!(
+        "v1/standing-runtime-checkpoints/{}/{}/{view_id}/epochs",
+        identity.tenant_id, identity.program_id,
+    ));
+    let mut stream = state.store.list(Some(&prefix));
+    let mut latest: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
+    let mut entries = 0usize;
+    loop {
+        // Charge each stream poll conservatively; a provider may paginate LIST.
+        charge_request(policy, requests)?;
+        let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? else {
+            break;
+        };
+        entries = entries.checked_add(1).ok_or_else(invalid)?;
+        if entries > MAX_PAGES || meta.location.as_ref().len() > MAX_INDEX_BYTES {
+            return Err(invalid());
+        }
+        let path = meta.location.to_string();
+        if !path.ends_with(".checkpoint.json") {
+            continue;
+        }
+        let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(path.clone())
+            .map_err(ApiError::bad_request)?;
+        if parts.tenant_id != identity.tenant_id
+            || parts.program_id != identity.program_id
+            || parts.view_id != view_id
+        {
+            return Err(invalid());
+        }
+        if let Some((_, previous)) = &latest {
+            if parts.logical_epoch == previous.logical_epoch {
+                return Err(invalid());
+            }
+            if parts.logical_epoch < previous.logical_epoch {
+                continue;
+            }
+        }
+        latest = Some((path, parts));
+    }
+    Ok(latest)
+}
+
+/// Normalize only the checkpoint's materialized output using its admitted projection.
+pub(super) fn checkpoint_publication(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+    key: &ObjectKey,
+) -> Result<Option<StandingRuntimeOutputPublication>, ApiError> {
+    let Some(value) =
+        super::checkpoint_publication::standing_runtime_checkpoint_published_output(checkpoint)
+    else {
+        return Ok(None);
+    };
+    let payload: Value = serde_json::from_str(
+        &checkpoint
+            .state_payload
+            .as_ref()
+            .ok_or_else(invalid)?
+            .payload,
+    )
+    .map_err(ApiError::bad_request)?;
+    if payload.get("output_schema").is_none() {
+        // Historical checkpoint-only outputs have no declared public schema.
+        // Keep their existing reader rather than assigning an inferred page schema.
+        return Ok(None);
+    }
+    let schema = checkpoint_output_schema(checkpoint)?;
+    if schema.relation_id != view_id {
+        return Err(invalid());
+    }
+    let output: DeltaBatch = serde_json::from_value(value).map_err(ApiError::bad_request)?;
+    let aggregates =
+        super::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(checkpoint)?;
+    let canonical = output.net_rows().map_err(ApiError::bad_request)?;
+    let total = canonical.iter().try_fold(0usize, |n, row| {
+        let copies = usize::try_from(row.weight)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(invalid)?;
+        n.checked_add(copies).ok_or_else(invalid)
+    })?;
+    let mut normalized = Vec::new();
+    // Each normalization batch is bounded; the existing converter supplies aliases,
+    // aggregate values and composite keys exactly as the public runtime query does.
+    for row in canonical {
+        {
+            let copies = 1;
+            let mut part = row.clone();
+            part.weight = 1;
+            let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
+                &schema,
+                &DeltaBatch::from_records([part]),
+                ScopedViewId {
+                    tenant_id: checkpoint.identity.tenant_id.clone(),
+                    program_id: checkpoint.identity.program_id.clone(),
+                    view_id: view_id.into(),
+                },
+                checkpoint.logical_epoch,
+                SnapshotPageRequest {
+                    max_rows: Some(copies),
+                    ..Default::default()
+                },
+                aggregates.as_deref(),
+                checkpoint,
+            )
+            .map_err(ApiError::bad_request)?;
+            let mut converted = Vec::new();
+            for batch in page.batches {
+                for i in 0..batch.num_rows() {
+                    let mut value = serde_json::Map::new();
+                    for (column, array) in schema.columns.iter().zip(batch.columns()) {
+                        let mut scalar = arrow_value_to_json(array, i)?;
+                        if column.data_type == SqlDataType::Json && !scalar.is_null() {
+                            scalar = serde_json::from_str(scalar.as_str().ok_or_else(invalid)?)
+                                .map_err(ApiError::bad_request)?;
+                        }
+                        value.insert(column.name.clone(), scalar);
+                    }
+                    converted.push(velorix_core::delta::DeltaRecord::new(
+                        row.key.clone(),
+                        velorix_core::delta::DeltaValue::from_json(Value::Object(value)),
+                        row.weight,
+                    ));
+                }
+            }
+            if converted.len() != copies {
+                return Err(invalid());
+            }
+            normalized.extend(
+                DeltaBatch::from_records(converted)
+                    .net_rows()
+                    .map_err(ApiError::bad_request)?,
+            );
+        }
+    }
+    if total.div_ceil(PAGE_ROWS).max(1) > MAX_PAGES {
+        // The durable payload retains the exact BAG after validating every compact row.
+        return Ok(None);
+    }
+    publication(
+        checkpoint,
+        view_id,
+        key,
+        DeltaBatch::from_records(normalized),
+    )
+    .map(Some)
 }
 
 fn root_hash(record: &StandingRuntimeOutputManifestRecord) -> Result<String, ApiError> {
@@ -143,13 +430,15 @@ fn root_hash(record: &StandingRuntimeOutputManifestRecord) -> Result<String, Api
 }
 
 fn page_hash(record: &StandingRuntimeOutputPageRecord) -> Result<String, ApiError> {
-    if record.output_encoding == CODEC {
+    if codec_spec(&record.output_encoding).is_some_and(|spec| spec.arrow) {
         return ipc_hash(record, &compact_batch(record)?);
     }
     // Exclude the manifest root to avoid a circular root -> page -> root digest.
     // The root binds this page digest, and readers require the page's root equality.
+    // The codec is part of the tuple so the bag JSON codec and the general JSON
+    // codec never hash to the same digest.
     let bytes = serde_json::to_vec(&(
-        LEGACY_CODEC,
+        &record.output_encoding,
         record.schema_version,
         &record.record_kind,
         &record.tenant_id,
@@ -166,7 +455,6 @@ fn page_hash(record: &StandingRuntimeOutputPageRecord) -> Result<String, ApiErro
     Ok(stable_bytes_hash(&bytes))
 }
 
-const IPC_HEADER: &str = "velorix.native.page";
 const BAG_FIELDS: [&str; 3] = [
     "__velorix_key_json",
     "__velorix_value_json",
@@ -176,7 +464,7 @@ const BAG_FIELDS: [&str; 3] = [
 fn compact_batch(record: &StandingRuntimeOutputPageRecord) -> Result<RecordBatch, ApiError> {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    let payload: NativeRows =
+    let payload: PageRows =
         serde_json::from_value(record.published_output.clone()).map_err(ApiError::bad_request)?;
     let schema = payload.schema.as_ref().ok_or_else(invalid)?;
     if schema
@@ -192,9 +480,17 @@ fn compact_batch(record: &StandingRuntimeOutputPageRecord) -> Result<RecordBatch
         r.weight = 1;
         r
     }));
-    let batch = velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
-        schema, &single,
-    )
+    // The bag codec extracts columns from the key first, the general
+    // materialized codec from the value first.
+    let batch = if codec_spec(&record.output_encoding).is_some_and(|spec| spec.bag) {
+        velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
+            schema, &single,
+        )
+    } else {
+        velorix_runtime::materialized_view_runtime::materialized_canonical_output_batch(
+            schema, &single,
+        )
+    }
     .map_err(ApiError::bad_request)?;
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
     fields.extend(
@@ -229,6 +525,7 @@ fn ipc_bytes(
     _hashing: bool,
 ) -> Result<Vec<u8>, ApiError> {
     use arrow::datatypes::Schema;
+    let spec = codec_spec(&record.output_encoding).ok_or_else(invalid)?;
     let mut header = record.clone();
     header.published_output["rows"] =
         serde_json::to_value(DeltaBatch::default()).map_err(ApiError::internal)?;
@@ -236,7 +533,7 @@ fn ipc_bytes(
     header.output_content_hash.clear();
     header.page_content_hash.clear();
     let metadata = [(
-        IPC_HEADER.into(),
+        spec.ipc_header.into(),
         serde_json::to_string(&header).map_err(ApiError::internal)?,
     )]
     .into_iter()
@@ -268,7 +565,7 @@ fn ipc_hash(
 }
 
 pub(super) fn encode_page(record: &StandingRuntimeOutputPageRecord) -> Result<Vec<u8>, ApiError> {
-    if record.output_encoding == CODEC {
+    if codec_spec(&record.output_encoding).is_some_and(|spec| spec.arrow) {
         ipc_bytes(record, &compact_batch(record)?, false)
     } else {
         serde_json::to_vec(record).map_err(ApiError::internal)
@@ -281,17 +578,34 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
     validate_ipc_frames(bytes)?;
     let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(ApiError::bad_request)?;
+    // The IPC header identifies the codec family; read it before the record
+    // header so the expected record kind and schema version are known.
+    let ipc_header = reader
+        .schema()
+        .metadata()
+        .keys()
+        .find(|key| {
+            key.as_str() == GENERAL_CODEC_SPEC.ipc_header
+                || key.as_str() == BAG_CODEC_SPEC.ipc_header
+        })
+        .cloned()
+        .ok_or_else(invalid)?;
+    let spec = if ipc_header == GENERAL_CODEC_SPEC.ipc_header {
+        &GENERAL_CODEC_SPEC
+    } else {
+        &BAG_CODEC_SPEC
+    };
     let header = reader
         .schema()
         .metadata()
-        .get(IPC_HEADER)
+        .get(ipc_header.as_str())
         .cloned()
         .ok_or_else(invalid)?;
     let mut record: StandingRuntimeOutputPageRecord =
         serde_json::from_str(&header).map_err(ApiError::bad_request)?;
-    if record.output_encoding != CODEC
-        || record.schema_version != 3
-        || record.record_kind != "standing_runtime_native_output_page_v3"
+    if record.output_encoding != spec.codec
+        || record.schema_version != spec.schema_version
+        || record.record_kind != spec.page_kind
         || record.source_kind != SOURCE
         || !record.output_content_hash.is_empty()
         || !record.page_content_hash.is_empty()
@@ -310,7 +624,7 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
     {
         return Err(invalid());
     }
-    let mut payload: NativeRows =
+    let mut payload: PageRows =
         serde_json::from_value(record.published_output.clone()).map_err(ApiError::bad_request)?;
     if !payload.rows.records().is_empty() {
         return Err(invalid());
@@ -423,7 +737,7 @@ pub(super) fn decode_page(
     bytes: &[u8],
     codec: &str,
 ) -> Result<StandingRuntimeOutputPageRecord, ApiError> {
-    if codec == CODEC {
+    if codec_spec(codec).is_some_and(|spec| spec.arrow) {
         decode_ipc(bytes).map(|(record, _)| record)
     } else {
         serde_json::from_slice(bytes).map_err(ApiError::bad_request)
@@ -435,7 +749,7 @@ fn decode_query_page(
     manifest: &StandingRuntimeOutputManifestRecord,
     reference: &StandingRuntimeOutputPageRef,
 ) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>), ApiError> {
-    let (record, batch) = if reference.output_encoding == CODEC {
+    let (record, batch) = if codec_spec(&reference.output_encoding).is_some_and(|spec| spec.arrow) {
         let (r, b) = decode_ipc(bytes)?;
         (r, Some(b))
     } else {
@@ -497,10 +811,10 @@ async fn read_query_page_with_decoder(
     let path = ObjectPath::from(reference.page_key.clone());
     let fetch =
         || super::checkpoint_publication::read_object_bytes_bounded(state, &path, max_bytes);
-    let bytes = if let Some(cache) = &state.native_read_cache {
-        let key = super::native_read_cache::NativeReadCacheKey {
-            store_id: state.native_read_cache_store_id().into(),
-            namespace: state.native_read_cache_namespace().into(),
+    let bytes = if let Some(cache) = &state.materialized_read_cache {
+        let key = super::materialized_read_cache::MaterializedReadCacheKey {
+            store_id: state.materialized_read_cache_store_id().into(),
+            namespace: state.materialized_read_cache_namespace().into(),
             tenant_id: manifest.tenant_id.clone(),
             program_id: manifest.program_id.clone(),
             output_id: manifest.view_id.clone(),
@@ -525,7 +839,7 @@ async fn read_query_page_with_decoder(
 
 async fn read_query_metadata(
     state: &ApiState,
-    key: super::native_read_cache::NativeReadCacheKey,
+    key: super::materialized_read_cache::MaterializedReadCacheKey,
     max_bytes: Option<u64>,
     validator: impl Fn(&[u8]) -> Result<(), ApiError>,
 ) -> Result<Vec<u8>, ApiError> {
@@ -540,7 +854,7 @@ async fn read_query_metadata(
         }
         validator(bytes)
     };
-    if let Some(cache) = &state.native_read_cache {
+    if let Some(cache) = &state.materialized_read_cache {
         cache.read_through(key, fetch, validate).await
     } else {
         let bytes = fetch().await?;
@@ -736,6 +1050,13 @@ pub(super) fn publication(
     if index.schema.relation_id != view_id {
         return Err(invalid());
     }
+    // A bag checkpoint publishes bag pages; every other admitted checkpoint
+    // publishes the general materialized pages.
+    let spec = if index.family.is_some() {
+        &BAG_CODEC_SPEC
+    } else {
+        &GENERAL_CODEC_SPEC
+    };
     let canonical = output.net_rows().map_err(ApiError::bad_request)?;
     let total = canonical.iter().try_fold(0usize, |total, row| {
         let weight = usize::try_from(row.weight)
@@ -787,8 +1108,8 @@ pub(super) fn publication(
             .unwrap()
             .push(page_statistics(&index.schema, &rows)?);
         let mut page = StandingRuntimeOutputPageRecord {
-            schema_version: 3,
-            record_kind: "standing_runtime_native_output_page_v3".into(),
+            schema_version: spec.schema_version,
+            record_kind: spec.page_kind.into(),
             tenant_id: checkpoint.identity.tenant_id.clone(),
             program_id: checkpoint.identity.program_id.clone(),
             view_id: view_id.into(),
@@ -797,9 +1118,9 @@ pub(super) fn publication(
             page_index,
             page_content_hash: String::new(),
             row_count,
-            output_encoding: CODEC.into(),
+            output_encoding: spec.codec.into(),
             source_kind: SOURCE.into(),
-            published_output: serde_json::to_value(NativeRows {
+            published_output: serde_json::to_value(PageRows {
                 family: index.family.clone(),
                 schema_fingerprint: index.schema.schema_fingerprint.clone(),
                 checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
@@ -823,13 +1144,13 @@ pub(super) fn publication(
             page_key: key.as_str().into(),
             page_content_hash: page.page_content_hash.clone(),
             row_count,
-            output_encoding: CODEC.into(),
+            output_encoding: spec.codec.into(),
         });
         page_records.push((key, page));
     }
     let mut manifest = StandingRuntimeOutputManifestRecord {
-        schema_version: 3,
-        record_kind: "standing_runtime_native_output_manifest_v3".into(),
+        schema_version: spec.schema_version,
+        record_kind: spec.manifest_kind.into(),
         tenant_id: checkpoint.identity.tenant_id.clone(),
         program_id: checkpoint.identity.program_id.clone(),
         view_id: view_id.into(),
@@ -837,7 +1158,7 @@ pub(super) fn publication(
         logical_epoch: checkpoint.logical_epoch,
         checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
         output_content_hash: String::new(),
-        output_encoding: CODEC.into(),
+        output_encoding: spec.codec.into(),
         output_row_count: total,
         source_kind: SOURCE.into(),
         pages,
@@ -867,20 +1188,19 @@ pub(super) fn validate_manifest(
     key: &ObjectKey,
     manifest: &StandingRuntimeOutputManifestRecord,
 ) -> Result<(), ApiError> {
-    let index: NativeIndex =
+    let index: PageIndex =
         serde_json::from_value(manifest.published_output.clone()).map_err(ApiError::bad_request)?;
     let (_, parts) = ObjectKey::parse_standing_runtime_output_manifest(key.as_str())
         .map_err(ApiError::bad_request)?;
-    let (version, kind) = if manifest.output_encoding == CODEC {
-        (3, "standing_runtime_native_output_manifest_v3")
-    } else {
-        (2, "standing_runtime_native_output_manifest_v2")
-    };
-    if manifest.schema_version != version
-        || manifest.record_kind != kind
-        || !is_native_codec(&manifest.output_encoding)
+    let spec = codec_spec(&manifest.output_encoding).ok_or_else(invalid)?;
+    if manifest.schema_version != spec.schema_version
+        || manifest.record_kind != spec.manifest_kind
         || manifest.source_kind != SOURCE
-        || index.family.is_empty()
+        || index
+            .family
+            .as_deref()
+            .is_some_and(|family| family.is_empty())
+        || spec.bag != index.family.is_some()
         || index.schema.relation_id != manifest.view_id
         || index.schema.schema_fingerprint.is_empty()
         || parts.tenant_id != manifest.tenant_id
@@ -991,10 +1311,18 @@ pub(super) fn publication_legacy(
     output: DeltaBatch,
 ) -> Result<StandingRuntimeOutputPublication, ApiError> {
     let mut p = publication(checkpoint, view_id, checkpoint_key, output)?;
+    // The legacy publication mirrors the source codec: the general Arrow codec
+    // falls back to the general JSON codec, the bag Arrow codec to the bag JSON
+    // codec. The record kinds come from the same spec table so the legacy
+    // manifest keeps the identity of its source codec.
+    let legacy_spec = match p.manifest_record.output_encoding.as_str() {
+        codec if codec == BAG_CODEC => &BAG_LEGACY_CODEC_SPEC,
+        _ => &LEGACY_CODEC_SPEC,
+    };
     for (key, page) in &mut p.page_records {
-        page.schema_version = 2;
-        page.record_kind = "standing_runtime_native_output_page_v2".into();
-        page.output_encoding = LEGACY_CODEC.into();
+        page.schema_version = legacy_spec.schema_version;
+        page.record_kind = legacy_spec.page_kind.into();
+        page.output_encoding = legacy_spec.codec.into();
         page.published_output
             .as_object_mut()
             .ok_or_else(invalid)?
@@ -1012,11 +1340,11 @@ pub(super) fn publication_legacy(
         let reference = &mut p.manifest_record.pages[page.page_index as usize];
         reference.page_key = key.as_str().into();
         reference.page_content_hash = page.page_content_hash.clone();
-        reference.output_encoding = LEGACY_CODEC.into();
+        reference.output_encoding = legacy_spec.codec.into();
     }
-    p.manifest_record.schema_version = 2;
-    p.manifest_record.record_kind = "standing_runtime_native_output_manifest_v2".into();
-    p.manifest_record.output_encoding = LEGACY_CODEC.into();
+    p.manifest_record.schema_version = legacy_spec.schema_version;
+    p.manifest_record.record_kind = legacy_spec.manifest_kind.into();
+    p.manifest_record.output_encoding = legacy_spec.codec.into();
     p.manifest_record
         .published_output
         .as_object_mut()
@@ -1042,20 +1370,19 @@ pub(super) fn validate_page(
     key: &ObjectKey,
     page: &StandingRuntimeOutputPageRecord,
 ) -> Result<(), ApiError> {
-    let payload: NativeRows =
+    let payload: PageRows =
         serde_json::from_value(page.published_output.clone()).map_err(ApiError::bad_request)?;
     let (_, parts) = ObjectKey::parse_standing_runtime_output_page(key.as_str())
         .map_err(ApiError::bad_request)?;
-    let (version, kind) = if page.output_encoding == CODEC {
-        (3, "standing_runtime_native_output_page_v3")
-    } else {
-        (2, "standing_runtime_native_output_page_v2")
-    };
-    if page.schema_version != version
-        || page.record_kind != kind
-        || !is_native_codec(&page.output_encoding)
+    let spec = codec_spec(&page.output_encoding).ok_or_else(invalid)?;
+    if page.schema_version != spec.schema_version
+        || page.record_kind != spec.page_kind
         || page.source_kind != SOURCE
-        || payload.family.is_empty()
+        || payload
+            .family
+            .as_deref()
+            .is_some_and(|family| family.is_empty())
+        || spec.bag != payload.family.is_some()
         || payload.schema_fingerprint.is_empty()
         || parts.tenant_id != page.tenant_id
         || parts.program_id != page.program_id
@@ -1076,13 +1403,21 @@ pub(super) fn validate_page_binding(
     page: &StandingRuntimeOutputPageRecord,
 ) -> Result<DeltaBatch, ApiError> {
     let rows = validate_page_binding_metadata(manifest, page)?;
-    let index: NativeIndex =
+    let index: PageIndex =
         serde_json::from_value(manifest.published_output.clone()).map_err(ApiError::bad_request)?;
-    velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
-        &index.schema,
-        &rows,
-    )
-    .map_err(ApiError::bad_request)?;
+    if codec_spec(&page.output_encoding).is_some_and(|spec| spec.bag) {
+        velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
+            &index.schema,
+            &rows,
+        )
+        .map_err(ApiError::bad_request)?;
+    } else {
+        velorix_runtime::materialized_view_runtime::materialized_canonical_output_batch(
+            &index.schema,
+            &rows,
+        )
+        .map_err(ApiError::bad_request)?;
+    }
     Ok(rows)
 }
 
@@ -1090,20 +1425,24 @@ fn validate_page_binding_metadata(
     manifest: &StandingRuntimeOutputManifestRecord,
     page: &StandingRuntimeOutputPageRecord,
 ) -> Result<DeltaBatch, ApiError> {
-    let index: NativeIndex =
+    let index: PageIndex =
         serde_json::from_value(manifest.published_output.clone()).map_err(ApiError::bad_request)?;
-    let payload: NativeRows =
+    let payload: PageRows =
         serde_json::from_value(page.published_output.clone()).map_err(ApiError::bad_request)?;
+    // Only the Arrow codecs carry a decoded page root and the inlined schema;
+    // the JSON codecs keep the whole payload in the record and bind the root
+    // hash directly.
+    let arrow = codec_spec(&page.output_encoding).is_some_and(|spec| spec.arrow);
     if page.tenant_id != manifest.tenant_id
         || page.program_id != manifest.program_id
         || page.view_id != manifest.view_id
         || page.logical_epoch != manifest.logical_epoch
         || (page.output_content_hash != manifest.output_content_hash
-            && !(page.output_encoding == CODEC && page.output_content_hash.is_empty()))
+            && !(arrow && page.output_content_hash.is_empty()))
         || payload.family != index.family
         || payload.schema_fingerprint != index.schema.schema_fingerprint
         || payload.checkpoint_content_hash != manifest.checkpoint_content_hash
-        || (page.output_encoding == CODEC && payload.schema.as_ref() != Some(&index.schema))
+        || (arrow && payload.schema.as_ref() != Some(&index.schema))
     {
         return Err(invalid());
     }
@@ -1128,7 +1467,7 @@ pub(super) fn validate_checkpoint_binding(
         return Ok(());
     };
     let expected = checkpoint_index(checkpoint)?;
-    let actual: NativeIndex =
+    let actual: PageIndex =
         serde_json::from_value(manifest.published_output.clone()).map_err(ApiError::bad_request)?;
     if expected.family != actual.family || expected.schema != actual.schema {
         return Err(invalid());
@@ -1399,11 +1738,16 @@ async fn query_bound_selected_policy_at_pointer(
                 )
         })
     };
+    // The checkpoint record is one object request against the read budget.
+    // Charge it before the fetch so a restrictive policy is rejected before
+    // any output page is read.
+    let mut metadata_requests = 0usize;
+    charge_request(policy, &mut metadata_requests)?;
     let bytes = read_query_metadata(
         state,
-        super::native_read_cache::NativeReadCacheKey {
-            store_id: state.native_read_cache_store_id().into(),
-            namespace: state.native_read_cache_namespace().into(),
+        super::materialized_read_cache::MaterializedReadCacheKey {
+            store_id: state.materialized_read_cache_store_id().into(),
+            namespace: state.materialized_read_cache_namespace().into(),
             tenant_id: identity.tenant_id.clone(),
             program_id: identity.program_id.clone(),
             output_id: output_id.into(),
@@ -1449,17 +1793,38 @@ async fn query_bound_selected_policy_at_pointer(
                 ObjectKey::parse_standing_runtime_output_manifest(*key)
                     .is_ok_and(|(_, p)| p.view_id == output_id)
             });
-        let path = matching.next().ok_or_else(invalid)?;
+        // A checkpoint without a published output manifest is not a malformed
+        // page set: it is a checkpoint-only publication, which the explicit
+        // legacy reader serves from the checkpoint's own published output.
+        // The already-consumed metadata budget travels with the delegation so
+        // the legacy reader cannot re-spend the same allowance.
+        let Some(path) = matching.next() else {
+            return super::query_serving::legacy_materialized_page(
+                state,
+                view_id,
+                identity,
+                output_id,
+                schema,
+                request,
+                filter.is_some(),
+                policy,
+                metadata_bytes,
+                metadata_requests,
+            )
+            .await
+            .map(Some);
+        };
         if matching.next().is_some() {
             return Err(invalid());
         }
         let (key, parts) = ObjectKey::parse_standing_runtime_output_manifest(path)
             .map_err(ApiError::bad_request)?;
+        charge_request(policy, &mut metadata_requests)?;
         let bytes = read_query_metadata(
             state,
-            super::native_read_cache::NativeReadCacheKey {
-                store_id: state.native_read_cache_store_id().into(),
-                namespace: state.native_read_cache_namespace().into(),
+            super::materialized_read_cache::MaterializedReadCacheKey {
+                store_id: state.materialized_read_cache_store_id().into(),
+                namespace: state.materialized_read_cache_namespace().into(),
                 tenant_id: identity.tenant_id.clone(),
                 program_id: identity.program_id.clone(),
                 output_id: output_id.into(),
@@ -1487,8 +1852,21 @@ async fn query_bound_selected_policy_at_pointer(
         )?;
         manifest
     };
-    if !is_native_codec(&manifest.output_encoding) {
-        return Ok(None);
+    if !is_bag_codec(&manifest.output_encoding) {
+        return super::query_serving::legacy_materialized_page(
+            state,
+            view_id,
+            identity,
+            output_id,
+            schema,
+            request,
+            filter.is_some(),
+            policy,
+            metadata_bytes,
+            metadata_requests,
+        )
+        .await
+        .map(Some);
     } // Explicit legacy reader remains responsible for v1.
     if manifest.checkpoint_key != pointer.checkpoint_key
         || manifest.logical_epoch != pointer.logical_epoch
@@ -1499,7 +1877,7 @@ async fn query_bound_selected_policy_at_pointer(
     {
         return Err(invalid());
     }
-    let index: NativeIndex =
+    let index: PageIndex =
         serde_json::from_value(manifest.published_output.clone()).map_err(ApiError::bad_request)?;
     // The legacy families must match their registered plan. Any other family is
     // admitted only when the manifest still binds the checkpoint it was
@@ -1507,7 +1885,8 @@ async fn query_bound_selected_policy_at_pointer(
     if index.schema != *schema {
         return Err(invalid());
     }
-    if index.family != family && validate_checkpoint_binding(&manifest, &record.checkpoint).is_err()
+    if index.family.as_deref() != Some(family)
+        && validate_checkpoint_binding(&manifest, &record.checkpoint).is_err()
     {
         return Err(invalid());
     }
@@ -1641,7 +2020,7 @@ async fn query_bound_selected_policy_at_pointer(
                 read_query_page(state, &manifest, page_ref, budget).await?;
             {
                 scan_bytes = scan_bytes.checked_add(byte_count).ok_or_else(invalid)?;
-                let payload: NativeRows = serde_json::from_value(page.published_output.clone())
+                let payload: PageRows = serde_json::from_value(page.published_output.clone())
                     .map_err(ApiError::bad_request)?;
                 let expanded = payload.rows.records().iter().try_fold(0u64, |n, row| {
                     let bytes = serde_json::to_vec(row).map_err(ApiError::internal)?.len() as u64;
@@ -2535,7 +2914,7 @@ pub(crate) mod tests {
                 publication.manifest_record.published_output["family"],
                 json!(kind)
             );
-            let index: NativeIndex =
+            let index: PageIndex =
                 serde_json::from_value(publication.manifest_record.published_output.clone())
                     .unwrap();
             assert_eq!(index.schema, schema);
@@ -2926,7 +3305,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn native_query_page_decodes_once_per_validated_read() {
-        use super::super::native_read_cache::{NativeReadCache, NativeReadCacheConfig};
+        use super::super::materialized_read_cache::{
+            MaterializedReadCache, MaterializedReadCacheConfig,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (mut state, _, _, publication, _) =
             installed(DeltaBatch::from_records([row(json!(2.), 7)])).await;
@@ -2943,7 +3324,7 @@ pub(crate) mod tests {
         assert_eq!(calls.swap(0, Ordering::Relaxed), 1, "uncached read");
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            NativeReadCache::open(NativeReadCacheConfig {
+            MaterializedReadCache::open(MaterializedReadCacheConfig {
                 directory: directory.path().into(),
                 memory_bytes: 256 * 1024,
                 disk_bytes: 8 * 1024 * 1024,
@@ -2951,7 +3332,7 @@ pub(crate) mod tests {
             .await
             .unwrap(),
         );
-        state = state.with_native_read_cache(cache.clone());
+        state = state.with_materialized_read_cache(cache.clone());
         for label in ["cold cache", "warm cache"] {
             let (record, batch, _) =
                 read_query_page_with_decoder(&state, manifest, reference, None, decode)
@@ -2972,14 +3353,14 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn native_cached_pages_revalidate_bytes_and_keep_metadata_heads_fresh() {
-        use super::super::native_read_cache::{
-            NativeReadCache, NativeReadCacheConfig, NativeReadCacheKey,
+        use super::super::materialized_read_cache::{
+            MaterializedReadCache, MaterializedReadCacheConfig, MaterializedReadCacheKey,
         };
         let (mut state, checkpoint, schema, p, _) =
             installed(DeltaBatch::from_records([row(json!(2.), 600)])).await;
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            NativeReadCache::open(NativeReadCacheConfig {
+            MaterializedReadCache::open(MaterializedReadCacheConfig {
                 directory: directory.path().into(),
                 memory_bytes: 256 * 1024,
                 disk_bytes: 8 * 1024 * 1024,
@@ -2987,7 +3368,7 @@ pub(crate) mod tests {
             .await
             .unwrap(),
         );
-        state = state.with_native_read_cache(cache.clone());
+        state = state.with_materialized_read_cache(cache.clone());
         let counts = crate::tests::ObjectStoreAccessCounts::default();
         state.store = Arc::new(crate::tests::CountingObjectStore::new(
             state.store.clone(),
@@ -3078,9 +3459,9 @@ pub(crate) mod tests {
             "warm cache still charges source policy objects"
         );
         assert_eq!(counts.get_paths().len(), 0);
-        let cache_key = NativeReadCacheKey {
-            store_id: state.native_read_cache_store_id().into(),
-            namespace: state.native_read_cache_namespace().into(),
+        let cache_key = MaterializedReadCacheKey {
+            store_id: state.materialized_read_cache_store_id().into(),
+            namespace: state.materialized_read_cache_namespace().into(),
             tenant_id: p.manifest_record.tenant_id.clone(),
             program_id: p.manifest_record.program_id.clone(),
             output_id: schema.relation_id.clone(),
@@ -3520,7 +3901,7 @@ pub(crate) mod tests {
         p.manifest_record.pages[1].page_key = p.page_records[1].0.as_str().into();
         p.manifest_record.pages[1].page_content_hash =
             p.page_records[1].1.page_content_hash.clone();
-        let rows: NativeRows =
+        let rows: PageRows =
             serde_json::from_value(p.page_records[1].1.published_output.clone()).unwrap();
         p.manifest_record.published_output["page_stats"][1] =
             serde_json::to_value(page_statistics(&schema, &rows.rows).unwrap()).unwrap();

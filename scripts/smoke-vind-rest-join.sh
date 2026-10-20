@@ -171,44 +171,44 @@ if ! curl -fsS --max-time 5 "$VELORIX_API_URL/v1/openapi.json" -H "$VELORIX_API_
 fi
 
 curl_api() {
-  curl -H 'Accept: application/json' -fsS --max-time 15 "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
+  curl -H "Accept: application/json" -fsS --max-time 15 "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
 }
 
 curl_api_status() {
   local output_file="$1"
   shift
-  curl -H 'Accept: application/json' -sS --max-time 15 -o "$output_file" -w '%{http_code}' "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
+  curl -H "Accept: application/json" -sS --max-time 15 -o "$output_file" -w '%{http_code}' "$@" -H "$VELORIX_API_AUTH_HEADER" 2>/dev/null
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"
-records_relation_id="rest_join_records_${run_id}"
-items_relation_id="rest_join_items_${run_id}"
-view_id="rest_join_records_by_item_${run_id}"
+left_relation_id="rest_join_left_${run_id}"
+right_relation_id="rest_join_right_${run_id}"
+view_id="rest_join_left_right_${run_id}"
 relation_version="2026-05-24.v1"
-records_stream_id="${records_relation_id}_stream"
-items_stream_id="${items_relation_id}_stream"
+left_stream_id="${left_relation_id}_stream"
+right_stream_id="${right_relation_id}_stream"
 api_path="/rest-join/${run_id}"
 
 healthz_file="${output_dir}/healthz.json"
 readyz_file="${output_dir}/readyz.json"
-records_relation_request_file="${output_dir}/records-relation-request.json"
-items_relation_request_file="${output_dir}/items-relation-request.json"
-records_relation_file="${output_dir}/records-relation.json"
-items_relation_file="${output_dir}/items-relation.json"
+left_relation_request_file="${output_dir}/left-relation-request.json"
+right_relation_request_file="${output_dir}/right-relation-request.json"
+left_relation_file="${output_dir}/left-relation.json"
+right_relation_file="${output_dir}/right-relation.json"
 view_request_file="${output_dir}/join-view-request.json"
 view_file="${output_dir}/join-view.json"
 backfill_file="${output_dir}/join-backfill.json"
 relations_ingest_file="${output_dir}/relations-ingest.json"
-records_ingest_file="${output_dir}/records-ingest.json"
-items_ingest_file="${output_dir}/items-ingest.json"
+left_ingest_file="${output_dir}/left-ingest.json"
+right_ingest_file="${output_dir}/right-ingest.json"
 view_query_file="${output_dir}/join-view-query.json"
 
 python3 - \
-  "$records_relation_request_file" \
-  "$items_relation_request_file" \
+  "$left_relation_request_file" \
+  "$right_relation_request_file" \
   "$view_request_file" \
-  "$records_relation_id" \
-  "$items_relation_id" \
+  "$left_relation_id" \
+  "$right_relation_id" \
   "$view_id" \
   "$relation_version" \
   "$api_path" <<'PY'
@@ -217,11 +217,11 @@ import json
 import sys
 
 (
-    records_request_path,
-    items_request_path,
+    left_request_path,
+    right_request_path,
     view_request_path,
-    records_relation_id,
-    items_relation_id,
+    left_relation_id,
+    right_relation_id,
     view_id,
     relation_version,
     api_path,
@@ -285,48 +285,48 @@ def catalog(relation_schema):
     }
 
 
-records_schema = schema(
-    records_relation_id,
+left_schema = schema(
+    left_relation_id,
     [
-        column("key", "utf8", 0, "primary_key"),
-        column("value", "int64", 1, "metadata"),
+        column("key_col", "utf8", 0, "primary_key"),
+        column("value_col", "int64", 1, "metadata"),
         column("delta", "int64", 2, "weight"),
     ],
-    "key",
+    "key_col",
 )
-items_schema = schema(
-    items_relation_id,
+right_schema = schema(
+    right_relation_id,
     [
-        column("key", "utf8", 0, "primary_key"),
-        column("offset", "int64", 1, "value"),
-        column("label", "utf8", 2, "metadata"),
+        column("key_col", "utf8", 0, "primary_key"),
+        column("value_col", "int64", 1, "value"),
+        column("category", "utf8", 2, "metadata"),
         column("delta", "int64", 3, "weight"),
     ],
-    "key",
+    "key_col",
 )
 
 sql = (
-    "select d.key, sum(r.value) as total_value, "
-    "count(*) as record_count, min(r.value) as min_value, "
-    f"max(r.value) as max_value from {records_relation_id} r "
-    f"join {items_relation_id} d on r.key = d.key group by d.key"
+    "select r.key_col, sum(l.value_col) as total_value, "
+    "count(*) as row_count, min(l.value_col) as min_value, "
+    f"max(l.value_col) as max_value from {left_relation_id} l "
+    f"join {right_relation_id} r on l.key_col = r.key_col group by r.key_col"
 )
 
 files = {
-    records_request_path: {
-        "catalog": catalog(records_schema),
+    left_request_path: {
+        "catalog": catalog(left_schema),
         "default_orders_sum_count": False,
     },
-    items_request_path: {
-        "catalog": catalog(items_schema),
+    right_request_path: {
+        "catalog": catalog(right_schema),
         "default_orders_sum_count": False,
     },
     view_request_path: {
         "view_id": view_id,
         "urlPath": api_path,
         "inputRelationRefs": [
-            {"relation_id": records_relation_id, "relation_version": relation_version},
-            {"relation_id": items_relation_id, "relation_version": relation_version},
+            {"relation_id": left_relation_id, "relation_version": relation_version},
+            {"relation_id": right_relation_id, "relation_version": relation_version},
         ],
         "sql": sql,
         "description": "standalone REST smoke for a two-relation materialized join via multi-relation relation ingest",
@@ -351,28 +351,28 @@ if [ "$authoritative_relation_ingest" = "1" ] && ! jq -e '
   exit 1
 fi
 
-records_relation_status="$(curl_api_status "$records_relation_file" \
+left_relation_status="$(curl_api_status "$left_relation_file" \
   -X POST "$VELORIX_API_URL/v1/relations" \
   -H 'content-type: application/json' \
-  -d @"$records_relation_request_file")"
-case "$records_relation_status" in
+  -d @"$left_relation_request_file")"
+case "$left_relation_status" in
   200 | 201) ;;
   *)
-    echo "expected records relation creation to return 200 or 201; got ${records_relation_status}" >&2
-    echo "records relation creation failed; raw response remains in private evidence" >&2
+    echo "expected left relation creation to return 200 or 201; got ${left_relation_status}" >&2
+    echo "left relation creation failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
 
-items_relation_status="$(curl_api_status "$items_relation_file" \
+right_relation_status="$(curl_api_status "$right_relation_file" \
   -X POST "$VELORIX_API_URL/v1/relations" \
   -H 'content-type: application/json' \
-  -d @"$items_relation_request_file")"
-case "$items_relation_status" in
+  -d @"$right_relation_request_file")"
+case "$right_relation_status" in
   200 | 201) ;;
   *)
-    echo "expected items relation creation to return 200 or 201; got ${items_relation_status}" >&2
-    echo "items relation creation failed; raw response remains in private evidence" >&2
+    echo "expected right relation creation to return 200 or 201; got ${right_relation_status}" >&2
+    echo "right relation creation failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
@@ -388,15 +388,15 @@ case "$view_status" in
       "$summary_file" \
       "$run_id" \
       "$VELORIX_API_URL" \
-      "$records_relation_id" \
-      "$items_relation_id" \
+      "$left_relation_id" \
+      "$right_relation_id" \
       "$relation_version" \
       "$view_id" \
       "$api_path" \
       "$view_status" \
       "$authoritative_relation_ingest" \
-      "$records_relation_file" \
-      "$items_relation_file" \
+      "$left_relation_file" \
+      "$right_relation_file" \
       "$view_file" \
       "$view_request_file" <<'PY'
 import json
@@ -407,15 +407,15 @@ from datetime import datetime, timezone
     summary_path,
     run_id,
     api_url,
-    records_relation_id,
-    items_relation_id,
+    left_relation_id,
+    right_relation_id,
     relation_version,
     view_id,
     api_path,
     view_status,
     authoritative_relation_ingest,
-    records_relation_path,
-    items_relation_path,
+    left_relation_path,
+    right_relation_path,
     view_path,
     view_request_path,
 ) = sys.argv[1:]
@@ -435,7 +435,7 @@ payload = {
     "relation_ingest_mode": "authoritative-single-batch" if authoritative_relation_ingest == "1" else "legacy-multi-relation",
     "api_url": api_url,
     "run_id": run_id,
-    "relation_ids": [records_relation_id, items_relation_id],
+    "relation_ids": [left_relation_id, right_relation_id],
     "relation_version": relation_version,
     "view_id": view_id,
     "promoted_api_path": api_path,
@@ -445,8 +445,8 @@ payload = {
     "view_response": view_response,
     "trusted_for_product_complete": False,
     "evidence_files": {
-        "records_relation": records_relation_path,
-        "items_relation": items_relation_path,
+        "left_relation": left_relation_path,
+        "right_relation": right_relation_path,
         "view": view_path,
     },
 }
@@ -462,33 +462,33 @@ PY
     ;;
 esac
 
-python3 - "$output_dir/records-ingest-request.json" "$output_dir/items-ingest-request.json" "$output_dir/relations-ingest-request.json" "$records_relation_id" "$items_relation_id" "$relation_version" "$records_stream_id" "$items_stream_id" <<'PY'
+python3 - "$output_dir/left-ingest-request.json" "$output_dir/right-ingest-request.json" "$output_dir/relations-ingest-request.json" "$left_relation_id" "$right_relation_id" "$relation_version" "$left_stream_id" "$right_stream_id" <<'PY'
 import json
 import sys
 
-records_path, items_path, relations_path, records_relation_id, items_relation_id, relation_version, records_stream_id, items_stream_id = sys.argv[1:]
+left_path, right_path, relations_path, left_relation_id, right_relation_id, relation_version, left_stream_id, right_stream_id = sys.argv[1:]
 payloads = {
-    records_path: {
-        "relation_id": records_relation_id,
+    left_path: {
+        "relation_id": left_relation_id,
         "relation_version": relation_version,
-        "stream_id": records_stream_id,
+        "stream_id": left_stream_id,
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"key": "item-a", "value": 42, "delta": 1},
-            {"key": "item-a", "value": 40, "delta": 1},
-            {"key": "item-b", "value": 15, "delta": 1},
+            {"key_col": "key-a", "value_col": 42, "delta": 1},
+            {"key_col": "key-a", "value_col": 40, "delta": 1},
+            {"key_col": "key-b", "value_col": 15, "delta": 1},
         ],
     },
-    items_path: {
-        "relation_id": items_relation_id,
+    right_path: {
+        "relation_id": right_relation_id,
         "relation_version": relation_version,
-        "stream_id": items_stream_id,
+        "stream_id": right_stream_id,
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"key": "item-a", "offset": -2, "label": "north", "delta": 1},
-            {"key": "item-b", "offset": 3, "label": "south", "delta": 1},
+            {"key_col": "key-a", "value_col": -2, "category": "group-a", "delta": 1},
+            {"key_col": "key-b", "value_col": 3, "category": "group-b", "delta": 1},
         ],
     },
 }
@@ -503,28 +503,28 @@ with open(relations_path, "w", encoding="utf-8") as f:
 PY
 
 if [ "$authoritative_relation_ingest" = "1" ]; then
-  curl_api -X POST "$VELORIX_API_URL/v1/relations/${records_relation_id}/ingest" \
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/${left_relation_id}/ingest" \
     -H 'content-type: application/json' \
-    -d @"$output_dir/records-ingest-request.json" \
-    >"$records_ingest_file"
-  curl_api -X POST "$VELORIX_API_URL/v1/relations/${items_relation_id}/ingest" \
+    -d @"$output_dir/left-ingest-request.json" \
+    >"$left_ingest_file"
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/${right_relation_id}/ingest" \
     -H 'content-type: application/json' \
-    -d @"$output_dir/items-ingest-request.json" \
-    >"$items_ingest_file"
-  python3 - "$relations_ingest_file" "$records_ingest_file" "$items_ingest_file" <<'PY'
+    -d @"$output_dir/right-ingest-request.json" \
+    >"$right_ingest_file"
+  python3 - "$relations_ingest_file" "$left_ingest_file" "$right_ingest_file" <<'PY'
 import json
 import sys
 
-output_path, records_path, items_path = sys.argv[1:]
-with open(records_path, "r", encoding="utf-8") as f:
-    records = json.load(f)
-with open(items_path, "r", encoding="utf-8") as f:
-    items = json.load(f)
+output_path, left_path, right_path = sys.argv[1:]
+with open(left_path, "r", encoding="utf-8") as f:
+    left = json.load(f)
+with open(right_path, "r", encoding="utf-8") as f:
+    right = json.load(f)
 with open(output_path, "w", encoding="utf-8") as f:
     json.dump(
         {
             "mode": "authoritative-single-batch",
-            "batches": [records, items],
+            "batches": [left, right],
         },
         f,
         indent=2,
@@ -565,16 +565,16 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     body = json.load(f)
 
-rows = {row.get("key"): row for row in body.get("rows") or []}
-item_a = rows.get("item-a") or {}
-item_b = rows.get("item-b") or {}
-if item_a.get("total_value") != 82 or item_a.get("record_count") != 2:
+rows = {row.get("key_col"): row for row in body.get("rows") or []}
+key_a = rows.get("key-a") or {}
+key_b = rows.get("key-b") or {}
+if key_a.get("total_value") != 82 or key_a.get("row_count") != 2:
     raise SystemExit(1)
-if item_a.get("min_value") != 40 or item_a.get("max_value") != 42:
+if key_a.get("min_value") != 40 or key_a.get("max_value") != 42:
     raise SystemExit(1)
-if item_b.get("total_value") != 15 or item_b.get("record_count") != 1:
+if key_b.get("total_value") != 15 or key_b.get("row_count") != 1:
     raise SystemExit(1)
-if item_b.get("min_value") != 15 or item_b.get("max_value") != 15:
+if key_b.get("min_value") != 15 or key_b.get("max_value") != 15:
     raise SystemExit(1)
 PY
   then
@@ -591,14 +591,14 @@ python3 - \
   "$summary_file" \
   "$run_id" \
   "$VELORIX_API_URL" \
-  "$records_relation_id" \
-  "$items_relation_id" \
+  "$left_relation_id" \
+  "$right_relation_id" \
   "$relation_version" \
   "$view_id" \
   "$api_path" \
   "$authoritative_relation_ingest" \
-  "$records_relation_file" \
-  "$items_relation_file" \
+  "$left_relation_file" \
+  "$right_relation_file" \
   "$view_file" \
   "$relations_ingest_file" \
   "$view_query_file" \
@@ -611,14 +611,14 @@ from datetime import datetime, timezone
     summary_path,
     run_id,
     api_url,
-    records_relation_id,
-    items_relation_id,
+    left_relation_id,
+    right_relation_id,
     relation_version,
     view_id,
     api_path,
     authoritative_relation_ingest,
-    records_relation_path,
-    items_relation_path,
+    left_relation_path,
+    right_relation_path,
     view_path,
     relations_ingest_path,
     query_path,
@@ -633,7 +633,7 @@ def read_json(path):
 
 view_request = read_json(view_request_path)
 query = read_json(query_path)
-rows = {row.get("key"): row for row in query.get("rows") or []}
+rows = {row.get("key_col"): row for row in query.get("rows") or []}
 payload = {
     "schema_version": 1,
     "evidence_kind": "velorix_join_rest_api_smoke",
@@ -642,7 +642,7 @@ payload = {
     "run_id": run_id,
     "api_url": api_url,
     "relation_ingest_mode": "authoritative-single-batch" if authoritative_relation_ingest == "1" else "legacy-multi-relation",
-    "relation_ids": [records_relation_id, items_relation_id],
+    "relation_ids": [left_relation_id, right_relation_id],
     "relation_version": relation_version,
     "view_id": view_id,
     "promoted_api_path": api_path,
@@ -650,13 +650,13 @@ payload = {
     "join_frontier_path": "/v1/relations/{relation_id}/ingest" if authoritative_relation_ingest == "1" else "/v1/relations/ingest",
     "join_frontier_contract": "sequential_relation_ingest_frontier_vector",
     "join_rows_verified": {
-        "item-a": rows["item-a"],
-        "item-b": rows["item-b"],
+        "key-a": rows["key-a"],
+        "key-b": rows["key-b"],
     },
     "trusted_for_product_complete": False,
     "evidence_files": {
-        "records_relation": records_relation_path,
-        "items_relation": items_relation_path,
+        "left_relation": left_relation_path,
+        "right_relation": right_relation_path,
         "view": view_path,
         "relations_ingest_frontier_vector": relations_ingest_path,
         "view_query": query_path,
@@ -672,5 +672,5 @@ cat <<EOF
 REST join smoke passed
 identifier_redaction=enabled
 evidence_public=${summary_public_file}
-join_rows_verified=item-a,item-b
+join_rows_verified=key-a,key-b
 EOF

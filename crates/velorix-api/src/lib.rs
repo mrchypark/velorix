@@ -166,8 +166,8 @@ mod demand_publication;
 mod demand_published;
 mod demand_source;
 mod ingest_epoch;
-mod native_output_pages;
-pub mod native_read_cache;
+mod materialized_output_pages;
+pub mod materialized_read_cache;
 mod openapi;
 mod owner_lease;
 mod query_response;
@@ -204,8 +204,10 @@ fn validate_native_family_spec_config(path: Option<&std::ffi::OsStr>) -> anyhow:
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn ObjectStore>,
-    native_read_cache: Option<Arc<native_read_cache::NativeReadCache>>,
-    native_read_cache_store_id: String,
+    materialized_read_cache: Option<Arc<materialized_read_cache::MaterializedReadCache>>,
+    materialized_read_cache_hit_accountant:
+        Option<Arc<dyn Fn(&str, u64) -> Result<(), ApiError> + Send + Sync>>,
+    materialized_read_cache_store_id: String,
     capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
     ingest_writer: Arc<DeployedIngestWriterRuntime<ObjectStoreAuthorityRef>>,
     meta_store: Option<Arc<dyn MetaStore>>,
@@ -1062,8 +1064,9 @@ impl ApiState {
 
         let state = Self {
             store,
-            native_read_cache: None,
-            native_read_cache_store_id: components.authority().store_id.clone(),
+            materialized_read_cache: None,
+            materialized_read_cache_hit_accountant: None,
+            materialized_read_cache_store_id: components.authority().store_id.clone(),
             capabilities,
             ingest_writer: Arc::new(ingest_writer),
             meta_store: None,
@@ -1108,19 +1111,19 @@ impl ApiState {
         Ok(state)
     }
 
-    pub fn with_native_read_cache(
+    pub fn with_materialized_read_cache(
         mut self,
-        cache: Arc<native_read_cache::NativeReadCache>,
+        cache: Arc<materialized_read_cache::MaterializedReadCache>,
     ) -> Self {
-        self.native_read_cache = Some(cache);
+        self.materialized_read_cache = Some(cache);
         self
     }
 
-    pub fn native_read_cache_store_id(&self) -> &str {
-        &self.native_read_cache_store_id
+    pub fn materialized_read_cache_store_id(&self) -> &str {
+        &self.materialized_read_cache_store_id
     }
 
-    pub fn native_read_cache_namespace(&self) -> &str {
+    pub fn materialized_read_cache_namespace(&self) -> &str {
         &self.ingest_writer.authority().namespace
     }
 
@@ -2114,20 +2117,6 @@ pub async fn run_from_env() -> anyhow::Result<()> {
                 16 * 1024 * 1024,
             )?,
         )?;
-    if let Some(cache_config) = config.native_read_cache {
-        state.native_read_cache_store_id = stable_bytes_hash(&serde_json::to_vec(&(
-            &config.endpoint,
-            &config.bucket,
-            &config.prefix,
-            &config.authority_store_id,
-        ))?);
-        match native_read_cache::NativeReadCache::open(cache_config).await {
-            Ok(cache) => state = state.with_native_read_cache(Arc::new(cache)),
-            Err(error) => {
-                eprintln!("native read cache unavailable; using authoritative reads: {error}")
-            }
-        }
-    }
     if let Some(token) = config.api_bearer_token {
         state = state
             .with_api_bearer_token(token)
@@ -2157,12 +2146,26 @@ pub async fn run_from_env() -> anyhow::Result<()> {
             config.standing_runtime_owner_ttl_ms,
         )?;
     }
-    state
-        .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
-        .await
-        .map_err(|error| anyhow!(error.to_string()))?;
-    let native_read_cache = state.native_read_cache.clone();
+    state.materialized_read_cache_store_id = stable_bytes_hash(&serde_json::to_vec(&(
+        &config.endpoint,
+        &config.bucket,
+        &config.prefix,
+        &config.authority_store_id,
+    ))?);
+    if let Some(cache_config) = config.materialized_read_cache {
+        match materialized_read_cache::MaterializedReadCache::open(cache_config).await {
+            Ok(cache) => state = state.with_materialized_read_cache(Arc::new(cache)),
+            Err(error) => {
+                eprintln!("materialized read cache unavailable; using authoritative reads: {error}")
+            }
+        }
+    }
+    let materialized_read_cache = state.materialized_read_cache.clone();
     let serve_result = async {
+        state
+            .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
         let listener = tokio::net::TcpListener::bind(config.bind).await?;
         let app = app(state);
         let tls = match config.tls {
@@ -2214,9 +2217,9 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         result
     }
     .await;
-    if let Some(cache) = native_read_cache {
+    if let Some(cache) = materialized_read_cache {
         if let Err(error) = cache.close().await {
-            eprintln!("native read cache close failed: {error}");
+            eprintln!("materialized read cache close failed: {error}");
         }
     }
     serve_result
@@ -3672,9 +3675,9 @@ fn arrow_data_type_from_sql_data_type(data_type: &SqlDataType) -> Result<DataTyp
         SqlDataType::Binary { .. } | SqlDataType::Varbinary => Ok(DataType::Binary),
         SqlDataType::Date => Ok(DataType::Date32),
         SqlDataType::Time => Ok(DataType::Time64(TimeUnit::Nanosecond)),
-        SqlDataType::Timestamp { .. } => Ok(DataType::Timestamp(
+        SqlDataType::Timestamp { timezone } => Ok(DataType::Timestamp(
             arrow::datatypes::TimeUnit::Nanosecond,
-            None,
+            timezone.clone().map(Into::into),
         )),
         SqlDataType::Interval { .. } => Ok(DataType::Utf8),
         SqlDataType::Array { element_type } => Ok(DataType::List(Arc::new(Field::new(
@@ -8651,7 +8654,7 @@ impl IntoResponse for ApiError {
 #[derive(Clone, Debug)]
 struct ApiConfig {
     bind: SocketAddr,
-    native_read_cache: Option<native_read_cache::NativeReadCacheConfig>,
+    materialized_read_cache: Option<materialized_read_cache::MaterializedReadCacheConfig>,
     tls: Option<ApiTlsConfig>,
     endpoint: String,
     access_key_id: String,
@@ -8721,24 +8724,25 @@ impl ApiConfig {
             std::env::var("VELORIX_STATE_PATH").unwrap_or_else(|_| "v1/state/slatedb".to_string());
         let operator_id =
             std::env::var("VELORIX_OPERATOR_ID").unwrap_or_else(|_| "velorix-api".to_string());
-        let native_read_cache_directory = std::env::var("VELORIX_NATIVE_READ_CACHE_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::temp_dir()
-                    .join("velorix-native-read-cache")
-                    .join(stable_bytes_hash(operator_id.as_bytes()))
-            });
-        let native_read_cache = if native_read_cache_directory.as_os_str().is_empty() {
+        let materialized_read_cache_directory =
+            std::env::var("VELORIX_MATERIALIZED_READ_CACHE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::env::temp_dir()
+                        .join("velorix-materialized-read-cache")
+                        .join(stable_bytes_hash(operator_id.as_bytes()))
+                });
+        let materialized_read_cache = if materialized_read_cache_directory.as_os_str().is_empty() {
             None
         } else {
-            let cache = native_read_cache::NativeReadCacheConfig {
-                directory: native_read_cache_directory,
+            let cache = materialized_read_cache::MaterializedReadCacheConfig {
+                directory: materialized_read_cache_directory,
                 memory_bytes: parse_positive_usize_env(
-                    "VELORIX_NATIVE_READ_CACHE_MEMORY_BYTES",
+                    "VELORIX_MATERIALIZED_READ_CACHE_MEMORY_BYTES",
                     64 * 1024 * 1024,
                 )?,
                 disk_bytes: parse_positive_usize_env(
-                    "VELORIX_NATIVE_READ_CACHE_DISK_BYTES",
+                    "VELORIX_MATERIALIZED_READ_CACHE_DISK_BYTES",
                     512 * 1024 * 1024,
                 )?,
             };
@@ -8815,7 +8819,7 @@ impl ApiConfig {
         )?;
         Ok(Self {
             bind,
-            native_read_cache,
+            materialized_read_cache,
             tls,
             endpoint,
             access_key_id,
