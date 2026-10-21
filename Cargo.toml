@@ -39,7 +39,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.11"
 sqlparser = "0.63.0"
 ring = "0.17"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rcgen = "0.14"
 slatedb = { version = "=0.16.0", default-features = false }
