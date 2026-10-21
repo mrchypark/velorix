@@ -653,7 +653,7 @@ impl StandingProgramRuntime for SetOpsRuntime {
         })
     }
     fn checkpoint(&self) -> Result<RuntimeCheckpoint, StandingProgramRuntimeError> {
-        let payload = self.limits.checkpoint_json(&CheckpointRef {
+        let payload = self.limits.checkpoint_arrow(&CheckpointRef {
             schema_version: 1,
             runtime_kind: RUNTIME_KIND,
             catalogs: &self.catalogs,
@@ -714,8 +714,8 @@ impl SetOpsRuntime {
             .as_ref()
             .ok_or_else(invalid_checkpoint)?;
         limits.validate_checkpoint(&state.payload)?;
-        let payload: Checkpoint =
-            serde_json::from_str(&state.payload).map_err(|_| invalid_checkpoint())?;
+        let payload: Checkpoint = velorix_core::arrow_state::from_state(&state.payload)
+            .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != 1 || payload.runtime_kind != RUNTIME_KIND {
             return Err(invalid_checkpoint());
         }
@@ -1152,7 +1152,7 @@ mod tests {
                     .collect(),
                 output: runtime.materialized_delta(),
             };
-            let expected = runtime.limits.checkpoint_json(&owned).unwrap();
+            let expected = runtime.limits.checkpoint_arrow(&owned).unwrap();
             // Restore's moved keys must match the old re-encoding path,
             // including duplicate UNION output and canonical row order.
             for (index, source) in owned.sources.iter().enumerate() {
@@ -1301,9 +1301,9 @@ mod tests {
         ] {
             let mut checkpoint = runtime.checkpoint().unwrap();
             let state = checkpoint.state_payload.as_mut().unwrap();
-            let mut payload: Value = serde_json::from_str(&state.payload).unwrap();
+            let mut payload: Value = velorix_core::arrow_state::from_state(&state.payload).unwrap();
             payload["runtime_kind"] = Value::from(kind);
-            state.payload = serde_json::to_string(&payload).unwrap();
+            state.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
             checkpoint.state_root.content_hash = stable_bytes_hash(state.payload.as_bytes());
             let error = restore_standing_runtime(checkpoint.clone()).err().unwrap();
             assert!(error.contains("unsupported legacy specialized runtime checkpoint"));

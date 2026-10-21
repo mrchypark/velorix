@@ -1,83 +1,93 @@
-# Checkpoint state: Arrow IPC with ZSTD 3
+# Runtime and durable checkpoint state: Arrow IPC with ZSTD 3
 
-Runtime state bodies have one durable format: `velorix-checkpoint-arrow-zstd-v1`.
-Their object keys end in `.state-payload.arrow`. There is no JSON body reader,
-JSON body writer, or fallback to a legacy inline state body. Checkpoint
-descriptors (`.checkpoint.json`) and fragment manifests remain small JSON
-metadata objects; they hold references and commitments, not the retained state.
+Runtime snapshots and durable state bodies use `velorix-runtime-arrow-v2`.
+`RuntimeCheckpointStatePayload.payload` and retained correction-state objects
+carry the shared `ArrowState` type, not a JSON string. Every runtime family uses
+the same Serde-to-Arrow representation. Snapshot creation, restore and cold
+window hydration do not serialize or parse JSON text.
 
-## General state representation
+Primary object keys end in `.state-payload.arrow`; retained state keys end in
+`.arrow`. There is no JSON state-body reader or writer. Checkpoint descriptors
+and fragment manifests remain JSON metadata containing references and
+commitments, with no embedded state body.
 
-The codec uses the same ordered tree for every runtime family and relation
-schema. One Arrow record batch contains these columns:
+## General representation
+
+A preorder tree occupies one Arrow record batch:
 
 | Column | Arrow type | Meaning |
 | --- | --- | --- |
-| `kind` | UInt8 | null, boolean, signed integer, unsigned integer, float, string, array, object |
-| `name` | nullable Utf8 | Object member name; null for array elements and the root |
-| `children` | UInt32 | Number of immediate children in preorder |
+| `kind` | UInt8 | null, boolean, signed/unsigned integer, float, string, sequence, map, bytes |
+| `children` | UInt32 | Number of immediate children; map children alternate key/value |
 | `boolean` | nullable Boolean | Boolean value |
-| `signed` | nullable Int64 | Signed integer value |
-| `unsigned` | nullable UInt64 | Unsigned integer value |
+| `signed` | nullable Int64 | Signed integer |
+| `unsigned` | nullable UInt64 | Unsigned integer |
 | `float` | nullable Float64 | Finite floating-point value |
-| `text` | nullable Utf8 | String value |
+| `text` | nullable Utf8 | String value, including map keys |
+| `binary` | nullable Binary | Explicit bytes, nested Arrow snapshots, or 16-byte i128/u128 scalars |
 
-The state is not stored in an opaque JSON or binary payload column. Object
-member order and array order are preserved. Integer range, nulls, Unicode and
-floating-point round trips retain the runtime's existing state commitment.
-The writer checks exact reconstruction before publication and rejects a state
-whose representation would change. The IPC schema metadata binds the tenant,
-program, view, epoch, runtime codec, logical state byte count and state hash.
-IPC buffer compression is explicitly ZSTD level 3.
+The body is typed state, not an opaque JSON blob. Maps have deterministic key
+order; sequences retain order. Signed and unsigned 64-bit and 128-bit limits, Unicode,
+nulls and floating-point bits (including negative zero) survive round trips.
+A bounded Serde serializer builds typed values before column construction;
+it charges nodes and strings before allocating their contents. Restore reads
+Arrow arrays through a direct Serde deserializer without constructing a second
+complete value tree. Enums, numeric map keys and nested snapshots use this same
+path. Existing row scalar types and JSON-valued SQL columns retain their own
+semantics; this does not change public row formats.
 
-Retained correction-state archives use the same typed tree and compression,
-with metadata bound to their object key, logical epoch, window key and state
-hash. Their keys also end in `.arrow`; the late-data hydration path no longer
-reads raw JSON archives. The runtime additionally verifies its identity binding
-inside the restored archive. Small states carry IPC schema overhead, so this
-format does not guarantee fewer bytes for every individual object.
+`ArrowState` shares its decoded arrays, subtree boundaries and encoded IPC bytes
+through `Arc`. Cloning a checkpoint does not clone its entire body. Top-level
+field lookup skips whole subtrees; runtime selection, schema extraction and
+output-layout inspection do not deserialize retained accumulators.
 
-The current runtime snapshot interface still produces a JSON string in memory.
-The storage boundary parses it once into typed Arrow columns, and recovery
-reconstructs that string for the runtime restore interface. This changes the
-durable body format; it does not yet eliminate JSON serialization inside every
-runtime implementation.
+IPC compression is explicitly ZSTD level 3. The state commitment hashes the
+canonical runtime IPC bytes. Storage binds tenant, program, view, epoch, codec,
+expanded state size and state hash in schema metadata. Retained-state envelopes
+bind object key, window key, epoch and hash. Adding/removing this envelope only
+rewrites the schema message: compressed record buffers are copied verbatim,
+not recompressed. Recovery strips the envelope before checking the runtime
+commitment; the runtime additionally validates state identity and semantics.
 
 ## Bounds, fragments and cache
 
-The logical state byte limit applies before encoding and after recovery.
-Readers validate IPC framing, row counts, compressed-buffer expansion lengths,
-tree depth, column types, null layouts and output length. These checks run
-before unbounded Arrow decompression or reconstructed-state allocation.
-The runtime state hash is checked before restoration, together with the object
-key and checkpoint descriptor identity. Extra batches and trailing bytes fail
-closed. Publication remains deterministic and create-only.
+State byte budgets charge 48 bytes per typed node plus string/binary bytes,
+independently of compression ratio. This is a conservative logical accounting
+unit, not an exact process-RSS measurement. Readers bound encoded object size,
+IPC frames, row counts, declared decompression sizes, tree depth, column types
+and null layouts before restoring runtime objects. Extra batches, dictionaries,
+truncated streams and trailing bytes fail closed. Query recovery reserves
+additional space for compressed copies, Arrow buffers and restored state.
 
-Fragmentation splits the compressed IPC stream when its encoded size exceeds
-the fragment limit. Each fragment has a byte count and hash. The version 2
-manifest separately declares compressed bytes and logical state bytes, and its
-header contains no state body. Recovery validates the manifest and fragments,
-assembles the bounded stream, decodes it and checks the complete state hash.
-Compressible states can therefore remain one object even when their logical
-size exceeds the fragment threshold. Object-write accounting uses the actual
-encoded size.
+Fragmentation splits the already-compressed IPC stream. Each fragment binds its
+byte count and hash. The v2 manifest declares encoded and expanded state sizes
+separately, and its header contains an empty body. Recovery validates fragments,
+assembles a bounded stream, decodes it and checks the complete state commitment.
+Compressible states may remain a single object even when expanded state exceeds
+the fragment threshold. Write accounting uses actual encoded bytes.
 
-Foyer stores disposable Arrow bytes and verified fragment bytes. Cache keys
-include the Arrow state codec; reads revalidate the logical state commitment
-and identity. Cached compressed bytes do not bypass decoded-state bounds or
-query memory policy.
+Foyer stores disposable encoded state and verified fragment bytes. Cache keys
+bind codec and identity. Cache hits still validate the state commitment and
+bounds; a cache is never an authority for accepting a different checkpoint.
+Decoded arrays are shared within a hydrated checkpoint. This is not a new
+unbounded global decoded-state cache.
 
-## Format transition
+## Format transition and verification
 
-Existing JSON state objects are neither deleted nor silently read as the new
-format. Their keys are rejected by the new state-root parser. Existing input
-objects are unchanged. An installation that has JSON checkpoints must explicitly
-rebuild or migrate its state before using this reader; this change does not
-perform that operation against existing user storage.
+Earlier JSON bodies and the previous storage-only Arrow v1 tree are rejected.
+Neither old state objects nor input objects are deleted or migrated by this
+change. Installations with those checkpoints need an explicit migration or
+rebuild before using the new reader. A storage-format transition is distinct
+from ingestion; no real datasets were re-ingested during local verification.
 
-Verification includes typed scalar and ordering round trips, deterministic
-encoding, corrupt/truncated data, JSON rejection, decompression bounds,
-fragment corruption, cache reuse, multiple SQL families, restart recovery and
-late event-time corrections followed by another restart. The integration
-fixtures are synthetic and use the normal admission, ingestion and recovery
-paths.
+Tests cover typed data, enums and numeric keys, nested snapshots, a fresh
+process reading persisted IPC bytes, identity/commitment failures, compressed
+size bounds, fragments and cache reuse. Existing synthetic admission/ingestion
+integration tests exercise multiple SQL families, restart recovery and late
+corrections followed by another restart. The ignored `snapshot_benchmark` test
+measures raw JSON and Arrow/ZSTD creation, typed restoration and field access
+on the same 25,000-row fixture; compression and I/O costs must be reported
+separately when interpreting those results.
+
+See [path audit and measured results](../development/runtime-arrow-snapshot-verification.md)
+for verification scope, format tradeoffs and reproducible commands.

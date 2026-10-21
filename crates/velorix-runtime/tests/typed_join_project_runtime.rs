@@ -77,10 +77,10 @@ fn bag_publication_validates_checkpoint_and_checkpoint_budget_is_atomic() {
     );
     let mut corrupt = checkpoint;
     let payload = &mut corrupt.state_payload.as_mut().unwrap().payload;
-    let mut state: Value = serde_json::from_str(payload).unwrap();
+    let mut state: Value = velorix_core::arrow_state::from_state(payload).unwrap();
     state["output"] =
         serde_json::to_value(velorix_core::delta::DeltaBatch::from_records([])).unwrap();
-    *payload = serde_json::to_string(&state).unwrap();
+    *payload = velorix_core::arrow_state::to_state(&state).unwrap();
     corrupt.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
     assert!(bag_checkpoint_published_output_with_limits(
         &corrupt,
@@ -623,9 +623,9 @@ fn checkpoint_rejects_corrupted_hash_codec_schema_and_torn_bag() {
     ] {
         let mut corrupt = checkpoint.clone();
         let state = corrupt.state_payload.as_mut().unwrap();
-        let mut payload: Value = serde_json::from_str(&state.payload).unwrap();
+        let mut payload: Value = velorix_core::arrow_state::from_state(&state.payload).unwrap();
         payload[field] = value;
-        state.payload = serde_json::to_string(&payload).unwrap();
+        state.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         corrupt.state_root.content_hash = stable_bytes_hash(state.payload.as_bytes());
         assert!(
             restore_standing_runtime(corrupt).is_err(),

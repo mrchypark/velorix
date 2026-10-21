@@ -1931,8 +1931,10 @@ pub(super) fn standing_runtime_output_delta_records_for_checkpoint_with_binding(
             DeltaBatch::from_records(output_delta.delta.net_rows().map_err(|_| {
                 ApiError::bad_request("standing runtime output delta is malformed")
             })?);
-        let output_delta_value = serde_json::to_value(&consolidated_delta)
+        let mut output_delta_value = serde_json::to_value(&consolidated_delta)
             .map_err(|source| ApiError::internal(source.to_string()))?;
+        // Logical output commitments must survive a map-order change on restore.
+        output_delta_value.sort_all_objects();
         let delta_bytes = serde_json::to_vec(&output_delta_value)
             .map_err(|source| ApiError::internal(source.to_string()))?;
         let delta_content_hash = stable_bytes_hash(&delta_bytes);
@@ -2223,7 +2225,7 @@ pub(super) fn standing_runtime_checkpoint_published_batch_with_limits(
         .state_payload
         .as_ref()
         .map(|payload| {
-            serde_json::from_str::<Snapshot>(&payload.payload)
+            velorix_core::arrow_state::from_state::<Snapshot>(&payload.payload)
                 .map(|snapshot| snapshot.published_output)
                 .map_err(ApiError::bad_request)
         })
@@ -2245,13 +2247,12 @@ pub(super) fn standing_runtime_checkpoint_published_output_with_limits(
     let Some(state_payload) = &checkpoint.state_payload else {
         return None;
     };
-    let Ok(payload) = serde_json::from_str::<Value>(&state_payload.payload) else {
-        return None;
-    };
-    payload
-        .get("published_output")
-        .filter(|published_output| !published_output.is_null())
-        .cloned()
+    state_payload
+        .payload
+        .field::<Value>("published_output")
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_null())
 }
 
 /// The published output of a checkpoint, without the runtime expansion limits.
@@ -2261,13 +2262,12 @@ pub(super) fn standing_runtime_checkpoint_published_output(
     let Some(state_payload) = &checkpoint.state_payload else {
         return None;
     };
-    let Ok(payload) = serde_json::from_str::<Value>(&state_payload.payload) else {
-        return None;
-    };
-    payload
-        .get("published_output")
-        .filter(|published_output| !published_output.is_null())
-        .cloned()
+    state_payload
+        .payload
+        .field::<Value>("published_output")
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_null())
 }
 
 pub(super) fn standing_runtime_published_output_row_count(
@@ -3493,7 +3493,7 @@ fn checkpoint_read_cache_key(
         codec: if raw.ends_with(".checkpoint.json") {
             "checkpoint-json"
         } else {
-            "checkpoint-arrow-zstd-v1"
+            "checkpoint-arrow-zstd-v2"
         }
         .into(),
         checkpoint_epoch,

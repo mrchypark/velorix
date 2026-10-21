@@ -41,7 +41,7 @@ impl RuntimeResourceLimits {
     }
     pub(super) fn validate_checkpoint(
         &self,
-        payload: &str,
+        payload: &velorix_core::arrow_state::ArrowState,
     ) -> Result<(), StandingProgramRuntimeError> {
         if payload.len() > self.max_checkpoint_bytes {
             return Err(limit_error("runtime_checkpoint_bytes"));
@@ -49,60 +49,41 @@ impl RuntimeResourceLimits {
         Ok(())
     }
 
-    pub(super) fn checkpoint_json<T: Serialize>(
+    pub(super) fn checkpoint_arrow<T: Serialize>(
         &self,
         value: &T,
-    ) -> Result<String, StandingProgramRuntimeError> {
-        struct Writer {
-            bytes: Vec<u8>,
-            limit: usize,
-            exceeded: bool,
-        }
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                let Some(required) = self
-                    .bytes
-                    .len()
-                    .checked_add(bytes.len())
-                    .filter(|size| *size <= self.limit)
-                else {
-                    self.exceeded = true;
-                    return Err(std::io::Error::other("checkpoint byte limit exceeded"));
-                };
-                if required > self.bytes.capacity() {
-                    let capacity = required
-                        .max(self.bytes.capacity().saturating_mul(2))
-                        .min(self.limit);
-                    self.bytes
-                        .try_reserve_exact(capacity - self.bytes.len())
-                        .map_err(std::io::Error::other)?;
-                }
-                self.bytes.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut writer = Writer {
-            bytes: Vec::new(),
-            limit: self.max_checkpoint_bytes,
-            exceeded: false,
-        };
-        serde_json::to_writer(&mut writer, value).map_err(|error| {
-            if writer.exceeded {
+    ) -> Result<velorix_core::arrow_state::ArrowState, StandingProgramRuntimeError> {
+        velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+            value,
+            self.max_checkpoint_bytes,
+        )
+        .map_err(|error| {
+            if error.to_string().contains("runtime_checkpoint_bytes") {
                 limit_error("runtime_checkpoint_bytes")
             } else {
                 StandingProgramRuntimeError::InvalidProgramIdentityDynamic {
-                    field: std::borrow::Cow::Owned(format!(
-                        "runtime_checkpoint_serialization: {error}"
-                    )),
+                    field: format!("runtime_checkpoint_serialization: {error}").into(),
                 }
             }
-        })?;
-        String::from_utf8(writer.bytes).map_err(|_| invalid_checkpoint())
+        })
     }
-
+    pub(super) fn validate_checkpoint_value<T: Serialize>(
+        &self,
+        value: &T,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        velorix_core::arrow_state::ArrowState::measure_serializable(
+            value,
+            self.max_checkpoint_bytes,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            if error.to_string().contains("runtime_checkpoint_bytes") {
+                limit_error("runtime_checkpoint_bytes")
+            } else {
+                invalid_checkpoint()
+            }
+        })
+    }
     pub(super) fn charge_expansion(
         &self,
         bytes: &mut usize,
@@ -208,7 +189,7 @@ mod tests {
             ..defaults
         };
         assert!(limits
-            .checkpoint_json(&"long")
+            .checkpoint_arrow(&"long")
             .unwrap_err()
             .to_string()
             .contains("runtime_checkpoint_bytes"));
@@ -229,10 +210,9 @@ mod tests {
                 ))
             }
         }
-        assert!(defaults
-            .checkpoint_json(&Invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("runtime_checkpoint_serialization: deliberate serialization failure"));
+        let error = defaults.checkpoint_arrow(&Invalid).unwrap_err().to_string();
+        assert!(error.contains("runtime_checkpoint_serialization:"));
+        assert!(error.contains("deliberate serialization failure"));
+        assert!(!error.contains("runtime_checkpoint_bytes"));
     }
 }

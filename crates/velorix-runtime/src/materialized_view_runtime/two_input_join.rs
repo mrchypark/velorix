@@ -275,7 +275,9 @@ impl TwoInputJoinRuntime {
         )
     }
 
-    fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
+    fn checkpoint_payload(
+        &self,
+    ) -> Result<velorix_core::arrow_state::ArrowState, StandingProgramRuntimeError> {
         let payload = JoinCheckpointPayload {
             schema_version: CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
             runtime_kind: match self.execution_binding.mode {
@@ -313,7 +315,7 @@ impl TwoInputJoinRuntime {
                 })
                 .collect(),
         };
-        serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())
+        velorix_core::arrow_state::to_state(&payload).map_err(|_| invalid_checkpoint())
     }
 
     fn restore_payload(
@@ -330,7 +332,8 @@ impl TwoInputJoinRuntime {
             });
         }
         let payload: JoinCheckpointPayload =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != expected_runtime_kind
         {
@@ -948,12 +951,7 @@ fn typed_join_equality_key(values: Vec<Value>, side: SupportedAggregateInputRela
 }
 
 pub(super) fn checkpoint_has_typed_join_project_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint.state_payload.as_ref().is_some_and(|payload| {
-        serde_json::from_str::<Value>(&payload.payload)
-            .ok()
-            .and_then(|value| value.get("runtime_kind").cloned())
-            == Some(Value::String(TYPED_JOIN_PROJECT_RUNTIME_KIND.into()))
-    })
+    checkpoint_kind(checkpoint).as_deref() == Some(TYPED_JOIN_PROJECT_RUNTIME_KIND)
 }
 
 /// Typed bag projection over the same sparse internal equijoin used by aggregate joins.
@@ -1482,7 +1480,7 @@ impl TypedJoinProjectRuntime {
         checkpoint.input_event_time_frontiers = event_frontiers.clone();
         checkpoint.applied_epochs.insert(key.clone(), logical_epoch);
         retain_recent_applied_epochs(&mut checkpoint.applied_epochs);
-        self.limits.checkpoint_json(&checkpoint)?;
+        self.limits.validate_checkpoint_value(&checkpoint)?;
         self.join
             .commit_prepared_epoch(prepared)
             .map_err(|_| invalid_runtime_state())?;
@@ -1652,7 +1650,7 @@ impl StandingProgramRuntime for TypedJoinProjectRuntime {
     }
 
     fn checkpoint(&self) -> Result<RuntimeCheckpoint, StandingProgramRuntimeError> {
-        let payload = self.limits.checkpoint_json(&self.checkpoint_data())?;
+        let payload = self.limits.checkpoint_arrow(&self.checkpoint_data())?;
         Ok(RuntimeCheckpoint {
             identity: self.identity.clone(),
             logical_epoch: self.logical_epoch,
@@ -1709,7 +1707,8 @@ impl TypedJoinProjectRuntime {
             return Err(invalid_checkpoint());
         }
         let payload: TypedJoinProjectCheckpoint =
-            serde_json::from_str(&state.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != 1
             || payload.runtime_kind != TYPED_JOIN_PROJECT_RUNTIME_KIND
             || payload.key_codec != TYPED_JOIN_PROJECT_KEY_CODEC

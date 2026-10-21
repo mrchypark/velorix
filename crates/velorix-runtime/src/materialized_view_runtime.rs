@@ -591,16 +591,7 @@ pub fn restore_standing_runtime_with_limits(
             .validate_checkpoint(&payload.payload)
             .map_err(|e| e.to_string())?;
     }
-    let runtime_kind = checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|value| {
-            value
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
+    let runtime_kind = checkpoint_kind(&checkpoint);
     reject_removed_runtime_kind(runtime_kind.as_deref()).map_err(|error| error.to_string())?;
     if runtime_kind.as_deref() == Some(set_ops::RUNTIME_KIND) {
         return set_ops::SetOpsRuntime::restore_with_limits(checkpoint, limits)
@@ -622,13 +613,7 @@ pub fn restore_standing_runtime_with_limits(
             .map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>)
             .map_err(|error| error.to_string());
     }
-    if checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|value| value.get("runtime_kind").cloned())
-        .is_some_and(|kind| kind == "ordered_window")
-    {
+    if runtime_kind.as_deref() == Some("ordered_window") {
         return crate::materialized_view_runtime::analytic_window_frame::OrderedWindowRuntime::restore_with_limits(checkpoint, limits).map(|runtime| Box::new(runtime) as Box<dyn StandingProgramRuntime + Send>).map_err(|error| error.to_string());
     }
     if crate::materialized_view_runtime::two_input_join::checkpoint_has_typed_join_project_payload(
@@ -702,12 +687,7 @@ pub fn restore_standing_runtime_with_limits(
     }
     // P0-8: reject unknown checkpoint kinds instead of falling through
     // to a default runtime which could silently produce wrong results
-    let kind = checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.payload).ok())
-        .and_then(|v| v.get("runtime_kind").cloned())
-        .and_then(|v| v.as_str().map(String::from));
+    let kind = runtime_kind;
     Err(format!(
         "unrecognized checkpoint runtime kind `{}`: cannot safely restore",
         kind.unwrap_or_else(|| "unknown".to_string())
@@ -9926,227 +9906,64 @@ fn invalid_runtime_state() -> StandingProgramRuntimeError {
     }
 }
 
-fn checkpoint_has_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
+fn checkpoint_kind(checkpoint: &RuntimeCheckpoint) -> Option<String> {
+    checkpoint
+        .state_payload
+        .as_ref()?
+        .payload
+        .field("runtime_kind")
+        .ok()
+        .flatten()
+}
+fn checkpoint_has_join_payload(c: &RuntimeCheckpoint) -> bool {
     matches!(
-        checkpoint
-            .state_payload
-            .as_ref()
-            .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-            .and_then(|payload| {
-                payload
-                    .get("runtime_kind")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .as_deref(),
+        checkpoint_kind(c).as_deref(),
         Some(JOIN_RUNTIME_KIND | JOIN_COMMON_DAG_REFERENCE_RUNTIME_KIND)
     )
 }
-
-fn checkpoint_has_three_input_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(three_input_join::THREE_INPUT_JOIN_RUNTIME_KIND)
+fn checkpoint_has_three_input_join_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(three_input_join::THREE_INPUT_JOIN_RUNTIME_KIND)
 }
-
-fn checkpoint_has_cross_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(cross_join::CROSS_JOIN_RUNTIME_KIND)
+fn checkpoint_has_cross_join_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(cross_join::CROSS_JOIN_RUNTIME_KIND)
 }
-
-fn checkpoint_has_temporal_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(temporal_join::TEMPORAL_JOIN_RUNTIME_KIND)
+fn checkpoint_has_temporal_join_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(temporal_join::TEMPORAL_JOIN_RUNTIME_KIND)
 }
-
-fn checkpoint_has_recursive_fixpoint_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(recursive_fixpoint::RECURSIVE_FIXPOINT_RUNTIME_KIND)
+fn checkpoint_has_recursive_fixpoint_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(recursive_fixpoint::RECURSIVE_FIXPOINT_RUNTIME_KIND)
 }
-
-fn checkpoint_has_interval_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(interval_join::INTERVAL_JOIN_RUNTIME_KIND)
+fn checkpoint_has_interval_join_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(interval_join::INTERVAL_JOIN_RUNTIME_KIND)
 }
-
-fn checkpoint_has_semi_anti_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(semi_anti_join::SEMI_ANTI_JOIN_RUNTIME_KIND)
+fn checkpoint_has_semi_anti_join_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(semi_anti_join::SEMI_ANTI_JOIN_RUNTIME_KIND)
 }
-
-fn checkpoint_has_common_dag_reference_join_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(JOIN_COMMON_DAG_REFERENCE_RUNTIME_KIND)
+fn checkpoint_has_common_dag_reference_join_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(JOIN_COMMON_DAG_REFERENCE_RUNTIME_KIND)
 }
-
-fn checkpoint_has_single_key_sum_count_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(SINGLE_KEY_SUM_COUNT_RUNTIME_KIND)
+fn checkpoint_has_single_key_sum_count_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(SINGLE_KEY_SUM_COUNT_RUNTIME_KIND)
 }
-
-fn checkpoint_has_filter_project_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(FILTER_PROJECT_RUNTIME_KIND)
+fn checkpoint_has_filter_project_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(FILTER_PROJECT_RUNTIME_KIND)
 }
-
-fn checkpoint_has_analytic_frame_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    matches!(
-        checkpoint
-            .state_payload
-            .as_ref()
-            .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload.payload).ok())
-            .and_then(|value| value.get("runtime_kind").cloned())
-            .and_then(|value| value.as_str().map(str::to_string)),
-        Some(kind) if kind == crate::materialized_view_runtime::analytic_window_frame::ANALYTIC_FRAME_RUNTIME_KIND
-    )
+fn checkpoint_has_analytic_frame_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(analytic_window_frame::ANALYTIC_FRAME_RUNTIME_KIND)
 }
-
-fn checkpoint_has_scalar_aggregate_filter_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    matches!(
-        checkpoint
-            .state_payload
-            .as_ref()
-            .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload.payload).ok())
-            .and_then(|value| value.get("runtime_kind").cloned())
-            .and_then(|value| value.as_str().map(str::to_string)),
-        Some(kind) if kind == crate::materialized_view_runtime::scalar_aggregate_filter::SCALAR_AGGREGATE_FILTER_RUNTIME_KIND
-    )
+fn checkpoint_has_scalar_aggregate_filter_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref()
+        == Some(scalar_aggregate_filter::SCALAR_AGGREGATE_FILTER_RUNTIME_KIND)
 }
-
-fn checkpoint_has_tumbling_window_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(TUMBLING_WINDOW_RUNTIME_KIND)
+fn checkpoint_has_tumbling_window_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(TUMBLING_WINDOW_RUNTIME_KIND)
 }
-
-fn checkpoint_has_latest_by_key_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(LATEST_BY_KEY_RUNTIME_KIND)
+fn checkpoint_has_latest_by_key_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(LATEST_BY_KEY_RUNTIME_KIND)
 }
-
-fn checkpoint_has_analytic_row_number_payload(checkpoint: &RuntimeCheckpoint) -> bool {
-    checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(ANALYTIC_ROW_NUMBER_RUNTIME_KIND)
+fn checkpoint_has_analytic_row_number_payload(c: &RuntimeCheckpoint) -> bool {
+    checkpoint_kind(c).as_deref() == Some(ANALYTIC_ROW_NUMBER_RUNTIME_KIND)
 }
-
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
@@ -10257,10 +10074,12 @@ pub fn bag_checkpoint_published_output_with_limits(
     limits: RuntimeResourceLimits,
 ) -> Result<Option<DeltaBatch>, StandingProgramRuntimeError> {
     limits.validate()?;
-    let payload = checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok());
+    let payload = checkpoint.state_payload.as_ref().and_then(|payload| {
+        payload
+            .payload
+            .project(&["runtime_kind", "plan", "output_schema", "published_output"])
+            .ok()
+    });
     let kind = payload
         .as_ref()
         .and_then(|payload| payload.get("runtime_kind"))
@@ -10340,7 +10159,7 @@ pub fn materialized_delta_to_page_with_checkpoint(
     let payload = checkpoint
         .state_payload
         .as_ref()
-        .map(|state| serde_json::from_str::<Value>(&state.payload))
+        .map(|state| state.payload.project(&["runtime_kind", "plan"]))
         .transpose()
         .map_err(|_| invalid_checkpoint())?;
     materialized_delta_to_page_with_payload(

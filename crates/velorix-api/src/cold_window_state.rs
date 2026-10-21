@@ -85,7 +85,7 @@ fn validate_event_time_state_reference(
 async fn read_retained_state(
     state: &ApiState,
     reference: &EventTimeStateRef,
-) -> Result<String, ApiError> {
+) -> Result<velorix_core::arrow_state::ArrowState, ApiError> {
     let path = validate_event_time_state_reference(reference)?;
     let decoded = std::sync::Mutex::new(None);
     let validate = |bytes: &[u8]| {
@@ -129,7 +129,7 @@ async fn read_retained_state(
                     output_id: reference.window_key.clone(),
                     object_path: path.to_string(),
                     content_hash: reference.state_root.content_hash.clone(),
-                    codec: "checkpoint-retained-arrow-zstd-v1".into(),
+                    codec: "checkpoint-retained-arrow-zstd-v2".into(),
                     root_hash: reference.state_root.content_hash.clone(),
                     checkpoint_epoch: reference.logical_epoch,
                 },
@@ -198,26 +198,21 @@ pub(super) async fn persist_event_time_state_object(
     })
     .await
     .map_err(ApiError::internal)??;
+    let bytes = bytes::Bytes::from(bytes);
     match state
         .store
-        .put_opts(
-            &path,
-            bytes::Bytes::from(bytes.clone()).into(),
-            PutMode::Create.into(),
-        )
+        .put_opts(&path, bytes.clone().into(), PutMode::Create.into())
         .await
     {
         Ok(_) => Ok(()),
         Err(object_store::Error::AlreadyExists { .. }) => {
-            let existing = state
-                .store
-                .get(&path)
-                .await
-                .map_err(ApiError::retryable_materialization_io)?
-                .bytes()
-                .await
-                .map_err(ApiError::retryable_materialization_io)?;
-            if existing.as_ref() != bytes.as_slice() {
+            let existing = checkpoint_publication::read_object_bytes_bounded(
+                state,
+                &path,
+                Some(bytes.len() as u64),
+            )
+            .await?;
+            if existing.as_slice() != bytes.as_ref() {
                 return Err(ApiError::conflict(format!(
                     "retained window state conflict at {path}"
                 )));
@@ -454,7 +449,10 @@ mod tests {
         let state = crate::tests::test_api_state_with_store(store, "retained-cache-owner", false)
             .await
             .with_materialized_read_cache(cache.clone());
-        let payload = json!({"state":{"values":[7,null,3.5]},"logical_epoch":1}).to_string();
+        let payload = velorix_core::arrow_state::to_state(
+            &json!({"state":{"values":[7,null,3.5]},"logical_epoch":1}),
+        )
+        .unwrap();
         let hash = stable_bytes_hash(payload.as_bytes());
         let object = EventTimeStateObject {
             reference: EventTimeStateRef {

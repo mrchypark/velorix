@@ -1086,7 +1086,8 @@ fn restore_rejects_inconsistent_materialized_output_and_missing_retained_row_val
     for remove_values in [false, true] {
         let mut checkpoint = original.clone();
         let state = checkpoint.state_payload.as_mut().unwrap();
-        let mut payload: serde_json::Value = serde_json::from_str(&state.payload).unwrap();
+        let mut payload: serde_json::Value =
+            velorix_core::arrow_state::from_state(&state.payload).unwrap();
         if remove_values {
             let partitions = payload["partitions"].as_object_mut().unwrap();
             let partition = partitions
@@ -1102,7 +1103,7 @@ fn restore_rejects_inconsistent_materialized_output_and_missing_retained_row_val
         } else {
             payload["published_output"] = json!({"records": []});
         }
-        state.payload = serde_json::to_string(&payload).unwrap();
+        state.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(state.payload.as_bytes());
         assert!(restore_standing_runtime(checkpoint).is_err());
     }

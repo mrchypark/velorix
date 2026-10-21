@@ -413,7 +413,7 @@ fn assert_final_snapshot(
     right_keys: &[i64],
 ) -> BenchResult<()> {
     let checkpoint = runtime.checkpoint()?;
-    let checkpoint_payload: serde_json::Value = serde_json::from_str(
+    let checkpoint_payload: serde_json::Value = velorix_core::arrow_state::from_state(
         &checkpoint
             .state_payload
             .as_ref()

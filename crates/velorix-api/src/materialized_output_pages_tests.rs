@@ -24,7 +24,8 @@ fn page_fixture() -> (RuntimeCheckpoint, RelationSchema, ObjectKey) {
         primary_key: vec!["id".into()],
     };
     let mut checkpoint = test_runtime_checkpoint(Vec::new());
-    let payload = json!({"output_schema":schema}).to_string();
+    let payload = json!({"output_schema":schema});
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
     checkpoint.state_payload.as_mut().unwrap().payload = payload;
     let key = ObjectKey::standing_runtime_checkpoint(
@@ -243,6 +244,7 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
     ));
     let state = test_api_state_with_store(store, "materialized-page-owner", false)
         .await
+        .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024)
         .with_meta_store(Arc::new(InMemoryMetaStore::default()));
     let router = app(state.clone());
     register(
@@ -646,8 +648,8 @@ fn publication_checkpoint(
             weight,
         )])
     };
-    let payload =
-        json!({"schema_version":1,"output_schema":schema,"published_output":output}).to_string();
+    let payload = json!({"schema_version":1,"output_schema":schema,"published_output":output});
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     RuntimeCheckpoint {
         identity: StandingProgramIdentity {
             tenant_id: "synthetic_tenant".into(),
@@ -731,7 +733,8 @@ async fn publication_state(store: Arc<dyn ObjectStore>, meta: Arc<InMemoryMetaSt
 
 fn publication_schema(checkpoint: &RuntimeCheckpoint) -> RelationSchema {
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     serde_json::from_value(payload["output_schema"].clone()).unwrap()
 }
 

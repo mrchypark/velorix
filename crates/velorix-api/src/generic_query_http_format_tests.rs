@@ -535,6 +535,7 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
         false,
     )
     .await
+    .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024)
     .with_meta_store(Arc::new(InMemoryMetaStore::default()));
     let router = app(state.clone());
     let catalog = test_relation_catalog_for_e2e(

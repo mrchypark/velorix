@@ -113,7 +113,9 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
     }
     assert_eq!(counts.get_paths(), vec![fragment.to_string()]);
 
-    let payload = json!({"retained": synthetic_state_text(64 * 1024)}).to_string();
+    let payload =
+        velorix_core::arrow_state::to_state(&json!({"retained": synthetic_state_text(64 * 1024)}))
+            .unwrap();
     let payload_hash = stable_bytes_hash(payload.as_bytes());
     let root = ObjectKey::standing_runtime_state_payload(
         "tenant",

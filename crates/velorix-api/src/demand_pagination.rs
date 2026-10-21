@@ -239,25 +239,16 @@ async fn read_legacy_output_record(
     } else {
         // Decode persisted output using the admitted layout, without loading
         // accumulator state or recomputing any source rows.
-        let mut decoding_checkpoint = record.checkpoint.clone();
-        decoding_checkpoint.state_payload = match execution {
-            VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => Some(
-                velorix_core::standing_program::RuntimeCheckpointStatePayload {
-                    codec_identity: String::new(),
-                    payload: serde_json::json!({"runtime_kind":"tumbling_event_time_aggregate"})
-                        .to_string(),
-                },
-            ),
-            VelorixLogicalViewExecutionV1::OrderedWindows { plan } => Some(
-                velorix_core::standing_program::RuntimeCheckpointStatePayload {
-                    codec_identity: String::new(),
-                    payload: serde_json::json!({"runtime_kind":"ordered_window","plan":plan})
-                        .to_string(),
-                },
-            ),
+        let layout = match execution {
+            VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { .. } => {
+                Some(serde_json::json!({"runtime_kind":"tumbling_event_time_aggregate"}))
+            }
+            VelorixLogicalViewExecutionV1::OrderedWindows { plan } => {
+                Some(serde_json::json!({"runtime_kind":"ordered_window","plan":plan}))
+            }
             _ => None,
         };
-        velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
+        velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_payload(
             schema,
             &delta,
             view,
@@ -268,7 +259,7 @@ async fn read_legacy_output_record(
                 max_rows: Some(total.max(1)),
             },
             aggregates.as_deref(),
-            &decoding_checkpoint,
+            layout.as_ref(),
         )
         .map_err(ApiError::bad_request)?
     };

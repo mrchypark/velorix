@@ -1677,8 +1677,8 @@ async fn assert_checkpoint_publication_failure_keeps_previous_pointer(failing_pr
         "schema_version": 1,
         "published_output": { "records": [] },
         "crash_matrix_epoch": next.logical_epoch,
-    })
-    .to_string();
+    });
+    let next_payload = velorix_core::arrow_state::to_state(&next_payload).unwrap();
     next.state_root.content_hash = stable_bytes_hash(next_payload.as_bytes());
     next.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: next.checkpoint_codec_identity.clone(),
@@ -1897,8 +1897,8 @@ fn advanced_test_runtime_checkpoint(
         "schema_version": 1,
         "published_output": { "records": [] },
         "test_marker": marker,
-    })
-    .to_string();
+    });
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     next.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
     next.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: next.checkpoint_codec_identity.clone(),
@@ -3014,8 +3014,8 @@ async fn standing_runtime_checkpoint_read_always_uses_meta_pointer() {
             "records": []
         },
         "meta_pointer_winner": true
-    })
-    .to_string();
+    });
+    let next_payload = velorix_core::arrow_state::to_state(&next_payload).unwrap();
     next.state_root.content_hash = stable_bytes_hash(next_payload.as_bytes());
     next.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
@@ -3075,14 +3075,14 @@ async fn standing_runtime_checkpoint_read_keeps_old_meta_pointer_when_new_checkp
     orphaned.logical_epoch = checkpoint.logical_epoch + 1;
     orphaned.input_frontiers[0].committed_offset_exclusive += 1;
     orphaned.output_frontiers[0].committed_epoch = orphaned.logical_epoch;
-    let orphaned_payload = serde_json::json!({
+    let orphaned_payload = velorix_core::arrow_state::to_state(&serde_json::json!({
         "schema_version": 1,
         "published_output": {
             "records": []
         },
         "orphaned_checkpoint": true
-    })
-    .to_string();
+    }))
+    .unwrap();
     orphaned.state_root.content_hash = stable_bytes_hash(orphaned_payload.as_bytes());
     orphaned.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
@@ -3234,8 +3234,8 @@ async fn standing_runtime_checkpoint_publish_rehydrates_empty_meta_pointer_after
             "records": []
         },
         "recovered_after_empty_meta": true
-    })
-    .to_string();
+    });
+    let next_payload = velorix_core::arrow_state::to_state(&next_payload).unwrap();
     next.state_root.content_hash = stable_bytes_hash(next_payload.as_bytes());
     next.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: "velorix-standing-program-checkpoint-v1".to_string(),
@@ -3359,13 +3359,13 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_corr
         standing_runtime_state_payload_record_for_checkpoint(&checkpoint, "purchases_by_user")
             .unwrap()
             .1;
-    corrupt_record.payload.payload = serde_json::json!({
+    corrupt_record.payload.payload = velorix_core::arrow_state::to_state(&serde_json::json!({
         "schema_version": 1,
         "published_output": {
             "records": [{"key": "poison", "value": {"sum": 1, "count": 1}, "weight": 1}]
         }
-    })
-    .to_string();
+    }))
+    .unwrap();
     state
         .store
         .put(
@@ -12119,7 +12119,10 @@ fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() 
     let mut scalar_checkpoint = test_runtime_checkpoint(Vec::new());
     scalar_checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: scalar_checkpoint.checkpoint_codec_identity.clone(),
-        payload: json!({"runtime_kind": "scalar_aggregate_filter"}).to_string(),
+        payload: velorix_core::arrow_state::to_state(
+            &json!({"runtime_kind": "scalar_aggregate_filter"}),
+        )
+        .unwrap(),
     });
     assert_eq!(
         crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
@@ -12132,7 +12135,8 @@ fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() 
     let mut temporal_checkpoint = test_runtime_checkpoint(Vec::new());
     temporal_checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: temporal_checkpoint.checkpoint_codec_identity.clone(),
-        payload: json!({"runtime_kind": "temporal_join_v1"}).to_string(),
+        payload: velorix_core::arrow_state::to_state(&json!({"runtime_kind": "temporal_join_v1"}))
+            .unwrap(),
     });
     assert_eq!(
         crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
@@ -12149,7 +12153,8 @@ fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() 
         let mut checkpoint = test_runtime_checkpoint(Vec::new());
         checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
             codec_identity: checkpoint.checkpoint_codec_identity.clone(),
-            payload: json!({"runtime_kind": runtime_kind}).to_string(),
+            payload: velorix_core::arrow_state::to_state(&json!({"runtime_kind": runtime_kind}))
+                .unwrap(),
         });
         assert_eq!(
             crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
@@ -12176,7 +12181,7 @@ fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() 
         }
         checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
             codec_identity: checkpoint.checkpoint_codec_identity.clone(),
-            payload: payload.to_string(),
+            payload: velorix_core::arrow_state::to_state(&payload).unwrap(),
         });
         let aggregate_outputs =
             crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
@@ -12190,7 +12195,10 @@ fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() 
     let mut unknown_checkpoint = test_runtime_checkpoint(Vec::new());
     unknown_checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
         codec_identity: unknown_checkpoint.checkpoint_codec_identity.clone(),
-        payload: json!({"runtime_kind": "future_runtime_kind"}).to_string(),
+        payload: velorix_core::arrow_state::to_state(
+            &json!({"runtime_kind": "future_runtime_kind"}),
+        )
+        .unwrap(),
     });
     let error = crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
         &unknown_checkpoint,
@@ -13551,7 +13559,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
     let old_state_object = old_record.checkpoint.state_root.object_key.clone();
     let old_pointer = standing_runtime_checkpoint_pointer_from_record(&old_record);
     let mut legacy_record = old_record.clone();
-    let mut payload: Value = serde_json::from_str(
+    let mut payload: Value = velorix_core::arrow_state::from_state(
         &legacy_record
             .checkpoint
             .state_payload
@@ -13565,7 +13573,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
         .expect("generic runtime payload should be an object")
         .remove("group_input_counts");
     payload["engine"]["logical_epoch"] = json!(legacy_record.checkpoint.logical_epoch + 1);
-    let payload = serde_json::to_string(&payload).unwrap();
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     let content_hash = stable_bytes_hash(payload.as_bytes());
     legacy_record.checkpoint.logical_epoch += 1;
     legacy_record.checkpoint.output_manifest_refs.clear();
@@ -16310,7 +16318,7 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
             .stable_digest()
             .unwrap()
     );
-    let payload: Value = serde_json::from_str(
+    let payload: Value = velorix_core::arrow_state::from_state(
         &checkpoint
             .checkpoint
             .state_payload
@@ -16503,7 +16511,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
             .await
             .unwrap()
             .unwrap();
-    let payload: Value = serde_json::from_str(
+    let payload: Value = velorix_core::arrow_state::from_state(
         &first_checkpoint
             .checkpoint
             .state_payload
@@ -16938,7 +16946,8 @@ fn assert_snapshot_and_commit_refs(refs: &[String]) -> Vec<String> {
 
 fn canonical_join_api_checkpoint(checkpoint: &RuntimeCheckpoint) -> Value {
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     json!({
         "logical_epoch": checkpoint.logical_epoch,
         "input_frontiers": checkpoint.input_frontiers,
@@ -19278,8 +19287,8 @@ pub(super) fn test_runtime_checkpoint(output_manifest_refs: Vec<String>) -> Runt
         "published_output": {
             "records": []
         }
-    })
-    .to_string();
+    });
+    let state_payload = velorix_core::arrow_state::to_state(&state_payload).unwrap();
     let content_hash = stable_bytes_hash(state_payload.as_bytes());
     RuntimeCheckpoint {
         identity: StandingProgramIdentity {
@@ -19369,8 +19378,8 @@ async fn generic_state_fragments_preserve_hash_restore_and_reject_corruption() {
     let payload = json!({
         "runtime_kind": "generic_set_ops_v1",
         "retained": synthetic_state_text(10 * 1024 * 1024),
-    })
-    .to_string();
+    });
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
     checkpoint.state_payload.as_mut().unwrap().payload = payload;
     validate_standing_runtime_budget(
@@ -19479,11 +19488,12 @@ async fn generic_state_fragments_preserve_hash_restore_and_reject_corruption() {
             .is_err()
     );
     // Fragmentation cannot relax the configured total-state bound.
-    checkpoint.state_payload.as_mut().unwrap().payload = json!({
-        "runtime_kind": "generic_set_ops_v1",
-        "retained": "x".repeat(17 * 1024 * 1024),
-    })
-    .to_string();
+    checkpoint.state_payload.as_mut().unwrap().payload =
+        velorix_core::arrow_state::to_state(&json!({
+            "runtime_kind": "generic_set_ops_v1",
+            "retained": "x".repeat(17 * 1024 * 1024),
+        }))
+        .unwrap();
     assert!(validate_standing_runtime_budget(
         &[],
         &checkpoint,
@@ -22774,7 +22784,7 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         checkpoint_arrow::decode(&body, restarted.max_standing_runtime_state_payload_bytes)
             .unwrap();
     assert_eq!(Some(decoded.payload), checkpoint.checkpoint.state_payload);
-    let payload: Value = serde_json::from_str(
+    let payload: Value = velorix_core::arrow_state::from_state(
         &checkpoint
             .checkpoint
             .state_payload
@@ -22854,7 +22864,8 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         ] {
             legacy.as_object_mut().unwrap().remove(field);
         }
-        old.state_payload.as_mut().unwrap().payload = serde_json::to_string(&legacy).unwrap();
+        old.state_payload.as_mut().unwrap().payload =
+            velorix_core::arrow_state::to_state(&legacy).unwrap();
         old.state_root.content_hash =
             stable_bytes_hash(old.state_payload.as_ref().unwrap().payload.as_bytes());
         let runtime =
@@ -23106,7 +23117,8 @@ async fn rest_window_archival_drains_multiple_bounded_export_chunks() {
         .unwrap()
         .unwrap();
     let payload: Value =
-        serde_json::from_str(&record.checkpoint.state_payload.unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&record.checkpoint.state_payload.unwrap().payload)
+            .unwrap();
     assert_eq!(payload["cold_state_refs"].as_object().unwrap().len(), 130);
     assert!(payload["state"]["rows"].as_object().unwrap().is_empty());
     let archived = store

@@ -405,7 +405,7 @@ The API reads these positive-integer byte limits from the environment:
 | `VELORIX_STANDING_RUNTIME_MAX_EXPANSION_BYTES` | 16 MiB | Expansion work |
 | `VELORIX_STANDING_RUNTIME_MAX_SNAPSHOT_BYTES` | 16 MiB | Snapshot work |
 | `VELORIX_STANDING_RUNTIME_MAX_STATE_FRAGMENT_BYTES` | 4 MiB | Individual state fragment |
-| `VELORIX_STANDING_RUNTIME_MAX_STATE_PAYLOAD_BYTES` | 8 MiB | Total state payload |
+| `VELORIX_STANDING_RUNTIME_MAX_STATE_PAYLOAD_BYTES` | 8 MiB | Expanded typed state: 48 bytes per node plus string/binary bytes |
 
 Expansion and snapshot limits are independent of the existing total state-payload
 limit. Increasing one does not increase the others. These settings are wired in

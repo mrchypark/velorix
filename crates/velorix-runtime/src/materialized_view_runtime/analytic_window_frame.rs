@@ -427,7 +427,8 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
                 .collect(),
             logical_epoch: self.logical_epoch,
         };
-        let payload = serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())?;
+        let payload =
+            velorix_core::arrow_state::to_state(&payload).map_err(|_| invalid_checkpoint())?;
         let content_hash = stable_bytes_hash(payload.as_bytes());
         Ok(RuntimeCheckpoint {
             identity: self.identity.clone(),
@@ -474,7 +475,8 @@ impl StandingProgramRuntime for AnalyticWindowFrameRuntime {
             });
         }
         let payload: AnalyticFrameCheckpointPayload =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != ANALYTIC_FRAME_RUNTIME_KIND
         {
@@ -1457,7 +1459,7 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
             applied_epochs: self.applied_epochs.clone(),
             logical_epoch: self.logical_epoch,
         };
-        let payload = self.limits.checkpoint_json(&payload)?;
+        let payload = self.limits.checkpoint_arrow(&payload)?;
         Ok(RuntimeCheckpoint {
             identity: self.identity.clone(),
             logical_epoch: self.logical_epoch,
@@ -1514,7 +1516,8 @@ impl OrderedWindowRuntime {
             return Err(invalid_checkpoint());
         }
         let payload: OrderedWindowCheckpoint =
-            serde_json::from_str(&state.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != ORDERED_WINDOW_RUNTIME_KIND
             || payload.logical_epoch != checkpoint.logical_epoch

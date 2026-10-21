@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arrow_state;
+
 pub mod collision_audit;
 pub mod delta;
 pub mod delta_to_arrow;

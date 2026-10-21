@@ -176,14 +176,18 @@ async fn run() -> BenchResult<()> {
     let checkpoint_requests_before = metered_store.snapshot();
     let checkpoint_started = Instant::now();
     let checkpoint = runtime.checkpoint()?;
-    let checkpoint_bytes = serde_json::to_vec(&checkpoint)?;
+    let checkpoint_bytes = Bytes::from(
+        velorix_core::arrow_state::to_state(&checkpoint)?
+            .as_bytes()
+            .to_vec(),
+    );
     let state_ref = publisher
         .write_state_object(&StateObjectWrite::new(
             STATE_OWNER,
             PARTITION_ID,
             CHECKPOINT_VERSION,
             "local-incremental-state",
-            Bytes::from(checkpoint_bytes.clone()),
+            checkpoint_bytes.clone(),
         )?)
         .await?;
     let checkpoint_state_key = state_ref.object_key.as_str().to_string();
@@ -231,7 +235,7 @@ async fn run() -> BenchResult<()> {
                 PARTITION_ID,
                 CHECKPOINT_VERSION,
                 "local-incremental-state",
-                Bytes::from(checkpoint_bytes.clone()),
+                checkpoint_bytes.clone(),
             )?)
             .await?;
         sample_publisher
@@ -284,7 +288,9 @@ async fn run() -> BenchResult<()> {
         let requests_before = metered_store.snapshot();
         let recovery_started = Instant::now();
         let checkpoint_bytes = publisher.read_state_object(&checkpoint_state_ref).await?;
-        let checkpoint: RuntimeCheckpoint = serde_json::from_slice(&checkpoint_bytes)?;
+        let checkpoint: RuntimeCheckpoint =
+            velorix_core::arrow_state::ArrowState::from_ipc(&checkpoint_bytes, 64 * 1024 * 1024)?
+                .decode()?;
         let mut recovered = restore_standing_runtime(checkpoint).map_err(std::io::Error::other)?;
         recovered.apply_changes(
             BATCH_COUNT + 1,

@@ -209,7 +209,8 @@ fn assert_persisted_output(runtime: &dyn StandingProgramRuntime, commit: &EpochC
     use velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint;
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: serde_json::Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     let output: DeltaBatch = serde_json::from_value(payload["published_output"].clone()).unwrap();
     let aggregates = if payload["runtime_kind"] == "single_key_sum_count" {
         let plan: SupportedViewPlan = serde_json::from_value(payload["plan"].clone()).unwrap();
@@ -782,10 +783,11 @@ fn nullable_order_and_nullable_tuple_identity_survive_restart_and_retraction() {
             let checkpoint = rt.checkpoint().unwrap();
             let mut tampered = checkpoint.clone();
             let payload = tampered.state_payload.as_mut().unwrap();
-            let mut json: serde_json::Value = serde_json::from_str(&payload.payload).unwrap();
+            let mut json: serde_json::Value =
+                velorix_core::arrow_state::from_state(&payload.payload).unwrap();
             let nulls_first = json["plan"]["order_nulls_first"].as_bool().unwrap();
             json["plan"]["order_nulls_first"] = serde_json::json!(!nulls_first);
-            payload.payload = serde_json::to_string(&json).unwrap();
+            payload.payload = velorix_core::arrow_state::to_state(&json).unwrap();
             tampered.state_root.content_hash = stable_bytes_hash(payload.payload.as_bytes());
             assert!(restore_standing_runtime(tampered).is_err());
             rt = restore_standing_runtime(checkpoint.clone()).unwrap();

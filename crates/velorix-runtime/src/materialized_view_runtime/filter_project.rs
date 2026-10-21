@@ -100,7 +100,9 @@ impl FilterProjectRuntime {
         )
     }
 
-    fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
+    fn checkpoint_payload(
+        &self,
+    ) -> Result<velorix_core::arrow_state::ArrowState, StandingProgramRuntimeError> {
         let published_output = self.current_output();
         let payload = FilterProjectCheckpointPayload {
             schema_version: CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
@@ -129,7 +131,7 @@ impl FilterProjectRuntime {
                 .collect(),
             logical_epoch: self.logical_epoch,
         };
-        serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())
+        velorix_core::arrow_state::to_state(&payload).map_err(|_| invalid_checkpoint())
     }
 
     fn current_output(&self) -> Cow<'_, DeltaBatch> {
@@ -197,7 +199,8 @@ impl FilterProjectRuntime {
             });
         }
         let payload: FilterProjectCheckpointPayload =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != FILTER_PROJECT_RUNTIME_KIND
         {

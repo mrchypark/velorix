@@ -1601,7 +1601,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
     let Some(state_payload) = &checkpoint.state_payload else {
         return Ok(None);
     };
-    let payload: Value = serde_json::from_str(&state_payload.payload)
+    let payload: Value = state_payload
+        .payload
+        .project(&["runtime_kind", "plan", "logical_plan"])
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     match payload.get("runtime_kind").and_then(Value::as_str) {
         Some(
@@ -1692,7 +1694,12 @@ fn is_materialized_bag_checkpoint(checkpoint: &RuntimeCheckpoint) -> bool {
     checkpoint
         .state_payload
         .as_ref()
-        .and_then(|state| serde_json::from_str::<Value>(&state.payload).ok())
+        .and_then(|state| {
+            state
+                .payload
+                .project(&["runtime_kind", "plan", "logical_plan"])
+                .ok()
+        })
         .and_then(|state| {
             state
                 .get("runtime_kind")
@@ -2127,11 +2134,9 @@ pub(super) async fn legacy_materialized_page(
     if let Some(memory_bytes) = policy.memory_limit_bytes {
         bounded.max_standing_runtime_state_payload_bytes = bounded
             .max_standing_runtime_state_payload_bytes
-            // Reserve the Arrow expansion bound (48x), runtime representation
-            // allowance (16x), and fixed IPC metadata overhead together.
-            .min(
-                usize::try_from(memory_bytes.saturating_sub(16 * 1024) / 64).unwrap_or(usize::MAX),
-            );
+            // State length already charges expanded typed nodes and strings.
+            // Reserve compressed copies, Arrow buffers and restored state together.
+            .min(usize::try_from(memory_bytes.saturating_sub(16 * 1024) / 8).unwrap_or(usize::MAX));
     }
     let cache_hit_store = store.clone();
     bounded.materialized_read_cache_hit_accountant = Some(Arc::new(move |path, bytes| {

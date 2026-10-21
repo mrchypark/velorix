@@ -121,7 +121,9 @@ impl TwoInputSemiAntiJoinRuntime {
         )
     }
 
-    fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
+    fn checkpoint_payload(
+        &self,
+    ) -> Result<velorix_core::arrow_state::ArrowState, StandingProgramRuntimeError> {
         let payload = SemiAntiJoinCheckpointPayloadV1 {
             schema_version: 1,
             runtime_kind: SEMI_ANTI_JOIN_RUNTIME_KIND.to_string(),
@@ -142,7 +144,7 @@ impl TwoInputSemiAntiJoinRuntime {
                 })
                 .collect(),
         };
-        serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())
+        velorix_core::arrow_state::to_state(&payload).map_err(|_| invalid_checkpoint())
     }
 
     pub fn restore(checkpoint: RuntimeCheckpoint) -> Result<Self, StandingProgramRuntimeError> {
@@ -159,7 +161,8 @@ impl TwoInputSemiAntiJoinRuntime {
             });
         }
         let payload: SemiAntiJoinCheckpointPayloadV1 =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != 1
             || payload.runtime_kind != SEMI_ANTI_JOIN_RUNTIME_KIND
             || payload.graph.logical_epoch != checkpoint.logical_epoch

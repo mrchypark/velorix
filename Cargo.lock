@@ -5640,8 +5640,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlparser 0.63.0",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

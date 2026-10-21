@@ -496,8 +496,10 @@ impl SingleKeySumCountRuntime {
         )
     }
 
-    fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
-        self.limits.checkpoint_json(&self.checkpoint_data())
+    fn checkpoint_payload(
+        &self,
+    ) -> Result<velorix_core::arrow_state::ArrowState, StandingProgramRuntimeError> {
+        self.limits.checkpoint_arrow(&self.checkpoint_data())
     }
 
     fn checkpoint_data(&self) -> GenericCheckpointPayload {
@@ -566,7 +568,7 @@ impl SingleKeySumCountRuntime {
                 logical_epoch,
             })
             .collect();
-        self.limits.checkpoint_json(&payload)?;
+        self.limits.validate_checkpoint_value(&payload)?;
         Ok(())
     }
 
@@ -585,7 +587,8 @@ impl SingleKeySumCountRuntime {
             });
         }
         let payload: GenericCheckpointPayload =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION {
             return Err(invalid_checkpoint());
         }

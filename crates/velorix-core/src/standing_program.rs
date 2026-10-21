@@ -494,7 +494,7 @@ fn invalid_causal_cut() -> StandingProgramRuntimeError {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCheckpointStatePayload {
     pub codec_identity: String,
-    pub payload: String,
+    pub payload: crate::arrow_state::ArrowState,
 }
 
 impl RuntimeCheckpoint {
@@ -596,7 +596,7 @@ pub struct EventTimeStateRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventTimeStateObject {
     pub reference: EventTimeStateRef,
-    pub payload: String,
+    pub payload: crate::arrow_state::ArrowState,
 }
 
 /// `reference: None` requires complete retained-source replay through `logical_epoch`.
@@ -660,7 +660,7 @@ pub trait StandingProgramRuntime {
     fn hydrate_event_time_state(
         &mut self,
         request: &EventTimeStateRequest,
-        payload: &str,
+        payload: &crate::arrow_state::ArrowState,
     ) -> Result<(), StandingProgramRuntimeError> {
         let _ = (request, payload);
         Err(StandingProgramRuntimeError::InvalidProgramIdentity {

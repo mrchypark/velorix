@@ -2720,8 +2720,8 @@ mod tests {
     #[test]
     fn graph_checkpoint_round_trips_through_the_wire_format() {
         let checkpoint = three_operator_graph().checkpoint().unwrap();
-        let encoded = serde_json::to_vec(&checkpoint).unwrap();
-        let decoded: NativeOperatorGraphCheckpointV1 = serde_json::from_slice(&encoded).unwrap();
+        let encoded = crate::arrow_state::to_state(&checkpoint).unwrap();
+        let decoded: NativeOperatorGraphCheckpointV1 = encoded.decode().unwrap();
         assert_eq!(decoded, checkpoint);
     }
 

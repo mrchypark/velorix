@@ -150,13 +150,21 @@ fn keyed_aggregate_kernel_restores_composite_null_group_state_from_wire_checkpoi
 
     let mut checkpointed = KeyedAggregateKernel::new();
     checkpointed.push_changes(1, &checkpoint_input).unwrap();
-    let encoded = serde_json::to_vec(&checkpointed.checkpoint_state().to_payload()).unwrap();
+    let encoded =
+        velorix_core::arrow_state::to_state(&checkpointed.checkpoint_state().to_payload()).unwrap();
+    let decoded = encoded
+        .decode::<EngineCheckpointPayload>()
+        .unwrap()
+        .into_checkpoint();
     assert!(
-        String::from_utf8_lossy(&encoded).contains("\"category\":null"),
+        decoded
+            .state()
+            .records()
+            .iter()
+            .any(|row| row.key.as_json().get("category") == Some(&serde_json::Value::Null)),
         "wire checkpoint must preserve a NULL composite-key component"
     );
-    let decoded = serde_json::from_slice::<EngineCheckpointPayload>(&encoded).unwrap();
-    let mut restored = KeyedAggregateKernel::from_checkpoint(decoded.into_checkpoint()).unwrap();
+    let mut restored = KeyedAggregateKernel::from_checkpoint(decoded).unwrap();
     restored.push_changes(2, &replay_input).unwrap();
 
     assert_eq!(restored.logical_epoch(), 2);
@@ -225,8 +233,8 @@ fn engine_checkpoint_payload_preserves_logical_epoch_and_state_when_serialized()
     let checkpoint =
         EngineCheckpoint::new(3, batch([state_delta("account-a", json!(10), json!(1))]));
 
-    let encoded = serde_json::to_vec(&checkpoint.to_payload()).unwrap();
-    let decoded = serde_json::from_slice::<EngineCheckpointPayload>(&encoded).unwrap();
+    let encoded = velorix_core::arrow_state::to_state(&checkpoint.to_payload()).unwrap();
+    let decoded = encoded.decode::<EngineCheckpointPayload>().unwrap();
     let restored = decoded.into_checkpoint();
 
     assert_eq!(restored.logical_epoch(), 3);

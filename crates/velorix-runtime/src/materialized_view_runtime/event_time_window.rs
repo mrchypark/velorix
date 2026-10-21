@@ -461,7 +461,7 @@ impl TumblingEventTimeAggregateRuntime {
         logical_epoch: LogicalEpoch,
     ) -> Result<EventTimeStateObject, StandingProgramRuntimeError> {
         let binding = self.runtime_binding()?;
-        let payload = serde_json::to_string(&ColdWindowAccumulator {
+        let payload = velorix_core::arrow_state::to_state(&ColdWindowAccumulator {
             schema_version: 1,
             runtime_binding: binding.clone(),
             window_key: key.to_string(),
@@ -655,7 +655,9 @@ impl TumblingEventTimeAggregateRuntime {
         )
     }
 
-    fn checkpoint_payload(&self) -> Result<String, StandingProgramRuntimeError> {
+    fn checkpoint_payload(
+        &self,
+    ) -> Result<velorix_core::arrow_state::ArrowState, StandingProgramRuntimeError> {
         let payload = TumblingWindowCheckpointPayload {
             schema_version: CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
             runtime_kind: TUMBLING_WINDOW_RUNTIME_KIND.to_string(),
@@ -693,7 +695,7 @@ impl TumblingEventTimeAggregateRuntime {
                 .collect(),
             logical_epoch: self.logical_epoch,
         };
-        serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())
+        velorix_core::arrow_state::to_state(&payload).map_err(|_| invalid_checkpoint())
     }
 
     fn restore_payload(
@@ -709,7 +711,8 @@ impl TumblingEventTimeAggregateRuntime {
             });
         }
         let mut payload: TumblingWindowCheckpointPayload =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != TUMBLING_WINDOW_RUNTIME_KIND
         {
@@ -1135,7 +1138,7 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
     fn hydrate_event_time_state(
         &mut self,
         request: &EventTimeStateRequest,
-        payload: &str,
+        payload: &velorix_core::arrow_state::ArrowState,
     ) -> Result<(), StandingProgramRuntimeError> {
         if self.state_request(&request.window_key).as_ref() != Some(request) {
             return Err(event_time_state_error("event_time_state_stale_request"));
@@ -1148,7 +1151,7 @@ impl StandingProgramRuntime for TumblingEventTimeAggregateRuntime {
             return Err(event_time_state_error("event_time_state_content_hash"));
         }
         let accumulator: ColdWindowAccumulator =
-            serde_json::from_str(payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(payload).map_err(|_| invalid_checkpoint())?;
         let binding = self.runtime_binding()?;
         if accumulator.schema_version != 1
             || accumulator.runtime_binding != binding
@@ -2342,9 +2345,9 @@ mod tests {
         assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
         let mut corrupted = checkpoint;
         let payload = corrupted.state_payload.as_mut().unwrap();
-        let mut json: Value = serde_json::from_str(&payload.payload).unwrap();
+        let mut json: Value = velorix_core::arrow_state::from_state(&payload.payload).unwrap();
         json["deferred_demand"]["coverage"] = serde_json::json!([]);
-        payload.payload = serde_json::to_string(&json).unwrap();
+        payload.payload = velorix_core::arrow_state::to_state(&json).unwrap();
         corrupted.state_root.content_hash = stable_bytes_hash(payload.payload.as_bytes());
         assert!(TumblingEventTimeAggregateRuntime::restore(corrupted).is_err());
     }

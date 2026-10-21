@@ -164,91 +164,53 @@ fn bag_publication_family(family: &str) -> bool {
     )
 }
 
-/// The generic extraction rule shared with the runtime: a checkpoint whose
-/// payload binds `output_schema` and `published_output` publishes Arrow pages
-/// regardless of its family name. This keeps a valid generic family from
-/// failing publication only because it is missing from a static list.
-fn binds_generic_output(payload: &Value) -> bool {
-    payload
-        .get("published_output")
-        .is_some_and(|output| !output.is_null())
-        && payload
-            .get("output_schema")
-            .is_some_and(|schema| !schema.is_null())
-}
-
-/// The general materialized output is published from the checkpoint's declared
-/// output schema. A checkpoint without a runtime kind of its own still
-/// publishes the general pages as long as it declares that schema.
-fn binds_output_schema(payload: &Value) -> bool {
-    payload
-        .get("output_schema")
-        .is_some_and(|schema| !schema.is_null())
-}
-
 pub(super) fn supports_checkpoint(checkpoint: &RuntimeCheckpoint) -> bool {
-    let Some(payload) = checkpoint
-        .state_payload
-        .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-    else {
+    let Some(state) = checkpoint.state_payload.as_ref().map(|p| &p.payload) else {
         return false;
     };
-    match payload.get("runtime_kind").and_then(Value::as_str) {
-        Some(family) => native_restore_family(family) || binds_generic_output(&payload),
-        // A general materialized checkpoint declares only the output schema;
-        // it carries no runtime kind of its own.
-        None => binds_output_schema(&payload),
+    match state.field::<String>("runtime_kind") {
+        Ok(Some(family)) => {
+            native_restore_family(&family)
+                || (state.has_non_null_field("output_schema")
+                    && state.has_non_null_field("published_output"))
+        }
+        Ok(None) => state.has_non_null_field("output_schema"),
+        Err(_) => false,
     }
 }
 
-/// The generic families are served only from an authoritative checkpoint
-/// pointer; without one the reader cannot select their Arrow pages.
 pub(super) fn generic_checkpoint_family(checkpoint: &RuntimeCheckpoint) -> bool {
     checkpoint
         .state_payload
         .as_ref()
-        .and_then(|payload| serde_json::from_str::<Value>(&payload.payload).ok())
-        .and_then(|payload| {
-            payload
-                .get("runtime_kind")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .and_then(|p| p.payload.field::<String>("runtime_kind").ok().flatten())
         .is_some_and(|family| !native_restore_family(&family))
 }
 
 fn checkpoint_index(checkpoint: &RuntimeCheckpoint) -> Result<PageIndex, ApiError> {
-    let payload = checkpoint.state_payload.as_ref().ok_or_else(invalid)?;
-    let value: Value = serde_json::from_str(&payload.payload).map_err(ApiError::bad_request)?;
-    let family = value.get("runtime_kind").and_then(Value::as_str);
-    if let Some(family) = family {
-        if !native_restore_family(family) && !binds_generic_output(&value) {
-            return Err(invalid());
-        }
-    } else if !binds_output_schema(&value) {
-        // Without a runtime kind the checkpoint must still declare the output
-        // schema; anything else is not publishable.
+    if !supports_checkpoint(checkpoint) {
         return Err(invalid());
     }
-    let schema = serde_json::from_value(value.get("output_schema").cloned().ok_or_else(invalid)?)
+    let Some(state) = checkpoint.state_payload.as_ref().map(|p| &p.payload) else {
+        return Err(invalid());
+    };
+    let family = state
+        .field::<String>("runtime_kind")
         .map_err(ApiError::bad_request)?;
     Ok(PageIndex {
-        // Only the bag families bind a family. Every other admitted checkpoint
-        // publishes the general materialized pages, which carry no family.
-        family: family
-            .filter(|family| bag_publication_family(family))
-            .map(str::to_string),
-        schema,
+        family: family.filter(|f| bag_publication_family(f)),
+        schema: checkpoint_output_schema(checkpoint)?,
         page_stats: None,
     })
 }
 
 fn checkpoint_output_schema(checkpoint: &RuntimeCheckpoint) -> Result<RelationSchema, ApiError> {
     let payload = checkpoint.state_payload.as_ref().ok_or_else(invalid)?;
-    let value: Value = serde_json::from_str(&payload.payload).map_err(ApiError::bad_request)?;
-    serde_json::from_value(value.get("output_schema").cloned().ok_or_else(invalid)?)
-        .map_err(ApiError::bad_request)
+    payload
+        .payload
+        .field("output_schema")
+        .map_err(ApiError::bad_request)?
+        .ok_or_else(invalid)
 }
 
 /// Charge one object request against the query policy budget.
@@ -319,19 +281,27 @@ pub(super) fn checkpoint_publication(
     view_id: &str,
     key: &ObjectKey,
 ) -> Result<Option<StandingRuntimeOutputPublication>, ApiError> {
-    let Some(value) =
-        super::checkpoint_publication::standing_runtime_checkpoint_published_output(checkpoint)
+    checkpoint_publication_batched(checkpoint, view_id, key, PAGE_ROWS)
+}
+
+fn checkpoint_publication_batched(
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+    key: &ObjectKey,
+    normalization_rows: usize,
+) -> Result<Option<StandingRuntimeOutputPublication>, ApiError> {
+    let Some(state) = checkpoint.state_payload.as_ref().map(|p| &p.payload) else {
+        return Ok(None);
+    };
+    let Some(output) = state
+        .field::<DeltaBatch>("published_output")
+        .map_err(ApiError::bad_request)?
     else {
         return Ok(None);
     };
-    let payload: Value = serde_json::from_str(
-        &checkpoint
-            .state_payload
-            .as_ref()
-            .ok_or_else(invalid)?
-            .payload,
-    )
-    .map_err(ApiError::bad_request)?;
+    let payload = state
+        .project(&["runtime_kind", "plan", "output_schema"])
+        .map_err(ApiError::bad_request)?;
     if payload.get("output_schema").is_none() {
         // Historical checkpoint-only outputs have no declared public schema.
         // Keep their existing reader rather than assigning an inferred page schema.
@@ -341,7 +311,6 @@ pub(super) fn checkpoint_publication(
     if schema.relation_id != view_id {
         return Err(invalid());
     }
-    let output: DeltaBatch = serde_json::from_value(value).map_err(ApiError::bad_request)?;
     let aggregates =
         super::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(checkpoint)?;
     let canonical = output.net_rows().map_err(ApiError::bad_request)?;
@@ -355,14 +324,15 @@ pub(super) fn checkpoint_publication(
     let mut normalized = Vec::new();
     // Each normalization batch is bounded; the existing converter supplies aliases,
     // aggregate values and composite keys exactly as the public runtime query does.
-    for row in canonical {
+    for chunk in canonical.chunks(normalization_rows.clamp(1, PAGE_ROWS)) {
         {
-            let copies = 1;
-            let mut part = row.clone();
-            part.weight = 1;
+            let parts = chunk.iter().cloned().map(|mut row| {
+                row.weight = 1;
+                row
+            });
             let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_payload(
                 &schema,
-                &DeltaBatch::from_records([part]),
+                &DeltaBatch::from_records(parts),
                 ScopedViewId {
                     tenant_id: checkpoint.identity.tenant_id.clone(),
                     program_id: checkpoint.identity.program_id.clone(),
@@ -370,14 +340,17 @@ pub(super) fn checkpoint_publication(
                 },
                 checkpoint.logical_epoch,
                 SnapshotPageRequest {
-                    max_rows: Some(copies),
+                    max_rows: Some(chunk.len()),
                     ..Default::default()
                 },
                 aggregates.as_deref(),
                 Some(&payload),
             )
             .map_err(ApiError::bad_request)?;
-            let mut converted = Vec::new();
+            if page.next_page_token.is_some() {
+                return Err(invalid());
+            }
+            let mut converted = Vec::with_capacity(chunk.len());
             for batch in page.batches {
                 for i in 0..batch.num_rows() {
                     let mut value = serde_json::Map::new();
@@ -389,6 +362,7 @@ pub(super) fn checkpoint_publication(
                         }
                         value.insert(column.name.clone(), scalar);
                     }
+                    let row = chunk.get(converted.len()).ok_or_else(invalid)?;
                     converted.push(velorix_core::delta::DeltaRecord::new(
                         row.key.clone(),
                         velorix_core::delta::DeltaValue::from_json(Value::Object(value)),
@@ -396,7 +370,7 @@ pub(super) fn checkpoint_publication(
                     ));
                 }
             }
-            if converted.len() != copies {
+            if converted.len() != chunk.len() {
                 return Err(invalid());
             }
             normalized.extend(
@@ -2242,6 +2216,66 @@ pub(crate) mod tests {
     use velorix_control::meta_admin::InMemoryMetaStore;
     use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 
+    fn compare_normalization_batches(rows: usize) {
+        let (mut checkpoint, schema) = fixture();
+        let output = DeltaBatch::from_records((0..rows).map(|i| {
+            DeltaRecord::new(
+                DeltaKey::from_json(json!(format!("id-{:05}", i / 3))),
+                DeltaValue::from_json(
+                    json!({"power": if i.is_multiple_of(13) {Value::Null} else {json!(i as f64 + 0.5)}}),
+                ),
+                if i.is_multiple_of(17) { 3 } else { 1 },
+            )
+        }));
+        let state = velorix_core::arrow_state::to_state(
+            &json!({"output_schema":schema,"published_output":output}),
+        )
+        .unwrap();
+        checkpoint.state_root.content_hash = stable_bytes_hash(state.as_bytes());
+        checkpoint.state_payload.as_mut().unwrap().payload = state;
+        let key = key(&checkpoint);
+        let start = Instant::now();
+        let single = checkpoint_publication_batched(&checkpoint, &schema.relation_id, &key, 1)
+            .unwrap()
+            .unwrap();
+        let single_time = start.elapsed();
+        let start = Instant::now();
+        let batched =
+            checkpoint_publication_batched(&checkpoint, &schema.relation_id, &key, PAGE_ROWS)
+                .unwrap()
+                .unwrap();
+        let batch_time = start.elapsed();
+        assert_eq!(single.manifest_key, batched.manifest_key);
+        assert_eq!(
+            serde_json::to_value(single.manifest_record).unwrap(),
+            serde_json::to_value(batched.manifest_record).unwrap()
+        );
+        assert_eq!(single.page_records.len(), batched.page_records.len());
+        for ((old_key, old), (new_key, new)) in
+            single.page_records.into_iter().zip(batched.page_records)
+        {
+            assert_eq!(old_key, new_key);
+            assert_eq!(
+                serde_json::to_value(old).unwrap(),
+                serde_json::to_value(new).unwrap()
+            );
+        }
+        eprintln!(
+            "normalization_rows={rows} single_row_ms={:.3} batch_512_ms={:.3}",
+            single_time.as_secs_f64() * 1000.0,
+            batch_time.as_secs_f64() * 1000.0
+        );
+    }
+    #[test]
+    fn normalization_batches_preserve_keys_weights_nulls_and_page_boundaries() {
+        compare_normalization_batches(1027);
+    }
+    #[test]
+    #[ignore = "explicit performance measurement"]
+    fn normalization_benchmark() {
+        compare_normalization_batches(25000);
+    }
+
     fn fixture() -> (RuntimeCheckpoint, RelationSchema) {
         let schema = RelationSchema {
             relation_id: "purchases_by_user".into(),
@@ -2263,8 +2297,8 @@ pub(crate) mod tests {
             primary_key: vec!["id".into()],
         };
         let mut checkpoint = crate::tests::test_runtime_checkpoint(Vec::new());
-        let payload =
-            json!({"runtime_kind": "generic_set_ops_v1", "output_schema": schema}).to_string();
+        let payload = json!({"runtime_kind": "generic_set_ops_v1", "output_schema": schema});
+        let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = payload;
         (checkpoint, schema)
@@ -2970,7 +3004,7 @@ pub(crate) mod tests {
         if runtime_kind == "ordered_window" {
             payload["plan"] = json!({"schema_version": 2});
         }
-        let payload = payload.to_string();
+        let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = payload;
         (checkpoint, schema)
@@ -3030,8 +3064,8 @@ pub(crate) mod tests {
     fn generic_family_without_output_schema_keeps_legacy_json_path() {
         let (mut checkpoint, schema) = fixture();
         let output = DeltaBatch::from_records([row(json!(1.), 2)]);
-        let payload =
-            json!({"runtime_kind": "ordered_window", "published_output": output}).to_string();
+        let payload = json!({"runtime_kind": "ordered_window", "published_output": output});
+        let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = payload;
         assert!(!supports_checkpoint(&checkpoint));
@@ -3061,8 +3095,8 @@ pub(crate) mod tests {
             "output_schema": schema,
             "published_output": output,
             "plan": {"schema_version": 1}
-        })
-        .to_string();
+        });
+        let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = payload;
         assert!(
@@ -3282,8 +3316,8 @@ pub(crate) mod tests {
     async fn native_mixed_between_matches_datafusion_common_coercion() {
         let (mut checkpoint, mut schema) = fixture();
         schema.columns[1].data_type = SqlDataType::Int64;
-        let payload =
-            json!({"runtime_kind":"generic_set_ops_v1","output_schema":schema}).to_string();
+        let payload = json!({"runtime_kind":"generic_set_ops_v1","output_schema":schema});
+        let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = payload;
         let (state, checkpoint, schema, _, _) = install_checkpoint(
@@ -3333,8 +3367,8 @@ pub(crate) mod tests {
             data_type: SqlDataType::Timestamp { timezone: None },
             nullable: false,
         });
-        let payload =
-            json!({"runtime_kind":"generic_set_ops_v1","output_schema":schema}).to_string();
+        let payload = json!({"runtime_kind":"generic_set_ops_v1","output_schema":schema});
+        let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = payload;
         let output =
