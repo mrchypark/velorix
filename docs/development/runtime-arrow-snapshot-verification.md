@@ -130,3 +130,34 @@ benchmark), 85 runtime unit tests and 262 runtime integration tests. The normal
 core test suite includes the generic codec and fresh-process tests; its ignored
 performance test was also executed explicitly in release mode. Deployed HTTP
 latency, remote S3 throughput and new real-data comparisons were not measured.
+
+## Complete local incremental benchmark
+
+The existing `local_incremental` harness was also executed with its new Arrow
+checkpoint envelope using the debug test profile and a temporary local object
+store. It completed, including publish/read/recover/replay and the other
+materialized-output workloads. Selected results:
+
+| Stage | p50 | p95 | Counted object-store operations |
+| --- | ---: | ---: | --- |
+| Native incremental view apply | 2.016 ms | 5.586 ms | 0 PUT / 0 GET / 0 LIST |
+| Checkpoint publication (9 samples) | 5.078 ms | 20.729 ms | 36 PUT / 0 GET / 0 LIST total |
+| Checkpoint recovery and tail replay (9 samples) | 17.905 ms | 109.768 ms | 9 GET, 0 PUT and 0 LIST total |
+| Direct ingest-envelope validation (257 envelopes) | 239.363 ms | 970.973 ms | 771 PUT / 230,529 GET / 2,057 LIST total |
+
+The whole benchmark reported 6,001 native rows/s, 477,790,208 peak RSS bytes
+(about 456 MiB), zero spill and 892,034 bytes written. These cover the complete
+multi-workload process and local counted operations, not remote S3 traffic or
+HTTP latency. They are debug-build diagnostics, not the release microbenchmark
+numbers above, and are not a pre/post comparison with an earlier server.
+
+The direct ingestion/admission harness remains a separate large cost target.
+For its 257 envelopes, GETs equal `7*N*(N-1)/2 + N`, while LISTs equal `8*N+1`.
+Together with the legacy coordinator's enumeration of admission/expiry records,
+this identifies repeated namespace-validation work in that fixture. The harness
+uses `IngestAdmissionCoordinator` directly; it is not the metadata-backed REST
+admission benchmark. No claim is made that this snapshot-format change optimizes
+that quadratic work or that these counts characterize every deployed mode.
+Any subsequent optimization must preserve cross-process overlap checks,
+expiry, ownership and durable admission proofs; these checks were not bypassed
+for a better benchmark number.
