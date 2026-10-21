@@ -185,6 +185,13 @@ impl VelorixRelationCatalogV1 {
                 })
             }
             SupportedIncrementalAdapterSpec::ScalarSumCount => Ok(spec),
+            SupportedIncrementalAdapterSpec::RowKeySumCount
+                if self.relation_schema.primary_key_column_ids.is_empty() =>
+            {
+                Err(RelationSchemaError::InvalidRelationSchema {
+                    field: "incremental_adapter.primary_key_column_ids",
+                })
+            }
             SupportedIncrementalAdapterSpec::RowKeySumCount => {
                 validate_single_value_column_for_adapter(&self.relation_schema).map(|()| spec)
             }
@@ -285,11 +292,7 @@ impl VelorixRelationSchemaV1 {
         if self.columns.is_empty() {
             return Err(RelationSchemaError::InvalidRelationSchema { field: "columns" });
         }
-        if self.primary_key_column_ids.is_empty() {
-            return Err(RelationSchemaError::InvalidRelationSchema {
-                field: "primary_key_column_ids",
-            });
-        }
+        // Empty keys describe a bag; keyed adapters enforce their own requirements.
         require_non_empty("weight_column_id", &self.weight_column_id)?;
         if self.allowed_operations.is_empty() {
             return Err(RelationSchemaError::InvalidRelationSchema {

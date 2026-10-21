@@ -42,10 +42,14 @@ use crate::{
     },
 };
 
+pub mod set_ops;
 mod typed_expr;
+pub use set_ops::*;
+pub mod typed_map;
+pub use typed_map::*;
 
 pub use typed_expr::{
-    builtin_udf_identity_for_name, builtin_udf_spec, validate_typed_expr_node,
+    bounded_json_path, builtin_udf_identity_for_name, builtin_udf_spec, validate_typed_expr_node,
     BuiltinScalarFunctionV1, BuiltinUdfIdentityV1, CanonicalI128V1, RuntimeScalarTypeV1,
     ScalarLiteralV1, TypedExprError, TypedExprKindV1, TypedExprNodeV1, TypedExprProgramV1,
     TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
@@ -201,6 +205,24 @@ impl PlannerRelationInput {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VelorixLogicalViewPlanNodeV1 {
+    TypedMap {
+        node_id: String,
+        input: String,
+        plan: Box<SupportedTypedMapPlanV1>,
+        output_schema: RelationSchema,
+    },
+    Series {
+        node_id: String,
+        input: String,
+        plan: Box<SupportedSeriesPlanV1>,
+        output_schema: RelationSchema,
+    },
+    UnionAll {
+        node_id: String,
+        inputs: Vec<SetOperationInputV1>,
+        plan: Box<SupportedUnionAllPlanV1>,
+        output_schema: RelationSchema,
+    },
     RelationScan {
         node_id: String,
         relation: LogicalPlanRelationRef,
@@ -435,6 +457,12 @@ pub enum LogicalPlanAggregateFunctionV1 {
     PercentileCont {
         percentile: f64,
     },
+    ArgMax {
+        ordering_column_ordinal: usize,
+    },
+    ApproxQuantile {
+        percentile: f64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -460,6 +488,15 @@ pub enum LogicalPlanStateKindV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VelorixLogicalViewExecutionV1 {
+    TypedMap {
+        plan: Box<SupportedTypedMapPlanV1>,
+    },
+    Series {
+        plan: Box<SupportedSeriesPlanV1>,
+    },
+    UnionAll {
+        plan: Box<SupportedUnionAllPlanV1>,
+    },
     SingleKeySumCount {
         plan: SupportedViewPlan,
     },
@@ -497,6 +534,12 @@ pub enum VelorixLogicalViewExecutionV1 {
     /// is `ROWS BETWEEN k PRECEDING AND k FOLLOWING` with constant k.
     AnalyticWindowFrames {
         plan: Box<SupportedAnalyticWindowFramePlanV1>,
+    },
+    OrderedWindows {
+        plan: Box<SupportedOrderedWindowPlanV1>,
+    },
+    TypedJoinProject {
+        plan: Box<SupportedTypedJoinProjectPlanV1>,
     },
     /// Phase 8.3: exact interval overlap inner join
     /// `left.start < right.end AND right.start < left.end` with non-null
@@ -598,6 +641,74 @@ pub enum WindowNavigationFunctionV1 {
     NthValue {
         value_column_id: String,
         n: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedOrderedWindowPlanV1 {
+    pub schema_version: u32,
+    pub input_relation_id: String,
+    pub key_column_id: String,
+    pub output_key_column_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_key_input_column_id: Option<String>,
+    pub partition_column_ids: Vec<String>,
+    pub order_column_id: String,
+    pub order_descending: bool,
+    /// None preserves legacy nonnullable plan serialization. SQL defaults put
+    /// NULL last for ASC and first for DESC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_nulls_first: Option<bool>,
+    pub outputs: Vec<OrderedWindowOutputV1>,
+    pub projections: Vec<OrderedWindowProjectionV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedTypedJoinProjectPlanV1 {
+    pub left_relation_id: String,
+    pub right_relation_id: String,
+    pub join_kind: SupportedJoinKind,
+    pub key_pairs: Vec<SupportedJoinKeyPairV1>,
+    pub projection: Vec<SupportedTypedJoinProjectionV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedTypedJoinProjectionV1 {
+    pub side: SupportedAggregateInputRelationSide,
+    pub column_id: String,
+    pub output_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coalesce_right_column_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedWindowOutputV1 {
+    pub output_column_id: String,
+    pub function: OrderedWindowFunctionV1,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedWindowProjectionV1 {
+    pub input_column_id: String,
+    pub output_column_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OrderedWindowFunctionV1 {
+    SumFloat64 {
+        value_column_id: String,
+        rows: bool,
+        preceding: u64,
+    },
+    Lag {
+        value_column_id: String,
+        offset: u64,
     },
 }
 
@@ -1421,7 +1532,25 @@ pub fn lower_supported_sql_to_logical_plan(
     catalogs: &[VelorixRelationCatalogV1],
     output_schema: &RelationSchema,
 ) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    if set_ops::is_union_all_sql(sql)? {
+        return lower_supported_union_all_sql_to_logical_plan(sql, catalogs, output_schema);
+    }
     if let [catalog] = catalogs {
+        if set_ops::is_series_sql(sql)? {
+            return lower_supported_series_sql_to_logical_plan(sql, catalog, output_schema);
+        }
+    }
+    if catalogs.len() == 2 && validate_supported_typed_join_project_sql(sql, catalogs).is_ok() {
+        return lower_supported_typed_join_project_sql_to_logical_plan(
+            sql,
+            catalogs,
+            output_schema,
+        );
+    }
+    if let [catalog] = catalogs {
+        if let Ok(plan) = validate_supported_ordered_window_sql(sql, catalog) {
+            return ordered_window_logical_plan(sql, catalog, output_schema, plan);
+        }
         if let Ok(query) = parse_single_query(sql) {
             if query.with.as_ref().is_some_and(|with| with.recursive) {
                 return lower_supported_recursive_cte_sql_to_logical_plan(
@@ -1433,25 +1562,28 @@ pub fn lower_supported_sql_to_logical_plan(
         }
     }
     match catalogs {
-        [catalog] => match lower_supported_join_view_sql_to_logical_plan(sql, catalogs, output_schema)
-        {
-            Ok(plan) => Ok(plan),
-            Err(ViewPlanError::UnsupportedShape { .. }) => {
-                match lower_supported_view_sql_to_logical_plan(sql, catalog, output_schema) {
-                    Ok(plan) => Ok(plan),
-                    Err(ViewPlanError::UnsupportedShape { .. }) => {
-                match lower_supported_latest_by_key_sql_to_logical_plan(sql, catalog, output_schema)
-                {
-                    Ok(plan) => Ok(plan),
-                    Err(ViewPlanError::UnsupportedShape { .. }) => {
-                        match lower_supported_tumbling_window_sql_to_logical_plan(
-                            sql,
-                            catalog,
-                            output_schema,
-                        ) {
-                            Ok(plan) => Ok(plan),
-                            Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                match lower_supported_analytic_row_number_sql_to_logical_plan(
+        [catalog] => {
+            match lower_supported_join_view_sql_to_logical_plan(sql, catalogs, output_schema) {
+                Ok(plan) => Ok(plan),
+                Err(ViewPlanError::UnsupportedShape { .. }) => {
+                    match lower_supported_view_sql_to_logical_plan(sql, catalog, output_schema) {
+                        Ok(plan) => Ok(plan),
+                        Err(ViewPlanError::UnsupportedShape { .. }) => {
+                            match lower_supported_latest_by_key_sql_to_logical_plan(
+                                sql,
+                                catalog,
+                                output_schema,
+                            ) {
+                                Ok(plan) => Ok(plan),
+                                Err(ViewPlanError::UnsupportedShape { .. }) => {
+                                    match lower_supported_tumbling_window_sql_to_logical_plan(
+                                        sql,
+                                        catalog,
+                                        output_schema,
+                                    ) {
+                                        Ok(plan) => Ok(plan),
+                                        Err(ViewPlanError::UnsupportedShape { .. }) => {
+                                            match lower_supported_analytic_row_number_sql_to_logical_plan(
                                     sql,
                                     catalog,
                                     output_schema,
@@ -1465,29 +1597,42 @@ pub fn lower_supported_sql_to_logical_plan(
                                         ) {
                                             Ok(plan) => Ok(plan),
                                             Err(ViewPlanError::UnsupportedShape { .. }) => {
-                                                lower_supported_filter_project_sql_to_logical_plan(
-                                                    sql,
-                                                    catalog,
-                                                    output_schema,
-                                                )
+                                                match validate_supported_filter_project_sql(sql, catalog) {
+                                                    Ok(_) => lower_supported_filter_project_sql_to_logical_plan(
+                                                        sql, catalog, output_schema,
+                                                    ),
+                                                    Err(filter_error @ ViewPlanError::UnsupportedShape { .. }) => {
+                                                        match validate_supported_typed_map_sql(sql, catalog) {
+                                                            Ok(_) => lower_supported_typed_map_sql_to_logical_plan(
+                                                                sql, catalog, output_schema,
+                                                            ),
+                                                            // A fallback that also rejects the SQL must not
+                                                            // erase the existing predicate/projection contract.
+                                                            Err(ViewPlanError::UnsupportedShape { .. }) => Err(filter_error),
+                                                            Err(error) => Err(error),
+                                                        }
+                                                    }
+                                                    Err(error) => Err(error),
+                                                }
                                             }
                                             Err(error) => Err(error),
                                         }
                                     }
                                     Err(error) => Err(error),
                                 }
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                Err(error) => Err(error),
                             }
-                            Err(error) => Err(error),
                         }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
                 }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-                }
-            }
-            Err(error) => Err(error),
-        },
+        }
         [_, _] => {
             match lower_supported_scalar_aggregate_filter_sql_to_logical_plan(
                 sql,
@@ -1504,22 +1649,30 @@ pub fn lower_supported_sql_to_logical_plan(
                         Ok(plan) => Ok(plan),
                         Err(ViewPlanError::UnsupportedShape { .. }) => {
                             match lower_supported_cross_join_sql_to_logical_plan(
-                                sql, catalogs, output_schema,
+                                sql,
+                                catalogs,
+                                output_schema,
                             ) {
                                 Ok(plan) => Ok(plan),
                                 Err(ViewPlanError::UnsupportedShape { .. }) => {
                                     match lower_supported_temporal_join_sql_to_logical_plan(
-                                        sql, catalogs, output_schema,
+                                        sql,
+                                        catalogs,
+                                        output_schema,
                                     ) {
                                         Ok(plan) => Ok(plan),
                                         Err(ViewPlanError::UnsupportedShape { .. }) => {
                                             match lower_supported_interval_join_sql_to_logical_plan(
-                                                sql, catalogs, output_schema,
+                                                sql,
+                                                catalogs,
+                                                output_schema,
                                             ) {
                                                 Ok(plan) => Ok(plan),
                                                 Err(ViewPlanError::UnsupportedShape { .. }) => {
                                                     lower_supported_join_view_sql_to_logical_plan(
-                                                        sql, catalogs, output_schema,
+                                                        sql,
+                                                        catalogs,
+                                                        output_schema,
                                                     )
                                                 }
                                                 Err(error) => Err(error),
@@ -1537,14 +1690,14 @@ pub fn lower_supported_sql_to_logical_plan(
                 Err(error) => Err(error),
             }
         }
-        [_, _, _] => {
-            lower_supported_three_input_inner_join_count_sql_to_logical_plan(
-                sql,
-                catalogs,
-                output_schema,
-            )
-        }
-        _ => unsupported("view SQL admission currently supports one, two, or exactly three input relations"),
+        [_, _, _] => lower_supported_three_input_inner_join_count_sql_to_logical_plan(
+            sql,
+            catalogs,
+            output_schema,
+        ),
+        _ => unsupported(
+            "view SQL admission currently supports one, two, or exactly three input relations",
+        ),
     }
 }
 
@@ -1554,6 +1707,13 @@ pub fn lower_supported_view_sql_to_logical_plan(
     output_schema: &RelationSchema,
 ) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
     let supported = validate_supported_view_sql(sql, catalog)?;
+    if supported.aggregate_output_identity == Some(SupportedAggregateOutputIdentity::Singleton)
+        && (!output_schema.primary_key.is_empty()
+            || output_schema.columns
+                != supported_singleton_aggregate_output_columns(&supported, catalog)?)
+    {
+        return unsupported("singleton aggregate output must have an empty primary key and exact names, types and nullability");
+    }
     finalize_logical_plan(single_key_sum_count_logical_plan(
         sql,
         catalog,
@@ -1759,6 +1919,7 @@ pub fn lower_supported_three_input_inner_join_count_sql_to_logical_plan_with_pol
 }
 
 pub fn validate_logical_view_plan(plan: &VelorixLogicalViewPlanV1) -> Result<(), ViewPlanError> {
+    set_ops::validate_set_operation_binding(plan)?;
     if plan.plan_version != LOGICAL_VIEW_PLAN_VERSION_V2 {
         return invalid_logical_plan("unsupported logical view plan version");
     }
@@ -2250,7 +2411,6 @@ pub fn validate_supported_view_sql(
     ) {
         return unsupported("view SQL currently supports scalar single-key sum/count views");
     }
-    let key_column = catalog_primary_key_column(catalog)?;
     let query = parse_single_query(sql)?;
     // Phase 7.1: an aggregate CTE followed by an identity/filter projection
     // over the CTE is inlined into a plain aggregate query (the outer
@@ -2276,6 +2436,34 @@ pub fn validate_supported_view_sql(
         .or(from_source.projection.as_ref());
     let group_keys =
         validate_aggregate_group_keys(select, catalog, relation_alias, source_projection)?;
+    // Group identity comes from GROUP BY, not source-row uniqueness. Older
+    // expression helpers still take one bound column; on bag inputs this is an
+    // ordinary source column, never an invented catalog primary key.
+    let source_single_key = catalog.relation_schema.primary_key_column_ids.len() == 1;
+    let key_column = if source_single_key {
+        catalog_primary_key_column(catalog)?
+    } else {
+        let grouping_column_id = group_keys.iter().find_map(|key| {
+            key.input_column_id.clone().or_else(|| {
+                key.expression.as_ref().and_then(|expression| {
+                    supported_projection_expr_column_ids(expression)
+                        .into_iter()
+                        .next()
+                })
+            })
+        });
+        match grouping_column_id {
+            Some(column_id) => catalog_column_by_id(catalog, &column_id)?,
+            None => catalog
+                .relation_schema
+                .columns
+                .iter()
+                .find(|column| column.column_id != catalog.relation_schema.weight_column_id)
+                .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                    reason: "aggregate input requires a public source column".into(),
+                })?,
+        }
+    };
     let projection = validate_projection(
         select,
         catalog,
@@ -2285,18 +2473,36 @@ pub fn validate_supported_view_sql(
         &group_keys,
     )?;
     if group_keys.is_empty() {
-        let [count] = projection.aggregate_outputs.as_slice() else {
-            return unsupported("global aggregate currently supports exactly count(*)");
+        let [aggregate] = projection.aggregate_outputs.as_slice() else {
+            return unsupported(
+                "global aggregate supports exactly one COUNT(*), SUM, MIN, MAX or AVG",
+            );
         };
-        if count.function != LogicalPlanAggregateFunctionV1::Count
-            || count.input_column_id.is_some()
-            || count.input_expression.is_some()
+        let supported_global = (aggregate.function == LogicalPlanAggregateFunctionV1::Count
+            && aggregate.input_column_id.is_none())
+            || (matches!(
+                aggregate.function,
+                LogicalPlanAggregateFunctionV1::Sum
+                    | LogicalPlanAggregateFunctionV1::Min
+                    | LogicalPlanAggregateFunctionV1::Max
+                    | LogicalPlanAggregateFunctionV1::Avg
+            ) && aggregate.input_column_id.is_some());
+        if !supported_global
+            || aggregate.input_expression.is_some()
             || select.distinct.is_some()
             || !projection.aggregate_filter_exprs.is_empty()
             || projection.aggregate_filter_expr.is_some()
             || select.having.is_some()
         {
-            return unsupported("global aggregate currently supports exactly count(*)");
+            return unsupported("global aggregate requires unfiltered COUNT(*) or one direct SUM/MIN/MAX/AVG column");
+        }
+        if aggregate.function != LogicalPlanAggregateFunctionV1::Count
+            && !matches!(
+                projection.value_column.physical_arrow_type,
+                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+            )
+        {
+            return unsupported("global value aggregates require Int64 or Float64 input");
         }
     }
     validate_aggregate_source_projection(
@@ -2372,7 +2578,8 @@ pub fn validate_supported_view_sql(
     Ok(SupportedViewPlan {
         input_relation_id: catalog.relation_schema.relation_id.clone(),
         group_key_column_id: key_column.column_id.clone(),
-        aggregate_output_identity: if group_keys.len() == 1
+        aggregate_output_identity: if source_single_key
+            && group_keys.len() == 1
             && group_keys[0].input_column_id.as_deref() == Some(key_column.column_id.as_str())
             && group_keys[0].expression.is_none()
         {
@@ -2394,6 +2601,60 @@ pub fn validate_supported_view_sql(
     })
 }
 
+/// Output of a global aggregate always has one row, including empty input.
+/// Value aggregates are nullable even when their source column is nonnullable.
+pub fn supported_singleton_aggregate_output_columns(
+    plan: &SupportedViewPlan,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<Vec<ColumnSchema>, ViewPlanError> {
+    if plan.aggregate_output_identity != Some(SupportedAggregateOutputIdentity::Singleton) {
+        return unsupported("expected singleton aggregate identity");
+    }
+    plan.aggregate_outputs
+        .iter()
+        .map(|output| {
+            let (data_type, nullable) = match output.function {
+                LogicalPlanAggregateFunctionV1::Count if output.input_column_id.is_none() => {
+                    (SqlDataType::Int64, false)
+                }
+                LogicalPlanAggregateFunctionV1::Sum
+                | LogicalPlanAggregateFunctionV1::Min
+                | LogicalPlanAggregateFunctionV1::Max
+                | LogicalPlanAggregateFunctionV1::Avg => {
+                    let id = output.input_column_id.as_deref().ok_or_else(|| {
+                        ViewPlanError::UnsupportedShape {
+                            reason: "singleton value aggregate requires an input column".into(),
+                        }
+                    })?;
+                    let column = catalog_column_by_id(catalog, id)?;
+                    let data_type = match column.physical_arrow_type {
+                        ArrowPhysicalTypeV1::Int64
+                            if output.function != LogicalPlanAggregateFunctionV1::Avg =>
+                        {
+                            SqlDataType::Int64
+                        }
+                        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64 => {
+                            SqlDataType::Float64
+                        }
+                        _ => {
+                            return unsupported(
+                                "global value aggregates require Int64 or Float64 input",
+                            )
+                        }
+                    };
+                    (data_type, true)
+                }
+                _ => return unsupported("unsupported singleton aggregate output"),
+            };
+            Ok(ColumnSchema {
+                name: output.output_column_id.clone(),
+                data_type,
+                nullable,
+            })
+        })
+        .collect()
+}
+
 pub fn validate_supported_tumbling_window_sql(
     sql: &str,
     catalog: &VelorixRelationCatalogV1,
@@ -2411,7 +2672,6 @@ pub fn validate_supported_tumbling_window_sql(
     ) {
         return unsupported("tumbling window SQL currently supports scalar or generic inputs");
     }
-    let key_column = catalog_primary_key_column(catalog)?;
     let query = parse_single_query(sql)?;
     let (select, cte_source) =
         supported_plain_select_allow_identity_cte_and_top_k(&query, catalog)?;
@@ -2446,6 +2706,24 @@ pub fn validate_supported_tumbling_window_sql(
             Err(error) => return Err(error),
         };
     let relation_alias = from_source.alias.as_deref();
+    // A grouping key identifies an output group, not a unique source row.
+    let key_column = if matches!(adapter, SupportedIncrementalAdapterSpec::Generic) {
+        catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|column| {
+                select
+                    .projection
+                    .first()
+                    .is_some_and(|item| select_item_references_column(item, column, relation_alias))
+            })
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "first tumbling projection must reference a grouping column".to_string(),
+            })?
+    } else {
+        catalog_primary_key_column(catalog)?
+    };
     let projection = validate_tumbling_projection(
         select,
         catalog,
@@ -2587,6 +2865,11 @@ pub fn validate_supported_filter_project_sql(
         return unsupported("filter/project SQL currently supports scalar or generic inputs");
     }
     let key_column = catalog_primary_key_column(catalog)?;
+    // The legacy keyed runtime cannot encode NULL source keys. Published
+    // aggregate group keys may be nullable; scalar views over them use TypedMap.
+    if key_column.nullable {
+        return unsupported("filter/project requires a non-nullable source primary key");
+    }
     let query = parse_single_query(sql)?;
     if matches!(query.body.as_ref(), SetExpr::SetOperation { .. }) {
         return validate_filter_project_set_query(&query, catalog, key_column);
@@ -3224,6 +3507,9 @@ fn derive_execution_implementation(
     plan: &VelorixLogicalViewPlanV1,
 ) -> Result<LogicalPlanExecutionImplementationV1, ViewPlanError> {
     let implementation_id = match &plan.execution {
+        VelorixLogicalViewExecutionV1::TypedMap { .. } => "velorix-typed-map-v1",
+        VelorixLogicalViewExecutionV1::Series { .. } => "velorix-series-flatmap-v1",
+        VelorixLogicalViewExecutionV1::UnionAll { .. } => "velorix-union-all-v1",
         VelorixLogicalViewExecutionV1::SingleKeySumCount { .. } => {
             "velorix-single-key-aggregate-specialization-v1"
         }
@@ -3265,6 +3551,12 @@ fn derive_execution_implementation(
         }
         VelorixLogicalViewExecutionV1::AnalyticWindowFrames { .. } => {
             "velorix-analytic-window-frames-specialization-v1"
+        }
+        VelorixLogicalViewExecutionV1::OrderedWindows { .. } => {
+            "velorix-ordered-windows-specialization-v1"
+        }
+        VelorixLogicalViewExecutionV1::TypedJoinProject { .. } => {
+            "velorix-typed-join-project-specialization-v1"
         }
         VelorixLogicalViewExecutionV1::IntervalJoin { .. } => {
             "velorix-interval-join-specialization-v1"
@@ -3425,6 +3717,9 @@ fn derive_operator_dag_contract(
 
 fn logical_node_id(node: &VelorixLogicalViewPlanNodeV1) -> &str {
     match node {
+        VelorixLogicalViewPlanNodeV1::TypedMap { node_id, .. } => node_id,
+        VelorixLogicalViewPlanNodeV1::Series { node_id, .. }
+        | VelorixLogicalViewPlanNodeV1::UnionAll { node_id, .. } => node_id,
         VelorixLogicalViewPlanNodeV1::RelationScan { node_id, .. }
         | VelorixLogicalViewPlanNodeV1::Filter { node_id, .. }
         | VelorixLogicalViewPlanNodeV1::Project { node_id, .. }
@@ -3444,6 +3739,9 @@ fn logical_node_id(node: &VelorixLogicalViewPlanNodeV1) -> &str {
 
 fn logical_node_kind(node: &VelorixLogicalViewPlanNodeV1) -> &'static str {
     match node {
+        VelorixLogicalViewPlanNodeV1::TypedMap { .. } => "typed_map",
+        VelorixLogicalViewPlanNodeV1::Series { .. } => "series_flatmap",
+        VelorixLogicalViewPlanNodeV1::UnionAll { .. } => "union_all",
         VelorixLogicalViewPlanNodeV1::RelationScan { .. } => "relation_scan",
         VelorixLogicalViewPlanNodeV1::Filter { .. } => "filter",
         VelorixLogicalViewPlanNodeV1::Project { .. } => "project",
@@ -3461,8 +3759,14 @@ fn logical_node_kind(node: &VelorixLogicalViewPlanNodeV1) -> &'static str {
     }
 }
 
-fn logical_node_inputs(node: &VelorixLogicalViewPlanNodeV1) -> Vec<(&'static str, &str)> {
+fn logical_node_inputs(node: &VelorixLogicalViewPlanNodeV1) -> Vec<(&str, &str)> {
     match node {
+        VelorixLogicalViewPlanNodeV1::TypedMap { input, .. } => vec![("input", input)],
+        VelorixLogicalViewPlanNodeV1::Series { input, .. } => vec![("input", input)],
+        VelorixLogicalViewPlanNodeV1::UnionAll { inputs, .. } => inputs
+            .iter()
+            .map(|input| (input.port_id.as_str(), input.node_id.as_str()))
+            .collect(),
         VelorixLogicalViewPlanNodeV1::RelationScan { .. } => Vec::new(),
         VelorixLogicalViewPlanNodeV1::Filter { input, .. }
         | VelorixLogicalViewPlanNodeV1::Project { input, .. }
@@ -3516,6 +3820,22 @@ fn required_columns_for_node(
     port_id: &str,
 ) -> Vec<LogicalPlanColumnRef> {
     match node {
+        VelorixLogicalViewPlanNodeV1::TypedMap { plan, .. } => {
+            set_ops::schema_columns(&plan.input_schema)
+        }
+        VelorixLogicalViewPlanNodeV1::Series { plan, .. } => {
+            set_ops::schema_columns(&plan.input_schema)
+        }
+        VelorixLogicalViewPlanNodeV1::UnionAll { inputs, .. } => {
+            if let Some(input) = inputs.iter().find(|input| input.port_id == port_id) {
+                input.required_columns.clone()
+            } else {
+                inputs
+                    .iter()
+                    .flat_map(|input| input.required_columns.clone())
+                    .collect()
+            }
+        }
         VelorixLogicalViewPlanNodeV1::Filter { predicate, .. } => {
             vec![predicate.column.clone()]
         }
@@ -3630,6 +3950,23 @@ fn derive_node_output(
     window_watermarks: &BTreeMap<String, BTreeSet<String>>,
 ) -> Result<OutputPortContractV1, ViewPlanError> {
     let mut schema = match node {
+        VelorixLogicalViewPlanNodeV1::TypedMap { output_schema, .. }
+        | VelorixLogicalViewPlanNodeV1::Series { output_schema, .. }
+        | VelorixLogicalViewPlanNodeV1::UnionAll { output_schema, .. } => RowSchemaV1 {
+            columns: output_schema
+                .columns
+                .iter()
+                .map(|column| PortColumnV1 {
+                    column_id: format!("{}.{}", output_schema.relation_id, column.name),
+                    logical_type: format!("{:?}", column.data_type),
+                    nullability: if column.nullable {
+                        NullabilityV1::Nullable
+                    } else {
+                        NullabilityV1::NonNull
+                    },
+                })
+                .collect(),
+        },
         VelorixLogicalViewPlanNodeV1::RelationScan { relation, .. } => {
             let mut columns = referenced_columns
                 .get(&relation.relation_id)
@@ -3871,6 +4208,9 @@ fn derive_node_output(
 
 fn derive_node_state(node: &VelorixLogicalViewPlanNodeV1) -> Option<StateContractV1> {
     let boundedness = match node {
+        VelorixLogicalViewPlanNodeV1::TypedMap { .. } => StateBoundednessV1::Unbounded,
+        VelorixLogicalViewPlanNodeV1::Series { .. }
+        | VelorixLogicalViewPlanNodeV1::UnionAll { .. } => StateBoundednessV1::Unbounded,
         VelorixLogicalViewPlanNodeV1::Project { .. }
         | VelorixLogicalViewPlanNodeV1::Aggregate { .. }
         | VelorixLogicalViewPlanNodeV1::TopK { .. }
@@ -5701,6 +6041,13 @@ fn invalid_logical_plan<T>(reason: impl Into<String>) -> Result<T, ViewPlanError
     Err(ViewPlanError::InvalidLogicalPlan {
         reason: reason.into(),
     })
+}
+
+/// Fresh and restored plans use the same generic operator contracts.
+pub fn validate_fresh_logical_view_plan(
+    plan: &VelorixLogicalViewPlanV1,
+) -> Result<(), ViewPlanError> {
+    validate_logical_view_plan(plan)
 }
 
 pub fn validate_supported_three_input_inner_join_count_sql(
@@ -11774,12 +12121,15 @@ fn validate_projection<'a>(
     };
     let aggregate_input_column_ids = aggregate_input_column_ids(&aggregate_outputs);
     if aggregate_input_column_ids.len() > 1 {
-        if !aggregate_filter_exprs.is_empty() {
-            return unsupported(
-                "multi-input single-key aggregate FILTER clauses are not supported",
-            );
-        }
         validate_raw_int64_multi_input_aggregates(catalog, &aggregate_outputs)?;
+    }
+    let mut retained_filter_columns = aggregate_input_column_ids.clone();
+    retained_filter_columns.insert(key_column.column_id.clone());
+    for key in group_keys {
+        retained_filter_columns.extend(key.input_column_id.iter().cloned());
+        if let Some(expression) = &key.expression {
+            retained_filter_columns.extend(supported_projection_expr_column_ids(expression));
+        }
     }
     for output in &aggregate_outputs {
         if matches!(
@@ -11810,6 +12160,15 @@ fn validate_projection<'a>(
         });
     let aggregate_filter_expr = shared_filter_expr
         .map(|filter_expr| {
+            if aggregate_input_column_ids.len() > 1 {
+                return validate_retained_aggregate_filter(
+                    filter_expr,
+                    catalog,
+                    key_column,
+                    relation_alias,
+                    &retained_filter_columns,
+                );
+            }
             validate_row_predicate_expr(
                 filter_expr,
                 catalog,
@@ -11823,18 +12182,30 @@ fn validate_projection<'a>(
     let per_output_filter_exprs = if aggregate_filter_expr.is_none()
         && !aggregate_filter_exprs.is_empty()
     {
-        if value_column.physical_arrow_type != ArrowPhysicalTypeV1::Int64 {
+        if !matches!(
+            value_column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+        ) {
             return unsupported(
-                "mixed aggregate FILTER currently supports Int64 value aggregate inputs",
+                "mixed aggregate FILTER currently supports Int64 or Float64 value aggregate inputs",
             );
         }
         for output in &aggregate_outputs {
+            if !aggregate_filter_exprs
+                .iter()
+                .any(|(id, _)| id == &output.output_column_id)
+            {
+                continue;
+            }
             match output.function {
                 LogicalPlanAggregateFunctionV1::Sum
                 | LogicalPlanAggregateFunctionV1::Min
                 | LogicalPlanAggregateFunctionV1::Max
-                | LogicalPlanAggregateFunctionV1::Avg => {}
-                LogicalPlanAggregateFunctionV1::Count if output.input_column_id.is_none() => {}
+                | LogicalPlanAggregateFunctionV1::Avg
+                | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {}
+                LogicalPlanAggregateFunctionV1::Count
+                    if output.input_column_id.is_none() || aggregate_input_column_ids.len() > 1 => {
+                }
                 LogicalPlanAggregateFunctionV1::CountDistinct
                     if output.input_column_id.as_deref()
                         == Some(value_column.column_id.as_str()) => {}
@@ -11848,6 +12219,18 @@ fn validate_projection<'a>(
         aggregate_filter_exprs
             .iter()
             .map(|(output_column_id, filter_expr)| {
+                if aggregate_input_column_ids.len() > 1 {
+                    return Ok((
+                        output_column_id.clone(),
+                        validate_retained_aggregate_filter(
+                            filter_expr,
+                            catalog,
+                            key_column,
+                            relation_alias,
+                            &retained_filter_columns,
+                        )?,
+                    ));
+                }
                 Ok((
                     output_column_id.clone(),
                     validate_row_predicate_expr(
@@ -11883,6 +12266,48 @@ fn aggregate_input_column_ids(aggregate_outputs: &[SupportedAggregateOutput]) ->
         .collect()
 }
 
+fn validate_retained_aggregate_filter(
+    expression: &Expr,
+    catalog: &VelorixRelationCatalogV1,
+    key_column: &RelationColumnV1,
+    relation_alias: Option<&str>,
+    retained_columns: &BTreeSet<String>,
+) -> Result<RowPredicateExpr, ViewPlanError> {
+    let predicate = validate_filter_project_predicate_expr(
+        expression,
+        catalog,
+        key_column,
+        &[],
+        relation_alias,
+        None,
+    )?;
+    fn retained(predicate: &RowPredicateExpr, columns: &BTreeSet<String>) -> bool {
+        match predicate {
+            RowPredicateExpr::Atom { predicate } => columns.contains(&predicate.column_id),
+            RowPredicateExpr::ScalarInt64Comparison { left, .. } => {
+                supported_projection_expr_column_ids(left)
+                    .iter()
+                    .all(|id| columns.contains(id))
+            }
+            RowPredicateExpr::ScalarInt64ExpressionComparison { left, right, .. } => {
+                supported_projection_expr_column_ids(left)
+                    .iter()
+                    .chain(supported_projection_expr_column_ids(right).iter())
+                    .all(|id| columns.contains(id))
+            }
+            RowPredicateExpr::And { left, right } | RowPredicateExpr::Or { left, right } => {
+                retained(left, columns) && retained(right, columns)
+            }
+        }
+    }
+    if !retained(&predicate, retained_columns) {
+        return unsupported(
+            "aggregate FILTER references a column not retained by its grouping or aggregate inputs",
+        );
+    }
+    Ok(predicate)
+}
+
 fn validate_raw_int64_multi_input_aggregates(
     catalog: &VelorixRelationCatalogV1,
     aggregate_outputs: &[SupportedAggregateOutput],
@@ -11901,7 +12326,9 @@ fn validate_raw_int64_multi_input_aggregates(
             | LogicalPlanAggregateFunctionV1::Count
             | LogicalPlanAggregateFunctionV1::CountDistinct
             | LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
-            | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => {}
+            | LogicalPlanAggregateFunctionV1::PercentileCont { .. }
+            | LogicalPlanAggregateFunctionV1::ArgMax { .. }
+            | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {}
         }
         let Some(input_column_id) = output.input_column_id.as_deref() else {
             continue;
@@ -11915,14 +12342,42 @@ fn validate_raw_int64_multi_input_aggregates(
                 reason: "multi-input aggregate input column is missing from relation catalog"
                     .to_string(),
             })?;
-        let nullable_count_distinct =
-            column.nullable && output.function == LogicalPlanAggregateFunctionV1::CountDistinct;
+        let nullable_count_distinct = column.nullable
+            && matches!(
+                output.function,
+                LogicalPlanAggregateFunctionV1::CountDistinct
+                    | LogicalPlanAggregateFunctionV1::Sum
+                    | LogicalPlanAggregateFunctionV1::Avg
+                    | LogicalPlanAggregateFunctionV1::Min
+                    | LogicalPlanAggregateFunctionV1::Max
+                    | LogicalPlanAggregateFunctionV1::Count
+                    | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
+            );
+        let arg_max_value = matches!(
+            output.function,
+            LogicalPlanAggregateFunctionV1::ArgMax { .. }
+        ) && matches!(
+            column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+        );
+        let float_value = column.physical_arrow_type == ArrowPhysicalTypeV1::Float64
+            && matches!(
+                output.function,
+                LogicalPlanAggregateFunctionV1::Sum
+                    | LogicalPlanAggregateFunctionV1::Avg
+                    | LogicalPlanAggregateFunctionV1::Min
+                    | LogicalPlanAggregateFunctionV1::Max
+                    | LogicalPlanAggregateFunctionV1::Count
+                    | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. }
+            );
         if column.column_id == catalog.relation_schema.weight_column_id
-            || (column.nullable && !nullable_count_distinct)
-            || column.physical_arrow_type != ArrowPhysicalTypeV1::Int64
+            || (column.nullable && !nullable_count_distinct && !float_value && !arg_max_value)
+            || (column.physical_arrow_type != ArrowPhysicalTypeV1::Int64
+                && !float_value
+                && !arg_max_value)
         {
             return unsupported(
-                "multi-input single-key aggregates currently support non-null Int64 inputs and nullable Int64 count(DISTINCT ...) inputs",
+                "multi-input aggregates require supported Int64 or Float64 value/count inputs; nullable percentile inputs are unsupported",
             );
         }
     }
@@ -12869,7 +13324,7 @@ fn validate_tumbling_projection<'a>(
         return unsupported("expected projection: key, window_start, window_end, aggregate...");
     };
     if !select_item_references_column(key, key_column, relation_alias) {
-        return unsupported("first tumbling projection must be the primary key column");
+        return unsupported("first tumbling projection must be the grouping column");
     }
     let output_key_column_id = select_item_alias_or_default(key, key_column.name.as_str())?;
     let Some(window_start_output_column_id) =
@@ -13058,6 +13513,36 @@ fn count_only_runtime_value_column<'a>(
     catalog: &'a VelorixRelationCatalogV1,
     aggregate_outputs: &[SupportedAggregateOutput],
 ) -> Result<&'a RelationColumnV1, ViewPlanError> {
+    if aggregate_outputs.iter().all(|output| {
+        output.function == LogicalPlanAggregateFunctionV1::Count
+            && output.input_column_id.is_none()
+            && output.input_expression.is_none()
+    }) {
+        // COUNT(*) consumes multiplicity, not a numeric payload. This legacy
+        // field is only a binding anchor; its type and NULLs do not affect count.
+        return catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|column| {
+                column.column_id != catalog.relation_schema.weight_column_id
+                    && !column.nullable
+                    && matches!(
+                        column.physical_arrow_type,
+                        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+                    )
+            })
+            .or_else(|| {
+                catalog
+                    .relation_schema
+                    .columns
+                    .iter()
+                    .find(|column| column.column_id != catalog.relation_schema.weight_column_id)
+            })
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "count(*) requires a public source column binding".into(),
+            });
+    }
     if let [output] = aggregate_outputs {
         if let Some(input_column_id) = &output.input_column_id {
             let input_column = catalog
@@ -13070,7 +13555,9 @@ fn count_only_runtime_value_column<'a>(
                 })?;
             if matches!(
                 input_column.physical_arrow_type,
-                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. }
+                ArrowPhysicalTypeV1::Int64
+                    | ArrowPhysicalTypeV1::Float64
+                    | ArrowPhysicalTypeV1::Decimal128 { .. }
             ) {
                 return Ok(input_column);
             }
@@ -14340,6 +14827,9 @@ fn normalize_projected_event_time_window(
     if matches!(groups[1 - *alias_index], Expr::Value(_)) {
         return unsupported("projected event-time window requires a named grouping key");
     }
+    if matches!(groups[1 - *alias_index], Expr::Value(_)) {
+        return unsupported("projected event-time window requires a named grouping key");
+    }
     if !matches!(*index, 0 | 1) || select.projection.len() < 3 {
         return unsupported("projected window and grouping key must precede aggregates");
     }
@@ -14559,6 +15049,56 @@ fn select_item_aggregate<'a>(
     }
 
     match canonical_function.as_str() {
+        "arg_max" => {
+            if arguments.duplicate_treatment.is_some() || filter_expr.is_some() {
+                return unsupported("ARG_MAX does not support DISTINCT or FILTER");
+            }
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(value)), FunctionArg::Unnamed(FunctionArgExpr::Expr(order))] =
+                arguments.args.as_slice()
+            else {
+                return unsupported("ARG_MAX requires direct value and ordering columns");
+            };
+            let bind = |expr| match source_projection {
+                Some(projection) => {
+                    source_projection_expression_column(expr, catalog, relation_alias, projection)
+                }
+                None => expression_column(expr, catalog, relation_alias),
+            };
+            let Some(value) = bind(value) else {
+                return unsupported("ARG_MAX value must be a registered projected column");
+            };
+            let Some(order) = bind(order) else {
+                return unsupported("ARG_MAX ordering must be a registered projected column");
+            };
+            if value.column_id == catalog.relation_schema.weight_column_id
+                || order.column_id == catalog.relation_schema.weight_column_id
+                || !matches!(
+                    value.physical_arrow_type,
+                    ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64
+                )
+                || !matches!(
+                    order.physical_arrow_type,
+                    ArrowPhysicalTypeV1::Int64
+                        | ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None }
+                )
+            {
+                return unsupported("ARG_MAX requires Int64/Float64 value and naive Int64/Timestamp ordering, excluding weight columns");
+            }
+            Ok(ParsedAggregateProjection {
+                output: SupportedAggregateOutput {
+                    function: LogicalPlanAggregateFunctionV1::ArgMax {
+                        ordering_column_ordinal: order.ordinal as usize,
+                    },
+                    input_column_id: Some(value.column_id.clone()),
+                    input_relation_side: None,
+                    input_expression: None,
+                    output_column_id,
+                },
+                input_column: Some(value),
+                count_input_column: None,
+                filter_expr: None,
+            })
+        }
         "sum" | "avg" | "min" | "max" => {
             if arguments.duplicate_treatment.is_some() {
                 return unsupported("DISTINCT value aggregate arguments are not supported");
@@ -14683,7 +15223,7 @@ fn select_item_aggregate<'a>(
                 filter_expr: filter_expr.clone(),
             })
         }
-        name @ ("percentile_disc" | "percentile_cont") => {
+        name @ ("percentile_disc" | "percentile_cont" | "approx_quantile") => {
             if arguments.duplicate_treatment.is_some() {
                 return unsupported("DISTINCT percentile arguments are not supported");
             }
@@ -14725,14 +15265,19 @@ fn select_item_aggregate<'a>(
                     "{name} does not support computed input expressions"
                 ));
             }
-            if !matches!(column.physical_arrow_type, ArrowPhysicalTypeV1::Int64) {
+            if !(column.physical_arrow_type == ArrowPhysicalTypeV1::Int64
+                || (name == "approx_quantile"
+                    && column.physical_arrow_type == ArrowPhysicalTypeV1::Float64))
+            {
                 return unsupported(format!(
                     "{name} currently supports only Int64 input columns"
                 ));
             }
             Ok(ParsedAggregateProjection {
                 output: SupportedAggregateOutput {
-                    function: if name == "percentile_disc" {
+                    function: if name == "approx_quantile" {
+                        LogicalPlanAggregateFunctionV1::ApproxQuantile { percentile }
+                    } else if name == "percentile_disc" {
                         LogicalPlanAggregateFunctionV1::PercentileDisc { percentile }
                     } else {
                         LogicalPlanAggregateFunctionV1::PercentileCont { percentile }
@@ -14868,6 +15413,12 @@ fn validate_join_value_aggregate_select_item<'a>(
         }
         LogicalPlanAggregateFunctionV1::Count | LogicalPlanAggregateFunctionV1::CountDistinct => {
             unreachable!("validated value aggregate function")
+        }
+        LogicalPlanAggregateFunctionV1::ArgMax { .. } => {
+            return unsupported("ARG_MAX joined aggregation requires a projected native join stage")
+        }
+        LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => {
+            return unsupported("APPROX_QUANTILE requires a single-relation native aggregate stage")
         }
     }
     Ok((
@@ -15602,15 +16153,23 @@ fn validate_numeric_sum_column(
         return unsupported("sum(value_column) must not reference the weight column");
     }
     match &column.physical_arrow_type {
-        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. } => Ok(()),
-        _ => unsupported("sum(value_column) currently supports Int64 or Decimal128 columns"),
+        ArrowPhysicalTypeV1::Int64
+        | ArrowPhysicalTypeV1::Float64
+        | ArrowPhysicalTypeV1::Decimal128 { .. } => Ok(()),
+        _ => {
+            unsupported("sum(value_column) currently supports Int64, Float64 or Decimal128 columns")
+        }
     }
 }
 
 fn validate_numeric_avg_column(column: &RelationColumnV1) -> Result<(), ViewPlanError> {
     match &column.physical_arrow_type {
-        ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Decimal128 { .. } => Ok(()),
-        _ => unsupported("avg(value_column) currently supports Int64 or Decimal128 columns"),
+        ArrowPhysicalTypeV1::Int64
+        | ArrowPhysicalTypeV1::Float64
+        | ArrowPhysicalTypeV1::Decimal128 { .. } => Ok(()),
+        _ => {
+            unsupported("avg(value_column) currently supports Int64, Float64 or Decimal128 columns")
+        }
     }
 }
 
@@ -15714,6 +16273,11 @@ fn supported_filter_project_typed_projection(
         Some(node) => node,
         None => return Ok(None),
     };
+    if matches!(&root.kind, TypedExprKindV1::Call { function: BuiltinScalarFunctionV1::SubtractInt64, args }
+        if args.iter().all(|arg| arg.result_type == RuntimeScalarTypeV1::Int64))
+    {
+        return Ok(None);
+    }
     let program = TypedExprProgramV1 {
         encoding_version: TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,
         root,
@@ -15726,12 +16290,378 @@ fn supported_filter_project_typed_projection(
     Ok(Some(program))
 }
 
+fn typed_stage_call(
+    function: BuiltinScalarFunctionV1,
+    args: Vec<TypedExprNodeV1>,
+) -> Result<TypedExprNodeV1, ViewPlanError> {
+    let result_type = typed_call_result_type(function, &args)?;
+    let nullable = match function {
+        BuiltinScalarFunctionV1::IsNullScalar => false,
+        BuiltinScalarFunctionV1::CoalesceInt64
+        | BuiltinScalarFunctionV1::CoalesceUtf8
+        | BuiltinScalarFunctionV1::CoalesceTimestampNanosecond
+        | BuiltinScalarFunctionV1::CoalesceBoolean
+        | BuiltinScalarFunctionV1::CoalesceDate32 => args.iter().all(|arg| arg.nullable),
+        BuiltinScalarFunctionV1::TryCastBoolean
+        | BuiltinScalarFunctionV1::JsonExtractString
+        | BuiltinScalarFunctionV1::NullIfInt64 => true,
+        _ => args.iter().any(|arg| arg.nullable),
+    };
+    Ok(TypedExprNodeV1 {
+        result_type,
+        nullable,
+        kind: TypedExprKindV1::Call { function, args },
+    })
+}
+
 fn typed_expr_node_from_expr(
     expr: &Expr,
     catalog: &VelorixRelationCatalogV1,
     relation_alias: Option<&str>,
 ) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
+    typed_expr_node_from_expr_in_context(expr, catalog, relation_alias, true)
+}
+
+fn typed_expr_node_from_expr_in_context(
+    expr: &Expr,
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+    reinterpret_event_time: bool,
+) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
     match expr {
+        Expr::Cast {
+            format: Some(_), ..
+        } => unsupported("typed projection CAST FORMAT is not supported"),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::LongArrow,
+            right,
+        } => {
+            let Expr::Value(ValueWithSpan {
+                value: SqlValue::SingleQuotedString(path),
+                ..
+            }) = right.as_ref()
+            else {
+                return unsupported("JSON text extraction requires a literal object-member path");
+            };
+            let path = if path.starts_with("$.") {
+                path.clone()
+            } else if !path.is_empty()
+                && path
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                format!("$.{path}")
+            } else {
+                return unsupported(
+                    "JSON text extraction supports simple object members or bounded $.field paths",
+                );
+            };
+            bounded_json_path(&path).map_err(|error| ViewPlanError::UnsupportedShape {
+                reason: error.to_string(),
+            })?;
+            let Some(input) = typed_expr_node_from_expr_in_context(
+                left,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            let path = TypedExprNodeV1 {
+                result_type: RuntimeScalarTypeV1::Utf8,
+                nullable: false,
+                kind: TypedExprKindV1::Literal {
+                    value: ScalarLiteralV1::Utf8 { value: path },
+                },
+            };
+            Ok(Some(typed_stage_call(
+                BuiltinScalarFunctionV1::JsonExtractString,
+                vec![input, path],
+            )?))
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                inner,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            let node = typed_stage_call(BuiltinScalarFunctionV1::IsNullScalar, vec![arg])?;
+            Ok(Some(if matches!(expr, Expr::IsNotNull(_)) {
+                typed_stage_call(BuiltinScalarFunctionV1::NotBoolean, vec![node])?
+            } else {
+                node
+            }))
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(typed_stage_call(
+                BuiltinScalarFunctionV1::NotBoolean,
+                vec![arg],
+            )?))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let Some(value) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(low) = typed_expr_node_from_expr_in_context(
+                low,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(high) = typed_expr_node_from_expr_in_context(
+                high,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            let lower = typed_stage_call(
+                BuiltinScalarFunctionV1::GreaterEqualScalar,
+                vec![value.clone(), low],
+            )?;
+            let upper =
+                typed_stage_call(BuiltinScalarFunctionV1::LessEqualScalar, vec![value, high])?;
+            let node = typed_stage_call(BuiltinScalarFunctionV1::AndBoolean, vec![lower, upper])?;
+            Ok(Some(if *negated {
+                typed_stage_call(BuiltinScalarFunctionV1::NotBoolean, vec![node])?
+            } else {
+                node
+            }))
+        }
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let mut args = Vec::new();
+            for branch in conditions {
+                let Some(condition) = typed_expr_node_from_expr_in_context(
+                    &branch.condition,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(result) = typed_expr_node_from_expr_in_context(
+                    &branch.result,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
+                else {
+                    return Ok(None);
+                };
+                args.extend([condition, result]);
+            }
+            if args.is_empty() {
+                return unsupported("typed CASE requires a WHEN branch");
+            }
+            let result_type = args
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .find(|node| {
+                    !matches!(
+                        node.kind,
+                        TypedExprKindV1::Literal {
+                            value: ScalarLiteralV1::Null { .. }
+                        }
+                    )
+                })
+                .map(|node| node.result_type)
+                .unwrap_or(RuntimeScalarTypeV1::Float64);
+            let otherwise = if let Some(expr) = else_result {
+                let Some(node) = typed_expr_node_from_expr_in_context(
+                    expr,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
+                else {
+                    return Ok(None);
+                };
+                node
+            } else {
+                TypedExprNodeV1 {
+                    result_type,
+                    nullable: true,
+                    kind: TypedExprKindV1::Literal {
+                        value: ScalarLiteralV1::Null {
+                            data_type: result_type,
+                        },
+                    },
+                }
+            };
+            args.push(otherwise);
+            let function = match result_type {
+                RuntimeScalarTypeV1::TimestampNanosecond => {
+                    BuiltinScalarFunctionV1::CaseTimestampNanosecond
+                }
+                RuntimeScalarTypeV1::Boolean => BuiltinScalarFunctionV1::CaseBoolean,
+                RuntimeScalarTypeV1::Float64 => BuiltinScalarFunctionV1::CaseFloat64,
+                RuntimeScalarTypeV1::Int64
+                    if args
+                        .iter()
+                        .any(|node| node.result_type == RuntimeScalarTypeV1::Float64) =>
+                {
+                    BuiltinScalarFunctionV1::CaseFloat64
+                }
+                _ => return Ok(None),
+            };
+            let result_type = typed_call_result_type(function, &args)?;
+            let last = args.len() - 1;
+            for (index, node) in args.iter_mut().enumerate() {
+                if (index == last || index % 2 == 1)
+                    && matches!(
+                        node.kind,
+                        TypedExprKindV1::Literal {
+                            value: ScalarLiteralV1::Null { .. }
+                        }
+                    )
+                {
+                    node.result_type = result_type;
+                    node.kind = TypedExprKindV1::Literal {
+                        value: ScalarLiteralV1::Null {
+                            data_type: result_type,
+                        },
+                    };
+                }
+            }
+            Ok(Some(typed_stage_call(function, args)?))
+        }
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type,
+            ..
+        } if matches!(
+            data_type,
+            DataType::Double(_)
+                | DataType::DoublePrecision
+                | DataType::BigInt(_)
+                | DataType::Int8(_)
+                | DataType::Int64
+        ) =>
+        {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            let target = if matches!(data_type, DataType::Double(_) | DataType::DoublePrecision) {
+                RuntimeScalarTypeV1::Float64
+            } else {
+                RuntimeScalarTypeV1::Int64
+            };
+            if arg.result_type == target {
+                return Ok(Some(arg));
+            }
+            Ok(None)
+        }
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type: sqlparser::ast::DataType::Varchar(None),
+            ..
+        } => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            if arg.result_type == RuntimeScalarTypeV1::Utf8 {
+                return Ok(Some(arg));
+            }
+            Ok(Some(typed_stage_call(
+                BuiltinScalarFunctionV1::Int64ToUtf8,
+                vec![arg],
+            )?))
+        }
+        Expr::Cast {
+            kind: CastKind::TryCast | CastKind::SafeCast,
+            expr,
+            data_type: sqlparser::ast::DataType::Boolean,
+            ..
+        } => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(typed_stage_call(
+                BuiltinScalarFunctionV1::TryCastBoolean,
+                vec![arg],
+            )?))
+        }
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            expr,
+            data_type: sqlparser::ast::DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None),
+            ..
+        } => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(typed_stage_call(
+                BuiltinScalarFunctionV1::TimestampToMicrosecondPrecision,
+                vec![arg],
+            )?))
+        }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             let Some(column) =
                 expression_filter_project_column(expr, catalog, relation_alias, None)
@@ -15742,11 +16672,12 @@ fn typed_expr_node_from_expr(
             // The public contract binds event-time columns as Int64
             // nanoseconds; typed temporal functions consume them as
             // timestamps.
-            let result_type = if catalog
-                .relation_schema
-                .event_time_column_id
-                .as_ref()
-                .is_some_and(|event_time_column_id| event_time_column_id == &column.column_id)
+            let result_type = if reinterpret_event_time
+                && catalog
+                    .relation_schema
+                    .event_time_column_id
+                    .as_ref()
+                    .is_some_and(|event_time_column_id| event_time_column_id == &column.column_id)
             {
                 RuntimeScalarTypeV1::TimestampNanosecond
             } else {
@@ -15761,11 +16692,106 @@ fn typed_expr_node_from_expr(
             }))
         }
         Expr::Value(value) => typed_literal_node(value),
+        Expr::Interval(interval) => {
+            let Some(Some(value)) = typed_interval_nanoseconds(interval) else {
+                return unsupported("typed interval must have a fixed duration");
+            };
+            Ok(Some(TypedExprNodeV1 {
+                result_type: RuntimeScalarTypeV1::Int64,
+                nullable: false,
+                kind: TypedExprKindV1::Literal {
+                    value: ScalarLiteralV1::Int64(value),
+                },
+            }))
+        }
+        Expr::Nested(expr) => typed_expr_node_from_expr_in_context(
+            expr,
+            catalog,
+            relation_alias,
+            reinterpret_event_time,
+        ),
+        Expr::Cast {
+            kind: CastKind::TryCast | CastKind::SafeCast,
+            expr,
+            data_type:
+                sqlparser::ast::DataType::Double(_)
+                | sqlparser::ast::DataType::Float(_)
+                | sqlparser::ast::DataType::DoublePrecision,
+            ..
+        } => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return unsupported("TRY_CAST AS DOUBLE requires a typed scalar expression");
+            };
+            Ok(Some(TypedExprNodeV1 {
+                result_type: RuntimeScalarTypeV1::Float64,
+                nullable: true,
+                kind: TypedExprKindV1::Call {
+                    function: BuiltinScalarFunctionV1::TryCastFloat64,
+                    args: vec![arg],
+                },
+            }))
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
+            let Some(arg) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
+                return Ok(None);
+            };
+            if arg.result_type != RuntimeScalarTypeV1::Float64 {
+                return Ok(None);
+            }
+            Ok(Some(TypedExprNodeV1 {
+                result_type: RuntimeScalarTypeV1::Float64,
+                nullable: arg.nullable,
+                kind: TypedExprKindV1::Call {
+                    function: BuiltinScalarFunctionV1::SubtractFloat64,
+                    args: vec![
+                        TypedExprNodeV1 {
+                            result_type: RuntimeScalarTypeV1::Float64,
+                            nullable: false,
+                            kind: TypedExprKindV1::Literal {
+                                value: ScalarLiteralV1::Float64 { canonical_bits: 0 },
+                            },
+                        },
+                        arg,
+                    ],
+                },
+            }))
+        }
         Expr::Function(Function {
             name: function_name,
             args,
+            parameters,
+            filter,
+            over,
+            within_group,
+            null_treatment,
             ..
         }) => {
+            if !matches!(parameters, FunctionArguments::None)
+                || filter.is_some()
+                || over.is_some()
+                || !within_group.is_empty()
+                || null_treatment.is_some()
+                || matches!(args, FunctionArguments::List(list) if list.duplicate_treatment.is_some() || !list.clauses.is_empty())
+            {
+                return unsupported(
+                    "typed scalar functions do not support aggregate or window modifiers",
+                );
+            }
             let name = function_name.to_string();
             if name.eq_ignore_ascii_case("ltrim") || name.eq_ignore_ascii_case("rtrim") {
                 return unsupported(
@@ -15783,7 +16809,12 @@ fn typed_expr_node_from_expr(
                     let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = argument else {
                         return unsupported("builtin UDFs only accept expression arguments");
                     };
-                    let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                    let Some(node) = typed_expr_node_from_expr_in_context(
+                        arg_expr,
+                        catalog,
+                        relation_alias,
+                        reinterpret_event_time,
+                    )?
                     else {
                         return unsupported(
                             "builtin UDF arguments must be columns, literals, or typed functions",
@@ -15825,7 +16856,12 @@ fn typed_expr_node_from_expr(
                 let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = argument else {
                     return unsupported("typed functions only accept expression arguments");
                 };
-                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                let Some(node) = typed_expr_node_from_expr_in_context(
+                    arg_expr,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
                 else {
                     return unsupported(
                         "typed function arguments must be columns, literals, or typed functions",
@@ -15833,12 +16869,177 @@ fn typed_expr_node_from_expr(
                 };
                 arg_nodes.push(node);
             }
+            if function == BuiltinScalarFunctionV1::TimeBucketNanoseconds && arg_nodes.len() == 2 {
+                if let Expr::Function(Function {
+                    args: FunctionArguments::List(list),
+                    ..
+                }) = expr
+                {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) =
+                        &list.args[0]
+                    {
+                        if let SqlValue::SingleQuotedString(width) = &value.value {
+                            let parsed = parse_single_query(&format!(
+                                "SELECT INTERVAL '{}'",
+                                width.replace('\'', "''")
+                            ))?;
+                            if let SetExpr::Select(select) = parsed.body.as_ref() {
+                                if let SelectItem::UnnamedExpr(Expr::Interval(interval)) =
+                                    &select.projection[0]
+                                {
+                                    if let Some(Some(ns)) = typed_interval_nanoseconds(interval) {
+                                        arg_nodes[0] = TypedExprNodeV1 {
+                                            result_type: RuntimeScalarTypeV1::Int64,
+                                            nullable: false,
+                                            kind: TypedExprKindV1::Literal {
+                                                value: ScalarLiteralV1::Int64(ns),
+                                            },
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                arg_nodes.push(TypedExprNodeV1 {
+                    result_type: RuntimeScalarTypeV1::Utf8,
+                    nullable: false,
+                    kind: TypedExprKindV1::Literal {
+                        value: ScalarLiteralV1::Utf8 {
+                            value: "UTC".into(),
+                        },
+                    },
+                });
+                if let TypedExprKindV1::Literal {
+                    value: ScalarLiteralV1::Int64(width),
+                } = arg_nodes[0].kind
+                {
+                    if width > 0 {
+                        // Fixed-duration SQL buckets use the Monday 2000-01-03 origin.
+                        let offset = 946_857_600_000_000_000_i64.rem_euclid(width);
+                        if offset != 0 {
+                            let offset = TypedExprNodeV1 {
+                                result_type: RuntimeScalarTypeV1::Int64,
+                                nullable: false,
+                                kind: TypedExprKindV1::Literal {
+                                    value: ScalarLiteralV1::Int64(offset),
+                                },
+                            };
+                            arg_nodes[1] = typed_stage_call(
+                                BuiltinScalarFunctionV1::TimestampSubtractNanoseconds,
+                                vec![arg_nodes[1].clone(), offset.clone()],
+                            )?;
+                            let bucket = typed_stage_call(function, arg_nodes)?;
+                            return Ok(Some(typed_stage_call(
+                                BuiltinScalarFunctionV1::TimestampAddNanoseconds,
+                                vec![bucket, offset],
+                            )?));
+                        }
+                    }
+                }
+            }
             let function = typed_function_with_field(name.as_str(), function, &arg_nodes)?;
+            if function == BuiltinScalarFunctionV1::CoalesceFloat64 {
+                let concrete = arg_nodes
+                    .iter()
+                    .filter(|arg| {
+                        !matches!(
+                            arg.kind,
+                            TypedExprKindV1::Literal {
+                                value: ScalarLiteralV1::Null { .. }
+                            }
+                        )
+                    })
+                    .map(|arg| arg.result_type)
+                    .collect::<Vec<_>>();
+                let result_type = if concrete.contains(&RuntimeScalarTypeV1::Float64)
+                    && concrete.iter().all(|ty| {
+                        matches!(
+                            ty,
+                            RuntimeScalarTypeV1::Float64 | RuntimeScalarTypeV1::Int64
+                        )
+                    }) {
+                    RuntimeScalarTypeV1::Float64
+                } else {
+                    concrete
+                        .first()
+                        .copied()
+                        .unwrap_or(RuntimeScalarTypeV1::Float64)
+                };
+                for arg in &mut arg_nodes {
+                    if matches!(
+                        arg.kind,
+                        TypedExprKindV1::Literal {
+                            value: ScalarLiteralV1::Null { .. }
+                        }
+                    ) {
+                        arg.result_type = result_type;
+                        arg.kind = TypedExprKindV1::Literal {
+                            value: ScalarLiteralV1::Null {
+                                data_type: result_type,
+                            },
+                        };
+                    }
+                }
+                let exact = match result_type {
+                    RuntimeScalarTypeV1::Utf8 => Some(BuiltinScalarFunctionV1::CoalesceUtf8),
+                    RuntimeScalarTypeV1::TimestampNanosecond => {
+                        Some(BuiltinScalarFunctionV1::CoalesceTimestampNanosecond)
+                    }
+                    RuntimeScalarTypeV1::Boolean => Some(BuiltinScalarFunctionV1::CoalesceBoolean),
+                    RuntimeScalarTypeV1::Date32 => Some(BuiltinScalarFunctionV1::CoalesceDate32),
+                    _ => None,
+                };
+                if let Some(function) = exact {
+                    return Ok(Some(typed_stage_call(function, arg_nodes)?));
+                }
+            }
+            if !reinterpret_event_time
+                && function == BuiltinScalarFunctionV1::CoalesceFloat64
+                && arg_nodes
+                    .iter()
+                    .all(|arg| arg.result_type == RuntimeScalarTypeV1::Int64)
+            {
+                return Ok(Some(typed_stage_call(
+                    BuiltinScalarFunctionV1::CoalesceInt64,
+                    arg_nodes,
+                )?));
+            }
+            if !reinterpret_event_time
+                && function == BuiltinScalarFunctionV1::NullIfFloat64
+                && arg_nodes
+                    .iter()
+                    .all(|arg| arg.result_type == RuntimeScalarTypeV1::Int64)
+            {
+                return Ok(Some(typed_stage_call(
+                    BuiltinScalarFunctionV1::NullIfInt64,
+                    arg_nodes,
+                )?));
+            }
+            if matches!(
+                function,
+                BuiltinScalarFunctionV1::CoalesceFloat64 | BuiltinScalarFunctionV1::NullIfFloat64
+            ) && !arg_nodes
+                .iter()
+                .any(|arg| arg.result_type == RuntimeScalarTypeV1::Float64)
+            {
+                return Ok(None);
+            }
             normalize_typed_temporal_unit_literal(function, &mut arg_nodes);
             let result_type = typed_call_result_type(function, &arg_nodes)?;
             Ok(Some(TypedExprNodeV1 {
                 result_type,
-                nullable: arg_nodes.iter().any(|node| node.nullable),
+                nullable: match function {
+                    BuiltinScalarFunctionV1::JsonExtractString
+                    | BuiltinScalarFunctionV1::TryCastFloat64
+                    | BuiltinScalarFunctionV1::NullIfFloat64 => true,
+                    BuiltinScalarFunctionV1::CoalesceFloat64
+                    | BuiltinScalarFunctionV1::GreatestFloat64
+                    | BuiltinScalarFunctionV1::LeastFloat64 => {
+                        arg_nodes.iter().all(|node| node.nullable)
+                    }
+                    _ => arg_nodes.iter().any(|node| node.nullable),
+                },
                 kind: TypedExprKindV1::Call {
                     function,
                     args: arg_nodes,
@@ -15873,7 +17074,12 @@ fn typed_expr_node_from_expr(
                     }
                     continue;
                 }
-                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                let Some(node) = typed_expr_node_from_expr_in_context(
+                    arg_expr,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -15889,8 +17095,46 @@ fn typed_expr_node_from_expr(
             let right_node = interval_right.ok_or_else(|| ViewPlanError::UnsupportedShape {
                 reason: "typed binary expressions require a right operand".to_string(),
             })?;
-            let function = if matches!(right_node.kind, TypedExprKindV1::Literal { .. })
-                && left_node.result_type == RuntimeScalarTypeV1::TimestampNanosecond
+            let comparison = match op {
+                BinaryOperator::StringConcat => Some(BuiltinScalarFunctionV1::Concat),
+                BinaryOperator::Lt => Some(BuiltinScalarFunctionV1::LessScalar),
+                BinaryOperator::LtEq => Some(BuiltinScalarFunctionV1::LessEqualScalar),
+                BinaryOperator::Gt => Some(BuiltinScalarFunctionV1::GreaterScalar),
+                BinaryOperator::GtEq => Some(BuiltinScalarFunctionV1::GreaterEqualScalar),
+                BinaryOperator::Eq => Some(BuiltinScalarFunctionV1::EqualScalar),
+                BinaryOperator::NotEq => Some(BuiltinScalarFunctionV1::NotEqualScalar),
+                BinaryOperator::And => Some(BuiltinScalarFunctionV1::AndBoolean),
+                BinaryOperator::Or => Some(BuiltinScalarFunctionV1::OrBoolean),
+                _ => None,
+            };
+            if let Some(function) = comparison {
+                return Ok(Some(typed_stage_call(
+                    function,
+                    vec![left_node, right_node],
+                )?));
+            }
+            if *op == BinaryOperator::Multiply {
+                if matches!(&**left, Expr::Interval(_)) {
+                    return Ok(Some(typed_stage_call(
+                        BuiltinScalarFunctionV1::ScaleIntervalNanoseconds,
+                        vec![left_node, right_node],
+                    )?));
+                }
+                if matches!(&**right, Expr::Interval(_)) {
+                    return Ok(Some(typed_stage_call(
+                        BuiltinScalarFunctionV1::ScaleIntervalNanoseconds,
+                        vec![right_node, left_node],
+                    )?));
+                }
+            }
+            let function = if *op == BinaryOperator::Minus
+                && left_node.result_type == right_node.result_type
+                && matches!(
+                    left_node.result_type,
+                    RuntimeScalarTypeV1::TimestampNanosecond | RuntimeScalarTypeV1::Int64
+                ) {
+                BuiltinScalarFunctionV1::SubtractInt64
+            } else if left_node.result_type == RuntimeScalarTypeV1::TimestampNanosecond
                 && right_node.result_type == RuntimeScalarTypeV1::Int64
             {
                 match op {
@@ -15951,7 +17195,13 @@ fn typed_expr_node_from_expr(
                     ))
                 }
             };
-            let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
+            let Some(node) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
                 return unsupported(
                     "EXTRACT argument must be a column, literal, or typed function",
                 );
@@ -15973,14 +17223,26 @@ fn typed_expr_node_from_expr(
             ..
         } => {
             let mut arg_nodes = Vec::new();
-            let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
+            let Some(node) = typed_expr_node_from_expr_in_context(
+                expr,
+                catalog,
+                relation_alias,
+                reinterpret_event_time,
+            )?
+            else {
                 return unsupported(
                     "SUBSTRING arguments must be columns, literals, or typed functions",
                 );
             };
             arg_nodes.push(node);
             if let Some(start) = substring_from {
-                let Some(node) = typed_expr_node_from_expr(start, catalog, relation_alias)? else {
+                let Some(node) = typed_expr_node_from_expr_in_context(
+                    start,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
+                else {
                     return unsupported(
                         "SUBSTRING arguments must be columns, literals, or typed functions",
                     );
@@ -15999,7 +17261,13 @@ fn typed_expr_node_from_expr(
                 });
             }
             if let Some(length) = substring_for {
-                let Some(node) = typed_expr_node_from_expr(length, catalog, relation_alias)? else {
+                let Some(node) = typed_expr_node_from_expr_in_context(
+                    length,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
+                else {
                     return unsupported(
                         "SUBSTRING arguments must be columns, literals, or typed functions",
                     );
@@ -16048,7 +17316,12 @@ fn typed_expr_node_from_expr(
             }
             let mut arg_nodes = Vec::new();
             for arg_expr in std::iter::once(&**expr).chain(trim_what.iter().map(|arg| &**arg)) {
-                let Some(node) = typed_expr_node_from_expr(arg_expr, catalog, relation_alias)?
+                let Some(node) = typed_expr_node_from_expr_in_context(
+                    arg_expr,
+                    catalog,
+                    relation_alias,
+                    reinterpret_event_time,
+                )?
                 else {
                     return unsupported(
                         "TRIM arguments must be columns, literals, or typed functions",
@@ -16061,8 +17334,12 @@ fn typed_expr_node_from_expr(
                     return unsupported("TRIM accepts at most one comma-separated character set");
                 }
                 if let [characters] = characters.as_slice() {
-                    let Some(node) =
-                        typed_expr_node_from_expr(characters, catalog, relation_alias)?
+                    let Some(node) = typed_expr_node_from_expr_in_context(
+                        characters,
+                        catalog,
+                        relation_alias,
+                        reinterpret_event_time,
+                    )?
                     else {
                         return unsupported(
                             "TRIM arguments must be columns, literals, or typed functions",
@@ -16087,12 +17364,22 @@ fn typed_expr_node_from_expr(
                 },
             }))
         }
-        Expr::Ceil { expr, field } => {
-            typed_ceil_floor_call(expr, field, true, catalog, relation_alias)
-        }
-        Expr::Floor { expr, field } => {
-            typed_ceil_floor_call(expr, field, false, catalog, relation_alias)
-        }
+        Expr::Ceil { expr, field } => typed_ceil_floor_call(
+            expr,
+            field,
+            true,
+            catalog,
+            relation_alias,
+            reinterpret_event_time,
+        ),
+        Expr::Floor { expr, field } => typed_ceil_floor_call(
+            expr,
+            field,
+            false,
+            catalog,
+            relation_alias,
+            reinterpret_event_time,
+        ),
         _ => Ok(None),
     }
 }
@@ -16103,6 +17390,7 @@ fn typed_ceil_floor_call(
     is_ceil: bool,
     catalog: &VelorixRelationCatalogV1,
     relation_alias: Option<&str>,
+    reinterpret_event_time: bool,
 ) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
     if !matches!(
         field,
@@ -16110,7 +17398,13 @@ fn typed_ceil_floor_call(
     ) {
         return unsupported("CEIL/FLOOR with a TO field or scale argument is not supported");
     }
-    let Some(node) = typed_expr_node_from_expr(expr, catalog, relation_alias)? else {
+    let Some(node) = typed_expr_node_from_expr_in_context(
+        expr,
+        catalog,
+        relation_alias,
+        reinterpret_event_time,
+    )?
+    else {
         return unsupported("CEIL/FLOOR arguments must be columns, literals, or typed functions");
     };
     if node.result_type != RuntimeScalarTypeV1::Float64 {
@@ -16134,12 +17428,28 @@ fn typed_ceil_floor_call(
 
 fn typed_literal_node(value: &ValueWithSpan) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
     let node = match &value.value {
+        SqlValue::Boolean(value) => TypedExprNodeV1 {
+            result_type: RuntimeScalarTypeV1::Boolean,
+            nullable: false,
+            kind: TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Boolean(*value),
+            },
+        },
         SqlValue::SingleQuotedString(text) => TypedExprNodeV1 {
             result_type: RuntimeScalarTypeV1::Utf8,
             nullable: false,
             kind: TypedExprKindV1::Literal {
                 value: ScalarLiteralV1::Utf8 {
                     value: text.clone(),
+                },
+            },
+        },
+        SqlValue::Null => TypedExprNodeV1 {
+            result_type: RuntimeScalarTypeV1::Float64,
+            nullable: true,
+            kind: TypedExprKindV1::Literal {
+                value: ScalarLiteralV1::Null {
+                    data_type: RuntimeScalarTypeV1::Float64,
                 },
             },
         },
@@ -16224,11 +17534,27 @@ fn is_typed_function_name(name: &str) -> bool {
             | "greatest"
             | "least"
             | "age_days"
+            | "json_valid"
+            | "json_extract_string"
+            | "coalesce"
+            | "nullif"
+            | "time_bucket"
+            | "epoch"
+            | "strftime"
+            | "to_timestamp"
     )
 }
 
 fn typed_function_for_name(name: &str) -> Option<BuiltinScalarFunctionV1> {
     match name.to_ascii_lowercase().as_str() {
+        "epoch" => Some(BuiltinScalarFunctionV1::EpochSeconds),
+        "strftime" => Some(BuiltinScalarFunctionV1::FormatTime),
+        "to_timestamp" => Some(BuiltinScalarFunctionV1::TimestampFromEpochSeconds),
+        "time_bucket" => Some(BuiltinScalarFunctionV1::TimeBucketNanoseconds),
+        "json_valid" => Some(BuiltinScalarFunctionV1::JsonValid),
+        "json_extract_string" => Some(BuiltinScalarFunctionV1::JsonExtractString),
+        "coalesce" => Some(BuiltinScalarFunctionV1::CoalesceFloat64),
+        "nullif" => Some(BuiltinScalarFunctionV1::NullIfFloat64),
         "concat" => Some(BuiltinScalarFunctionV1::Concat),
         "substring" | "substr" => Some(BuiltinScalarFunctionV1::Substring),
         "upper" | "ucase" => Some(BuiltinScalarFunctionV1::Upper),
@@ -16253,6 +17579,51 @@ fn typed_call_result_type(
     args: &[TypedExprNodeV1],
 ) -> Result<RuntimeScalarTypeV1, ViewPlanError> {
     match function {
+        BuiltinScalarFunctionV1::CoalesceUtf8 => Ok(RuntimeScalarTypeV1::Utf8),
+        BuiltinScalarFunctionV1::CoalesceTimestampNanosecond => {
+            Ok(RuntimeScalarTypeV1::TimestampNanosecond)
+        }
+        BuiltinScalarFunctionV1::CoalesceBoolean => Ok(RuntimeScalarTypeV1::Boolean),
+        BuiltinScalarFunctionV1::CoalesceDate32 => Ok(RuntimeScalarTypeV1::Date32),
+        BuiltinScalarFunctionV1::Int64ToUtf8 => Ok(RuntimeScalarTypeV1::Utf8),
+        BuiltinScalarFunctionV1::TryCastBoolean | BuiltinScalarFunctionV1::CaseBoolean => {
+            Ok(RuntimeScalarTypeV1::Boolean)
+        }
+        BuiltinScalarFunctionV1::TimestampFromEpochSeconds
+        | BuiltinScalarFunctionV1::TimestampToMicrosecondPrecision => {
+            Ok(RuntimeScalarTypeV1::TimestampNanosecond)
+        }
+        BuiltinScalarFunctionV1::ScaleIntervalNanoseconds
+        | BuiltinScalarFunctionV1::NullIfInt64
+        | BuiltinScalarFunctionV1::CoalesceInt64 => Ok(RuntimeScalarTypeV1::Int64),
+        BuiltinScalarFunctionV1::CaseFloat64 | BuiltinScalarFunctionV1::EpochSeconds => {
+            Ok(RuntimeScalarTypeV1::Float64)
+        }
+        BuiltinScalarFunctionV1::CaseTimestampNanosecond
+        | BuiltinScalarFunctionV1::GreatestTimestampNanosecond
+        | BuiltinScalarFunctionV1::LeastTimestampNanosecond => {
+            Ok(RuntimeScalarTypeV1::TimestampNanosecond)
+        }
+        BuiltinScalarFunctionV1::LessScalar
+        | BuiltinScalarFunctionV1::LessEqualScalar
+        | BuiltinScalarFunctionV1::GreaterScalar
+        | BuiltinScalarFunctionV1::GreaterEqualScalar
+        | BuiltinScalarFunctionV1::EqualScalar
+        | BuiltinScalarFunctionV1::NotEqualScalar
+        | BuiltinScalarFunctionV1::AndBoolean
+        | BuiltinScalarFunctionV1::OrBoolean
+        | BuiltinScalarFunctionV1::IsNullScalar
+        | BuiltinScalarFunctionV1::NotBoolean => Ok(RuntimeScalarTypeV1::Boolean),
+        BuiltinScalarFunctionV1::SubtractInt64 => Ok(RuntimeScalarTypeV1::Int64),
+        BuiltinScalarFunctionV1::FormatTime => Ok(RuntimeScalarTypeV1::Utf8),
+        BuiltinScalarFunctionV1::TimeBucketNanoseconds => {
+            Ok(RuntimeScalarTypeV1::TimestampNanosecond)
+        }
+        BuiltinScalarFunctionV1::JsonValid => Ok(RuntimeScalarTypeV1::Boolean),
+        BuiltinScalarFunctionV1::JsonExtractString => Ok(RuntimeScalarTypeV1::Utf8),
+        BuiltinScalarFunctionV1::TryCastFloat64
+        | BuiltinScalarFunctionV1::CoalesceFloat64
+        | BuiltinScalarFunctionV1::NullIfFloat64 => Ok(RuntimeScalarTypeV1::Float64),
         BuiltinScalarFunctionV1::Concat
         | BuiltinScalarFunctionV1::Substring
         | BuiltinScalarFunctionV1::Upper
@@ -16346,10 +17717,12 @@ fn typed_call_result_type(
             Ok(RuntimeScalarTypeV1::Float64)
         }
         BuiltinScalarFunctionV1::GreatestFloat64 | BuiltinScalarFunctionV1::LeastFloat64 => {
-            if !args
-                .iter()
-                .all(|arg| arg.result_type == RuntimeScalarTypeV1::Float64)
-            {
+            if !args.iter().all(|arg| {
+                matches!(
+                    arg.result_type,
+                    RuntimeScalarTypeV1::Float64 | RuntimeScalarTypeV1::Int64
+                )
+            }) {
                 return unsupported(format!("{function:?} requires float64 arguments"));
             }
             Ok(RuntimeScalarTypeV1::Float64)
@@ -16448,6 +17821,17 @@ fn typed_function_with_field(
     args: &[TypedExprNodeV1],
 ) -> Result<BuiltinScalarFunctionV1, ViewPlanError> {
     let name = name.to_ascii_lowercase();
+    if matches!(name.as_str(), "greatest" | "least")
+        && args
+            .iter()
+            .all(|arg| arg.result_type == RuntimeScalarTypeV1::TimestampNanosecond)
+    {
+        return Ok(if name == "greatest" {
+            BuiltinScalarFunctionV1::GreatestTimestampNanosecond
+        } else {
+            BuiltinScalarFunctionV1::LeastTimestampNanosecond
+        });
+    }
     if name == "extract" {
         let field = match args.first().map(|arg| &arg.kind) {
             Some(TypedExprKindV1::Literal {
@@ -16742,6 +18126,8 @@ fn rebuilt_aggregate_call(
         LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => "percentile_disc",
         LogicalPlanAggregateFunctionV1::PercentileCont { .. } => "percentile_cont",
         LogicalPlanAggregateFunctionV1::Avg => "avg",
+        LogicalPlanAggregateFunctionV1::ArgMax { .. } => return Ok(None),
+        LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => return Ok(None),
     };
     let mut arguments = FunctionArguments::List(FunctionArgumentList {
         duplicate_treatment: if aggregate.function == LogicalPlanAggregateFunctionV1::CountDistinct
@@ -17655,6 +19041,901 @@ fn catalog_column_from_expr<'a>(
                 .to_string(),
         }
     })
+}
+
+pub fn validate_supported_typed_join_project_sql(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+) -> Result<SupportedTypedJoinProjectPlanV1, ViewPlanError> {
+    let [first, second] = catalogs else {
+        return unsupported("typed join projection requires two catalogs");
+    };
+    first.validate()?;
+    second.validate()?;
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("typed join projection requires SELECT");
+    };
+    validate_plain_select_clauses(select)?;
+    if select.selection.is_some()
+        || select.distinct.is_some()
+        || !group_by_is_empty(&select.group_by)
+        || select.having.is_some()
+        || query.order_by.is_some()
+    {
+        return unsupported(
+            "typed join projection requires direct columns without filters, aggregate or ordering",
+        );
+    }
+    let [from] = select.from.as_slice() else {
+        return unsupported("typed join projection requires one joined FROM");
+    };
+    let [join] = from.joins.as_slice() else {
+        return unsupported("typed join projection requires exactly one JOIN");
+    };
+    if join.global {
+        return unsupported("GLOBAL typed join is unsupported");
+    }
+    let left_table = registered_table_ref(&from.relation, "left")?;
+    let right_table = registered_table_ref(&join.relation, "right")?;
+    let find_catalog = |name: &str| {
+        catalogs
+            .iter()
+            .find(|catalog| catalog.relation_schema.relation_id == name)
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "typed join table is not registered".into(),
+            })
+    };
+    let left = find_catalog(&left_table.name)?;
+    let right = find_catalog(&right_table.name)?;
+    if left.relation_schema.relation_id == right.relation_schema.relation_id {
+        return unsupported("typed projected self joins are unsupported");
+    }
+    let (join_kind, constraint) = match &join.join_operator {
+        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+            (SupportedJoinKind::Inner, constraint)
+        }
+        JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+            (SupportedJoinKind::Left, constraint)
+        }
+        JoinOperator::FullOuter(constraint) => (SupportedJoinKind::Full, constraint),
+        _ => return unsupported("typed join projection supports INNER, LEFT or FULL JOIN only"),
+    };
+    let pairs = match constraint {
+        JoinConstraint::Using(columns) => columns
+            .iter()
+            .map(|name| {
+                let name = single_object_name_identifier(name).ok_or_else(|| {
+                    ViewPlanError::UnsupportedShape {
+                        reason: "JOIN USING requires unqualified columns".into(),
+                    }
+                })?;
+                Ok((
+                    catalog_column_by_identifier(left, &name)?,
+                    catalog_column_by_identifier(right, &name)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ViewPlanError>>()?,
+        JoinConstraint::On(expr) => join_on_conjuncts(expr)
+            .into_iter()
+            .map(|expr| {
+                let Some((l, r)) =
+                    join_on_equality_refs(expr, &left_table.alias, &right_table.alias)?
+                else {
+                    return unsupported(
+                        "typed JOIN ON requires only cross-input column equalities",
+                    );
+                };
+                Ok((
+                    qualified_ref_catalog_column(&l, left)?,
+                    qualified_ref_catalog_column(&r, right)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ViewPlanError>>()?,
+        _ => return unsupported("typed join requires ON equalities or USING columns"),
+    };
+    if pairs.is_empty() {
+        return unsupported("typed join requires at least one equality key");
+    }
+    for (left_key, right_key) in &pairs {
+        if left_key.physical_arrow_type != right_key.physical_arrow_type
+            || !matches!(
+                left_key.physical_arrow_type,
+                ArrowPhysicalTypeV1::Int64
+                    | ArrowPhysicalTypeV1::Utf8
+                    | ArrowPhysicalTypeV1::Boolean
+                    | ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None }
+            )
+            || left_key.column_id == left.relation_schema.weight_column_id
+            || right_key.column_id == right.relation_schema.weight_column_id
+        {
+            return unsupported(
+                "typed join equality keys require matching scalar types, excluding weights",
+            );
+        }
+    }
+    let mut key_pairs = pairs
+        .iter()
+        .map(|(l, r)| SupportedJoinKeyPairV1 {
+            left_column_id: l.column_id.clone(),
+            right_column_id: r.column_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    key_pairs.sort_by(|a, b| {
+        (&a.left_column_id, &a.right_column_id).cmp(&(&b.left_column_id, &b.right_column_id))
+    });
+    validate_ordered_join_key_pairs(
+        key_pairs
+            .iter()
+            .map(|pair| (&pair.left_column_id, &pair.right_column_id)),
+    )?;
+    let mut projection = Vec::new();
+    let mut outputs = BTreeSet::new();
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => return unsupported("typed join projections must be direct columns"),
+        };
+        if let Expr::Function(function) = expr {
+            if function_name_eq(&function.name, "coalesce") && join_kind == SupportedJoinKind::Full
+            {
+                let FunctionArguments::List(args) = &function.args else {
+                    return unsupported("FULL key COALESCE requires two direct columns");
+                };
+                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(l)), FunctionArg::Unnamed(FunctionArgExpr::Expr(r))] =
+                    args.args.as_slice()
+                else {
+                    return unsupported("FULL key COALESCE requires two direct columns");
+                };
+                let Some(l) = expression_catalog_column(l, left, Some(&left_table.alias)) else {
+                    return unsupported("FULL key COALESCE first column must be left");
+                };
+                let Some(r) = expression_catalog_column(r, right, Some(&right_table.alias)) else {
+                    return unsupported("FULL key COALESCE second column must be right");
+                };
+                if !key_pairs.iter().any(|pair| {
+                    pair.left_column_id == l.column_id && pair.right_column_id == r.column_id
+                }) {
+                    return unsupported(
+                        "FULL key COALESCE must reference one admitted equality pair",
+                    );
+                }
+                let Some(alias) = alias else {
+                    return unsupported("FULL key COALESCE requires output alias");
+                };
+                if !outputs.insert(alias.to_ascii_lowercase()) {
+                    return unsupported("typed join aliases must be unique");
+                }
+                projection.push(SupportedTypedJoinProjectionV1 {
+                    side: SupportedAggregateInputRelationSide::Left,
+                    column_id: l.column_id.clone(),
+                    output_name: alias.into(),
+                    coalesce_right_column_id: Some(r.column_id.clone()),
+                });
+                continue;
+            }
+            return unsupported("typed join functions require an explicit native projected stage");
+        }
+        let (side, column, catalog) =
+            if let Some(column) = expression_catalog_column(expr, left, Some(&left_table.alias)) {
+                if matches!(expr, Expr::Identifier(_))
+                    && expression_catalog_column(expr, right, Some(&right_table.alias)).is_some()
+                    && !matches!(constraint, JoinConstraint::Using(_))
+                {
+                    return unsupported("ambiguous typed join column must be qualified");
+                }
+                (SupportedAggregateInputRelationSide::Left, column, left)
+            } else if let Some(column) =
+                expression_catalog_column(expr, right, Some(&right_table.alias))
+            {
+                (SupportedAggregateInputRelationSide::Right, column, right)
+            } else {
+                return unsupported("typed join projection column is not registered");
+            };
+        validate_ordered_window_value_column(catalog, column)?;
+        let output_name = alias.unwrap_or(&column.name).to_string();
+        if !outputs.insert(output_name.to_ascii_lowercase()) {
+            return unsupported("typed join output names must be unique");
+        }
+        projection.push(SupportedTypedJoinProjectionV1 {
+            side,
+            column_id: column.column_id.clone(),
+            output_name,
+            coalesce_right_column_id: None,
+        });
+    }
+    if projection.is_empty() {
+        return unsupported("typed join requires projections");
+    }
+    Ok(SupportedTypedJoinProjectPlanV1 {
+        left_relation_id: left.relation_schema.relation_id.clone(),
+        right_relation_id: right.relation_schema.relation_id.clone(),
+        join_kind,
+        key_pairs,
+        projection,
+    })
+}
+
+pub fn lower_supported_typed_join_project_sql_to_logical_plan(
+    sql: &str,
+    catalogs: &[VelorixRelationCatalogV1],
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    let supported = validate_supported_typed_join_project_sql(sql, catalogs)?;
+    let left = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == supported.left_relation_id)
+        .expect("admitted left");
+    let right = catalogs
+        .iter()
+        .find(|catalog| catalog.relation_schema.relation_id == supported.right_relation_id)
+        .expect("admitted right");
+    // Projected joins preserve multiplicity; no projected column is proven unique.
+    if !output_schema.primary_key.is_empty() {
+        return unsupported("typed join output must declare an empty primary key (bag semantics)");
+    }
+    let left_schema = PlannerRelationInput::from_source_catalog(left)?.relation;
+    let right_schema = PlannerRelationInput::from_source_catalog(right)?.relation;
+    let expected_columns = supported
+        .projection
+        .iter()
+        .map(|projection| {
+            let (catalog, schema) = if projection.side == SupportedAggregateInputRelationSide::Left
+            {
+                (left, &left_schema)
+            } else {
+                (right, &right_schema)
+            };
+            let source = catalog_column_by_id(catalog, &projection.column_id)?;
+            let column = schema
+                .columns
+                .iter()
+                .find(|column| column.name == source.name)
+                .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                    reason: "typed join projection must reference a public source column".into(),
+                })?;
+            let nullable = if let Some(right_id) = &projection.coalesce_right_column_id {
+                source.nullable || catalog_column_by_id(right, right_id)?.nullable
+            } else {
+                source.nullable
+                    || supported.join_kind == SupportedJoinKind::Full
+                    || (supported.join_kind == SupportedJoinKind::Left
+                        && projection.side == SupportedAggregateInputRelationSide::Right)
+            };
+            Ok(ColumnSchema {
+                name: projection.output_name.clone(),
+                data_type: column.data_type.clone(),
+                nullable,
+            })
+        })
+        .collect::<Result<Vec<_>, ViewPlanError>>()?;
+    if output_schema.columns != expected_columns {
+        return unsupported(
+            "typed join output columns must match projected names, types and nullability",
+        );
+    }
+    let refs = supported
+        .key_pairs
+        .iter()
+        .map(|pair| LogicalPlanJoinKeyPairV1 {
+            left_key: column_ref(&supported.left_relation_id, &pair.left_column_id),
+            right_key: column_ref(&supported.right_relation_id, &pair.right_column_id),
+        })
+        .collect::<Vec<_>>();
+    let first = &refs[0];
+    let composite_equality = (refs.len() > 1).then(|| LogicalPlanCompositeJoinEqualityV1 {
+        schema_version: 1,
+        additional_pairs: refs[1..].to_vec(),
+    });
+    let step = LogicalPlanBinaryJoinStepV1 {
+        node_id: "typed_join".into(),
+        right_input: "right_scan".into(),
+        left_key: first.left_key.clone(),
+        right_key: first.right_key.clone(),
+        composite_equality,
+        join_kind: supported.join_kind,
+    };
+    let mut joins = if supported.join_kind == SupportedJoinKind::Full {
+        vec![VelorixLogicalViewPlanNodeV1::FullEquiJoin {
+            node_id: step.node_id.clone(),
+            left: "left_scan".into(),
+            right: step.right_input,
+            left_key: step.left_key,
+            right_key: step.right_key,
+            output_key: column_ref(
+                &output_schema.relation_id,
+                &supported.projection[0].output_name,
+            ),
+            composite_equality: step.composite_equality,
+        }]
+    } else {
+        lower_join_chain_to_binary_dag("left_scan", &[step])?.0
+    };
+    let output = logical_relation_from_schema(output_schema);
+    let mut nodes = vec![
+        VelorixLogicalViewPlanNodeV1::RelationScan {
+            node_id: "left_scan".into(),
+            relation: logical_relation_from_catalog(left),
+        },
+        VelorixLogicalViewPlanNodeV1::RelationScan {
+            node_id: "right_scan".into(),
+            relation: logical_relation_from_catalog(right),
+        },
+    ];
+    nodes.append(&mut joins);
+    nodes.push(VelorixLogicalViewPlanNodeV1::Project {
+        node_id: "typed_projection".into(),
+        input: "typed_join".into(),
+        columns: supported
+            .projection
+            .iter()
+            .map(|projection| {
+                column_ref(
+                    if projection.side == SupportedAggregateInputRelationSide::Left {
+                        &supported.left_relation_id
+                    } else {
+                        &supported.right_relation_id
+                    },
+                    &projection.column_id,
+                )
+            })
+            .collect(),
+        computed_columns: Vec::new(),
+    });
+    nodes.push(VelorixLogicalViewPlanNodeV1::Output {
+        node_id: "output_materialized_view".into(),
+        input: "typed_projection".into(),
+        relation: output.clone(),
+    });
+    finalize_logical_plan(VelorixLogicalViewPlanV1 {
+        plan_version: LOGICAL_VIEW_PLAN_VERSION_V2,
+        plan_hash: None,
+        view_sql: sql.into(),
+        capability_version: LOGICAL_VIEW_PLAN_CAPABILITY_VERSION_V2.into(),
+        key_semantics_version: INCREMENTAL_KEY_SEMANTICS_VERSION_V1.into(),
+        bag_semantics_version: INCREMENTAL_BAG_SEMANTICS_VERSION_V1.into(),
+        input_relations: vec![
+            logical_relation_from_catalog(left),
+            logical_relation_from_catalog(right),
+        ],
+        output_relation: output,
+        nodes,
+        operator_dag_contract: empty_operator_dag_contract(),
+        state_requirements: Vec::new(),
+        output_codec_version: LOGICAL_VIEW_OUTPUT_CODEC_VERSION_V1.into(),
+        execution_implementation: None,
+        execution: VelorixLogicalViewExecutionV1::TypedJoinProject {
+            plan: Box::new(supported),
+        },
+    })
+}
+
+pub fn validate_supported_ordered_window_sql(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<SupportedOrderedWindowPlanV1, ViewPlanError> {
+    use sqlparser::ast::{WindowFrameBound, WindowFrameUnits};
+    catalog.validate()?;
+    let keys = &catalog.relation_schema.primary_key_column_ids;
+    let key = keys
+        .first()
+        .map(|id| catalog_column_by_id(catalog, id))
+        .transpose()?;
+    for id in keys {
+        let column = catalog_column_by_id(catalog, id)?;
+        validate_ordered_window_value_column(catalog, column)?;
+        if column.physical_arrow_type == ArrowPhysicalTypeV1::Float64 {
+            return unsupported("ordered window identity requires exact scalar keys");
+        }
+    }
+    let query = parse_single_query(sql)?;
+    validate_query_level_clauses(&query, false)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("ordered windows require a single SELECT");
+    };
+    let mut plain_select = select.clone();
+    plain_select.named_window.clear();
+    validate_plain_select_clauses_allow_qualify(&plain_select)?;
+    if select.selection.is_some()
+        || select.qualify.is_some()
+        || select.distinct.is_some()
+        || !group_by_is_empty(&select.group_by)
+        || select.having.is_some()
+        || query.order_by.is_some()
+    {
+        return unsupported("ordered windows require projected source rows without WHERE, QUALIFY, DISTINCT, GROUP BY, HAVING or output ORDER BY");
+    }
+    let [from] = select.from.as_slice() else {
+        return unsupported("ordered windows require one registered relation");
+    };
+    if !from.joins.is_empty() {
+        return unsupported("ordered windows do not support JOIN");
+    }
+    let table = registered_table_ref(&from.relation, "ordered")?;
+    if table.name != catalog.relation_schema.relation_id {
+        return unsupported("ordered windows must reference the registered relation");
+    }
+    let alias = Some(table.alias.as_str());
+    let key_item = key.and_then(|key| {
+        select
+            .projection
+            .iter()
+            .find(|item| select_item_references_bound_column(item, catalog, key, alias, None))
+    });
+    let output_key_column_id = match (key, key_item) {
+        (Some(key), Some(item)) => {
+            select_item_alias_or_source_default(item, &key.name, alias, None)?
+        }
+        (Some(_), None) => {
+            return unsupported("ordered windows require a direct primary key projection")
+        }
+        (None, _) => String::new(),
+    };
+    let mut plan = SupportedOrderedWindowPlanV1 {
+        schema_version: if keys.is_empty() {
+            3
+        } else if keys.len() == 1
+            && key.is_some_and(|key| {
+                !key.nullable && key.physical_arrow_type == ArrowPhysicalTypeV1::Utf8
+            })
+        {
+            1
+        } else {
+            2
+        },
+        input_relation_id: catalog.relation_schema.relation_id.clone(),
+        key_column_id: key.map(|key| key.column_id.clone()).unwrap_or_default(),
+        output_key_column_id: output_key_column_id.clone(),
+        output_key_input_column_id: None,
+        partition_column_ids: Vec::new(),
+        order_column_id: String::new(),
+        order_descending: false,
+        order_nulls_first: None,
+        outputs: Vec::new(),
+        projections: Vec::new(),
+    };
+    let mut names = BTreeSet::new();
+    if key.is_some() {
+        names.insert(output_key_column_id.to_ascii_lowercase());
+    }
+    for item in &select.projection {
+        if key_item.is_some_and(|key_item| std::ptr::eq(item, key_item)) {
+            continue;
+        }
+        let (expr, output_alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.as_str())),
+            _ => {
+                return unsupported(
+                    "ordered windows accept direct columns and supported window functions only",
+                )
+            }
+        };
+        if let Some(column) = expression_catalog_column(expr, catalog, alias) {
+            validate_ordered_window_value_column(catalog, column)?;
+            let output = output_alias.unwrap_or(&column.name).to_string();
+            if !names.insert(output.to_ascii_lowercase()) {
+                return unsupported("ordered window output aliases must be unique");
+            }
+            plan.projections.push(OrderedWindowProjectionV1 {
+                input_column_id: column.column_id.clone(),
+                output_column_id: output,
+            });
+            continue;
+        }
+        let Expr::Function(function) = expr else {
+            return unsupported(
+                "ordered window expressions must be direct columns or SUM/LAG window calls",
+            );
+        };
+        if function.filter.is_some()
+            || !function.within_group.is_empty()
+            || !matches!(function.parameters, FunctionArguments::None)
+        {
+            return unsupported("ordered window function modifiers are unsupported");
+        }
+        if function.null_treatment.is_some() {
+            return unsupported(
+                "ordered window NULL treatment modifiers are unsupported; LAG respects NULLs",
+            );
+        }
+        let window = match &function.over {
+            Some(WindowType::WindowSpec(window)) => window,
+            Some(WindowType::NamedWindow(name)) => {
+                let definitions = select
+                    .named_window
+                    .iter()
+                    .filter(|definition| identifier_eq(&definition.0.value, &name.value))
+                    .collect::<Vec<_>>();
+                let [definition] = definitions.as_slice() else {
+                    return unsupported("named OVER window must resolve to one definition");
+                };
+                let sqlparser::ast::NamedWindowExpr::WindowSpec(window) = &definition.1 else {
+                    return unsupported("chained named windows are unsupported");
+                };
+                window
+            }
+            _ => return unsupported("ordered windows require an OVER specification"),
+        };
+        if window.window_name.is_some() {
+            return unsupported("ordered windows require inline partition/order specifications");
+        }
+        let partitions = window
+            .partition_by
+            .iter()
+            .map(|expr| {
+                let column = expression_catalog_column(expr, catalog, alias).ok_or_else(|| {
+                    ViewPlanError::UnsupportedShape {
+                        reason: "ordered window PARTITION BY must reference registered columns"
+                            .into(),
+                    }
+                })?;
+                if column.column_id == catalog.relation_schema.weight_column_id
+                    || !supported_scalar_join_key_atom(&column.physical_arrow_type)
+                {
+                    return unsupported(
+                        "ordered partition columns must be scalar and must not reference weight",
+                    );
+                }
+                Ok(column.column_id.clone())
+            })
+            .collect::<Result<Vec<_>, ViewPlanError>>()?;
+        let [order] = window.order_by.as_slice() else {
+            return unsupported("ordered windows require one ORDER BY column");
+        };
+        let order_column =
+            expression_catalog_column(&order.expr, catalog, alias).ok_or_else(|| {
+                ViewPlanError::UnsupportedShape {
+                    reason: "ordered window ORDER BY must reference a registered column".into(),
+                }
+            })?;
+        if order.with_fill.is_some() {
+            return unsupported("ordered window WITH FILL is unsupported");
+        }
+        let mut nonnullable_order = order_column.clone();
+        nonnullable_order.nullable = false;
+        validate_latest_ordering_column(catalog, &nonnullable_order)?;
+        let descending = supported_order_ascending(order)? == Some(false);
+        let nulls_first = order.options.nulls_first.unwrap_or(descending);
+        let bound_nulls_first =
+            (order_column.nullable || order.options.nulls_first.is_some()).then_some(nulls_first);
+        if plan.outputs.is_empty() {
+            plan.partition_column_ids = partitions;
+            plan.order_column_id = order_column.column_id.clone();
+            plan.order_descending = descending;
+            plan.order_nulls_first = bound_nulls_first;
+        } else if partitions != plan.partition_column_ids
+            || order_column.column_id != plan.order_column_id
+            || descending != plan.order_descending
+            || nulls_first != plan.order_nulls_first.unwrap_or(plan.order_descending)
+        {
+            return unsupported(
+                "ordered window outputs must share the same partition and order columns",
+            );
+        }
+        let FunctionArguments::List(args) = &function.args else {
+            return unsupported("ordered windows require normal arguments");
+        };
+        if args.duplicate_treatment.is_some() || !args.clauses.is_empty() {
+            return unsupported("ordered windows do not support DISTINCT or argument clauses");
+        }
+        let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(value_expr))) = args.args.first()
+        else {
+            return unsupported("ordered window function requires a column argument");
+        };
+        let value = expression_catalog_column(value_expr, catalog, alias).ok_or_else(|| {
+            ViewPlanError::UnsupportedShape {
+                reason: "ordered window input must be a projected registered column".into(),
+            }
+        })?;
+        if value.column_id == catalog.relation_schema.weight_column_id {
+            return unsupported("ordered windows must not expose weight columns");
+        }
+        let name = function.name.to_string().to_ascii_lowercase();
+        let spec = match name.as_str() {
+            "sum" => {
+                if args.args.len() != 1 || value.physical_arrow_type != ArrowPhysicalTypeV1::Float64
+                {
+                    return unsupported("ordered SUM requires one Float64 column");
+                }
+                let (rows, preceding) = match &window.window_frame {
+                    None => (false, 0),
+                    Some(frame) => {
+                        if !matches!(frame.start_bound, WindowFrameBound::Preceding(None)) {
+                            return unsupported("ordered SUM requires UNBOUNDED PRECEDING start");
+                        }
+                        let preceding = match frame
+                            .end_bound
+                            .as_ref()
+                            .unwrap_or(&WindowFrameBound::CurrentRow)
+                        {
+                            WindowFrameBound::CurrentRow => 0,
+                            WindowFrameBound::Preceding(Some(expr)) => {
+                                const_frame_bound(expr, "PRECEDING")?
+                            }
+                            _ => {
+                                return unsupported(
+                                    "ordered SUM end must be CURRENT ROW or constant PRECEDING",
+                                )
+                            }
+                        };
+                        match frame.units {
+                            WindowFrameUnits::Rows => (true, preceding),
+                            WindowFrameUnits::Range if preceding == 0 => (false, 0),
+                            _ => return unsupported(
+                                "ordered SUM supports cumulative ROWS or RANGE CURRENT ROW only",
+                            ),
+                        }
+                    }
+                };
+                OrderedWindowFunctionV1::SumFloat64 {
+                    value_column_id: value.column_id.clone(),
+                    rows,
+                    preceding,
+                }
+            }
+            "lag" => {
+                if args.args.len() > 2 || window.window_frame.is_some() {
+                    return unsupported("ordered LAG supports one value and optional constant offset, without frame/default argument");
+                }
+                let offset = if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) =
+                    args.args.get(1)
+                {
+                    const_frame_bound(expr, "LAG offset")?
+                } else if args.args.len() == 1 {
+                    1
+                } else {
+                    return unsupported("LAG offset must be a constant integer");
+                };
+                validate_ordered_window_value_column(catalog, value)?;
+                OrderedWindowFunctionV1::Lag {
+                    value_column_id: value.column_id.clone(),
+                    offset,
+                }
+            }
+            _ => {
+                return unsupported(format!(
+                    "ordered window function `{name}` is unsupported; native SUM/LAG only"
+                ))
+            }
+        };
+        let output = output_alias.unwrap_or(&name).to_string();
+        if !names.insert(output.to_ascii_lowercase()) {
+            return unsupported("ordered window output aliases must be unique");
+        }
+        plan.outputs.push(OrderedWindowOutputV1 {
+            output_column_id: output,
+            function: spec,
+        });
+    }
+    if plan.outputs.is_empty() {
+        return unsupported("ordered windows require a SUM or LAG output");
+    }
+    supported_ordered_window_output_primary_key(catalog, &plan)?;
+    Ok(plan)
+}
+
+/// Output aliases for the declared identity tuple, in catalog key order.
+pub fn supported_ordered_window_output_primary_key(
+    catalog: &VelorixRelationCatalogV1,
+    plan: &SupportedOrderedWindowPlanV1,
+) -> Result<Vec<String>, ViewPlanError> {
+    catalog
+        .relation_schema
+        .primary_key_column_ids
+        .iter()
+        .map(|id| {
+            if id == &plan.key_column_id {
+                return Ok(plan.output_key_column_id.clone());
+            }
+            plan.projections
+                .iter()
+                .find(|projection| &projection.input_column_id == id)
+                .map(|projection| projection.output_column_id.clone())
+                .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                    reason:
+                        "ordered windows require every primary key component directly projected"
+                            .into(),
+                })
+        })
+        .collect()
+}
+
+fn validate_ordered_window_value_column(
+    catalog: &VelorixRelationCatalogV1,
+    column: &RelationColumnV1,
+) -> Result<(), ViewPlanError> {
+    if column.column_id == catalog.relation_schema.weight_column_id
+        || !matches!(
+            column.physical_arrow_type,
+            ArrowPhysicalTypeV1::Boolean
+                | ArrowPhysicalTypeV1::Utf8
+                | ArrowPhysicalTypeV1::Int64
+                | ArrowPhysicalTypeV1::Float64
+                | ArrowPhysicalTypeV1::Date32
+                | ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None }
+        )
+    {
+        return unsupported("ordered window values require primitive scalar columns or naive timestamps, excluding weight columns");
+    }
+    Ok(())
+}
+
+pub fn lower_supported_ordered_window_sql_to_logical_plan(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+    output_schema: &RelationSchema,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    ordered_window_logical_plan(
+        sql,
+        catalog,
+        output_schema,
+        validate_supported_ordered_window_sql(sql, catalog)?,
+    )
+}
+
+pub fn supported_ordered_window_output_columns(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+    supported: &SupportedOrderedWindowPlanV1,
+) -> Result<Vec<ColumnSchema>, ViewPlanError> {
+    let query = parse_single_query(sql)?;
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("ordered windows require SELECT");
+    };
+    let input = catalog_input_relation_schema(catalog).map_err(|error| {
+        ViewPlanError::UnsupportedShape {
+            reason: error.to_string(),
+        }
+    })?;
+    let mut by_name = BTreeMap::new();
+    let source_type = |id: &str| -> Result<SqlDataType, ViewPlanError> {
+        let column = catalog_column_by_id(catalog, id)?;
+        input
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column.name)
+            .map(|column| column.data_type.clone())
+            .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                reason: "ordered output source type is missing".into(),
+            })
+    };
+    if supported.schema_version != 3 {
+        by_name.insert(
+            supported.output_key_column_id.clone(),
+            ColumnSchema {
+                name: supported.output_key_column_id.clone(),
+                data_type: source_type(&supported.key_column_id)?,
+                nullable: catalog_column_by_id(catalog, &supported.key_column_id)?.nullable,
+            },
+        );
+    }
+    for projection in &supported.projections {
+        let column = catalog_column_by_id(catalog, &projection.input_column_id)?;
+        by_name.insert(
+            projection.output_column_id.clone(),
+            ColumnSchema {
+                name: projection.output_column_id.clone(),
+                data_type: source_type(&column.column_id)?,
+                nullable: column.nullable,
+            },
+        );
+    }
+    for output in &supported.outputs {
+        let data_type = match &output.function {
+            OrderedWindowFunctionV1::SumFloat64 { .. } => SqlDataType::Float64,
+            OrderedWindowFunctionV1::Lag {
+                value_column_id, ..
+            } => source_type(value_column_id)?,
+        };
+        by_name.insert(
+            output.output_column_id.clone(),
+            ColumnSchema {
+                name: output.output_column_id.clone(),
+                data_type,
+                nullable: true,
+            },
+        );
+    }
+    select
+        .projection
+        .iter()
+        .map(|item| {
+            let name = match item {
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                SelectItem::UnnamedExpr(Expr::Identifier(name)) => name.value.clone(),
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => parts
+                    .last()
+                    .map(|name| name.value.clone())
+                    .unwrap_or_default(),
+                SelectItem::UnnamedExpr(Expr::Function(function)) => {
+                    function.name.to_string().to_ascii_lowercase()
+                }
+                _ => return unsupported("ordered output item is unsupported"),
+            };
+            by_name
+                .remove(&name)
+                .ok_or_else(|| ViewPlanError::UnsupportedShape {
+                    reason: "ordered output alias mismatch".into(),
+                })
+        })
+        .collect()
+}
+
+fn ordered_window_logical_plan(
+    sql: &str,
+    catalog: &VelorixRelationCatalogV1,
+    output_schema: &RelationSchema,
+    supported: SupportedOrderedWindowPlanV1,
+) -> Result<VelorixLogicalViewPlanV1, ViewPlanError> {
+    if output_schema.columns != supported_ordered_window_output_columns(sql, catalog, &supported)?
+        || output_schema.primary_key
+            != supported_ordered_window_output_primary_key(catalog, &supported)?
+    {
+        return unsupported(
+            "ordered window output schema must match admitted SQL order, types and nullability",
+        );
+    }
+    let mut plan = analytic_row_number_logical_plan(
+        sql,
+        catalog,
+        output_schema,
+        SupportedAnalyticRowNumberPlan {
+            input_relation_id: supported.input_relation_id.clone(),
+            key_column_id: if supported.schema_version == 3 {
+                supported.order_column_id.clone()
+            } else {
+                supported.key_column_id.clone()
+            },
+            output_key_column_id: supported.output_key_column_id.clone(),
+            function: SupportedAnalyticWindowFunction::RowNumber,
+            partition_column_id: supported
+                .partition_column_ids
+                .first()
+                .unwrap_or(if supported.schema_version == 3 {
+                    &supported.order_column_id
+                } else {
+                    &supported.key_column_id
+                })
+                .clone(),
+            order_column_id: supported.order_column_id.clone(),
+            order_descending: supported.order_descending,
+            output_row_number_column_id: supported.outputs[0].output_column_id.clone(),
+            predicate_expr: None,
+            rank_limit: None,
+        },
+    );
+    if supported.schema_version == 3 {
+        for requirement in &mut plan.state_requirements {
+            requirement.key_columns = catalog
+                .relation_schema
+                .columns
+                .iter()
+                .filter(|column| column.column_id != catalog.relation_schema.weight_column_id)
+                .map(|column| column_ref(&supported.input_relation_id, &column.column_id))
+                .collect();
+        }
+    } else if supported.schema_version == 2 {
+        for requirement in &mut plan.state_requirements {
+            for id in catalog
+                .relation_schema
+                .primary_key_column_ids
+                .iter()
+                .skip(1)
+            {
+                let key = column_ref(&supported.input_relation_id, id);
+                if !requirement.key_columns.contains(&key) {
+                    requirement.key_columns.push(key);
+                }
+            }
+        }
+    }
+    plan.execution = VelorixLogicalViewExecutionV1::OrderedWindows {
+        plan: Box::new(supported),
+    };
+    finalize_logical_plan(plan)
 }
 
 pub fn lower_supported_analytic_window_frame_sql_to_logical_plan(

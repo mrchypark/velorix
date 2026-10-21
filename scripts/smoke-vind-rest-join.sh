@@ -181,34 +181,34 @@ curl_api_status() {
 }
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)_$$"
-readings_relation_id="rest_join_readings_${run_id}"
-devices_relation_id="rest_join_devices_${run_id}"
-view_id="rest_join_readings_by_device_${run_id}"
+left_relation_id="rest_join_left_${run_id}"
+right_relation_id="rest_join_right_${run_id}"
+view_id="rest_join_left_right_${run_id}"
 relation_version="2026-05-24.v1"
-readings_stream_id="${readings_relation_id}_stream"
-devices_stream_id="${devices_relation_id}_stream"
+left_stream_id="${left_relation_id}_stream"
+right_stream_id="${right_relation_id}_stream"
 api_path="/rest-join/${run_id}"
 
 healthz_file="${output_dir}/healthz.json"
 readyz_file="${output_dir}/readyz.json"
-readings_relation_request_file="${output_dir}/readings-relation-request.json"
-devices_relation_request_file="${output_dir}/devices-relation-request.json"
-readings_relation_file="${output_dir}/readings-relation.json"
-devices_relation_file="${output_dir}/devices-relation.json"
+left_relation_request_file="${output_dir}/left-relation-request.json"
+right_relation_request_file="${output_dir}/right-relation-request.json"
+left_relation_file="${output_dir}/left-relation.json"
+right_relation_file="${output_dir}/right-relation.json"
 view_request_file="${output_dir}/join-view-request.json"
 view_file="${output_dir}/join-view.json"
 backfill_file="${output_dir}/join-backfill.json"
 relations_ingest_file="${output_dir}/relations-ingest.json"
-readings_ingest_file="${output_dir}/readings-ingest.json"
-devices_ingest_file="${output_dir}/devices-ingest.json"
+left_ingest_file="${output_dir}/left-ingest.json"
+right_ingest_file="${output_dir}/right-ingest.json"
 view_query_file="${output_dir}/join-view-query.json"
 
 python3 - \
-  "$readings_relation_request_file" \
-  "$devices_relation_request_file" \
+  "$left_relation_request_file" \
+  "$right_relation_request_file" \
   "$view_request_file" \
-  "$readings_relation_id" \
-  "$devices_relation_id" \
+  "$left_relation_id" \
+  "$right_relation_id" \
   "$view_id" \
   "$relation_version" \
   "$api_path" <<'PY'
@@ -217,11 +217,11 @@ import json
 import sys
 
 (
-    readings_request_path,
-    devices_request_path,
+    left_request_path,
+    right_request_path,
     view_request_path,
-    readings_relation_id,
-    devices_relation_id,
+    left_relation_id,
+    right_relation_id,
     view_id,
     relation_version,
     api_path,
@@ -285,48 +285,48 @@ def catalog(relation_schema):
     }
 
 
-readings_schema = schema(
-    readings_relation_id,
+left_schema = schema(
+    left_relation_id,
     [
-        column("device_id", "utf8", 0, "primary_key"),
-        column("temperature_c", "int64", 1, "metadata"),
+        column("key_col", "utf8", 0, "primary_key"),
+        column("value_col", "int64", 1, "metadata"),
         column("delta", "int64", 2, "weight"),
     ],
-    "device_id",
+    "key_col",
 )
-devices_schema = schema(
-    devices_relation_id,
+right_schema = schema(
+    right_relation_id,
     [
-        column("device_id", "utf8", 0, "primary_key"),
-        column("calibration_offset", "int64", 1, "value"),
-        column("site", "utf8", 2, "metadata"),
+        column("key_col", "utf8", 0, "primary_key"),
+        column("value_col", "int64", 1, "value"),
+        column("category", "utf8", 2, "metadata"),
         column("delta", "int64", 3, "weight"),
     ],
-    "device_id",
+    "key_col",
 )
 
 sql = (
-    "select d.device_id, sum(r.temperature_c) as total_temperature_c, "
-    "count(*) as reading_count, min(r.temperature_c) as min_temperature_c, "
-    f"max(r.temperature_c) as max_temperature_c from {readings_relation_id} r "
-    f"join {devices_relation_id} d on r.device_id = d.device_id group by d.device_id"
+    "select r.key_col, sum(l.value_col) as total_value, "
+    "count(*) as row_count, min(l.value_col) as min_value, "
+    f"max(l.value_col) as max_value from {left_relation_id} l "
+    f"join {right_relation_id} r on l.key_col = r.key_col group by r.key_col"
 )
 
 files = {
-    readings_request_path: {
-        "catalog": catalog(readings_schema),
+    left_request_path: {
+        "catalog": catalog(left_schema),
         "default_orders_sum_count": False,
     },
-    devices_request_path: {
-        "catalog": catalog(devices_schema),
+    right_request_path: {
+        "catalog": catalog(right_schema),
         "default_orders_sum_count": False,
     },
     view_request_path: {
         "view_id": view_id,
         "urlPath": api_path,
         "inputRelationRefs": [
-            {"relation_id": readings_relation_id, "relation_version": relation_version},
-            {"relation_id": devices_relation_id, "relation_version": relation_version},
+            {"relation_id": left_relation_id, "relation_version": relation_version},
+            {"relation_id": right_relation_id, "relation_version": relation_version},
         ],
         "sql": sql,
         "description": "standalone REST smoke for a two-relation materialized join via multi-relation relation ingest",
@@ -351,28 +351,28 @@ if [ "$authoritative_relation_ingest" = "1" ] && ! jq -e '
   exit 1
 fi
 
-readings_relation_status="$(curl_api_status "$readings_relation_file" \
+left_relation_status="$(curl_api_status "$left_relation_file" \
   -X POST "$VELORIX_API_URL/v1/relations" \
   -H 'content-type: application/json' \
-  -d @"$readings_relation_request_file")"
-case "$readings_relation_status" in
+  -d @"$left_relation_request_file")"
+case "$left_relation_status" in
   200 | 201) ;;
   *)
-    echo "expected readings relation creation to return 200 or 201; got ${readings_relation_status}" >&2
-    echo "readings relation creation failed; raw response remains in private evidence" >&2
+    echo "expected left relation creation to return 200 or 201; got ${left_relation_status}" >&2
+    echo "left relation creation failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
 
-devices_relation_status="$(curl_api_status "$devices_relation_file" \
+right_relation_status="$(curl_api_status "$right_relation_file" \
   -X POST "$VELORIX_API_URL/v1/relations" \
   -H 'content-type: application/json' \
-  -d @"$devices_relation_request_file")"
-case "$devices_relation_status" in
+  -d @"$right_relation_request_file")"
+case "$right_relation_status" in
   200 | 201) ;;
   *)
-    echo "expected devices relation creation to return 200 or 201; got ${devices_relation_status}" >&2
-    echo "devices relation creation failed; raw response remains in private evidence" >&2
+    echo "expected right relation creation to return 200 or 201; got ${right_relation_status}" >&2
+    echo "right relation creation failed; raw response remains in private evidence" >&2
     exit 1
     ;;
 esac
@@ -388,15 +388,15 @@ case "$view_status" in
       "$summary_file" \
       "$run_id" \
       "$VELORIX_API_URL" \
-      "$readings_relation_id" \
-      "$devices_relation_id" \
+      "$left_relation_id" \
+      "$right_relation_id" \
       "$relation_version" \
       "$view_id" \
       "$api_path" \
       "$view_status" \
       "$authoritative_relation_ingest" \
-      "$readings_relation_file" \
-      "$devices_relation_file" \
+      "$left_relation_file" \
+      "$right_relation_file" \
       "$view_file" \
       "$view_request_file" <<'PY'
 import json
@@ -407,15 +407,15 @@ from datetime import datetime, timezone
     summary_path,
     run_id,
     api_url,
-    readings_relation_id,
-    devices_relation_id,
+    left_relation_id,
+    right_relation_id,
     relation_version,
     view_id,
     api_path,
     view_status,
     authoritative_relation_ingest,
-    readings_relation_path,
-    devices_relation_path,
+    left_relation_path,
+    right_relation_path,
     view_path,
     view_request_path,
 ) = sys.argv[1:]
@@ -435,7 +435,7 @@ payload = {
     "relation_ingest_mode": "authoritative-single-batch" if authoritative_relation_ingest == "1" else "legacy-multi-relation",
     "api_url": api_url,
     "run_id": run_id,
-    "relation_ids": [readings_relation_id, devices_relation_id],
+    "relation_ids": [left_relation_id, right_relation_id],
     "relation_version": relation_version,
     "view_id": view_id,
     "promoted_api_path": api_path,
@@ -445,8 +445,8 @@ payload = {
     "view_response": view_response,
     "trusted_for_product_complete": False,
     "evidence_files": {
-        "readings_relation": readings_relation_path,
-        "devices_relation": devices_relation_path,
+        "left_relation": left_relation_path,
+        "right_relation": right_relation_path,
         "view": view_path,
     },
 }
@@ -462,33 +462,33 @@ PY
     ;;
 esac
 
-python3 - "$output_dir/readings-ingest-request.json" "$output_dir/devices-ingest-request.json" "$output_dir/relations-ingest-request.json" "$readings_relation_id" "$devices_relation_id" "$relation_version" "$readings_stream_id" "$devices_stream_id" <<'PY'
+python3 - "$output_dir/left-ingest-request.json" "$output_dir/right-ingest-request.json" "$output_dir/relations-ingest-request.json" "$left_relation_id" "$right_relation_id" "$relation_version" "$left_stream_id" "$right_stream_id" <<'PY'
 import json
 import sys
 
-readings_path, devices_path, relations_path, readings_relation_id, devices_relation_id, relation_version, readings_stream_id, devices_stream_id = sys.argv[1:]
+left_path, right_path, relations_path, left_relation_id, right_relation_id, relation_version, left_stream_id, right_stream_id = sys.argv[1:]
 payloads = {
-    readings_path: {
-        "relation_id": readings_relation_id,
+    left_path: {
+        "relation_id": left_relation_id,
         "relation_version": relation_version,
-        "stream_id": readings_stream_id,
+        "stream_id": left_stream_id,
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"device_id": "pump-a", "temperature_c": 42, "delta": 1},
-            {"device_id": "pump-a", "temperature_c": 40, "delta": 1},
-            {"device_id": "pump-b", "temperature_c": 15, "delta": 1},
+            {"key_col": "key-a", "value_col": 42, "delta": 1},
+            {"key_col": "key-a", "value_col": 40, "delta": 1},
+            {"key_col": "key-b", "value_col": 15, "delta": 1},
         ],
     },
-    devices_path: {
-        "relation_id": devices_relation_id,
+    right_path: {
+        "relation_id": right_relation_id,
         "relation_version": relation_version,
-        "stream_id": devices_stream_id,
+        "stream_id": right_stream_id,
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"device_id": "pump-a", "calibration_offset": -2, "site": "north", "delta": 1},
-            {"device_id": "pump-b", "calibration_offset": 3, "site": "south", "delta": 1},
+            {"key_col": "key-a", "value_col": -2, "category": "group-a", "delta": 1},
+            {"key_col": "key-b", "value_col": 3, "category": "group-b", "delta": 1},
         ],
     },
 }
@@ -503,28 +503,28 @@ with open(relations_path, "w", encoding="utf-8") as f:
 PY
 
 if [ "$authoritative_relation_ingest" = "1" ]; then
-  curl_api -X POST "$VELORIX_API_URL/v1/relations/${readings_relation_id}/ingest" \
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/${left_relation_id}/ingest" \
     -H 'content-type: application/json' \
-    -d @"$output_dir/readings-ingest-request.json" \
-    >"$readings_ingest_file"
-  curl_api -X POST "$VELORIX_API_URL/v1/relations/${devices_relation_id}/ingest" \
+    -d @"$output_dir/left-ingest-request.json" \
+    >"$left_ingest_file"
+  curl_api -X POST "$VELORIX_API_URL/v1/relations/${right_relation_id}/ingest" \
     -H 'content-type: application/json' \
-    -d @"$output_dir/devices-ingest-request.json" \
-    >"$devices_ingest_file"
-  python3 - "$relations_ingest_file" "$readings_ingest_file" "$devices_ingest_file" <<'PY'
+    -d @"$output_dir/right-ingest-request.json" \
+    >"$right_ingest_file"
+  python3 - "$relations_ingest_file" "$left_ingest_file" "$right_ingest_file" <<'PY'
 import json
 import sys
 
-output_path, readings_path, devices_path = sys.argv[1:]
-with open(readings_path, "r", encoding="utf-8") as f:
-    readings = json.load(f)
-with open(devices_path, "r", encoding="utf-8") as f:
-    devices = json.load(f)
+output_path, left_path, right_path = sys.argv[1:]
+with open(left_path, "r", encoding="utf-8") as f:
+    left = json.load(f)
+with open(right_path, "r", encoding="utf-8") as f:
+    right = json.load(f)
 with open(output_path, "w", encoding="utf-8") as f:
     json.dump(
         {
             "mode": "authoritative-single-batch",
-            "batches": [readings, devices],
+            "batches": [left, right],
         },
         f,
         indent=2,
@@ -565,16 +565,16 @@ import sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     body = json.load(f)
 
-rows = {row.get("device_id"): row for row in body.get("rows") or []}
-pump_a = rows.get("pump-a") or {}
-pump_b = rows.get("pump-b") or {}
-if pump_a.get("total_temperature_c") != 82 or pump_a.get("reading_count") != 2:
+rows = {row.get("key_col"): row for row in body.get("rows") or []}
+key_a = rows.get("key-a") or {}
+key_b = rows.get("key-b") or {}
+if key_a.get("total_value") != 82 or key_a.get("row_count") != 2:
     raise SystemExit(1)
-if pump_a.get("min_temperature_c") != 40 or pump_a.get("max_temperature_c") != 42:
+if key_a.get("min_value") != 40 or key_a.get("max_value") != 42:
     raise SystemExit(1)
-if pump_b.get("total_temperature_c") != 15 or pump_b.get("reading_count") != 1:
+if key_b.get("total_value") != 15 or key_b.get("row_count") != 1:
     raise SystemExit(1)
-if pump_b.get("min_temperature_c") != 15 or pump_b.get("max_temperature_c") != 15:
+if key_b.get("min_value") != 15 or key_b.get("max_value") != 15:
     raise SystemExit(1)
 PY
   then
@@ -591,14 +591,14 @@ python3 - \
   "$summary_file" \
   "$run_id" \
   "$VELORIX_API_URL" \
-  "$readings_relation_id" \
-  "$devices_relation_id" \
+  "$left_relation_id" \
+  "$right_relation_id" \
   "$relation_version" \
   "$view_id" \
   "$api_path" \
   "$authoritative_relation_ingest" \
-  "$readings_relation_file" \
-  "$devices_relation_file" \
+  "$left_relation_file" \
+  "$right_relation_file" \
   "$view_file" \
   "$relations_ingest_file" \
   "$view_query_file" \
@@ -611,14 +611,14 @@ from datetime import datetime, timezone
     summary_path,
     run_id,
     api_url,
-    readings_relation_id,
-    devices_relation_id,
+    left_relation_id,
+    right_relation_id,
     relation_version,
     view_id,
     api_path,
     authoritative_relation_ingest,
-    readings_relation_path,
-    devices_relation_path,
+    left_relation_path,
+    right_relation_path,
     view_path,
     relations_ingest_path,
     query_path,
@@ -633,7 +633,7 @@ def read_json(path):
 
 view_request = read_json(view_request_path)
 query = read_json(query_path)
-rows = {row.get("device_id"): row for row in query.get("rows") or []}
+rows = {row.get("key_col"): row for row in query.get("rows") or []}
 payload = {
     "schema_version": 1,
     "evidence_kind": "velorix_join_rest_api_smoke",
@@ -642,7 +642,7 @@ payload = {
     "run_id": run_id,
     "api_url": api_url,
     "relation_ingest_mode": "authoritative-single-batch" if authoritative_relation_ingest == "1" else "legacy-multi-relation",
-    "relation_ids": [readings_relation_id, devices_relation_id],
+    "relation_ids": [left_relation_id, right_relation_id],
     "relation_version": relation_version,
     "view_id": view_id,
     "promoted_api_path": api_path,
@@ -650,13 +650,13 @@ payload = {
     "join_frontier_path": "/v1/relations/{relation_id}/ingest" if authoritative_relation_ingest == "1" else "/v1/relations/ingest",
     "join_frontier_contract": "sequential_relation_ingest_frontier_vector",
     "join_rows_verified": {
-        "pump-a": rows["pump-a"],
-        "pump-b": rows["pump-b"],
+        "key-a": rows["key-a"],
+        "key-b": rows["key-b"],
     },
     "trusted_for_product_complete": False,
     "evidence_files": {
-        "readings_relation": readings_relation_path,
-        "devices_relation": devices_relation_path,
+        "left_relation": left_relation_path,
+        "right_relation": right_relation_path,
         "view": view_path,
         "relations_ingest_frontier_vector": relations_ingest_path,
         "view_query": query_path,
@@ -672,5 +672,5 @@ cat <<EOF
 REST join smoke passed
 identifier_redaction=enabled
 evidence_public=${summary_public_file}
-join_rows_verified=pump-a,pump-b
+join_rows_verified=key-a,key-b
 EOF

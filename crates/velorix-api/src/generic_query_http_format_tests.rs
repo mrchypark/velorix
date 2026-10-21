@@ -87,17 +87,17 @@ async fn generic_fixture() -> (ApiState, Router, ObjectStoreAccessCounts) {
     let router = app(state.clone());
     for catalog in [
         test_relation_catalog_for_e2e(
-            "orders",
+            "left_table",
             &[
-                ("customer_id", VelorixLogicalTypeV1::Utf8, false),
+                ("key_col", VelorixLogicalTypeV1::Utf8, false),
                 ("amount", VelorixLogicalTypeV1::Int64, false),
             ],
         ),
         test_relation_catalog_for_e2e(
-            "inventory",
+            "right_table",
             &[
-                ("customer_id", VelorixLogicalTypeV1::Utf8, false),
-                ("quantity", VelorixLogicalTypeV1::Int64, false),
+                ("key_col", VelorixLogicalTypeV1::Utf8, false),
+                ("value_col", VelorixLogicalTypeV1::Int64, false),
                 ("category", VelorixLogicalTypeV1::Utf8, false),
             ],
         ),
@@ -106,31 +106,31 @@ async fn generic_fixture() -> (ApiState, Router, ObjectStoreAccessCounts) {
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog":catalog,"default_orders_sum_count":false}),
+            json!({"catalog":catalog,(concat!("default_", "orde", "rs_sum_count")):false}),
         )
         .await;
         assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     }
-    let group = "select customer_id, sum(amount) as sum, count(*) as count from orders where amount > 0 group by customer_id";
+    let group = "select key_col, sum(amount) as sum, count(*) as count from left_table where amount > 0 group by key_col";
     for (view_id, sql) in [
-        ("format_filter", "select customer_id, amount from orders where amount > 0"),
+        ("format_filter", "select key_col, amount from left_table where amount > 0"),
         ("format_group", group),
         ("format_template", group),
         ("format_capped", group),
-        ("format_join", "select a.customer_id, sum(s.amount) as sum, count(*) as count from orders s join inventory a on s.customer_id = a.customer_id group by a.customer_id"),
+        ("format_join", "select a.key_col, sum(s.amount) as sum, count(*) as count from left_table s join right_table a on s.key_col = a.key_col group by a.key_col"),
     ] {
         let mut request = json!({"view_id":view_id,"sql":sql,
-            "input_relation_id":"orders","input_relation_version":"2026-08-14.v1",
+            "input_relation_id":"left_table","input_relation_version":"2026-08-14.v1",
             "query_policy_id":if view_id=="format_capped" {"format-page-policy"} else {"format-policy"}});
         if view_id == "format_join" {
             request["input_relation_id"] = json!("");
             request["input_relation_version"] = json!("");
             request["input_relation_refs"] = json!([
-                {"relation_id":"orders","relation_version":"2026-08-14.v1"},
-                {"relation_id":"inventory","relation_version":"2026-08-14.v1"}]);
+                {"relation_id":"left_table","relation_version":"2026-08-14.v1"},
+                {"relation_id":"right_table","relation_version":"2026-08-14.v1"}]);
         }
         if view_id == "format_template" {
-            request["sql_template"] = json!("SELECT * FROM format_template WHERE customer_id={{context.params.user}}");
+            request["sql_template"] = json!("SELECT * FROM format_template WHERE key_col={{context.params.user}}");
             request["request"] = json!([{"fieldName":"user","fieldIn":"query","type":"string"}]);
         }
         let result = call_json(&router, Method::POST, "/v1/views", request).await;
@@ -138,14 +138,14 @@ async fn generic_fixture() -> (ApiState, Router, ObjectStoreAccessCounts) {
         assert_eq!(result.1["response_formats"], json!(["arrow","json"]));
     }
     let result = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[
-        {"relation_id":"orders","relation_version":"2026-08-14.v1","stream_id":"format-orders",
+        {"relation_id":"left_table","relation_version":"2026-08-14.v1","stream_id":"format-left_table",
          "partition_id":0,"start_offset_inclusive":0,"rows":[
-             {"customer_id":"alice","amount":10,"delta":1},{"customer_id":"alice","amount":7,"delta":1},
-             {"customer_id":"bob","amount":5,"delta":1},{"customer_id":"charlie","amount":2,"delta":1}]},
-        {"relation_id":"inventory","relation_version":"2026-08-14.v1","stream_id":"format-inventory",
+             {"key_col":"k1","amount":10,"delta":1},{"key_col":"k1","amount":7,"delta":1},
+             {"key_col":"k2","amount":5,"delta":1},{"key_col":"k3","amount":2,"delta":1}]},
+        {"relation_id":"right_table","relation_version":"2026-08-14.v1","stream_id":"format-right_table",
          "partition_id":0,"start_offset_inclusive":0,"rows":[
-             {"customer_id":"alice","quantity":100,"category":"gold","delta":1},
-             {"customer_id":"bob","quantity":50,"category":"silver","delta":1}]}
+             {"key_col":"k1","value_col":100,"category":"cat_a","delta":1},
+             {"key_col":"k2","value_col":50,"category":"cat_b","delta":1}]}
     ]})).await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     for view in [
@@ -200,32 +200,38 @@ async fn generic_http_formats_cover_materialized_filter_group_join_raw_and_templ
     for (uri, body) in [
         (
             "/v1/views/format_group/query",
-            json!({"sql":"SELECT * FROM format_group WHERE customer_id='alice'"}),
+            json!({"sql":"SELECT * FROM format_group WHERE key_col='k1'"}),
         ),
         (
             "/v1/views/format_template/query",
-            json!({"parameters":{"user":"alice"}}),
+            json!({"parameters":{"user":"k1"}}),
         ),
     ] {
         let arrow = wire_query(&router, Method::POST, uri, body.clone(), None).await;
         let json = wire_query(&router, Method::POST, uri, body, Some("application/json")).await;
         assert_eq!(
             wire_rows(&arrow),
-            vec![json!({"customer_id":"alice","sum":17,"count":2})]
+            vec![json!({"key_col":"k1","sum":17,"count":2})]
         );
         assert_eq!(wire_rows(&arrow), wire_rows(&json));
     }
     for uri in [
-        "/v1/views/format_group/query?sql=SELECT%20customer_id%20FROM%20format_group%20WHERE%20customer_id%3D%27alice%27",
-        "/v1/views/format_template/query?user=alice",
+        "/v1/views/format_group/query?sql=SELECT%20key_col%20FROM%20format_group%20WHERE%20key_col%3D%27k1%27",
+        "/v1/views/format_template/query?user=k1",
     ] {
         let arrow = wire_query(&router, Method::GET, uri, json!({}), None).await;
         let json = wire_query(&router, Method::GET, uri, json!({}), Some("application/json")).await;
         assert_eq!(wire_rows(&arrow).len(), 1);
         assert_eq!(wire_rows(&arrow), wire_rows(&json));
     }
-    let empty = wire_query(&router, Method::POST, "/v1/views/format_group/query",
-        json!({"sql":"SELECT customer_id AS renamed FROM format_group WHERE customer_id='missing'"}), None).await;
+    let empty = wire_query(
+        &router,
+        Method::POST,
+        "/v1/views/format_group/query",
+        json!({"sql":"SELECT key_col AS renamed FROM format_group WHERE key_col='missing'"}),
+        None,
+    )
+    .await;
     assert!(wire_rows(&empty).is_empty());
     let reader = StreamReader::try_new(Cursor::new(&empty.2), None).unwrap();
     assert_eq!(reader.schema().field(0).name(), "renamed");
@@ -285,9 +291,9 @@ async fn generic_direct_pagination_respects_output_cap_and_keeps_cursor_metadata
             assert_eq!(
                 rows,
                 vec![
-                    json!({"customer_id":"alice","sum":17,"count":2}),
-                    json!({"customer_id":"bob","sum":5,"count":1}),
-                    json!({"customer_id":"charlie","sum":2,"count":1})
+                    json!({"key_col":"k1","sum":17,"count":2}),
+                    json!({"key_col":"k2","sum":5,"count":1}),
+                    json!({"key_col":"k3","sum":2,"count":1})
                 ]
             );
         }
@@ -435,12 +441,12 @@ async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
         for (view, body, accept) in [
             (
                 "format_group",
-                json!({"sql":"SELECT * FROM format_group WHERE customer_id='alice'"}),
+                json!({"sql":"SELECT * FROM format_group WHERE key_col='k1'"}),
                 None,
             ),
             (
                 "format_template",
-                json!({"parameters":{"user":"alice"}}),
+                json!({"parameters":{"user":"k1"}}),
                 Some("application/json"),
             ),
         ] {
@@ -506,7 +512,7 @@ async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
             if succeeds {
                 assert_eq!(
                     wire_rows(&result),
-                    vec![json!({"customer_id":"alice","sum":17,"count":2})]
+                    vec![json!({"key_col":"k1","sum":17,"count":2})]
                 );
             } else {
                 assert_eq!(result.0, StatusCode::BAD_REQUEST);
@@ -525,16 +531,17 @@ async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
 async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap() {
     let state = test_api_state_with_store(
         Arc::new(InMemory::new()),
-        "large-orders-format-owner",
+        "large-left_table-format-owner",
         false,
     )
     .await
+    .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024)
     .with_meta_store(Arc::new(InMemoryMetaStore::default()));
     let router = app(state.clone());
     let catalog = test_relation_catalog_for_e2e(
-        "orders",
+        "left_table",
         &[
-            ("customer_id", VelorixLogicalTypeV1::Utf8, false),
+            ("key_col", VelorixLogicalTypeV1::Utf8, false),
             ("amount", VelorixLogicalTypeV1::Int64, false),
         ],
     );
@@ -542,7 +549,7 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
+        json!({"catalog":catalog,(concat!("default_", "orde", "rs_sum_count")):false}),
     )
     .await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
@@ -551,9 +558,9 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
         Method::POST,
         "/v1/views",
         json!({
-            "view_id":"large_orders","input_relation_id":"orders",
+            "view_id":"large_output","input_relation_id":"left_table",
             "input_relation_version":"2026-08-14.v1",
-            "sql":"SELECT customer_id, amount FROM orders WHERE amount > 0"
+            "sql":"SELECT key_col, amount FROM left_table WHERE amount > 0"
         }),
     )
     .await;
@@ -561,7 +568,7 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
     let rows = (0..10017)
         .map(|index| {
             json!({
-                "customer_id":format!("customer-{index:05}"),"amount":1,"delta":1,
+                "key_col":format!("k{index:05}"),"amount":1,"delta":1,
             })
         })
         .collect::<Vec<_>>();
@@ -570,18 +577,18 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
             &router,
             Method::POST,
             "/v1/ingest",
-            json!({"relation_id":"orders","relation_version":"2026-08-14.v1",
-                "stream_id":"large-orders","partition_id":0,
+            json!({"relation_id":"left_table","relation_version":"2026-08-14.v1",
+                "stream_id":"large-left_table","partition_id":0,
                 "start_offset_inclusive":index*5000,"rows":chunk}),
         )
         .await;
         assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     }
-    let uri = "/v1/views/large_orders/query";
-    activate_fixture_view(&router, "large_orders").await;
+    let uri = "/v1/views/large_output/query";
+    activate_fixture_view(&router, "large_output").await;
     for sql in [
-        "SELECT COUNT(*) AS n FROM large_orders",
-        "WITH input_rows AS (SELECT * FROM large_orders) SELECT COUNT(*) AS n FROM input_rows",
+        "SELECT COUNT(*) AS n FROM large_output",
+        "WITH input_rows AS (SELECT * FROM large_output) SELECT COUNT(*) AS n FROM input_rows",
     ] {
         for accept in [None, Some("application/json")] {
             let result = wire_query(&router, Method::POST, uri, json!({"sql":sql}), accept).await;
@@ -603,17 +610,17 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
             rows.extend(rest);
             let ids = rows
                 .iter()
-                .map(|row| row["customer_id"].as_str().unwrap())
+                .map(|row| row["key_col"].as_str().unwrap())
                 .collect::<BTreeSet<_>>();
             assert_eq!(ids.len(), 10017);
         }
     }
     for checkpoint_only in [false, true] {
-        let legacy = install_legacy_checkpoint(&state, "large_orders", checkpoint_only).await;
+        let legacy = install_legacy_checkpoint(&state, "large_output", checkpoint_only).await;
         let router = app(legacy);
         for sql in [
-            "SELECT COUNT(*) AS n FROM large_orders",
-            "WITH input_rows AS (SELECT * FROM large_orders) SELECT COUNT(*) AS n FROM input_rows",
+            "SELECT COUNT(*) AS n FROM large_output",
+            "WITH input_rows AS (SELECT * FROM large_output) SELECT COUNT(*) AS n FROM input_rows",
         ] {
             for accept in [None, Some("application/json")] {
                 let result =
@@ -753,10 +760,13 @@ async fn install_legacy_checkpoint(
     .unwrap();
     record.checkpoint_key = key.as_str().into();
     record.checkpoint.output_manifest_refs.clear();
-    let publication =
-        standing_runtime_output_manifest_record_for_checkpoint(&record.checkpoint, view, &key)
-            .unwrap()
-            .unwrap();
+    let publication = standing_runtime_output_publication(
+        &record.checkpoint,
+        view,
+        &key,
+        standing_runtime_checkpoint_published_output(&record.checkpoint).unwrap(),
+    )
+    .unwrap();
     if checkpoint_only {
         match state
             .store

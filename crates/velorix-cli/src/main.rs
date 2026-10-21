@@ -1470,8 +1470,8 @@ mod tests {
             "relation_version": "v1",
             "columns": [
                 {
-                    "column_id": "sensor_id",
-                    "name": "sensor_id",
+                    "column_id": "key",
+                    "name": "key",
                     "logical_type": {"kind": "utf8"},
                     "physical_arrow_type": {"kind": "utf8"},
                     "nullable": false,
@@ -1497,7 +1497,7 @@ mod tests {
                     "semantic_role": "weight"
                 }
             ],
-            "primary_key_column_ids": ["sensor_id"],
+            "primary_key_column_ids": ["key"],
             "weight_column_id": "weight",
             "allowed_operations": ["insert", "delete"],
             "event_time_column_id": null

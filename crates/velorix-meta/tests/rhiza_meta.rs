@@ -40,6 +40,7 @@ fn standing_runtime_checkpoint_pointer(
         plan_hash: String::new(),
         coverage_hash: String::new(),
         input_coverage: None,
+        published_input_bootstrap: None,
         previous_checkpoint_key: String::new(),
         previous_manifest_hash: String::new(),
     }
@@ -162,6 +163,26 @@ async fn concurrent_clients_single_native_node_fence_the_other() {
         second.acquire_standing_runtime_owner(request("owner-b")),
     );
     let outcomes = [left.unwrap(), right.unwrap()];
+    let acquired = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => {
+                Some(standing_runtime_owner_token(claim.clone()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let renewed = first
+        .renew_standing_runtime_owner(acquired.clone(), 30_000)
+        .await
+        .unwrap();
+    assert_eq!(standing_runtime_owner_token(renewed), acquired);
+    let mut foreign = acquired.clone();
+    foreign.owner_id = "foreign".into();
+    assert!(second
+        .renew_standing_runtime_owner(foreign, 30_000)
+        .await
+        .is_err());
     assert_eq!(
         outcomes
             .iter()

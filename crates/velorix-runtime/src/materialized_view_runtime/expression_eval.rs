@@ -59,10 +59,7 @@ pub fn evaluate_typed_expr(
     program: &TypedExprProgramV1,
     get_column: &dyn Fn(&str) -> Option<RuntimeScalarValue>,
 ) -> Result<RuntimeScalarValue, ExpressionEvaluationError> {
-    program
-        .validate()
-        .map_err(|error| ExpressionEvaluationError::Failed(error.to_string()))?;
-    evaluate_node(&program.root, get_column)
+    crate::compiled_expression::CompiledTypedExpr::compile(program)?.evaluate(get_column)
 }
 
 pub fn evaluate_node(
@@ -74,6 +71,48 @@ pub fn evaluate_node(
             .ok_or_else(|| ExpressionEvaluationError::MissingColumn(column_id.clone())),
         TypedExprKindV1::Literal { value } => Ok(literal_value(value)),
         TypedExprKindV1::Call { function, args } => {
+            if matches!(
+                function,
+                BuiltinScalarFunctionV1::CoalesceFloat64
+                    | BuiltinScalarFunctionV1::CoalesceInt64
+                    | BuiltinScalarFunctionV1::CoalesceUtf8
+                    | BuiltinScalarFunctionV1::CoalesceTimestampNanosecond
+                    | BuiltinScalarFunctionV1::CoalesceBoolean
+                    | BuiltinScalarFunctionV1::CoalesceDate32
+            ) {
+                for arg in args {
+                    let value = evaluate_node(arg, get_column)?;
+                    if !matches!(value, RuntimeScalarValue::Null(_)) {
+                        return if *function == BuiltinScalarFunctionV1::CoalesceFloat64 {
+                            Ok(RuntimeScalarValue::Float64(float_operand(
+                                &value, *function,
+                            )?))
+                        } else {
+                            Ok(value)
+                        };
+                    }
+                }
+                return Ok(RuntimeScalarValue::Null(node.result_type));
+            }
+            if matches!(
+                function,
+                BuiltinScalarFunctionV1::CaseFloat64
+                    | BuiltinScalarFunctionV1::CaseTimestampNanosecond
+                    | BuiltinScalarFunctionV1::CaseBoolean
+            ) {
+                for pair in args[..args.len() - 1].as_chunks::<2>().0 {
+                    if matches!(
+                        evaluate_node(&pair[0], get_column)?,
+                        RuntimeScalarValue::Boolean(true)
+                    ) {
+                        return case_result(*function, evaluate_node(&pair[1], get_column)?);
+                    }
+                }
+                return case_result(
+                    *function,
+                    evaluate_node(args.last().expect("validated CASE"), get_column)?,
+                );
+            }
             let mut values = Vec::with_capacity(args.len());
             for arg in args {
                 values.push(evaluate_node(arg, get_column)?);
@@ -87,6 +126,22 @@ pub fn evaluate_node(
             }
             evaluate_udf(identity, &values)
         }
+    }
+}
+
+fn case_result(
+    function: BuiltinScalarFunctionV1,
+    value: RuntimeScalarValue,
+) -> Result<RuntimeScalarValue, ExpressionEvaluationError> {
+    if function == BuiltinScalarFunctionV1::CaseFloat64 {
+        if matches!(value, RuntimeScalarValue::Null(_)) {
+            return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64));
+        }
+        Ok(RuntimeScalarValue::Float64(float_operand(
+            &value, function,
+        )?))
+    } else {
+        Ok(value)
     }
 }
 
@@ -117,6 +172,322 @@ fn evaluate_call(
     args: &[RuntimeScalarValue],
 ) -> Result<RuntimeScalarValue, ExpressionEvaluationError> {
     match function {
+        BuiltinScalarFunctionV1::CoalesceUtf8
+        | BuiltinScalarFunctionV1::CoalesceTimestampNanosecond
+        | BuiltinScalarFunctionV1::CoalesceBoolean
+        | BuiltinScalarFunctionV1::CoalesceDate32 => Err(ExpressionEvaluationError::Failed(
+            "COALESCE requires lazy node evaluation".into(),
+        )),
+        BuiltinScalarFunctionV1::CoalesceInt64 => Ok(args
+            .iter()
+            .find(|value| !matches!(value, RuntimeScalarValue::Null(_)))
+            .cloned()
+            .unwrap_or(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))),
+        BuiltinScalarFunctionV1::NullIfInt64 => match (&args[0], &args[1]) {
+            (RuntimeScalarValue::Int64(left), RuntimeScalarValue::Int64(right))
+                if left == right =>
+            {
+                Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64))
+            }
+            _ => Ok(args[0].clone()),
+        },
+        BuiltinScalarFunctionV1::Int64ToUtf8 => match args[0] {
+            RuntimeScalarValue::Int64(value) => Ok(RuntimeScalarValue::Utf8(value.to_string())),
+            _ => Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Utf8)),
+        },
+        BuiltinScalarFunctionV1::CaseFloat64
+        | BuiltinScalarFunctionV1::CaseTimestampNanosecond
+        | BuiltinScalarFunctionV1::CaseBoolean => Err(ExpressionEvaluationError::Failed(
+            "CASE requires lazy node evaluation".into(),
+        )),
+        BuiltinScalarFunctionV1::TryCastBoolean => {
+            let value = match &args[0] {
+                RuntimeScalarValue::Boolean(value) => Some(*value),
+                RuntimeScalarValue::Int64(value) => Some(*value != 0),
+                RuntimeScalarValue::Float64(value) if value.is_finite() => Some(*value != 0.0),
+                RuntimeScalarValue::Utf8(value) => match value.to_ascii_lowercase().as_str() {
+                    "true" | "t" | "1" | "yes" | "y" => Some(true),
+                    "false" | "f" | "0" | "no" | "n" => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Ok(value
+                .map(RuntimeScalarValue::Boolean)
+                .unwrap_or(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Boolean)))
+        }
+        BuiltinScalarFunctionV1::TimestampFromEpochSeconds
+        | BuiltinScalarFunctionV1::ScaleIntervalNanoseconds => {
+            let timestamp = function == BuiltinScalarFunctionV1::TimestampFromEpochSeconds;
+            let result_type = if timestamp {
+                RuntimeScalarTypeV1::TimestampNanosecond
+            } else {
+                RuntimeScalarTypeV1::Int64
+            };
+            if args
+                .iter()
+                .any(|arg| matches!(arg, RuntimeScalarValue::Null(_)))
+            {
+                return Ok(RuntimeScalarValue::Null(result_type));
+            }
+            // Timestamp/interval SQL conversions resolve to microseconds before storage in nanoseconds.
+            let micros = if timestamp {
+                (float_operand(&args[0], function)? * 1_000_000.0).round_ties_even()
+            } else {
+                (float_operand(&args[0], function)? / 1_000.0 * float_operand(&args[1], function)?)
+                    .round_ties_even()
+            };
+            if !micros.is_finite()
+                || !(-9_223_372_036_854_775.0..9_223_372_036_854_775.0).contains(&micros)
+            {
+                return Err(ExpressionEvaluationError::Failed(
+                    "temporal conversion overflow".into(),
+                ));
+            }
+            let ns = (micros as i64).checked_mul(1_000).ok_or_else(|| {
+                ExpressionEvaluationError::Failed("temporal conversion overflow".into())
+            })?;
+            Ok(if timestamp {
+                RuntimeScalarValue::TimestampNanosecond(ns)
+            } else {
+                RuntimeScalarValue::Int64(ns)
+            })
+        }
+        BuiltinScalarFunctionV1::TimestampToMicrosecondPrecision => match args[0] {
+            RuntimeScalarValue::TimestampNanosecond(value) => Ok(
+                RuntimeScalarValue::TimestampNanosecond(value / 1_000 * 1_000),
+            ),
+            _ => Ok(RuntimeScalarValue::Null(
+                RuntimeScalarTypeV1::TimestampNanosecond,
+            )),
+        },
+        BuiltinScalarFunctionV1::SubtractInt64 => match args {
+            [RuntimeScalarValue::Int64(left), RuntimeScalarValue::Int64(right)]
+            | [RuntimeScalarValue::TimestampNanosecond(left), RuntimeScalarValue::TimestampNanosecond(right)] => {
+                left.checked_sub(*right)
+                    .map(RuntimeScalarValue::Int64)
+                    .ok_or_else(|| {
+                        ExpressionEvaluationError::Failed("integer subtraction overflow".into())
+                    })
+            }
+            _ => Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Int64)),
+        },
+        BuiltinScalarFunctionV1::IsNullScalar => Ok(RuntimeScalarValue::Boolean(matches!(
+            args[0],
+            RuntimeScalarValue::Null(_)
+        ))),
+        BuiltinScalarFunctionV1::NotBoolean => match args[0] {
+            RuntimeScalarValue::Boolean(value) => Ok(RuntimeScalarValue::Boolean(!value)),
+            _ => Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Boolean)),
+        },
+        BuiltinScalarFunctionV1::AndBoolean | BuiltinScalarFunctionV1::OrBoolean => {
+            let boolean = |value: &RuntimeScalarValue| match value {
+                RuntimeScalarValue::Boolean(value) => Some(*value),
+                _ => None,
+            };
+            let (left, right) = (boolean(&args[0]), boolean(&args[1]));
+            let value = if function == BuiltinScalarFunctionV1::AndBoolean {
+                if left == Some(false) || right == Some(false) {
+                    Some(false)
+                } else if left == Some(true) && right == Some(true) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if left == Some(true) || right == Some(true) {
+                Some(true)
+            } else if left == Some(false) && right == Some(false) {
+                Some(false)
+            } else {
+                None
+            };
+            Ok(value
+                .map(RuntimeScalarValue::Boolean)
+                .unwrap_or(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Boolean)))
+        }
+        BuiltinScalarFunctionV1::LessScalar
+        | BuiltinScalarFunctionV1::LessEqualScalar
+        | BuiltinScalarFunctionV1::GreaterScalar
+        | BuiltinScalarFunctionV1::GreaterEqualScalar
+        | BuiltinScalarFunctionV1::EqualScalar
+        | BuiltinScalarFunctionV1::NotEqualScalar => {
+            use std::cmp::Ordering;
+            if args
+                .iter()
+                .any(|arg| matches!(arg, RuntimeScalarValue::Null(_)))
+            {
+                return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Boolean));
+            }
+            let ordering = match args {
+                [RuntimeScalarValue::Boolean(left), RuntimeScalarValue::Boolean(right)] => {
+                    left.cmp(right)
+                }
+                [RuntimeScalarValue::Utf8(left), RuntimeScalarValue::Utf8(right)] => {
+                    left.cmp(right)
+                }
+                [RuntimeScalarValue::Int64(left), RuntimeScalarValue::Int64(right)]
+                | [RuntimeScalarValue::TimestampNanosecond(left), RuntimeScalarValue::TimestampNanosecond(right)] => {
+                    left.cmp(right)
+                }
+                [left, right] => float_operand(left, function)?
+                    .partial_cmp(&float_operand(right, function)?)
+                    .ok_or(ExpressionEvaluationError::NonFiniteFloat)?,
+                _ => {
+                    return Err(ExpressionEvaluationError::Failed(
+                        "comparison requires two scalars".into(),
+                    ))
+                }
+            };
+            Ok(RuntimeScalarValue::Boolean(match function {
+                BuiltinScalarFunctionV1::LessScalar => ordering == Ordering::Less,
+                BuiltinScalarFunctionV1::LessEqualScalar => ordering != Ordering::Greater,
+                BuiltinScalarFunctionV1::GreaterScalar => ordering == Ordering::Greater,
+                BuiltinScalarFunctionV1::GreaterEqualScalar => ordering != Ordering::Less,
+                BuiltinScalarFunctionV1::EqualScalar => ordering == Ordering::Equal,
+                _ => ordering != Ordering::Equal,
+            }))
+        }
+        BuiltinScalarFunctionV1::EpochSeconds => match args[0] {
+            RuntimeScalarValue::TimestampNanosecond(value) => {
+                Ok(RuntimeScalarValue::Float64(value as f64 / 1e9))
+            }
+            _ => Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64)),
+        },
+        BuiltinScalarFunctionV1::FormatTime => match args[0] {
+            RuntimeScalarValue::TimestampNanosecond(value) => {
+                let seconds = value.div_euclid(1_000_000_000).rem_euclid(86400);
+                Ok(RuntimeScalarValue::Utf8(format!(
+                    "{:02}:{:02}:{:02}",
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60
+                )))
+            }
+            _ => Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Utf8)),
+        },
+        BuiltinScalarFunctionV1::GreatestTimestampNanosecond
+        | BuiltinScalarFunctionV1::LeastTimestampNanosecond => {
+            let values = args.iter().filter_map(|value| match value {
+                RuntimeScalarValue::TimestampNanosecond(value) => Some(*value),
+                _ => None,
+            });
+            let result = if function == BuiltinScalarFunctionV1::GreatestTimestampNanosecond {
+                values.max()
+            } else {
+                values.min()
+            };
+            Ok(result
+                .map(RuntimeScalarValue::TimestampNanosecond)
+                .unwrap_or(RuntimeScalarValue::Null(
+                    RuntimeScalarTypeV1::TimestampNanosecond,
+                )))
+        }
+        BuiltinScalarFunctionV1::TimeBucketNanoseconds => {
+            if args
+                .iter()
+                .any(|arg| matches!(arg, RuntimeScalarValue::Null(_)))
+            {
+                return Ok(RuntimeScalarValue::Null(
+                    RuntimeScalarTypeV1::TimestampNanosecond,
+                ));
+            }
+            let [RuntimeScalarValue::Int64(width), RuntimeScalarValue::TimestampNanosecond(timestamp), RuntimeScalarValue::Utf8(zone)] =
+                args
+            else {
+                return Err(ExpressionEvaluationError::Failed(
+                    "TIME_BUCKET invalid arguments".into(),
+                ));
+            };
+            if *width <= 0 {
+                return Err(ExpressionEvaluationError::Failed(
+                    "TIME_BUCKET width must be positive".into(),
+                ));
+            }
+            let offset: i128 = match zone.as_str() {
+                "UTC" => 0,
+                "Asia/Seoul" => 9 * 3_600_000_000_000,
+                _ => {
+                    return Err(ExpressionEvaluationError::Failed(
+                        "TIME_BUCKET unsupported timezone".into(),
+                    ))
+                }
+            };
+            let timestamp = i128::from(*timestamp);
+            let width = i128::from(*width);
+            let bucket = (timestamp + offset).div_euclid(width) * width - offset;
+            Ok(RuntimeScalarValue::TimestampNanosecond(
+                i64::try_from(bucket).map_err(|_| {
+                    ExpressionEvaluationError::Failed("TIME_BUCKET timestamp overflow".into())
+                })?,
+            ))
+        }
+        BuiltinScalarFunctionV1::JsonValid => match &args[0] {
+            RuntimeScalarValue::Utf8(value) => Ok(RuntimeScalarValue::Boolean(
+                serde_json::from_str::<serde_json::Value>(value).is_ok(),
+            )),
+            RuntimeScalarValue::Null(_) => {
+                Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Boolean))
+            }
+            _ => Err(ExpressionEvaluationError::Failed(
+                "JSON_VALID requires utf8".into(),
+            )),
+        },
+        BuiltinScalarFunctionV1::JsonExtractString => {
+            let null = RuntimeScalarValue::Null(RuntimeScalarTypeV1::Utf8);
+            let [RuntimeScalarValue::Utf8(json), RuntimeScalarValue::Utf8(path)] = args else {
+                return Ok(null);
+            };
+            let parts = velorix_core::view_plan::bounded_json_path(path)
+                .map_err(|error| ExpressionEvaluationError::Failed(error.to_string()))?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+                return Ok(null);
+            };
+            let mut selected = &value;
+            for part in parts {
+                let Some(next) = selected.as_object().and_then(|object| object.get(part)) else {
+                    return Ok(null);
+                };
+                selected = next;
+            }
+            Ok(match selected {
+                serde_json::Value::Null => null,
+                serde_json::Value::String(value) => RuntimeScalarValue::Utf8(value.clone()),
+                value => RuntimeScalarValue::Utf8(value.to_string()),
+            })
+        }
+        BuiltinScalarFunctionV1::TryCastFloat64 => {
+            let value = match &args[0] {
+                RuntimeScalarValue::Utf8(value) => value.trim().parse::<f64>().ok(),
+                RuntimeScalarValue::Int64(value) => Some(*value as f64),
+                RuntimeScalarValue::Float64(value) => Some(*value),
+                _ => None,
+            };
+            Ok(match value.filter(|value| value.is_finite()) {
+                Some(value) => RuntimeScalarValue::Float64(canonicalize_float(value)),
+                None => RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64),
+            })
+        }
+        BuiltinScalarFunctionV1::CoalesceFloat64 => {
+            for arg in args {
+                if !matches!(arg, RuntimeScalarValue::Null(_)) {
+                    return Ok(RuntimeScalarValue::Float64(float_operand(arg, function)?));
+                }
+            }
+            Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64))
+        }
+        BuiltinScalarFunctionV1::NullIfFloat64 => {
+            if matches!(args[0], RuntimeScalarValue::Null(_)) {
+                return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64));
+            }
+            let left = float_operand(&args[0], function)?;
+            if !matches!(args[1], RuntimeScalarValue::Null(_))
+                && left == float_operand(&args[1], function)?
+            {
+                Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64))
+            } else {
+                Ok(RuntimeScalarValue::Float64(left))
+            }
+        }
         BuiltinScalarFunctionV1::Concat => {
             let mut out = String::new();
             for arg in args {
@@ -284,7 +655,29 @@ fn evaluate_call(
             if !value.is_finite() {
                 return Err(ExpressionEvaluationError::NonFiniteFloat);
             }
-            Ok(RuntimeScalarValue::Float64(round_half_away(value)))
+            let digits = match args.get(1) {
+                None => 0,
+                Some(RuntimeScalarValue::Int64(value)) => *value,
+                Some(RuntimeScalarValue::Null(_)) => {
+                    return Ok(RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64))
+                }
+                _ => {
+                    return Err(ExpressionEvaluationError::Failed(
+                        "ROUND digits requires int64".into(),
+                    ))
+                }
+            };
+            if !(-308..=308).contains(&digits) {
+                return Err(ExpressionEvaluationError::Failed(
+                    "ROUND digits must be between -308 and 308".into(),
+                ));
+            }
+            let factor = 10_f64.powi(digits as i32);
+            let result = round_half_away(value * factor) / factor;
+            if !result.is_finite() {
+                return Err(ExpressionEvaluationError::NonFiniteFloat);
+            }
+            Ok(RuntimeScalarValue::Float64(canonicalize_float(result)))
         }
         BuiltinScalarFunctionV1::AddFloat64
         | BuiltinScalarFunctionV1::SubtractFloat64
@@ -324,17 +717,18 @@ fn evaluate_call(
             let mut best: Option<f64> = None;
             for arg in args {
                 match arg {
-                    RuntimeScalarValue::Float64(value) => {
+                    RuntimeScalarValue::Float64(_) | RuntimeScalarValue::Int64(_) => {
+                        let value = float_operand(arg, function)?;
                         if !value.is_finite() {
                             return Err(ExpressionEvaluationError::NonFiniteFloat);
                         }
                         best = Some(match best {
-                            None => *value,
+                            None => value,
                             Some(current) => {
                                 if function == BuiltinScalarFunctionV1::GreatestFloat64 {
-                                    current.max(*value)
+                                    current.max(value)
                                 } else {
-                                    current.min(*value)
+                                    current.min(value)
                                 }
                             }
                         });
@@ -730,6 +1124,103 @@ pub fn evaluate_udf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_numeric_string_missing_malformed_and_null() {
+        let path = RuntimeScalarValue::Utf8("$.active_p".into());
+        for (json, expected) in [
+            (r#"{"active_p":" -12.5 "}"#, Some(-12.5)),
+            (r#"{"active_p":4}"#, Some(4.0)),
+            (r#"{"active_p":null}"#, None),
+            (r#"{}"#, None),
+            ("broken", None),
+            (r#"{"active_p":"NaN"}"#, None),
+            (r#"{"active_p":"1e400"}"#, None),
+        ] {
+            let extracted = evaluate_call(
+                BuiltinScalarFunctionV1::JsonExtractString,
+                &[RuntimeScalarValue::Utf8(json.into()), path.clone()],
+            )
+            .unwrap();
+            let converted =
+                evaluate_call(BuiltinScalarFunctionV1::TryCastFloat64, &[extracted]).unwrap();
+            match expected {
+                Some(expected) => assert_eq!(converted, RuntimeScalarValue::Float64(expected)),
+                None => assert_eq!(
+                    converted,
+                    RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64)
+                ),
+            }
+        }
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::JsonValid,
+                &[RuntimeScalarValue::Utf8("broken".into())]
+            )
+            .unwrap(),
+            RuntimeScalarValue::Boolean(false)
+        );
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::TryCastFloat64,
+                &[RuntimeScalarValue::Null(RuntimeScalarTypeV1::Utf8)]
+            )
+            .unwrap(),
+            RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64)
+        );
+    }
+
+    #[test]
+    fn float_controls_and_negative_time_bucket() {
+        use RuntimeScalarValue::{Float64, Int64, TimestampNanosecond, Utf8};
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::GreatestFloat64,
+                &[Float64(-12.5), Int64(0)]
+            )
+            .unwrap(),
+            Float64(0.0)
+        );
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::RoundFloat64,
+                &[Float64(-12.345), Int64(2)]
+            )
+            .unwrap(),
+            Float64(-12.35)
+        );
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::NullIfFloat64,
+                &[Float64(0.0), Int64(0)]
+            )
+            .unwrap(),
+            RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64)
+        );
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::CoalesceFloat64,
+                &[
+                    RuntimeScalarValue::Null(RuntimeScalarTypeV1::Float64),
+                    Int64(0)
+                ]
+            )
+            .unwrap(),
+            Float64(0.0)
+        );
+        assert_eq!(
+            evaluate_call(
+                BuiltinScalarFunctionV1::TimeBucketNanoseconds,
+                &[
+                    Int64(60_000_000_000),
+                    TimestampNanosecond(-1),
+                    Utf8("Asia/Seoul".into())
+                ]
+            )
+            .unwrap(),
+            TimestampNanosecond(-60_000_000_000)
+        );
+    }
     use velorix_core::view_plan::{
         BuiltinScalarFunctionV1, RuntimeScalarTypeV1, ScalarLiteralV1, TypedExprKindV1,
         TypedExprNodeV1, TypedExprProgramV1, TYPED_EXPR_PROGRAM_SCHEMA_VERSION_V1,

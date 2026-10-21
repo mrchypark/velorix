@@ -5,8 +5,10 @@
 //! [`InMemoryMetaStore`] before publishing that snapshot with a root CAS.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::rhiza_kv::{RhizaKvError, RhizaKvStore};
@@ -31,23 +33,40 @@ use crate::{
     RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
     ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
     ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
-    StandingRuntimeOwnerClaim, StoreRelationCatalogOutcome, VelorixRelationCatalogV1,
-    ViewBootstrapControlV1,
+    StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    VelorixRelationCatalogV1, ViewBootstrapControlV1,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 8;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// A metadata store using only Rhiza 0.19.0's linearizable KV operations.
 #[derive(Clone)]
 pub struct RhizaKvMetaStore {
     snapshot: RhizaKvSnapshot,
+    /// Process-local cache of the decoded snapshot, valid only while the KV
+    /// root token still matches the cached token.
+    cache: Arc<RwLock<Option<(RootToken, crate::InMemoryMetaState)>>>,
+    /// Serializes full snapshot loads so one root change decodes once.
+    full_load_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    full_loads: Arc<AtomicUsize>,
+    /// Forces one simulated CAS conflict for the retry regression test.
+    #[cfg(test)]
+    conflict_once: Arc<AtomicBool>,
+}
+
+struct LoadedState {
+    root: Option<RootToken>,
+    state: crate::InMemoryMetaState,
+    cache_hit: bool,
 }
 
 impl RhizaKvMetaStore {
     pub fn new(kv: RhizaKvStore) -> Self {
-        Self {
-            snapshot: RhizaKvSnapshot::new(kv),
-        }
+        Self::from_snapshot(RhizaKvSnapshot::new(kv))
     }
 
     pub async fn open(
@@ -70,7 +89,15 @@ impl RhizaKvMetaStore {
     }
 
     pub fn from_snapshot(snapshot: RhizaKvSnapshot) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            cache: Arc::new(RwLock::new(None)),
+            full_load_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            full_loads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            conflict_once: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Close the native node after all metadata callers have stopped.
@@ -78,52 +105,164 @@ impl RhizaKvMetaStore {
         self.snapshot.close().await.map_err(snapshot_error)
     }
 
-    async fn load(&self) -> Result<(Option<RootToken>, crate::InMemoryMetaState), MetaStoreError> {
+    async fn load_state(&self) -> Result<LoadedState, MetaStoreError> {
+        let Some(root) = self.snapshot.root().await.map_err(snapshot_error)? else {
+            *self.cache.write().await = None;
+            return Ok(LoadedState {
+                root: None,
+                state: crate::InMemoryMetaState::default(),
+                cache_hit: false,
+            });
+        };
+        if let Some((cached_root, state)) = self.cache.read().await.as_ref() {
+            if *cached_root == root {
+                return Ok(LoadedState {
+                    root: Some(root),
+                    state: state.clone(),
+                    cache_hit: true,
+                });
+            }
+        }
+        let _guard = self.full_load_lock.lock().await;
+        if let Some((cached_root, state)) = self.cache.read().await.as_ref() {
+            if *cached_root == root {
+                return Ok(LoadedState {
+                    root: Some(root),
+                    state: state.clone(),
+                    cache_hit: true,
+                });
+            }
+        }
+        #[cfg(test)]
+        self.full_loads.fetch_add(1, Ordering::SeqCst);
         match self.snapshot.load().await.map_err(snapshot_error)? {
-            Some((root, bytes)) => rhiza_snapshot::decode(&bytes)
-                .map(|state| (Some(root), state))
-                .map_err(|error| MetaStoreError::Serialization(error.to_string())),
-            None => Ok((None, crate::InMemoryMetaState::default())),
+            Some((loaded_root, bytes)) => {
+                let state = rhiza_snapshot::decode(&bytes)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+                *self.cache.write().await = Some((loaded_root.clone(), state.clone()));
+                Ok(LoadedState {
+                    root: Some(loaded_root),
+                    state,
+                    cache_hit: false,
+                })
+            }
+            None => {
+                *self.cache.write().await = None;
+                Ok(LoadedState {
+                    root: None,
+                    state: crate::InMemoryMetaState::default(),
+                    cache_hit: false,
+                })
+            }
         }
     }
 
-    async fn read_eval<R, F, Fut>(&self, evaluate: F) -> Result<R, MetaStoreError>
+    async fn read_eval<R, F, Fut>(
+        &self,
+        operation: &'static str,
+        evaluate: F,
+    ) -> Result<R, MetaStoreError>
     where
         F: FnOnce(InMemoryMetaStore) -> Fut,
         Fut: Future<Output = Result<R, MetaStoreError>>,
     {
-        let (_, state) = self.load().await?;
-        let now = unix_time_ms()?;
-        evaluate(InMemoryMetaStore::from_state_for_evaluation(state, now)).await
+        let started = std::time::Instant::now();
+        let loaded = self.load_state().await;
+        let cache_hit = loaded.as_ref().is_ok_and(|loaded| loaded.cache_hit);
+        let result = match loaded {
+            Ok(loaded) => match unix_time_ms() {
+                Ok(now) => {
+                    evaluate(InMemoryMetaStore::from_state_for_evaluation(
+                        loaded.state,
+                        now,
+                    ))
+                    .await
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        report_diag(operation, cache_hit, started);
+        result
     }
 
-    async fn mutate<R, F, Fut>(&self, evaluate: F) -> Result<R, MetaStoreError>
+    async fn mutate<R, F, Fut>(
+        &self,
+        operation: &'static str,
+        evaluate: F,
+    ) -> Result<R, MetaStoreError>
     where
         F: Fn(InMemoryMetaStore) -> Fut + Send + Sync,
         Fut: Future<Output = Result<R, MetaStoreError>> + Send,
         R: Send,
     {
+        let started = std::time::Instant::now();
+        let mut cache_hit = None;
+        let mut result = Err(MetaStoreError::RhizaContention {
+            attempts: MAX_CAS_ATTEMPTS,
+        });
         for _ in 0..MAX_CAS_ATTEMPTS {
-            let (expected, state) = self.load().await?;
-            let now = unix_time_ms()?;
-            let evaluator = InMemoryMetaStore::from_state_for_evaluation(state, now);
-            let outcome = evaluate(evaluator.clone()).await?;
-            let encoded = rhiza_snapshot::encode(&evaluator.snapshot_state().await)
-                .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+            let loaded = match self.load_state().await {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            cache_hit = Some(loaded.cache_hit);
+            let now = match unix_time_ms() {
+                Ok(now) => now,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            let evaluator = InMemoryMetaStore::from_state_for_evaluation(loaded.state, now);
+            let outcome = match evaluate(evaluator.clone()).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            };
+            let state = evaluator.snapshot_state().await;
+            let encoded = match rhiza_snapshot::encode(&state) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    result = Err(MetaStoreError::Serialization(error.to_string()));
+                    break;
+                }
+            };
+            #[cfg(test)]
+            if self.conflict_once.swap(false, Ordering::SeqCst) {
+                *self.cache.write().await = None;
+                continue;
+            }
             let request_id = Uuid::now_v7().to_string();
-            match self
+            let exchanged = match self
                 .snapshot
-                .compare_exchange(expected, encoded, request_id)
+                .compare_exchange(loaded.root, encoded, request_id)
                 .await
-                .map_err(snapshot_error)?
             {
-                CompareExchange::Applied(_) => return Ok(outcome),
-                CompareExchange::Conflict => continue,
+                Ok(exchanged) => exchanged,
+                Err(error) => {
+                    result = Err(snapshot_error(error));
+                    break;
+                }
+            };
+            match exchanged {
+                CompareExchange::Applied(new_root) => {
+                    *self.cache.write().await = Some((new_root, state));
+                    result = Ok(outcome);
+                    break;
+                }
+                CompareExchange::Conflict => {
+                    *self.cache.write().await = None;
+                }
             }
         }
-        Err(MetaStoreError::RhizaContention {
-            attempts: MAX_CAS_ATTEMPTS,
-        })
+        report_diag(operation, cache_hit.unwrap_or(false), started);
+        result
     }
 
     fn capabilities(mut capabilities: MetaStoreCapabilities) -> MetaStoreCapabilities {
@@ -178,6 +317,18 @@ fn snapshot_error(error: SnapshotError) -> MetaStoreError {
     }
 }
 
+/// Opt-in one-line-per-operation timing. Unset means no environment lookup cost
+/// beyond the `var_os` call and no output.
+fn report_diag(operation: &str, cache_hit: bool, started: std::time::Instant) {
+    if std::env::var_os("VELORIX_META_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "meta_diag op={operation} cache={} ms={}",
+            if cache_hit { "hit" } else { "miss" },
+            started.elapsed().as_millis()
+        );
+    }
+}
+
 impl RhizaKvMetaStore {
     /// Open the store from the canonical `RHIZA_*` process environment with the
     /// private recovery listener already bound. Metadata operations and the
@@ -202,12 +353,22 @@ impl RhizaKvMetaStore {
     pub async fn ready(&self) -> Result<bool, MetaStoreError> {
         self.snapshot.ready().await.map_err(snapshot_error)
     }
+
+    #[cfg(test)]
+    fn full_loads(&self) -> usize {
+        self.full_loads.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn force_conflict_once(&self) {
+        self.conflict_once.store(true, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
 impl MetaStore for RhizaKvMetaStore {
     async fn read_meta_store_capabilities(&self) -> Result<MetaStoreCapabilities, MetaStoreError> {
-        self.read_eval(|store| async move {
+        self.read_eval("read_meta_store_capabilities", |store| async move {
             store
                 .read_meta_store_capabilities()
                 .await
@@ -220,7 +381,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         catalog: VelorixRelationCatalogV1,
     ) -> Result<StoreRelationCatalogOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("store_relation_catalog", move |store| {
             let catalog = catalog.clone();
             async move { store.store_relation_catalog(catalog).await }
         })
@@ -234,7 +395,7 @@ impl MetaStore for RhizaKvMetaStore {
     ) -> Result<VelorixRelationCatalogV1, MetaStoreError> {
         let relation_id = relation_id.to_owned();
         let relation_version = relation_version.to_owned();
-        self.read_eval(move |store| async move {
+        self.read_eval("read_relation_catalog", move |store| async move {
             store
                 .read_relation_catalog(&relation_id, &relation_version)
                 .await
@@ -246,7 +407,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         reservation: IngestRangeReservation,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("reserve_ingest_range", move |store| {
             let reservation = reservation.clone();
             async move { store.reserve_ingest_range(reservation).await }
         })
@@ -257,7 +418,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: ReserveAuthoritativeIngestRangeRequest,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("reserve_authoritative_ingest_range", move |store| {
             let request = request.clone();
             async move { store.reserve_authoritative_ingest_range(request).await }
         })
@@ -268,7 +429,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         reservation: IngestRangeReservation,
     ) -> Result<CommitIngestRangeOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("commit_ingest_range", move |store| {
             let reservation = reservation.clone();
             async move { store.commit_ingest_range(reservation).await }
         })
@@ -279,7 +440,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: PublishIngestReservationRequest,
     ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("publish_ingest_reservation", move |store| {
             let request = request.clone();
             async move { store.publish_ingest_reservation(request).await }
         })
@@ -291,11 +452,14 @@ impl MetaStore for RhizaKvMetaStore {
         request_id: &str,
     ) -> Result<Option<AuthoritativeIngestPublication>, MetaStoreError> {
         let request_id = request_id.to_owned();
-        self.read_eval(move |store| async move {
-            store
-                .read_authoritative_ingest_publication(&request_id)
-                .await
-        })
+        self.read_eval(
+            "read_authoritative_ingest_publication",
+            move |store| async move {
+                store
+                    .read_authoritative_ingest_publication(&request_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -304,9 +468,10 @@ impl MetaStore for RhizaKvMetaStore {
         key: &PartitionAuthorityKey,
     ) -> Result<Vec<AuthoritativeIngestPublication>, MetaStoreError> {
         let key = key.clone();
-        self.read_eval(move |store| async move {
-            store.list_authoritative_ingest_publications(&key).await
-        })
+        self.read_eval(
+            "list_authoritative_ingest_publications",
+            move |store| async move { store.list_authoritative_ingest_publications(&key).await },
+        )
         .await
     }
 
@@ -314,7 +479,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         reservations: Vec<IngestRangeReservation>,
     ) -> Result<Vec<CommitIngestRangeOutcome>, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("commit_ingest_ranges", move |store| {
             let reservations = reservations.clone();
             async move { store.commit_ingest_ranges(reservations).await }
         })
@@ -325,7 +490,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: CaptureIngestSourceCutRequest,
     ) -> Result<IngestSourceCutV1, MetaStoreError> {
-        self.read_eval(move |store| {
+        self.read_eval("capture_ingest_source_cut", move |store| {
             let request = request.clone();
             async move { store.capture_ingest_source_cut(request).await }
         })
@@ -335,20 +500,22 @@ impl MetaStore for RhizaKvMetaStore {
     async fn read_relation_ingest_capability(
         &self,
     ) -> Result<RelationIngestCapability, MetaStoreError> {
-        self.read_eval(|store| async move { store.read_relation_ingest_capability().await })
-            .await
-            .map(|mut capability| {
-                capability.backend_name = "rhiza-kv".into();
-                capability.durable_across_restart = true;
-                capability
-            })
+        self.read_eval("read_relation_ingest_capability", |store| async move {
+            store.read_relation_ingest_capability().await
+        })
+        .await
+        .map(|mut capability| {
+            capability.backend_name = "rhiza-kv".into();
+            capability.durable_across_restart = true;
+            capability
+        })
     }
 
     async fn capture_relation_ingest_source_cut(
         &self,
         request: CaptureRelationIngestSourceCutRequest,
     ) -> Result<RelationIngestSourceCutV1, MetaStoreError> {
-        self.read_eval(move |store| {
+        self.read_eval("capture_relation_ingest_source_cut", move |store| {
             let request = request.clone();
             async move { store.capture_relation_ingest_source_cut(request).await }
         })
@@ -359,7 +526,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: CaptureRelationIngestSourceCutsRequest,
     ) -> Result<Vec<RelationIngestSourceIdentityCutV1>, MetaStoreError> {
-        self.read_eval(move |store| {
+        self.read_eval("capture_relation_ingest_source_cuts", move |store| {
             let request = request.clone();
             async move { store.capture_relation_ingest_source_cuts(request).await }
         })
@@ -370,7 +537,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: BeginViewBootstrapRequest,
     ) -> Result<BeginViewBootstrapOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("begin_view_bootstrap", move |store| {
             let request = request.clone();
             async move { store.begin_view_bootstrap(request).await }
         })
@@ -386,7 +553,7 @@ impl MetaStore for RhizaKvMetaStore {
         let tenant_id = tenant_id.to_owned();
         let program_id = program_id.to_owned();
         let view_id = view_id.to_owned();
-        self.read_eval(move |store| async move {
+        self.read_eval("read_view_bootstrap", move |store| async move {
             store
                 .read_view_bootstrap(&tenant_id, &program_id, &view_id)
                 .await
@@ -398,7 +565,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: FixViewBootstrapActivationCutRequest,
     ) -> Result<FixViewBootstrapActivationCutOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("fix_view_bootstrap_activation_cut", move |store| {
             let request = request.clone();
             async move { store.fix_view_bootstrap_activation_cut(request).await }
         })
@@ -409,7 +576,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: PromoteViewBootstrapRequest,
     ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("promote_view_bootstrap", move |store| {
             let request = request.clone();
             async move { store.promote_view_bootstrap(request).await }
         })
@@ -420,9 +587,21 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("acquire_standing_runtime_owner", move |store| {
             let request = request.clone();
             async move { store.acquire_standing_runtime_owner(request).await }
+        })
+        .await
+    }
+
+    async fn renew_standing_runtime_owner(
+        &self,
+        owner: StandingRuntimeOwnerToken,
+        ttl_ms: u64,
+    ) -> Result<StandingRuntimeOwnerClaim, MetaStoreError> {
+        self.mutate("renew_standing_runtime_owner", move |store| {
+            let owner = owner.clone();
+            async move { store.renew_standing_runtime_owner(owner, ttl_ms).await }
         })
         .await
     }
@@ -436,7 +615,7 @@ impl MetaStore for RhizaKvMetaStore {
         let tenant_id = tenant_id.to_owned();
         let program_id = program_id.to_owned();
         let view_id = view_id.to_owned();
-        self.read_eval(move |store| async move {
+        self.read_eval("read_standing_runtime_owner", move |store| async move {
             store
                 .read_standing_runtime_owner(&tenant_id, &program_id, &view_id)
                 .await
@@ -448,7 +627,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: PublishStandingRuntimeCheckpointRequest,
     ) -> Result<PublishStandingRuntimeCheckpointOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("publish_standing_runtime_checkpoint", move |store| {
             let request = request.clone();
             async move { store.publish_standing_runtime_checkpoint(request).await }
         })
@@ -464,33 +643,38 @@ impl MetaStore for RhizaKvMetaStore {
         let tenant_id = tenant_id.to_owned();
         let program_id = program_id.to_owned();
         let view_id = view_id.to_owned();
-        self.read_eval(move |store| async move {
-            store
-                .read_standing_runtime_checkpoint(&tenant_id, &program_id, &view_id)
-                .await
-        })
+        self.read_eval(
+            "read_standing_runtime_checkpoint",
+            move |store| async move {
+                store
+                    .read_standing_runtime_checkpoint(&tenant_id, &program_id, &view_id)
+                    .await
+            },
+        )
         .await
     }
 
     async fn read_partition_authority_capability(
         &self,
     ) -> Result<PartitionAuthorityCapability, MetaStoreError> {
-        self.read_eval(|store| async move { store.read_partition_authority_capability().await })
-            .await
-            .map(|mut capability| {
-                capability.backend_name = "rhiza-kv".into();
-                capability.backend_owned_time = false;
-                capability.durable_across_restart = true;
-                capability.production_safe = false;
-                capability
-            })
+        self.read_eval("read_partition_authority_capability", |store| async move {
+            store.read_partition_authority_capability().await
+        })
+        .await
+        .map(|mut capability| {
+            capability.backend_name = "rhiza-kv".into();
+            capability.backend_owned_time = false;
+            capability.durable_across_restart = true;
+            capability.production_safe = false;
+            capability
+        })
     }
 
     async fn acquire_partition_authority(
         &self,
         request: AcquirePartitionAuthorityRequest,
     ) -> Result<AcquirePartitionAuthorityOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("acquire_partition_authority", move |store| {
             let request = request.clone();
             async move { store.acquire_partition_authority(request).await }
         })
@@ -502,15 +686,17 @@ impl MetaStore for RhizaKvMetaStore {
         key: &PartitionAuthorityKey,
     ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
         let key = key.clone();
-        self.read_eval(move |store| async move { store.read_partition_authority(&key).await })
-            .await
+        self.read_eval("read_partition_authority", move |store| async move {
+            store.read_partition_authority(&key).await
+        })
+        .await
     }
 
     async fn acquire_relation_partition_authority(
         &self,
         request: AcquireRelationPartitionAuthorityRequest,
     ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("acquire_relation_partition_authority", move |store| {
             let request = request.clone();
             async move { store.acquire_relation_partition_authority(request).await }
         })
@@ -523,6 +709,7 @@ impl MetaStore for RhizaKvMetaStore {
     ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
         let key = key.clone();
         self.read_eval(
+            "read_relation_partition_authority",
             move |store| async move { store.read_relation_partition_authority(&key).await },
         )
         .await
@@ -532,14 +719,17 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: ReserveRelationAuthoritativeIngestRangeRequest,
     ) -> Result<ReserveIngestRangeOutcome, MetaStoreError> {
-        self.mutate(move |store| {
-            let request = request.clone();
-            async move {
-                store
-                    .reserve_relation_authoritative_ingest_range(request)
-                    .await
-            }
-        })
+        self.mutate(
+            "reserve_relation_authoritative_ingest_range",
+            move |store| {
+                let request = request.clone();
+                async move {
+                    store
+                        .reserve_relation_authoritative_ingest_range(request)
+                        .await
+                }
+            },
+        )
         .await
     }
 
@@ -547,7 +737,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: PublishRelationIngestReservationRequest,
     ) -> Result<PublishIngestReservationOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("publish_relation_ingest_reservation", move |store| {
             let request = request.clone();
             async move { store.publish_relation_ingest_reservation(request).await }
         })
@@ -559,11 +749,14 @@ impl MetaStore for RhizaKvMetaStore {
         request_id: &str,
     ) -> Result<Option<RelationAuthoritativeIngestPublication>, MetaStoreError> {
         let request_id = request_id.to_owned();
-        self.read_eval(move |store| async move {
-            store
-                .read_relation_authoritative_ingest_publication(&request_id)
-                .await
-        })
+        self.read_eval(
+            "read_relation_authoritative_ingest_publication",
+            move |store| async move {
+                store
+                    .read_relation_authoritative_ingest_publication(&request_id)
+                    .await
+            },
+        )
         .await
     }
 
@@ -572,11 +765,14 @@ impl MetaStore for RhizaKvMetaStore {
         key: &RelationPartitionAuthorityKey,
     ) -> Result<Vec<RelationAuthoritativeIngestPublication>, MetaStoreError> {
         let key = key.clone();
-        self.read_eval(move |store| async move {
-            store
-                .list_relation_authoritative_ingest_publications(&key)
-                .await
-        })
+        self.read_eval(
+            "list_relation_authoritative_ingest_publications",
+            move |store| async move {
+                store
+                    .list_relation_authoritative_ingest_publications(&key)
+                    .await
+            },
+        )
         .await
     }
 
@@ -584,7 +780,7 @@ impl MetaStore for RhizaKvMetaStore {
         &self,
         request: PublishPartitionCheckpointPointerRequest,
     ) -> Result<PublishPartitionCheckpointPointerOutcome, MetaStoreError> {
-        self.mutate(move |store| {
+        self.mutate("publish_partition_checkpoint_pointer", move |store| {
             let request = request.clone();
             async move { store.publish_partition_checkpoint_pointer(request).await }
         })
@@ -597,6 +793,7 @@ impl MetaStore for RhizaKvMetaStore {
     ) -> Result<Option<PartitionCheckpointPointer>, MetaStoreError> {
         let key = key.clone();
         self.read_eval(
+            "read_partition_checkpoint_pointer",
             move |store| async move { store.read_partition_checkpoint_pointer(&key).await },
         )
         .await
@@ -607,9 +804,167 @@ impl MetaStore for RhizaKvMetaStore {
         tenant_id: &str,
     ) -> Result<u64, MetaStoreError> {
         let tenant_id = tenant_id.to_owned();
-        self.read_eval(move |store| async move {
-            store.read_view_dependency_graph_revision(&tenant_id).await
-        })
+        self.read_eval(
+            "read_view_dependency_graph_revision",
+            move |store| async move { store.read_view_dependency_graph_revision(&tenant_id).await },
+        )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StoreRelationCatalogOutcome, VelorixRelationCatalogV1};
+    use velorix_core::relation::{
+        ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
+        IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
+        RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
+        VelorixRelationSchemaV1, VelorixRelationSourceV1,
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+    };
+
+    fn catalog(version: &str) -> VelorixRelationCatalogV1 {
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: "orders".into(),
+            relation_name: "orders".into(),
+            relation_version: version.into(),
+            columns: vec![
+                RelationColumnV1 {
+                    column_id: "account_id".into(),
+                    name: "account_id".into(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                    semantic_role: RelationSemanticRoleV1::PrimaryKey,
+                },
+                RelationColumnV1 {
+                    column_id: "amount".into(),
+                    name: "amount".into(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 1,
+                    semantic_role: RelationSemanticRoleV1::Value,
+                },
+                RelationColumnV1 {
+                    column_id: "weight".into(),
+                    name: "weight".into(),
+                    logical_type: VelorixLogicalTypeV1::Int64,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                    nullable: false,
+                    ordinal: 2,
+                    semantic_role: RelationSemanticRoleV1::Weight,
+                },
+            ],
+            primary_key_column_ids: vec!["account_id".into()],
+            weight_column_id: "weight".into(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            event_time_column_id: None,
+        };
+        let schema_fingerprint =
+            SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
+        VelorixRelationCatalogV1 {
+            relation_source: VelorixRelationSourceV1::SourceRelation,
+            schema_version: RELATION_SCHEMA_VERSION_V1,
+            relation_schema,
+            schema_fingerprint: schema_fingerprint.clone(),
+            datafusion_registration: DataFusionRegistrationV1 {
+                mode: DataFusionRegistrationModeV1::View,
+                name: "orders".into(),
+            },
+            incremental_relation: IncrementalRelationBindingV1 {
+                relation_id: "orders".into(),
+                schema_fingerprint,
+            },
+            incremental_adapter: IncrementalAdapterBindingV1 {
+                adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.into(),
+            },
+        }
+    }
+
+    async fn store() -> (tempfile::TempDir, RhizaKvMetaStore) {
+        let directory = tempfile::tempdir().unwrap();
+        // Local mode skips peer/operator listeners, which sandboxed test runs
+        // cannot bind.
+        let store = RhizaKvMetaStore::open_config(
+            rhizadb::Config::new(directory.path())
+                .node_id("meta-cache")
+                .local(),
+        )
+        .await
+        .unwrap();
+        (directory, store)
+    }
+
+    #[tokio::test]
+    async fn consecutive_reads_share_one_full_load() {
+        let (_directory, store) = store().await;
+        assert_eq!(
+            store.store_relation_catalog(catalog("v1")).await.unwrap(),
+            StoreRelationCatalogOutcome::Created
+        );
+        let after_write = store.full_loads();
+        for _ in 0..3 {
+            store.read_relation_catalog("orders", "v1").await.unwrap();
+        }
+        assert_eq!(store.full_loads(), after_write);
+    }
+
+    #[tokio::test]
+    async fn root_change_from_another_store_forces_reload() {
+        // Two stores over one native node keep independent caches, which is
+        // how a writer in another process changes the root.
+        let directory = tempfile::tempdir().unwrap();
+        let kv = RhizaKvStore::open_config(
+            rhizadb::Config::new(directory.path())
+                .node_id("meta-cache")
+                .local(),
+        )
+        .await
+        .unwrap();
+        let first = RhizaKvMetaStore::new(kv.clone());
+        let second = RhizaKvMetaStore::new(kv);
+        first.store_relation_catalog(catalog("v1")).await.unwrap();
+        assert_eq!(
+            first.read_relation_catalog("orders", "v1").await.unwrap(),
+            catalog("v1")
+        );
+        let before = first.full_loads();
+
+        second.store_relation_catalog(catalog("v2")).await.unwrap();
+        assert_eq!(
+            first.read_relation_catalog("orders", "v2").await.unwrap(),
+            catalog("v2")
+        );
+        assert!(first.full_loads() > before);
+    }
+
+    #[tokio::test]
+    async fn applied_mutation_caches_without_reload() {
+        let (_directory, store) = store().await;
+        store.store_relation_catalog(catalog("v1")).await.unwrap();
+        let after_apply = store.full_loads();
+        store.read_relation_catalog("orders", "v1").await.unwrap();
+        assert_eq!(store.full_loads(), after_apply);
+    }
+
+    #[tokio::test]
+    async fn conflict_invalidates_cache_and_retries() {
+        let (_directory, store) = store().await;
+        store.store_relation_catalog(catalog("v1")).await.unwrap();
+        store.read_relation_catalog("orders", "v1").await.unwrap();
+        let before = store.full_loads();
+        store.force_conflict_once();
+        assert_eq!(
+            store.store_relation_catalog(catalog("v2")).await.unwrap(),
+            StoreRelationCatalogOutcome::Created
+        );
+        assert!(store.full_loads() > before, "conflict must reload");
+        assert_eq!(
+            store.read_relation_catalog("orders", "v2").await.unwrap(),
+            catalog("v2")
+        );
     }
 }

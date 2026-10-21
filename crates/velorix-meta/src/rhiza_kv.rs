@@ -5,6 +5,15 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use thiserror::Error;
 
+/// The consensus layer of rhizadb 0.19.0 rejects any replicated mutation whose
+/// encoded command exceeds this bound, defined as
+/// `MaxReplicatedValueBytes = 128 << 10` at
+/// native/pkg/quepaxa/types.go:19 and enforced in native/pkg/network/server.go
+/// and native/pkg/quepaxa/core.go. This is the bound on the whole encoded
+/// command (key, CAS `expected` value, request metadata), not the bound on a
+/// single value.
+pub const MAX_REPLICATED_MUTATION_BYTES: usize = 128 * 1024;
+
 #[derive(Debug, Error)]
 pub enum RhizaKvError {
     #[error("Rhiza KV operation failed ({code}): {message}")]
@@ -13,6 +22,16 @@ pub enum RhizaKvError {
     Indeterminate { request_id: String, detail: String },
     #[error("Rhiza KV database still has {0} outstanding references")]
     OutstandingReferences(usize),
+    #[error(
+        "Rhiza KV request for key {key} would encode to ~{encoded_bytes} bytes, over the {limit}-byte replicated-mutation bound (value {value_bytes} bytes, expected {expected_bytes} bytes)"
+    )]
+    RequestTooLarge {
+        key: String,
+        encoded_bytes: usize,
+        limit: usize,
+        value_bytes: usize,
+        expected_bytes: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -164,10 +183,12 @@ impl RhizaKvStore {
         key: impl Into<String> + Send + 'static,
         value: Vec<u8>,
     ) -> Result<bool, RhizaKvError> {
+        let key = key.into();
+        check_mutation_size(&key, value.len(), 0)?;
         self.mutate(
             "kv_cas",
             request_id,
-            json!({"key": key.into(), "value": STANDARD.encode(value), "expected": "", "expected_exists": false}),
+            json!({"key": key, "value": STANDARD.encode(value), "expected": "", "expected_exists": false}),
         )
         .await
     }
@@ -178,12 +199,16 @@ impl RhizaKvStore {
         expected: Option<Vec<u8>>,
         value: Vec<u8>,
     ) -> Result<bool, RhizaKvError> {
+        let key = key.into();
+        if let Some(expected_bytes) = expected.as_ref() {
+            check_mutation_size(&key, value.len(), expected_bytes.len())?;
+        }
         let expected = expected.map(|v| STANDARD.encode(v));
         if expected.is_none() {
             return self.put_if_absent(request_id, key, value).await;
         }
         let expected_exists = expected.is_some();
-        self.mutate("kv_cas", request_id, json!({"key": key.into(), "value": STANDARD.encode(value), "expected": expected, "expected_exists": expected_exists})).await
+        self.mutate("kv_cas", request_id, json!({"key": key, "value": STANDARD.encode(value), "expected": expected, "expected_exists": expected_exists})).await
     }
     async fn mutate(
         &self,
@@ -267,6 +292,39 @@ fn operation(e: rhizadb::Error) -> RhizaKvError {
     }
 }
 
+/// Base64-encoded length of `bytes` input bytes, rounded up to a 4-byte
+/// boundary.
+fn base64_len(bytes: usize) -> usize {
+    bytes.div_ceil(3) * 4
+}
+
+/// Estimated encoded size of a `kv_cas` command: both values base64-encoded,
+/// the key, and 1024 bytes of headroom for JSON field names, the request ID,
+/// and other request metadata.
+fn estimated_mutation_bytes(key: &str, value_bytes: usize, expected_bytes: usize) -> usize {
+    base64_len(value_bytes) + base64_len(expected_bytes) + key.len() + 1024
+}
+
+/// Reject an oversized replicated mutation up front, so it surfaces as an
+/// actionable error rather than the backend's opaque `invalid_request`.
+fn check_mutation_size(
+    key: &str,
+    value_bytes: usize,
+    expected_bytes: usize,
+) -> Result<(), RhizaKvError> {
+    let encoded_bytes = estimated_mutation_bytes(key, value_bytes, expected_bytes);
+    if encoded_bytes > MAX_REPLICATED_MUTATION_BYTES {
+        return Err(RhizaKvError::RequestTooLarge {
+            key: key.to_string(),
+            encoded_bytes,
+            limit: MAX_REPLICATED_MUTATION_BYTES,
+            value_bytes,
+            expected_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn validate_receipt(
     request_id: &str,
     receipt: &rhizadb::MutationReceipt,
@@ -326,5 +384,62 @@ mod tests {
             validate_receipt("request", &receipt("rejected", Some("precondition_failed"))),
             Err(RhizaKvError::Operation { code, .. }) if code == "precondition_failed"
         ));
+    }
+
+    #[test]
+    fn base64_len_matches_standard_encoding_boundaries() {
+        for (bytes, expected) in [
+            (0usize, 0usize),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+            (4, 8),
+            (5, 8),
+            (6, 8),
+            (7, 12),
+            (9, 12),
+            (10, 16),
+        ] {
+            assert_eq!(base64_len(bytes), expected, "input {bytes} bytes");
+            assert_eq!(
+                base64_len(bytes),
+                STANDARD.encode(vec![0u8; bytes]).len(),
+                "input {bytes} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn size_check_accepts_a_small_mutation() {
+        let key = "velorix/snapshot/page/0123456789abcdef";
+        assert!(estimated_mutation_bytes(key, 1024, 0) <= MAX_REPLICATED_MUTATION_BYTES);
+        assert!(check_mutation_size(key, 1024, 0).is_ok());
+    }
+
+    #[test]
+    fn size_check_rejects_an_oversized_mutation_with_recorded_sizes() {
+        let key = "velorix/snapshot/page/ffff";
+        let value_bytes = 200 * 1024;
+        let expected_bytes = 512;
+        let encoded_bytes = base64_len(value_bytes) + base64_len(expected_bytes) + key.len() + 1024;
+        assert_eq!(key.len(), 26);
+        assert_eq!(encoded_bytes, 274802);
+        assert!(encoded_bytes > MAX_REPLICATED_MUTATION_BYTES);
+        match check_mutation_size(key, value_bytes, expected_bytes) {
+            Err(RhizaKvError::RequestTooLarge {
+                key: reported_key,
+                encoded_bytes: reported_encoded,
+                limit,
+                value_bytes: reported_value,
+                expected_bytes: reported_expected,
+            }) => {
+                assert_eq!(reported_key, key);
+                assert_eq!(reported_encoded, encoded_bytes);
+                assert_eq!(limit, MAX_REPLICATED_MUTATION_BYTES);
+                assert_eq!(reported_value, value_bytes);
+                assert_eq!(reported_expected, expected_bytes);
+            }
+            other => panic!("expected RequestTooLarge, got {other:?}"),
+        }
     }
 }

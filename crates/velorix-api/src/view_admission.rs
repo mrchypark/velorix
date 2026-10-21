@@ -4,15 +4,25 @@ pub(super) async fn create_view(
     State(state): State<ApiState>,
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
-    validate_public_view_feature_admission(&state, &request)?;
+    let _admission_timer =
+        checkpoint_publication::CursorPhaseTimer::new(&request.view_id, 0, "admission_total");
     let resolved_inputs = resolve_standing_inputs_for_view_request(&state, &request).await?;
     validate_resolved_input_scope(&resolved_inputs)?;
     let catalogs = resolved_inputs
         .iter()
         .map(|input| input.catalog())
         .collect::<Result<Vec<_>, ApiError>>()?;
+    validate_public_view_feature_admission(&state, &request)?;
     let spec = view_spec_from_request(&state, &request, &catalogs)?;
-    let relations = spec
+    let has_published_inputs = resolved_inputs
+        .iter()
+        .any(ResolvedAdmissionInputV1::is_published_view);
+    let mut history_spec = spec.clone();
+    if has_published_inputs {
+        history_spec.input_relations =
+            published_input_history_roots(&state, &resolved_inputs).await?;
+    }
+    let relations = history_spec
         .input_relations
         .iter()
         .map(|input| (input.relation_id.as_str(), input.relation_version.as_str()))
@@ -26,10 +36,49 @@ pub(super) async fn create_view(
                 .await,
         );
     }
+    // Validate source-cut identities without using emptiness as readiness evidence.
+    let requires_backfill =
+        standing_runtime_create_requires_backfill(&state, &history_spec).await?;
+    let demand_managed = state.authoritative_relation_ingest_enabled();
+    if !demand_managed {
+        for input in &resolved_inputs {
+            if let ResolvedAdmissionInputV1::PublishedView { producer, .. } = input {
+                if view_query_availability(&producer.lifecycle) {
+                    bootstrap_legacy_view_if_empty(&state, producer).await?;
+                }
+            }
+        }
+    }
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let input_bindings =
-        input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs).await?;
+    let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
+    let existing = state
+        .view_registry()?
+        .list_active()
+        .await
+        .map_err(materialized_view_registry_error_to_api)?
+        .into_iter()
+        .find(|active| active.spec.view_id == spec.view_id && active.spec_hash == spec_hash);
+    let input_bindings = if let Some(runtime) =
+        existing.as_ref().and_then(|active| active.runtime.as_ref())
+    {
+        // An interrupted declaration owns its original immutable baseline.
+        // Retrying the request must never recapture a newer producer head.
+        for input in &runtime.input_bindings {
+            if let StandingInputBindingV1::PublishedView {
+                published_relation, ..
+            } = input
+            {
+                if !resolved_inputs.iter().any(|resolved| matches!(resolved,
+                    ResolvedAdmissionInputV1::PublishedView { binding, .. } if binding == published_relation)) {
+                    return Err(ApiError::conflict("existing declaration producer binding changed"));
+                }
+            }
+        }
+        runtime.input_bindings.clone()
+    } else {
+        input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs).await?
+    };
     let mut runtime_binding = materialized_view_runtime_binding_for_spec(
         &catalogs,
         &spec,
@@ -42,7 +91,6 @@ pub(super) async fn create_view(
             ApiError::bad_request("materialized view runtime binding is missing a logical plan")
         })?,
     )?;
-    let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
     let api_metadata = api_metadata_from_create_view_request(&request);
     validate_view_api_metadata(&api_metadata)?;
     validate_query_policy_reference(&state, &api_metadata).await?;
@@ -68,14 +116,18 @@ pub(super) async fn create_view(
     for candidate in &candidate_edges {
         validate_view_dependency_graph_with_candidate(&existing_edges, candidate)?;
     }
-    let pending_runtime = build_standing_runtime_for_runtime_binding(
-        &state,
-        &spec,
-        &runtime_binding,
-        &catalogs,
-        &spec.input_relations,
-        &spec.output_relations,
-    )?;
+    let pending_runtime = if existing.is_some() {
+        None
+    } else {
+        build_standing_runtime_for_runtime_binding(
+            &state,
+            &spec,
+            &runtime_binding,
+            &catalogs,
+            &spec.input_relations,
+            &spec.output_relations,
+        )?
+    };
     let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
     let bootstrap =
         begin_authoritative_view_bootstrap(&state, &spec, &runtime_binding, &input_bindings)
@@ -86,9 +138,63 @@ pub(super) async fn create_view(
         bootstrap.bootstrap_generation,
     )?;
     runtime_binding.input_bindings = input_bindings;
-    let requires_backfill = standing_runtime_create_requires_backfill(&state, &spec).await?;
-    let lifecycle = lifecycle_for_create_view_execution(&execution_mode, requires_backfill);
-    let outcome = if let Some(runtime) = pending_runtime {
+    // Declaration establishes bindings, not checkpoint coverage, even for empty input.
+    let deferred_lifecycle = MaterializedViewLifecycleStatus::standing_runtime_deploying(Some(
+        "backfill_required: materialization is deferred until a query or explicit backfill"
+            .to_string(),
+    ));
+    let mut lifecycle = if demand_managed {
+        deferred_lifecycle.clone()
+    } else {
+        lifecycle_for_create_view_execution(
+            &execution_mode,
+            requires_backfill && !has_published_inputs,
+        )
+    };
+    let outcome = if let Some(existing) = existing.as_ref() {
+        // Registration is immutable. An identical retry may reconcile lifecycle,
+        // but must not replace captured bindings or reset completed/paused work.
+        if existing.runtime.as_ref() != Some(&runtime_binding)
+            || existing.api.as_ref() != Some(&api_metadata)
+            || existing.execution_mode != execution_mode
+        {
+            return Err(ApiError::conflict(
+                "existing declaration runtime or API metadata changed",
+            ));
+        }
+        let identity = &runtime_binding.standing_program_identity;
+        let operation_lock = state.standing_runtime_operation_lock(identity, &spec.view_id)?;
+        let _operation_guard = operation_lock.lock().await;
+        let current = state
+            .view_registry()?
+            .read_active(&spec.view_id)
+            .await
+            .map_err(materialized_view_registry_error_to_api)?;
+        if current.spec_hash != spec_hash
+            || current.runtime != existing.runtime
+            || current.api != existing.api
+        {
+            return Err(ApiError::conflict(
+                "existing declaration changed during retry",
+            ));
+        }
+        lifecycle = current.lifecycle.clone();
+        if demand_managed
+            && view_query_availability(&lifecycle)
+            && read_latest_standing_runtime_checkpoint_header(&state, identity, &spec.view_id)
+                .await?
+                .is_none()
+        {
+            lifecycle = deferred_lifecycle;
+            state
+                .view_registry()?
+                .update_standing_runtime_lifecycle(&spec.view_id, &spec_hash, lifecycle.clone())
+                .await
+                .map_err(materialized_view_registry_error_to_api)?;
+            remove_standing_runtime(&state, identity, &spec.view_id)?;
+        }
+        RegisterMaterializedViewOutcome::Duplicate
+    } else if let Some(runtime) = pending_runtime {
         let operation_lock =
             state.standing_runtime_operation_lock(runtime.program_identity(), &spec.view_id)?;
         let _operation_guard = operation_lock.lock().await;
@@ -114,12 +220,18 @@ pub(super) async fn create_view(
         )
         .await?
     };
-    if view_has_published_view_inputs(&runtime_binding) {
-        bootstrap_consumer_view_after_registration(
+    if !demand_managed && has_published_inputs && view_query_availability(&lifecycle) {
+        let active = state
+            .view_registry()?
+            .read_active(&spec.view_id)
+            .await
+            .map_err(materialized_view_registry_error_to_api)?;
+        bootstrap_legacy_view_if_empty(&state, &active).await?;
+        drain_published_view_dependencies(&state).await?;
+        activate_authoritative_view_bootstrap(
             &state,
-            &spec,
-            &runtime_binding,
-            &resolved_inputs,
+            &runtime_binding.standing_program_identity,
+            &spec.view_id,
         )
         .await?;
     }
@@ -142,128 +254,11 @@ pub(super) async fn create_view(
     ))
 }
 
-fn view_has_published_view_inputs(runtime: &MaterializedViewRuntimeBinding) -> bool {
+pub(super) fn view_has_published_view_inputs(runtime: &MaterializedViewRuntimeBinding) -> bool {
     runtime
         .input_bindings
         .iter()
         .any(|binding| matches!(binding, StandingInputBindingV1::PublishedView { .. }))
-}
-
-async fn bootstrap_consumer_view_after_registration(
-    state: &ApiState,
-    spec: &StandingViewSpec,
-    runtime: &MaterializedViewRuntimeBinding,
-    resolved_inputs: &[ResolvedAdmissionInputV1],
-) -> Result<(), ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(&spec.view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    let Some(identity) = active_standing_runtime_identity(&active) else {
-        return Err(ApiError::bad_request(format!(
-            "consumer view `{}` has no standing runtime identity",
-            spec.view_id
-        )));
-    };
-    for resolved in resolved_inputs {
-        let ResolvedAdmissionInputV1::PublishedView { binding, .. } = resolved else {
-            continue;
-        };
-        let binding = binding.clone();
-        let input_binding = runtime
-            .input_bindings
-            .iter()
-            .find_map(|candidate| match candidate {
-                StandingInputBindingV1::PublishedView {
-                    edge_id,
-                    producer_tenant_id,
-                    producer_program_id,
-                    published_relation,
-                    bootstrap_cursor,
-                    ..
-                } if published_relation == &binding => Some((
-                    edge_id,
-                    producer_tenant_id,
-                    producer_program_id,
-                    published_relation,
-                    bootstrap_cursor,
-                )),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "consumer view `{}` is missing its persisted published-view input binding",
-                    spec.view_id
-                ))
-            })?;
-        let (
-            edge_id,
-            producer_tenant_id,
-            producer_program_id,
-            published_relation,
-            bootstrap_cursor,
-        ) = input_binding;
-        let edge = view_dependency_edge_from_binding(
-            producer_tenant_id,
-            &identity.program_id,
-            &spec.view_id,
-            1,
-            &published_relation.relation.relation_id,
-            &published_relation.relation.relation_version,
-            producer_program_id,
-            published_relation,
-        )
-        .map_err(ApiError::bad_request)?;
-        if &edge.edge_id != edge_id {
-            return Err(ApiError::bad_request(format!(
-                "consumer view `{}` dependency edge mismatch",
-                spec.view_id
-            )));
-        }
-        // Duplicate CREATE requests must resume, not reapply: if the consumer
-        // already has a checkpoint with this edge's cursor, the baseline was
-        // applied and only catch-up is needed. A checkpoint without the edge
-        // cursor is corrupt and fails closed.
-        let latest =
-            read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?;
-        let baseline_pending = match &latest {
-            Some(record) => match consumer_edge_cursor(record, edge_id)? {
-                Some(_) => false,
-                None => {
-                    return Err(ApiError::bad_request(format!(
-                        "consumer view `{}` has a checkpoint without the dependency cursor for edge `{edge_id}`",
-                        spec.view_id
-                    )));
-                }
-            },
-            None => true,
-        };
-        if baseline_pending {
-            bootstrap_consumer_from_published_snapshot(
-                state,
-                &active,
-                &ConsumerViewDependencyInputV1 {
-                    edge,
-                    binding: published_relation.clone(),
-                    bootstrap_cursor: bootstrap_cursor.clone(),
-                },
-            )
-            .await?;
-        }
-    }
-    drain_published_view_dependencies(state).await?;
-    activate_authoritative_view_bootstrap(state, identity, &spec.view_id).await?;
-    state
-        .view_registry()?
-        .update_standing_runtime_lifecycle(
-            &spec.view_id,
-            &active.spec_hash,
-            MaterializedViewLifecycleStatus::standing_runtime(),
-        )
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    Ok(())
 }
 
 async fn begin_authoritative_view_bootstrap(
@@ -484,7 +479,12 @@ pub(super) fn validate_public_runtime_plan_admission(
         VelorixLogicalViewExecutionV1::IntervalJoin { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::RecursiveFixpointV1 { .. } => Ok(()),
         VelorixLogicalViewExecutionV1::CrossJoin { .. } => Ok(()),
-        VelorixLogicalViewExecutionV1::TemporalJoin { .. } => Ok(()),
+        VelorixLogicalViewExecutionV1::TemporalJoin { .. }
+        | VelorixLogicalViewExecutionV1::OrderedWindows { .. }
+        | VelorixLogicalViewExecutionV1::Series { .. }
+        | VelorixLogicalViewExecutionV1::UnionAll { .. }
+        | VelorixLogicalViewExecutionV1::TypedMap { .. }
+        | VelorixLogicalViewExecutionV1::TypedJoinProject { .. } => Ok(()),
     }
 }
 
@@ -800,13 +800,14 @@ pub(super) fn build_standing_runtime_for_runtime_binding(
         .as_ref()
         .ok_or_else(|| ApiError::bad_request("standing runtime binding is missing logical plan"))?;
     let runtime = factory
-        .create_with_catalogs_plan_and_spec(
+        .create_with_resource_limits(
             identity,
             catalogs,
             logical_plan,
             spec,
             expected_input_schemas,
             expected_output_schemas,
+            state.runtime_resource_limits(),
         )
         .map_err(ApiError::internal)?;
     if runtime.program_identity() != identity {
@@ -823,6 +824,68 @@ pub(super) fn build_standing_runtime_for_runtime_binding(
         expected_output_schemas,
     )?;
     Ok(Some(runtime))
+}
+
+/// Targeted cache-miss restore. The caller must hold this view's operation lock
+/// through any replay of the returned plan. Keep the returned Arc until the
+/// operation is finished so residency pruning cannot discard the runtime.
+pub(super) fn restore_standing_runtime_resident_locked<'a>(
+    state: &'a ApiState,
+    active: &'a ActiveMaterializedView,
+) -> impl std::future::Future<
+    Output = Result<Option<(SharedStandingRuntime, Option<StandingRuntimeReplayPlan>)>, ApiError>,
+> + Send
+       + 'a {
+    // Keep cold restore's large future out of every ingest/consumer caller's
+    // inline state, including cache hits. This does not spawn or release locks.
+    Box::pin(restore_standing_runtime_resident_locked_inner(
+        state, active,
+    ))
+}
+
+async fn restore_standing_runtime_resident_locked_inner(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+) -> Result<Option<(SharedStandingRuntime, Option<StandingRuntimeReplayPlan>)>, ApiError> {
+    let Some(identity) = active_standing_runtime_identity(active) else {
+        return Ok(None);
+    };
+    if let Some(runtime) = state.standing_runtime(identity, &active.spec.view_id)? {
+        return Ok(Some((runtime, None)));
+    }
+    // Preserve the source-first reconciliation rule: missing durable state is
+    // not permission to silently perform an initial backfill on a cache miss.
+    if state.authoritative_relation_ingest_enabled()
+        && active
+            .runtime
+            .as_ref()
+            .is_some_and(|binding| !view_has_published_view_inputs(binding))
+        && read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+            .await?
+            .is_none()
+        && standing_runtime_create_requires_backfill(state, &active.spec).await?
+    {
+        state
+            .view_registry()?
+            .update_standing_runtime_lifecycle(
+                &active.spec.view_id,
+                &active.spec_hash,
+                lifecycle_for_create_view_execution(
+                    &MaterializedViewExecutionMode::StandingRuntime,
+                    true,
+                ),
+            )
+            .await
+            .map_err(materialized_view_registry_error_to_api)?;
+        return Ok(None);
+    }
+    let replay = ensure_standing_runtime_for_active_view(state, active).await?;
+    let runtime = state
+        .standing_runtime(identity, &active.spec.view_id)?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("standing runtime unavailable after targeted restore")
+        })?;
+    Ok(Some((runtime, replay)))
 }
 
 pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
@@ -858,6 +921,7 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
         catalogs_for_input_bindings(state, runtime_binding).await?
     };
 
+    let resource_limits = state.runtime_resource_limits();
     let (runtime, replay_plan) = if let Some(record) =
         read_latest_standing_runtime_checkpoint(state, identity, &spec.view_id).await?
     {
@@ -874,12 +938,13 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
             let expected_output_schemas = expected_output_schemas.to_vec();
             (
                 tokio::task::spawn_blocking(move || {
-                    factory.restore_with_catalogs_and_spec(
+                    factory.restore_with_resource_limits(
                         record.checkpoint,
                         &catalogs,
                         &spec,
                         &expected_input_schemas,
                         &expected_output_schemas,
+                        resource_limits,
                     )
                 })
                 .await
@@ -909,13 +974,14 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
             let expected_output_schemas = expected_output_schemas.to_vec();
             (
                 tokio::task::spawn_blocking(move || {
-                    factory.create_with_catalogs_plan_and_spec(
+                    factory.create_with_resource_limits(
                         &identity,
                         &catalogs,
                         &logical_plan,
                         &spec,
                         &expected_input_schemas,
                         &expected_output_schemas,
+                        resource_limits,
                     )
                 })
                 .await
@@ -934,13 +1000,14 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
         let expected_output_schemas = expected_output_schemas.to_vec();
         (
             tokio::task::spawn_blocking(move || {
-                factory.create_with_catalogs_plan_and_spec(
+                factory.create_with_resource_limits(
                     &identity,
                     &catalogs,
                     &logical_plan,
                     &spec,
                     &expected_input_schemas,
                     &expected_output_schemas,
+                    resource_limits,
                 )
             })
             .await

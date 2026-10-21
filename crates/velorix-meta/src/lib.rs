@@ -33,6 +33,7 @@ pub mod proto {
     tonic::include_proto!("velorix.meta.v1");
 }
 
+mod published_input_bootstrap;
 #[cfg(feature = "rhiza-backend")]
 pub mod rhiza;
 #[cfg(feature = "rhiza-backend")]
@@ -44,6 +45,10 @@ pub mod rhiza_meta;
 mod rhiza_snapshot;
 mod source_cut;
 mod view_bootstrap;
+pub use published_input_bootstrap::{
+    PublishedInputBootstrapCursorV1, PublishedInputBootstrapProgressV1,
+    PUBLISHED_INPUT_BOOTSTRAP_SCHEMA_VERSION_V1,
+};
 
 pub use source_cut::{
     CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest,
@@ -215,6 +220,8 @@ pub struct IngestRangeReservation {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandingRuntimeCheckpointPointer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_input_bootstrap: Option<PublishedInputBootstrapProgressV1>,
     pub tenant_id: String,
     pub program_id: String,
     pub view_id: String,
@@ -710,6 +717,26 @@ pub trait MetaStore: Send + Sync + 'static {
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError>;
 
+    /// Creates transport bound to the calling executor for independent renewal.
+    /// In-process stores need no replacement. Transport-backed wrappers must
+    /// forward this hook so renewal does not depend on the request executor.
+    async fn isolated_owner_renewal_store(
+        &self,
+    ) -> Result<Option<Arc<dyn MetaStore>>, MetaStoreError> {
+        Ok(None)
+    }
+
+    /// Extends only this exact unexpired epoch; never reacquires lost ownership.
+    async fn renew_standing_runtime_owner(
+        &self,
+        _owner: StandingRuntimeOwnerToken,
+        _ttl_ms: u64,
+    ) -> Result<StandingRuntimeOwnerClaim, MetaStoreError> {
+        Err(MetaStoreError::UnsupportedCapability(
+            "conditional_standing_runtime_owner_renewal",
+        ))
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         tenant_id: &str,
@@ -995,6 +1022,20 @@ where
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
         (**self).acquire_standing_runtime_owner(request).await
+    }
+
+    async fn renew_standing_runtime_owner(
+        &self,
+        owner: StandingRuntimeOwnerToken,
+        ttl_ms: u64,
+    ) -> Result<StandingRuntimeOwnerClaim, MetaStoreError> {
+        (**self).renew_standing_runtime_owner(owner, ttl_ms).await
+    }
+
+    async fn isolated_owner_renewal_store(
+        &self,
+    ) -> Result<Option<Arc<dyn MetaStore>>, MetaStoreError> {
+        (**self).isolated_owner_renewal_store().await
     }
 
     async fn read_standing_runtime_owner(
@@ -1760,10 +1801,21 @@ impl MetaStore for InMemoryMetaStore {
         let Some(activation_cut) = control.activation_cut.as_ref() else {
             return Ok(PromoteViewBootstrapOutcome::Conflict);
         };
+        // Legacy Active records returned above remain valid without progress.
+        // A pending derived record must be explicitly upgraded by the API from
+        // verified full-baseline evidence; an empty physical cut is not proof.
         if guard.standing_runtime_checkpoints.get(&key) != Some(&request.checkpoint)
             || request.checkpoint.bootstrap_generation != control.bootstrap_generation
             || request.checkpoint.plan_hash != control.plan_hash
             || !view_bootstrap::checkpoint_covers_source_cut(&request.checkpoint, activation_cut)
+            || (!control.view_inputs.is_empty()
+                && !request
+                    .checkpoint
+                    .published_input_bootstrap
+                    .as_ref()
+                    .is_some_and(|progress| {
+                        progress.matches_control(&control) && progress.is_complete()
+                    }))
         {
             return Ok(PromoteViewBootstrapOutcome::Conflict);
         }
@@ -1771,6 +1823,40 @@ impl MetaStore for InMemoryMetaStore {
         control.active_checkpoint = Some(request.checkpoint);
         guard.view_bootstraps.insert(key, control.clone());
         Ok(PromoteViewBootstrapOutcome::Promoted(control))
+    }
+
+    async fn renew_standing_runtime_owner(
+        &self,
+        owner: StandingRuntimeOwnerToken,
+        ttl_ms: u64,
+    ) -> Result<StandingRuntimeOwnerClaim, MetaStoreError> {
+        AcquireStandingRuntimeOwnerRequest {
+            tenant_id: owner.tenant_id.clone(),
+            program_id: owner.program_id.clone(),
+            view_id: owner.view_id.clone(),
+            owner_id: owner.owner_id.clone(),
+            ttl_ms,
+        }
+        .validate()?;
+        let mut guard = self.inner.write().await;
+        let now = self.evaluation_time_ms()?;
+        let key =
+            standing_runtime_owner_scope_key(&owner.tenant_id, &owner.program_id, &owner.view_id);
+        validate_current_standing_runtime_owner(
+            guard.standing_runtime_owners.get(&key),
+            &owner,
+            now,
+        )?;
+        let mut claim = guard
+            .standing_runtime_owners
+            .get(&key)
+            .cloned()
+            .ok_or(MetaStoreError::StandingRuntimeOwnerMismatch)?;
+        claim.expires_at_unix_ms = now
+            .checked_add(ttl_ms)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        guard.standing_runtime_owners.insert(key, claim.clone());
+        Ok(claim)
     }
 
     async fn acquire_standing_runtime_owner(
@@ -1917,6 +2003,30 @@ impl MetaStore for InMemoryMetaStore {
         }
         if current != request.expected_previous.as_ref() {
             return Ok(PublishStandingRuntimeCheckpointOutcome::Conflict);
+        }
+
+        if let Some(progress) = &request.candidate.published_input_bootstrap {
+            let Some(control) = guard.view_bootstraps.get(&key) else {
+                return Ok(PublishStandingRuntimeCheckpointOutcome::Conflict);
+            };
+            if !progress.matches_control(control)
+                || (control.lifecycle == ViewBootstrapLifecycleV1::Active
+                    && !progress.is_complete())
+            {
+                return Ok(PublishStandingRuntimeCheckpointOutcome::Conflict);
+            }
+        }
+        if let Some(previous) =
+            current.and_then(|pointer| pointer.published_input_bootstrap.as_ref())
+        {
+            if !request
+                .candidate
+                .published_input_bootstrap
+                .as_ref()
+                .is_some_and(|next| next.follows(previous))
+            {
+                return Ok(PublishStandingRuntimeCheckpointOutcome::Conflict);
+            }
         }
 
         guard
@@ -2855,6 +2965,21 @@ impl PublishPartitionCheckpointPointerRequest {
 
 impl StandingRuntimeCheckpointPointer {
     fn validate(&self) -> Result<(), MetaStoreError> {
+        if let Some(progress) = &self.published_input_bootstrap {
+            progress.validate()?;
+            if !progress.is_complete() && self.input_coverage.is_some() {
+                return Err(MetaStoreError::Serialization(
+                    "partial published bootstrap cannot claim input coverage".into(),
+                ));
+            }
+            if progress.bootstrap_generation != self.bootstrap_generation
+                || progress.plan_hash != self.plan_hash
+            {
+                return Err(MetaStoreError::Serialization(
+                    "published bootstrap checkpoint identity mismatch".into(),
+                ));
+            }
+        }
         validate_standing_runtime_scope(&self.tenant_id, &self.program_id, &self.view_id)?;
         require_non_empty("checkpoint_key", &self.checkpoint_key)?;
         require_non_empty("content_hash", &self.content_hash)?;
@@ -2901,9 +3026,11 @@ impl StandingRuntimeCheckpointPointer {
                 }
             }
             None => {
-                if self.bootstrap_generation != 0
-                    || !self.plan_hash.is_empty()
-                    || !self.coverage_hash.is_empty()
+                if !self.coverage_hash.is_empty()
+                    || (self.published_input_bootstrap.is_none()
+                        && ((self.bootstrap_generation == 0) != self.plan_hash.is_empty()
+                            || (self.bootstrap_generation != 0
+                                && self.previous_checkpoint_key.is_empty())))
                 {
                     return Err(MetaStoreError::Serialization(
                         "standing runtime checkpoint has partial coverage commitment".to_string(),
@@ -3861,6 +3988,29 @@ where
         }))
     }
 
+    async fn renew_standing_runtime_owner(
+        &self,
+        request: Request<proto::RenewStandingRuntimeOwnerRequest>,
+    ) -> Result<Response<proto::AcquireStandingRuntimeOwnerResponse>, Status> {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        let owner = request
+            .owner
+            .ok_or_else(|| Status::invalid_argument("missing owner token"))?;
+        let claim = self
+            .store
+            .renew_standing_runtime_owner(
+                standing_runtime_owner_token_from_proto(owner),
+                request.ttl_ms,
+            )
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::AcquireStandingRuntimeOwnerResponse {
+            outcome: "renewed".into(),
+            claim: Some(standing_runtime_owner_claim_to_proto(claim)),
+        }))
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         request: Request<proto::ReadStandingRuntimeOwnerRequest>,
@@ -4767,6 +4917,14 @@ fn standing_runtime_checkpoint_pointer_from_proto(
         )
     };
     Ok(StandingRuntimeCheckpointPointer {
+        published_input_bootstrap: if pointer.published_input_bootstrap_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_slice(&pointer.published_input_bootstrap_json)
+                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?,
+            )
+        },
         tenant_id: pointer.tenant_id,
         program_id: pointer.program_id,
         view_id: pointer.view_id,
@@ -4788,6 +4946,13 @@ fn standing_runtime_checkpoint_pointer_to_proto(
     pointer: StandingRuntimeCheckpointPointer,
 ) -> proto::StandingRuntimeCheckpointPointer {
     proto::StandingRuntimeCheckpointPointer {
+        published_input_bootstrap_json: pointer
+            .published_input_bootstrap
+            .map(|progress| {
+                serde_json::to_vec(&progress)
+                    .expect("bootstrap progress contains only JSON-safe fields")
+            })
+            .unwrap_or_default(),
         tenant_id: pointer.tenant_id,
         program_id: pointer.program_id,
         view_id: pointer.view_id,
@@ -4890,6 +5055,7 @@ fn partition_authority_remote_error(error: tonic::Status) -> MetaStoreError {
 #[derive(Clone)]
 pub struct GrpcMetaStore {
     client: proto::velorix_meta_client::VelorixMetaClient<Channel>,
+    endpoint: Endpoint,
     bearer_token: Option<MetadataValue<tonic::metadata::Ascii>>,
 }
 
@@ -4958,7 +5124,8 @@ impl GrpcMetaStore {
                 .tls_config(config)
                 .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
         }
-        let channel = channel
+        let endpoint = channel;
+        let channel = endpoint
             .connect()
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
@@ -4966,6 +5133,7 @@ impl GrpcMetaStore {
 
         Ok(Self {
             client,
+            endpoint,
             bearer_token: None,
         })
     }
@@ -5019,6 +5187,23 @@ impl GrpcMetaStore {
 
 #[async_trait]
 impl MetaStore for GrpcMetaStore {
+    async fn isolated_owner_renewal_store(
+        &self,
+    ) -> Result<Option<Arc<dyn MetaStore>>, MetaStoreError> {
+        // Reconnect on the renewal executor: Channel::clone shares the original
+        // buffer worker and connection driver instead of migrating either one.
+        let channel = self
+            .endpoint
+            .connect()
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
+        Ok(Some(Arc::new(Self {
+            client: proto::velorix_meta_client::VelorixMetaClient::new(channel),
+            endpoint: self.endpoint.clone(),
+            bearer_token: self.bearer_token.clone(),
+        })))
+    }
+
     // Relation-scoped authority forwarding is kept separate from the legacy
     // view-scoped methods below.
 
@@ -5568,6 +5753,29 @@ impl MetaStore for GrpcMetaStore {
         }
     }
 
+    async fn renew_standing_runtime_owner(
+        &self,
+        owner: StandingRuntimeOwnerToken,
+        ttl_ms: u64,
+    ) -> Result<StandingRuntimeOwnerClaim, MetaStoreError> {
+        let response = self
+            .client()
+            .renew_standing_runtime_owner(self.request(proto::RenewStandingRuntimeOwnerRequest {
+                owner: Some(standing_runtime_owner_token_to_proto(owner)),
+                ttl_ms,
+            }))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        if response.outcome != "renewed" {
+            return Err(MetaStoreError::UnexpectedOutcome(response.outcome));
+        }
+        response
+            .claim
+            .map(standing_runtime_owner_claim_from_proto)
+            .ok_or_else(|| MetaStoreError::UnexpectedOutcome("missing renewed owner claim".into()))
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         tenant_id: &str,
@@ -5963,6 +6171,63 @@ mod relation_partition_authority_tests {
         assert!(source.contains("velorix_relation_ingest_reservations"));
         assert!(source.contains("async fn acquire_relation_partition_authority"));
         assert!(source.contains("async fn list_relation_authoritative_ingest_publications"));
+    }
+
+    #[tokio::test]
+    async fn conditional_owner_renewal_preserves_epoch_and_fences_expiry_and_takeover() {
+        let store = InMemoryMetaStore::from_state_for_evaluation(InMemoryMetaState::default(), 100);
+        let acquire = |owner_id: &str| AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: owner_id.into(),
+            ttl_ms: 10,
+        };
+        let original = match store
+            .acquire_standing_runtime_owner(acquire("a"))
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+            other => panic!("unexpected {other:?}"),
+        };
+        let before =
+            InMemoryMetaStore::from_state_for_evaluation(store.snapshot_state().await, 109);
+        let renewed = before
+            .renew_standing_runtime_owner(original.token(), 10)
+            .await
+            .unwrap();
+        assert_eq!(renewed.token(), original.token());
+        assert_eq!(renewed.expires_at_unix_ms, 119);
+        let mut foreign = original.token();
+        foreign.owner_id = "b".into();
+        assert!(matches!(
+            before.renew_standing_runtime_owner(foreign, 10).await,
+            Err(MetaStoreError::StandingRuntimeOwnerMismatch)
+        ));
+        let expired =
+            InMemoryMetaStore::from_state_for_evaluation(before.snapshot_state().await, 119);
+        assert!(matches!(
+            expired
+                .renew_standing_runtime_owner(original.token(), 10)
+                .await,
+            Err(MetaStoreError::StandingRuntimeOwnerMismatch)
+        ));
+        let takeover = match expired
+            .acquire_standing_runtime_owner(acquire("b"))
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(takeover.owner_epoch, original.owner_epoch + 1);
+        assert!(matches!(
+            expired
+                .renew_standing_runtime_owner(original.token(), 10)
+                .await,
+            Err(MetaStoreError::StandingRuntimeOwnerMismatch)
+        ));
     }
 
     #[tokio::test]

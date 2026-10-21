@@ -1532,6 +1532,7 @@ fn smoke_checkpoint_pointer(
         plan_hash: String::new(),
         coverage_hash: String::new(),
         input_coverage: None,
+        published_input_bootstrap: None,
         previous_checkpoint_key: previous
             .map(|pointer| pointer.checkpoint_key.clone())
             .unwrap_or_default(),

@@ -250,6 +250,15 @@
       "reason": "foyer-memory 0.22.6 uses paste 1.0.15 for compile-time macros; RUSTSEC-2024-0436 reports it unmaintained. Foyer is confined to disposable, non-authoritative caching, while the unmaintained build dependency still requires a bounded review exception.",
       "replacement_plan": "Track upstream foyer-memory removal or replacement of paste with a maintained macro dependency. Upgrade or remove the Foyer integration if this exception cannot be renewed before expiry, and remove this record once cargo-deny no longer reports the warning.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "unsafe-libyaml",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "unsafe-libyaml 0.2.11 is an archived unsafe transliteration of libyaml's C code reached through serde_yaml 0.9.34+deprecated via figment 0.10.19 and slatedb 0.16.0 in velorix-storage. It sits on the storage configuration parsing path rather than the query or checkpoint authority path, and RUSTSEC-2024-0449 states that no safe upgrade exists.",
+      "replacement_plan": "Track the upstream serde_yaml deprecation removal or the slatedb/figment line dropping serde_yaml. If this exception cannot be renewed before expiry, replace the storage configuration parsing path.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     }
   ]
 }

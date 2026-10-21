@@ -23,6 +23,11 @@ this guide does not demonstrate recovery after that process restarts.
 
 Run all commands from the repository root.
 
+External family specifications are unsupported. A nonempty
+`VELORIX_NATIVE_FAMILY_SPEC_PATH` causes API startup to fail; unset it and use
+supported generic SQL views. External specs do not establish that SQL has the
+same semantics as the fixed runtime.
+
 ## 1. Start Versity Gateway
 
 Create an isolated Docker network and a persistent volume:
@@ -107,6 +112,11 @@ export VELORIX_API_BIND=127.0.0.1:8080
 export VELORIX_API_ALLOW_UNAUTHENTICATED_DEV=1
 export VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-only
 
+# Optional materialized read cache directory. Unset this variable to use the
+# default directory under the system temporary directory, or set it to an empty
+# value to disable the cache.
+export VELORIX_MATERIALIZED_READ_CACHE_DIR="${TMPDIR:-/tmp}/velorix-materialized-read-cache"
+
 cargo run -p velorix-api
 ```
 
@@ -121,6 +131,24 @@ curl -fsS http://127.0.0.1:8080/readyz
 
 `/readyz` should report `"status":"ready"`, an object store configured with
 conditional updates, and `"standing_runtime_fencing_mode":"unsafe-dev-only"`.
+
+### Materialized Read Cache
+
+The API caches verified immutable materialized read bytes in a Foyer hybrid
+memory and disk cache. Three environment variables configure it:
+
+| Environment variable | Default | Constraint |
+| --- | --- | --- |
+| `VELORIX_MATERIALIZED_READ_CACHE_DIR` | System temporary directory, then `velorix-materialized-read-cache/<operator-id digest>` | An explicitly empty value disables the cache. |
+| `VELORIX_MATERIALIZED_READ_CACHE_MEMORY_BYTES` | `67108864` (64 MiB) | Positive and addressable by the process. |
+| `VELORIX_MATERIALIZED_READ_CACHE_DISK_BYTES` | `536870912` (512 MiB) | At least 8 MiB, addressable, and a multiple of 4096 bytes. |
+
+Use a dedicated directory per API process on a persistent local filesystem if
+you want the cache to survive process restarts. Two API processes must not
+share one directory; a conflicting open disables that process's cache and
+falls back to authoritative reads. Invalid capacity values fail startup. See
+[materialized query reads and cache](development/materialized-query-cache.md)
+for the cache lifecycle and validation rules.
 
 ## 3. Create a Relation and a View
 
@@ -296,17 +324,17 @@ canonical `VelorixRelationSchemaV1` input; the CLI computes the fingerprint,
 copies it into every required binding, constructs the table registration, and
 validates the selected ingest adapter.
 
-Save this example as `/tmp/measurements-schema.json`:
+Save this example as `/tmp/src-table-schema.json`:
 
 ```json
 {
-  "relation_id": "measurements",
-  "relation_name": "measurements",
+  "relation_id": "src_table",
+  "relation_name": "src_table",
   "relation_version": "v1",
   "columns": [
     {
-      "column_id": "sensor_id",
-      "name": "sensor_id",
+      "column_id": "key_col",
+      "name": "key_col",
       "logical_type": {"kind": "utf8"},
       "physical_arrow_type": {"kind": "utf8"},
       "nullable": false,
@@ -314,8 +342,8 @@ Save this example as `/tmp/measurements-schema.json`:
       "semantic_role": "primary_key"
     },
     {
-      "column_id": "reading",
-      "name": "reading",
+      "column_id": "value_col",
+      "name": "value_col",
       "logical_type": {"kind": "int64"},
       "physical_arrow_type": {"kind": "int64"},
       "nullable": false,
@@ -332,7 +360,7 @@ Save this example as `/tmp/measurements-schema.json`:
       "semantic_role": "weight"
     }
   ],
-  "primary_key_column_ids": ["sensor_id"],
+  "primary_key_column_ids": ["key_col"],
   "weight_column_id": "weight",
   "allowed_operations": ["insert", "delete"],
   "event_time_column_id": null
@@ -343,14 +371,14 @@ Generate the exact API request body and register it:
 
 ```bash
 cargo run -q -p velorix-cli -- relation-catalog \
-  --schema /tmp/measurements-schema.json \
+  --schema /tmp/src-table-schema.json \
   --adapter-id incremental-adapter-generic-v1 \
-  > /tmp/measurements-relation.json
+  > /tmp/src-table-relation.json
 
 curl -fsS -X POST \
   http://127.0.0.1:8080/v1/relations \
   -H 'content-type: application/json' \
-  --data-binary @/tmp/measurements-relation.json
+  --data-binary @/tmp/src-table-relation.json
 ```
 
 Use `--schema -` to read the schema explicitly from standard input. Both

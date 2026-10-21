@@ -158,15 +158,24 @@ use velorix_runtime::{
     },
 };
 
+mod checkpoint_arrow;
+mod checkpoint_fragments;
 mod checkpoint_publication;
 mod cold_window_state;
+mod demand_materialization;
+mod demand_publication;
+mod demand_published;
+mod demand_source;
 mod ingest_epoch;
 mod materialized_output_pages;
 pub mod materialized_read_cache;
 mod openapi;
+mod owner_lease;
 mod query_response;
 mod query_serving;
 mod recovery;
+mod runtime_residency;
+mod scope_dependencies;
 mod view_admission;
 mod view_dependencies;
 
@@ -182,11 +191,25 @@ const PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS: usize = 3;
 const PUBLIC_1_0_MAX_TOP_K_LIMIT: usize = 1_000;
 const DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS: usize = 100_000;
 const DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const NATIVE_FAMILY_SPEC_PATH_ENV: &str = "VELORIX_NATIVE_FAMILY_SPEC_PATH";
+
+fn validate_native_family_spec_config(path: Option<&std::ffi::OsStr>) -> anyhow::Result<()> {
+    if path.is_some_and(|path| !path.is_empty()) {
+        anyhow::bail!(
+            "VELORIX_NATIVE_FAMILY_SPEC_PATH is unsupported: external native family specs do not prove SQL semantics; unset it and use supported generic SQL views"
+        );
+    }
+    Ok(())
+}
+
+pub type MaterializedReadCacheHitAccountant =
+    Arc<dyn Fn(&str, u64) -> Result<(), ApiError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn ObjectStore>,
     materialized_read_cache: Option<Arc<materialized_read_cache::MaterializedReadCache>>,
+    materialized_read_cache_hit_accountant: Option<MaterializedReadCacheHitAccountant>,
     materialized_read_cache_store_id: String,
     capabilities: Arc<AuthoritativeObjectStoreCapabilitiesV1>,
     ingest_writer: Arc<DeployedIngestWriterRuntime<ObjectStoreAuthorityRef>>,
@@ -207,6 +230,10 @@ pub struct ApiState {
     max_ingest_rows: usize,
     max_standing_runtime_output_delta_records: usize,
     max_standing_runtime_state_payload_bytes: usize,
+    max_standing_runtime_state_fragment_bytes: usize,
+    max_standing_runtime_expansion_bytes: usize,
+    max_standing_runtime_snapshot_bytes: usize,
+    standing_runtime_resident_limit: usize,
     output_compaction_interval_epochs: u64,
     experimental_advanced_view_features: bool,
     public_view_feature_policy: PublicViewFeaturePolicyV1,
@@ -220,6 +247,7 @@ pub struct ApiState {
     /// authoritative meta-store graph revision CAS extends this fence across
     /// processes.
     view_dependency_graph_mutex: Arc<AsyncMutex<()>>,
+    demand_scheduler: Arc<demand_materialization::DemandScheduler>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,6 +448,45 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
         checkpoint: RuntimeCheckpoint,
     ) -> Result<Box<dyn StandingProgramRuntime + Send>, String>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_resource_limits(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalogs: &[VelorixRelationCatalogV1],
+        logical_plan: &VelorixLogicalViewPlanV1,
+        spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+        _limits: velorix_runtime::materialized_view_runtime::RuntimeResourceLimits,
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        self.create_with_catalogs_plan_and_spec(
+            identity,
+            catalogs,
+            logical_plan,
+            spec,
+            input_schemas,
+            output_schemas,
+        )
+    }
+
+    fn restore_with_resource_limits(
+        &self,
+        checkpoint: RuntimeCheckpoint,
+        catalogs: &[VelorixRelationCatalogV1],
+        spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+        _limits: velorix_runtime::materialized_view_runtime::RuntimeResourceLimits,
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        self.restore_with_catalogs_and_spec(
+            checkpoint,
+            catalogs,
+            spec,
+            input_schemas,
+            output_schemas,
+        )
+    }
+
     fn restore_with_catalogs_and_spec(
         &self,
         checkpoint: RuntimeCheckpoint,
@@ -435,6 +502,11 @@ pub trait StandingProgramRuntimeFactory: Send + Sync + 'static {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StandingRuntimeCheckpointRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    demand_materialization: Option<demand_materialization::DemandCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_input_bootstrap:
+        Option<velorix_control::meta_admin::PublishedInputBootstrapProgressV1>,
     schema_version: u16,
     record_kind: String,
     view_id: String,
@@ -456,6 +528,11 @@ pub(crate) fn standing_runtime_checkpoint_record_from_slice(
         normalize_legacy_standing_program_identity_value(identity);
     }
     let mut record: StandingRuntimeCheckpointRecord = serde_json::from_value(value)?;
+    if let Some(demand) = &record.demand_materialization {
+        demand
+            .validate_checkpoint(&record.checkpoint)
+            .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))?;
+    }
     record.manifest_hash = stable_bytes_hash(bytes);
     Ok(record)
 }
@@ -489,7 +566,7 @@ fn move_legacy_key(
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct StandingRuntimeStatePayloadRecord {
     schema_version: u16,
@@ -612,6 +689,35 @@ struct StandingRuntimeApplyResult {
 struct MaterializedViewRuntimeFactory;
 
 impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
+    fn create_with_resource_limits(
+        &self,
+        identity: &StandingProgramIdentity,
+        catalogs: &[VelorixRelationCatalogV1],
+        logical_plan: &VelorixLogicalViewPlanV1,
+        _spec: &StandingViewSpec,
+        input_schemas: &[RelationSchema],
+        output_schemas: &[RelationSchema],
+        limits: velorix_runtime::materialized_view_runtime::RuntimeResourceLimits,
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_runtime::materialized_view_runtime::create_standing_runtime_with_logical_plan_and_catalogs_with_limits(
+            identity, catalogs, logical_plan.clone(), input_schemas, output_schemas, limits,
+        )
+    }
+
+    fn restore_with_resource_limits(
+        &self,
+        checkpoint: RuntimeCheckpoint,
+        _catalogs: &[VelorixRelationCatalogV1],
+        _spec: &StandingViewSpec,
+        _input_schemas: &[RelationSchema],
+        _output_schemas: &[RelationSchema],
+        limits: velorix_runtime::materialized_view_runtime::RuntimeResourceLimits,
+    ) -> Result<Box<dyn StandingProgramRuntime + Send>, String> {
+        velorix_runtime::materialized_view_runtime::restore_standing_runtime_with_limits(
+            checkpoint, limits,
+        )
+    }
+
     fn output_schemas_for_view_request(
         &self,
         view_id: &str,
@@ -619,12 +725,49 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         catalog: &VelorixRelationCatalogV1,
         _input_schema_fingerprint: &str,
     ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+        if let Ok(plan) = velorix_core::view_plan::validate_supported_series_sql(sql, catalog) {
+            return bag_stage_output_schema(view_id, plan.output_columns)
+                .map(|schema| Some(vec![schema]));
+        }
+        if let Ok(plan) =
+            velorix_core::view_plan::validate_supported_ordered_window_sql(sql, catalog)
+        {
+            let columns = velorix_core::view_plan::supported_ordered_window_output_columns(
+                sql, catalog, &plan,
+            )
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let primary_key = velorix_core::view_plan::supported_ordered_window_output_primary_key(
+                catalog, &plan,
+            )
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            let schema_fingerprint =
+                materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+            return Ok(Some(vec![RelationSchema {
+                relation_id: view_id.into(),
+                relation_name: view_id.into(),
+                relation_version: "v1".into(),
+                schema_fingerprint,
+                columns,
+                primary_key,
+            }]));
+        }
         let Ok(plan) = validate_catalog_backed_sum_count_view_sql(sql, catalog) else {
             let Ok(plan) = validate_supported_latest_by_key_sql(sql, catalog) else {
                 let Ok(plan) = validate_supported_tumbling_window_sql(sql, catalog) else {
                     let Ok(plan) = validate_supported_analytic_row_number_sql(sql, catalog) else {
                         let Ok(plan) = validate_supported_filter_project_sql(sql, catalog) else {
-                            return Ok(None);
+                            let Ok(plan) =
+                                velorix_core::view_plan::validate_supported_typed_map_sql(
+                                    sql, catalog,
+                                )
+                            else {
+                                return Ok(None);
+                            };
+                            return bag_stage_output_schema(
+                                view_id,
+                                velorix_core::view_plan::supported_typed_map_output_columns(&plan),
+                            )
+                            .map(|schema| Some(vec![schema]));
                         };
                         return filter_project_output_schema(view_id, catalog, &plan)
                             .map(|schema| Some(vec![schema]));
@@ -648,6 +791,69 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         catalogs: &[VelorixRelationCatalogV1],
         input_schema_fingerprint: &str,
     ) -> Result<Option<Vec<RelationSchema>>, ApiError> {
+        if let Ok(plan) = velorix_core::view_plan::validate_supported_union_all_sql(sql, catalogs) {
+            return bag_stage_output_schema(view_id, plan.output_columns)
+                .map(|schema| Some(vec![schema]));
+        }
+        if let Ok(plan) =
+            velorix_core::view_plan::validate_supported_typed_join_project_sql(sql, catalogs)
+        {
+            let mut columns = Vec::with_capacity(plan.projection.len());
+            for projection in &plan.projection {
+                let relation_id = if projection.side == SupportedAggregateInputRelationSide::Left {
+                    &plan.left_relation_id
+                } else {
+                    &plan.right_relation_id
+                };
+                let catalog = catalogs
+                    .iter()
+                    .find(|catalog| &catalog.relation_schema.relation_id == relation_id)
+                    .ok_or_else(|| ApiError::bad_request("typed join input catalog missing"))?;
+                let column = catalog
+                    .relation_schema
+                    .columns
+                    .iter()
+                    .find(|column| column.column_id == projection.column_id)
+                    .ok_or_else(|| ApiError::bad_request("typed join projection column missing"))?;
+                let nullable = if let Some(right_id) = &projection.coalesce_right_column_id {
+                    let right = catalogs
+                        .iter()
+                        .find(|catalog| {
+                            catalog.relation_schema.relation_id == plan.right_relation_id
+                        })
+                        .and_then(|catalog| {
+                            catalog
+                                .relation_schema
+                                .columns
+                                .iter()
+                                .find(|column| &column.column_id == right_id)
+                        })
+                        .ok_or_else(|| ApiError::bad_request("typed join coalesced key missing"))?;
+                    column.nullable || right.nullable
+                } else {
+                    column.nullable
+                        || plan.join_kind == velorix_core::view_plan::SupportedJoinKind::Full
+                        || (plan.join_kind == velorix_core::view_plan::SupportedJoinKind::Left
+                            && projection.side == SupportedAggregateInputRelationSide::Right)
+                };
+                columns.push(ColumnSchema {
+                    name: projection.output_name.clone(),
+                    data_type: sql_type_from_catalog_column(column)?,
+                    nullable,
+                });
+            }
+            let primary_key = Vec::new();
+            let schema_fingerprint =
+                materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
+            return Ok(Some(vec![RelationSchema {
+                relation_id: view_id.into(),
+                relation_name: view_id.into(),
+                relation_version: "v1".into(),
+                schema_fingerprint,
+                columns,
+                primary_key,
+            }]));
+        }
         if catalogs.len() == 3 {
             if let Ok(plan) = validate_supported_three_input_inner_join_count_sql(sql, catalogs) {
                 if catalogs
@@ -815,6 +1021,17 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
 }
 
 impl ApiState {
+    fn runtime_resource_limits(
+        &self,
+    ) -> velorix_runtime::materialized_view_runtime::RuntimeResourceLimits {
+        velorix_runtime::materialized_view_runtime::RuntimeResourceLimits {
+            max_checkpoint_bytes: self.max_standing_runtime_state_payload_bytes,
+            max_expansion_bytes: self.max_standing_runtime_expansion_bytes,
+            max_expansion_rows: self.max_standing_runtime_output_delta_records,
+            max_snapshot_bytes: self.max_standing_runtime_snapshot_bytes,
+        }
+    }
+
     pub async fn from_validated_authority(
         validated: ValidatedOperatorAuthority,
         state_path: impl Into<String>,
@@ -851,6 +1068,7 @@ impl ApiState {
         let state = Self {
             store,
             materialized_read_cache: None,
+            materialized_read_cache_hit_accountant: None,
             materialized_read_cache_store_id: components.authority().store_id.clone(),
             capabilities,
             ingest_writer: Arc::new(ingest_writer),
@@ -873,6 +1091,10 @@ impl ApiState {
                 DEFAULT_MAX_STANDING_RUNTIME_OUTPUT_DELTA_RECORDS,
             max_standing_runtime_state_payload_bytes:
                 DEFAULT_MAX_STANDING_RUNTIME_STATE_PAYLOAD_BYTES,
+            max_standing_runtime_state_fragment_bytes: 4 * 1024 * 1024,
+            max_standing_runtime_expansion_bytes: 16 * 1024 * 1024,
+            max_standing_runtime_snapshot_bytes: 16 * 1024 * 1024,
+            standing_runtime_resident_limit: runtime_residency::DEFAULT_RESIDENT_LIMIT,
             output_compaction_interval_epochs: 0,
             experimental_advanced_view_features: false,
             public_view_feature_policy: PublicViewFeaturePolicyV1::default(),
@@ -882,6 +1104,7 @@ impl ApiState {
             standing_runtime_factories: Arc::new(StandingRuntimeFactoryRegistry::default()),
             query_runtimes: Arc::new(Mutex::new(HashMap::new())),
             view_dependency_graph_mutex: Arc::new(AsyncMutex::new(())),
+            demand_scheduler: Arc::new(demand_materialization::DemandScheduler::default()),
         };
         state.register_standing_program_runtime_factory(
             MATERIALIZED_VIEW_RUNTIME_NAME,
@@ -1083,6 +1306,34 @@ impl ApiState {
         self.max_standing_runtime_output_delta_records = max_output_delta_records;
         self.max_standing_runtime_state_payload_bytes = max_state_payload_bytes;
         self
+    }
+
+    pub fn with_standing_runtime_state_fragment_bytes(
+        mut self,
+        bytes: usize,
+    ) -> Result<Self, ApiError> {
+        if bytes == 0 {
+            return Err(ApiError::bad_request(
+                "checkpoint fragment byte limit must be positive",
+            ));
+        }
+        self.max_standing_runtime_state_fragment_bytes = bytes;
+        Ok(self)
+    }
+
+    pub fn with_standing_runtime_work_byte_limits(
+        mut self,
+        expansion_bytes: usize,
+        snapshot_bytes: usize,
+    ) -> Result<Self, ApiError> {
+        if expansion_bytes == 0 || snapshot_bytes == 0 {
+            return Err(ApiError::bad_request(
+                "runtime work byte limits must be positive",
+            ));
+        }
+        self.max_standing_runtime_expansion_bytes = expansion_bytes;
+        self.max_standing_runtime_snapshot_bytes = snapshot_bytes;
+        Ok(self)
     }
 
     pub fn with_output_compaction_interval_epochs(mut self, interval_epochs: u64) -> Self {
@@ -1417,6 +1668,9 @@ impl ApiState {
         )
     }
 
+    /// Reopens registered view declarations. Operator state is restored on
+    /// demand; startup does not replay history or drain the dependency graph.
+    /// The count describes registered bindings, not resident runtimes.
     pub async fn restore_standing_program_runtimes_from_active_views(
         &self,
     ) -> Result<usize, ApiError> {
@@ -1424,7 +1678,18 @@ impl ApiState {
             .await
     }
 
-    pub(crate) async fn restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(
+    pub(crate) fn restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(
+        &self,
+        allow_legacy_rebuild: bool,
+    ) -> impl std::future::Future<Output = Result<usize, ApiError>> + Send + '_ {
+        // Legacy replay owns a large future. Keep its state out of every
+        // startup/restart caller's stack, as with the replay boundary itself.
+        Box::pin(
+            self.restore_standing_program_runtimes_from_active_views_inner(allow_legacy_rebuild),
+        )
+    }
+
+    async fn restore_standing_program_runtimes_from_active_views_inner(
         &self,
         allow_legacy_rebuild: bool,
     ) -> Result<usize, ApiError> {
@@ -1437,16 +1702,60 @@ impl ApiState {
         let mut restored = 0;
 
         for active in active_views {
+            // Registry records are durable and independently queryable. Merely
+            // opening the service must not start materialization of every view.
+            // An explicitly selected legacy migration remains an opt-in action.
+            if self.authoritative_relation_ingest_enabled()
+                && (!allow_legacy_rebuild || !self.legacy_rebuild_targeted(&active.spec.view_id))
+            {
+                if active_standing_runtime_identity(&active).is_some() {
+                    restored += 1;
+                }
+                continue;
+            }
             if !standing_runtime_can_accept_incremental_ingest(&active) {
                 continue;
             }
-            if active_standing_runtime_identity(&active).is_none() {
+            let Some(identity) = active_standing_runtime_identity(&active) else {
+                continue;
+            };
+            // Older authoritative admissions could label an unmaterialized
+            // source-first view Running. Restore must not become its backfill.
+            if self.authoritative_relation_ingest_enabled()
+                && active
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|binding| !view_has_published_view_inputs(binding))
+                && read_latest_standing_runtime_checkpoint(self, identity, &active.spec.view_id)
+                    .await?
+                    .is_none()
+                && standing_runtime_create_requires_backfill(self, &active.spec).await?
+            {
+                self.view_registry()?
+                    .update_standing_runtime_lifecycle(
+                        &active.spec.view_id,
+                        &active.spec_hash,
+                        lifecycle_for_create_view_execution(
+                            &MaterializedViewExecutionMode::StandingRuntime,
+                            true,
+                        ),
+                    )
+                    .await
+                    .map_err(materialized_view_registry_error_to_api)?;
                 continue;
             }
+            // Protect the newly inserted runtime until its replay completes.
+            // Startup may restore a caught-up view without publishing anything.
+            let operation = self.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
+            let operation_guard = operation.lock().await;
             match ensure_standing_runtime_for_active_view(self, &active).await {
                 Ok(Some(replay_plan)) => {
-                    replay_committed_ingest_into_standing_runtime(self, &active, &replay_plan)
-                        .await?;
+                    replay_committed_ingest_into_standing_runtime_locked(
+                        self,
+                        &active,
+                        &replay_plan,
+                    )
+                    .await?;
                     restored += 1;
                 }
                 Ok(None) => {}
@@ -1462,11 +1771,15 @@ impl ApiState {
                 }
                 Err(error) => return Err(error),
             }
+            drop(operation_guard);
+            self.prune_standing_runtime_residents()?;
         }
 
-        // After restoring runtimes, pull pending producer commits into
-        // dependent consumer views so the chain is caught up.
-        drain_published_view_dependencies(self).await?;
+        if !self.authoritative_relation_ingest_enabled() {
+            drain_published_view_dependencies(self).await?;
+        }
+        // Legacy replay and explicit migration may have loaded operator state.
+        self.prune_standing_runtime_residents()?;
 
         Ok(restored)
     }
@@ -1719,6 +2032,7 @@ fn default_positive_scores_view_request(
 }
 
 pub async fn run_from_env() -> anyhow::Result<()> {
+    validate_native_family_spec_config(env::var_os(NATIVE_FAMILY_SPEC_PATH_ENV).as_deref())?;
     let config = ApiConfig::from_env()?;
     let store = config.object_store()?;
     let validated = validate_operator_authority(
@@ -1787,7 +2101,25 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         .with_standing_runtime_owner_ttl_ms(config.standing_runtime_owner_ttl_ms)
         .with_legacy_rebuild_view_id(config.legacy_rebuild_view_id)
         .with_output_compaction_interval_epochs(config.output_compaction_interval_epochs)
-        .with_experimental_advanced_view_features(config.experimental_advanced_view_features);
+        .with_experimental_advanced_view_features(config.experimental_advanced_view_features)
+        .with_standing_runtime_resident_limit(parse_positive_usize_env(
+            "VELORIX_STANDING_RUNTIME_RESIDENT_LIMIT",
+            runtime_residency::DEFAULT_RESIDENT_LIMIT,
+        )?)
+        .with_standing_runtime_state_fragment_bytes(parse_positive_usize_env(
+            "VELORIX_STANDING_RUNTIME_MAX_STATE_FRAGMENT_BYTES",
+            4 * 1024 * 1024,
+        )?)?
+        .with_standing_runtime_work_byte_limits(
+            parse_positive_usize_env(
+                "VELORIX_STANDING_RUNTIME_MAX_EXPANSION_BYTES",
+                16 * 1024 * 1024,
+            )?,
+            parse_positive_usize_env(
+                "VELORIX_STANDING_RUNTIME_MAX_SNAPSHOT_BYTES",
+                16 * 1024 * 1024,
+            )?,
+        )?;
     if let Some(token) = config.api_bearer_token {
         state = state
             .with_api_bearer_token(token)
@@ -2189,6 +2521,14 @@ pub struct QueryViewRequest {
 struct BackfillViewRequest {
     #[serde(default)]
     batch_limit: Option<usize>,
+    #[serde(default)]
+    scope: Option<demand_materialization::DemandScope>,
+    #[serde(default)]
+    budget: Option<demand_materialization::DemandBudget>,
+    #[serde(default)]
+    action: demand_materialization::DemandAction,
+    #[serde(default)]
+    order: demand_materialization::DemandOrder,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2505,7 +2845,10 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
                 "max_join_input_relations": PUBLIC_1_0_MAX_JOIN_INPUT_RELATIONS,
                 "max_top_k_limit": PUBLIC_1_0_MAX_TOP_K_LIMIT,
                 "max_output_delta_records_per_commit": state.max_standing_runtime_output_delta_records,
-                "max_state_payload_bytes_per_checkpoint": state.max_standing_runtime_state_payload_bytes
+                "max_state_payload_bytes_per_checkpoint": state.max_standing_runtime_state_payload_bytes,
+                "max_state_fragment_bytes": state.max_standing_runtime_state_fragment_bytes,
+                "max_expansion_bytes": state.max_standing_runtime_expansion_bytes,
+                "max_snapshot_bytes": state.max_standing_runtime_snapshot_bytes
             },
             "checkpoint_coalescing": "one checkpoint publish per affected active view per committed epoch",
             "latency_diagnostics": "ingest responses include total_us, avg_batch_us, avg_row_us, rows_per_second, workload shape, and write coalescing counters; detailed stage timings belong in traces/metrics",
@@ -2881,9 +3224,88 @@ async fn run_view_backfill(
     State(state): State<ApiState>,
     AxumPath(view_id): AxumPath<String>,
     Json(request): Json<BackfillViewRequest>,
-) -> Result<(StatusCode, Json<BackfillViewResponse>), ApiError> {
-    let outcome = run_view_backfill_step(&state, &view_id, request.batch_limit, None, None).await?;
-    Ok((StatusCode::OK, Json(outcome)))
+) -> Result<Response, ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(&view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    if !ingest_epoch::is_demand_managed_view(&state, &active).await? {
+        if request.scope.is_some()
+            || request.budget.is_some()
+            || request.action != demand_materialization::DemandAction::Step
+            || request.order != demand_materialization::DemandOrder::Forward
+        {
+            return Err(ApiError::bad_request(
+                "demand backfill controls require an authoritative demand-managed view",
+            ));
+        }
+        let outcome =
+            run_view_backfill_step(&state, &view_id, request.batch_limit, None, None).await?;
+        return Ok((StatusCode::OK, Json(outcome)).into_response());
+    }
+    let mut budget = request.budget.clone().unwrap_or_default();
+    if let Some(limit) = request.batch_limit {
+        if request.budget.is_some() && limit != budget.batch_limit {
+            return Err(ApiError::bad_request(
+                "conflicting batch_limit and budget.batch_limit",
+            ));
+        }
+        budget.batch_limit = limit;
+    }
+    budget.validate()?;
+    let Some(_turn) = state.demand_scheduler.explicit_turn() else {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"materialization":{"status":"yielded","complete":false}})),
+        )
+            .into_response());
+    };
+    if request.action != demand_materialization::DemandAction::Step {
+        demand_materialization::set_demand_control(
+            &state,
+            &active,
+            request.action == demand_materialization::DemandAction::Pause,
+            request.order,
+        )
+        .await?;
+        return Ok(Json(serde_json::json!({"materialization":{"status":if request.action == demand_materialization::DemandAction::Pause {"paused"} else {"resumed"},"complete":false}})).into_response());
+    }
+    if let Some(identity) = active_standing_runtime_identity(&active) {
+        if checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
+            &state, identity, &view_id,
+        )
+        .await?
+        .and_then(|record| record.demand_materialization)
+        .is_some_and(|progress| progress.paused)
+        {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"materialization":{"status":"paused","complete":false}})),
+            )
+                .into_response());
+        }
+    }
+    let outcome = demand_materialization::materialize_demand(
+        &state,
+        &active,
+        &demand_materialization::DemandRequest {
+            scope: request.scope,
+            budget,
+        },
+        request.order,
+        false,
+    )
+    .await?;
+    Ok((
+        if outcome.complete {
+            StatusCode::OK
+        } else {
+            StatusCode::ACCEPTED
+        },
+        Json(serde_json::json!({"materialization":outcome})),
+    )
+        .into_response())
 }
 
 fn spawn_background_view_output_compaction(state: ApiState, view_id: String) -> bool {
@@ -2964,10 +3386,12 @@ async fn compact_view_output_once(
         ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
             .map_err(ApiError::bad_request)?
             .0;
-    let publication = standing_runtime_output_manifest_record_for_checkpoint(
+    let publication = standing_runtime_output_manifest_record_for_checkpoint_with_limits(
         &record.checkpoint,
         &record.view_id,
         &checkpoint_key,
+        state.runtime_resource_limits(),
+        state.meta_store.is_some(),
     )?
     .ok_or_else(|| {
         ApiError::bad_request(format!(
@@ -3052,10 +3476,12 @@ async fn publish_standing_runtime_output_snapshot_from_checkpoint(
         ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
             .map_err(ApiError::bad_request)?
             .0;
-    let publication = standing_runtime_output_manifest_record_for_checkpoint(
+    let publication = standing_runtime_output_manifest_record_for_checkpoint_with_limits(
         &record.checkpoint,
         &record.view_id,
         &checkpoint_key,
+        state.runtime_resource_limits(),
+        state.meta_store.is_some(),
     )?
     .ok_or_else(|| {
         ApiError::bad_request(format!(
@@ -6136,6 +6562,14 @@ fn aggregate_output_schema(
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedViewPlan,
 ) -> Result<RelationSchema, ApiError> {
+    if plan.aggregate_output_identity
+        == Some(velorix_core::view_plan::SupportedAggregateOutputIdentity::Singleton)
+    {
+        let columns =
+            velorix_core::view_plan::supported_singleton_aggregate_output_columns(plan, catalog)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        return bag_stage_output_schema(view_id, columns);
+    }
     let group_keys = supported_view_plan_group_keys(plan);
     let aggregate_outputs = supported_view_plan_aggregate_outputs(plan);
     let mut columns = Vec::with_capacity(group_keys.len() + aggregate_outputs.len());
@@ -6239,6 +6673,27 @@ fn projection_expression_output_type(
     }
 }
 
+fn bag_stage_output_schema(
+    view_id: &str,
+    columns: Vec<ColumnSchema>,
+) -> Result<RelationSchema, ApiError> {
+    // Expansion and UNION ALL preserve multiplicity; neither proves a unique key.
+    let primary_key = Vec::new();
+    Ok(RelationSchema {
+        relation_id: view_id.into(),
+        relation_name: view_id.into(),
+        relation_version: "v1".into(),
+        schema_fingerprint: materialized_output_schema_fingerprint(
+            view_id,
+            "v1",
+            &columns,
+            &primary_key,
+        )?,
+        columns,
+        primary_key,
+    })
+}
+
 fn latest_by_key_output_schema(
     view_id: &str,
     catalog: &VelorixRelationCatalogV1,
@@ -6339,6 +6794,32 @@ fn filter_project_output_schema(
             nullable: projection.expression.is_none() && input_column.nullable,
         });
     }
+    for projection in &plan.typed_value_columns {
+        use velorix_core::view_plan::RuntimeScalarTypeV1;
+        projection
+            .program
+            .validate()
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let data_type = match projection.program.root.result_type {
+            RuntimeScalarTypeV1::Boolean => SqlDataType::Bool,
+            RuntimeScalarTypeV1::Int64 => SqlDataType::Int64,
+            RuntimeScalarTypeV1::Float64 => SqlDataType::Float64,
+            RuntimeScalarTypeV1::Utf8 => SqlDataType::Utf8,
+            RuntimeScalarTypeV1::Date32 => SqlDataType::Date,
+            RuntimeScalarTypeV1::TimestampNanosecond => SqlDataType::Timestamp { timezone: None },
+            RuntimeScalarTypeV1::Decimal128 { precision, scale } => SqlDataType::Decimal {
+                precision,
+                scale: u8::try_from(scale).map_err(|_| {
+                    ApiError::bad_request("typed decimal scale must be nonnegative")
+                })?,
+            },
+        };
+        columns.push(ColumnSchema {
+            name: projection.output_column_id.clone(),
+            data_type,
+            nullable: projection.program.root.nullable,
+        });
+    }
     let primary_key = vec![output_key_name];
     let schema_fingerprint =
         materialized_output_schema_fingerprint(view_id, "v1", &columns, &primary_key)?;
@@ -6403,17 +6884,12 @@ fn tumbling_window_output_schema(
     catalog: &VelorixRelationCatalogV1,
     plan: &SupportedTumblingWindowPlan,
 ) -> Result<RelationSchema, ApiError> {
-    let [primary_key_id] = catalog.relation_schema.primary_key_column_ids.as_slice() else {
-        return Err(ApiError::bad_request(
-            "tumbling window view requires exactly one primary key column",
-        ));
-    };
     let key_column = catalog
         .relation_schema
         .columns
         .iter()
-        .find(|column| &column.column_id == primary_key_id)
-        .ok_or_else(|| ApiError::bad_request("primary key column is missing from catalog"))?;
+        .find(|column| column.column_id == plan.group_key_column_id)
+        .ok_or_else(|| ApiError::bad_request("group key column is missing from catalog"))?;
     let output_key_name = if plan.output_key_column_id.is_empty() {
         key_column.name.clone()
     } else {
@@ -6782,6 +7258,12 @@ fn join_aggregate_output_type(
     aggregate: &SupportedAggregateOutput,
 ) -> Result<SqlDataType, ApiError> {
     match aggregate.function {
+        LogicalPlanAggregateFunctionV1::ArgMax { .. } => Err(ApiError::bad_request(
+            "ARG_MAX requires a single-relation native aggregate stage",
+        )),
+        LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => Err(ApiError::bad_request(
+            "APPROX_QUANTILE requires a single-relation native aggregate stage",
+        )),
         LogicalPlanAggregateFunctionV1::PercentileDisc { .. }
         | LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Err(ApiError::bad_request(
             "percentile aggregates are not supported in join views yet",
@@ -6950,12 +7432,13 @@ fn generic_single_key_sum_count_sum_type_for_column(
         .ok_or_else(|| ApiError::bad_request("sum value column is missing from catalog"))?;
     match &value.physical_arrow_type {
         ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Int64),
+        ArrowPhysicalTypeV1::Float64 => Ok(SqlDataType::Float64),
         ArrowPhysicalTypeV1::Decimal128 { precision, scale } => Ok(SqlDataType::Decimal {
             precision: *precision,
             scale: *scale,
         }),
         _ => Err(ApiError::bad_request(format!(
-            "single-key sum/count materialized runtime value column `{}` must be Int64 or Decimal128",
+            "single-key sum/count materialized runtime value column `{}` must be Int64, Float64 or Decimal128",
             value.name
         ))),
     }
@@ -6966,7 +7449,7 @@ fn single_key_aggregate_output_type(
     aggregate: &SupportedAggregateOutput,
 ) -> Result<SqlDataType, ApiError> {
     match aggregate.function {
-        LogicalPlanAggregateFunctionV1::Sum => {
+        LogicalPlanAggregateFunctionV1::Sum | LogicalPlanAggregateFunctionV1::ArgMax { .. } => {
             let column_id = aggregate
                 .input_column_id
                 .as_ref()
@@ -6977,7 +7460,8 @@ fn single_key_aggregate_output_type(
             Ok(SqlDataType::Int64)
         }
         LogicalPlanAggregateFunctionV1::PercentileDisc { .. } => Ok(SqlDataType::Int64),
-        LogicalPlanAggregateFunctionV1::PercentileCont { .. } => Ok(SqlDataType::Float64),
+        LogicalPlanAggregateFunctionV1::PercentileCont { .. }
+        | LogicalPlanAggregateFunctionV1::ApproxQuantile { .. } => Ok(SqlDataType::Float64),
         LogicalPlanAggregateFunctionV1::Avg => {
             let column_id = aggregate
                 .input_column_id
@@ -6990,9 +7474,11 @@ fn single_key_aggregate_output_type(
                 .find(|column| &column.column_id == column_id)
                 .ok_or_else(|| ApiError::bad_request("avg value column is missing from catalog"))?;
             match &value.physical_arrow_type {
-                ArrowPhysicalTypeV1::Int64 => Ok(SqlDataType::Float64),
+                ArrowPhysicalTypeV1::Int64 | ArrowPhysicalTypeV1::Float64 => {
+                    Ok(SqlDataType::Float64)
+                }
                 _ => Err(ApiError::bad_request(format!(
-                    "single-key materialized runtime avg column `{}` must be Int64",
+                    "single-key materialized runtime avg column `{}` must be Int64 or Float64",
                     value.name
                 ))),
             }
@@ -8327,13 +8813,13 @@ impl ApiConfig {
         let experimental_advanced_view_features =
             parse_bool_env("VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES", false)?;
         let authoritative_relation_ingest =
-            parse_bool_env("VELORIX_API_AUTHORITATIVE_RELATION_INGEST", false)?;
+            parse_bool_env("VELORIX_API_AUTHORITATIVE_RELATION_INGEST", true)?;
         let relation_ingest_owner_id = optional_nonempty_env("VELORIX_RELATION_INGEST_OWNER_ID");
-        if authoritative_relation_ingest && relation_ingest_owner_id.is_none() {
-            return Err(anyhow!(
-                "VELORIX_RELATION_INGEST_OWNER_ID is required when VELORIX_API_AUTHORITATIVE_RELATION_INGEST=1"
-            ));
-        }
+        validate_relation_ingest_mode_config(
+            authoritative_relation_ingest,
+            relation_ingest_owner_id.as_deref(),
+            meta_grpc_endpoint.as_deref(),
+        )?;
         Ok(Self {
             bind,
             materialized_read_cache,
@@ -8693,6 +9179,27 @@ fn validate_relation_ingest_capability_for_api(
     }
 }
 
+fn validate_relation_ingest_mode_config(
+    authoritative: bool,
+    owner_id: Option<&str>,
+    meta_endpoint: Option<&str>,
+) -> anyhow::Result<()> {
+    if !authoritative {
+        return Ok(());
+    }
+    if owner_id.is_none_or(|value| value.trim().is_empty()) {
+        return Err(anyhow!(
+            "authoritative ingest is enabled by default: VELORIX_RELATION_INGEST_OWNER_ID is required; set VELORIX_API_AUTHORITATIVE_RELATION_INGEST=0 only for explicit legacy mode"
+        ));
+    }
+    if meta_endpoint.is_none_or(|value| value.trim().is_empty()) {
+        return Err(anyhow!(
+            "authoritative ingest requires VELORIX_META_GRPC_ENDPOINT; metadata capability validation must succeed before serving"
+        ));
+    }
+    Ok(())
+}
+
 async fn validate_authoritative_relation_ingest_startup(
     meta_store: &dyn MetaStore,
 ) -> anyhow::Result<()> {
@@ -8929,3 +9436,6 @@ fn validate_production_standing_runtime_fencing(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod generic_api_tests;

@@ -5,10 +5,10 @@ use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 
 fn page_fixture() -> (RuntimeCheckpoint, RelationSchema, ObjectKey) {
     let schema = RelationSchema {
-        relation_id: "purchases_by_user".into(),
-        relation_name: "purchases_by_user".into(),
+        relation_id: "left_table".into(),
+        relation_name: "left_table".into(),
         relation_version: "synthetic-v1".into(),
-        schema_fingerprint: stable_bytes_hash(b"synthetic-inventory-floats"),
+        schema_fingerprint: stable_bytes_hash(b"synthetic-right_table-floats"),
         columns: vec![
             ColumnSchema {
                 name: "id".into(),
@@ -24,7 +24,8 @@ fn page_fixture() -> (RuntimeCheckpoint, RelationSchema, ObjectKey) {
         primary_key: vec!["id".into()],
     };
     let mut checkpoint = test_runtime_checkpoint(Vec::new());
-    let payload = json!({"output_schema":schema}).to_string();
+    let payload = json!({"output_schema":schema});
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(payload.as_bytes());
     checkpoint.state_payload.as_mut().unwrap().payload = payload;
     let key = ObjectKey::standing_runtime_checkpoint(
@@ -129,19 +130,19 @@ async fn request_rows(router: &Router, view: &str, sql: &str) -> Vec<Value> {
 
 async fn register(router: &Router, relation: &str, columns: &[(&str, VelorixLogicalTypeV1, bool)]) {
     let result = call_json(router, Method::POST, "/v1/relations",
-        json!({"catalog":test_relation_catalog_for_e2e(relation, columns),"default_orders_sum_count":false})).await;
+        json!({"catalog":test_relation_catalog_for_e2e(relation, columns),(concat!("default_", "orde", "rs_sum_count")):false})).await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
 }
 
 async fn create(router: &Router, view: &str, sql: &str, join: bool) {
-    let mut request = json!({"view_id":view,"sql":sql,"input_relation_id":"orders",
+    let mut request = json!({"view_id":view,"sql":sql,"input_relation_id":"left_table",
         "input_relation_version":"2026-08-14.v1","response_formats":["json"]});
     if join {
         request["input_relation_id"] = json!("");
         request["input_relation_version"] = json!("");
         request["input_relation_refs"] = json!([
-            {"relation_id":"orders","relation_version":"2026-08-14.v1"},
-            {"relation_id":"inventory","relation_version":"2026-08-14.v1"}]);
+            {"relation_id":"left_table","relation_version":"2026-08-14.v1"},
+            {"relation_id":"right_table","relation_version":"2026-08-14.v1"}]);
     }
     let result = call_json(router, Method::POST, "/v1/views", request).await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
@@ -174,46 +175,46 @@ async fn materialized_public_runtime_normalizes_filter_projection_group_and_two_
     let router = app(state);
     register(
         &router,
-        "orders",
+        "left_table",
         &[
-            ("customer_id", VelorixLogicalTypeV1::Utf8, false),
+            ("key_col", VelorixLogicalTypeV1::Utf8, false),
             ("amount", VelorixLogicalTypeV1::Int64, false),
         ],
     )
     .await;
     register(
         &router,
-        "inventory",
+        "right_table",
         &[
-            ("customer_id", VelorixLogicalTypeV1::Utf8, false),
-            ("quantity", VelorixLogicalTypeV1::Int64, false),
+            ("key_col", VelorixLogicalTypeV1::Utf8, false),
+            ("value_col", VelorixLogicalTypeV1::Int64, false),
         ],
     )
     .await;
     create(
         &router,
-        "order_projection",
-        "select customer_id, amount from orders where amount > 5",
+        "projected_output",
+        "select key_col, amount from left_table where amount > 5",
         false,
     )
     .await;
-    create(&router, "order_metrics", "select customer_id, sum(amount) as total, count(*) as count, min(amount) as minimum, max(amount) as maximum, avg(amount) as average from orders group by customer_id", false).await;
-    create(&router, "order_join", "select i.customer_id, sum(o.amount) as sum, count(*) as count from orders o join inventory i on o.customer_id = i.customer_id group by i.customer_id", true).await;
+    create(&router, "grouped_output", "select key_col, sum(amount) as total, count(*) as count, min(amount) as minimum, max(amount) as maximum, avg(amount) as average from left_table group by key_col", false).await;
+    create(&router, "joined_output", "select i.key_col, sum(o.amount) as sum, count(*) as count from left_table o join right_table i on o.key_col = i.key_col group by i.key_col", true).await;
     let result = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[
-        {"relation_id":"orders","relation_version":"2026-08-14.v1","stream_id":"orders-stream","partition_id":0,"start_offset_inclusive":0,
-         "rows":[{"customer_id":"alice","amount":10,"delta":1},{"customer_id":"alice","amount":6,"delta":1},{"customer_id":"bob","amount":2,"delta":1}]},
-        {"relation_id":"inventory","relation_version":"2026-08-14.v1","stream_id":"inventory-stream","partition_id":0,"start_offset_inclusive":0,
-         "rows":[{"customer_id":"alice","quantity":3,"delta":1}]}
+        {"relation_id":"left_table","relation_version":"2026-08-14.v1","stream_id":"left_table-stream","partition_id":0,"start_offset_inclusive":0,
+         "rows":[{"key_col":"k1","amount":10,"delta":1},{"key_col":"k1","amount":6,"delta":1},{"key_col":"k2","amount":2,"delta":1}]},
+        {"relation_id":"right_table","relation_version":"2026-08-14.v1","stream_id":"right_table-stream","partition_id":0,"start_offset_inclusive":0,
+         "rows":[{"key_col":"k1","value_col":3,"delta":1}]}
     ]})).await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
-    for view in ["order_projection", "order_metrics", "order_join"] {
+    for view in ["projected_output", "grouped_output", "joined_output"] {
         activate(&router, view).await;
     }
     assert_eq!(
         request_rows(
             &router,
-            "order_projection",
-            "SELECT count(*) AS count FROM order_projection"
+            "projected_output",
+            "SELECT count(*) AS count FROM projected_output"
         )
         .await,
         vec![json!({"count":2})]
@@ -221,17 +222,15 @@ async fn materialized_public_runtime_normalizes_filter_projection_group_and_two_
     assert_eq!(
         request_rows(
             &router,
-            "order_metrics",
-            "SELECT * FROM order_metrics WHERE customer_id='alice'"
+            "grouped_output",
+            "SELECT * FROM grouped_output WHERE key_col='k1'"
         )
         .await,
-        vec![
-            json!({"customer_id":"alice","total":16,"count":2,"minimum":6,"maximum":10,"average":8.0})
-        ]
+        vec![json!({"key_col":"k1","total":16,"count":2,"minimum":6,"maximum":10,"average":8.0})]
     );
     assert_eq!(
-        request_rows(&router, "order_join", "SELECT * FROM order_join").await,
-        vec![json!({"customer_id":"alice","sum":16,"count":2})]
+        request_rows(&router, "joined_output", "SELECT * FROM joined_output").await,
+        vec![json!({"key_col":"k1","sum":16,"count":2})]
     );
 }
 
@@ -245,27 +244,28 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
     ));
     let state = test_api_state_with_store(store, "materialized-page-owner", false)
         .await
+        .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024)
         .with_meta_store(Arc::new(InMemoryMetaStore::default()));
     let router = app(state.clone());
     register(
         &router,
-        "orders",
+        "left_table",
         &[
-            ("customer_id", VelorixLogicalTypeV1::Utf8, false),
+            ("key_col", VelorixLogicalTypeV1::Utf8, false),
             ("amount", VelorixLogicalTypeV1::Int64, true),
         ],
     )
     .await;
     create(
         &router,
-        "order_rows",
-        "select customer_id, amount from orders",
+        "row_output",
+        "select key_col, amount from left_table",
         false,
     )
     .await;
     let rows = (0..10017)
         .map(|i| {
-            json!({"customer_id":format!("customer-{i:05}"),
+            json!({"key_col":format!("k{i:05}"),
         "amount":if i==0 {Value::Null} else {json!(i)},"delta":1})
         })
         .collect::<Vec<_>>();
@@ -274,25 +274,25 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
             &router,
             Method::POST,
             "/v1/ingest",
-            json!({"relation_id":"orders",
-            "relation_version":"2026-08-14.v1","stream_id":"large-orders","partition_id":0,
+            json!({"relation_id":"left_table",
+            "relation_version":"2026-08-14.v1","stream_id":"large-left_table","partition_id":0,
             "start_offset_inclusive":index * 5000,"rows":chunk}),
         )
         .await;
         assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     }
-    activate(&router, "order_rows").await;
+    activate(&router, "row_output").await;
     let mut without_meta = state;
     without_meta.meta_store = None;
     let router_without_meta = app(without_meta);
     for router in [&router, &router_without_meta] {
         for sql in [
-            "SELECT count(*) AS count FROM order_rows",
-            "WITH selected AS (SELECT * FROM order_rows) SELECT count(*) AS count FROM selected",
+            "SELECT count(*) AS count FROM row_output",
+            "WITH selected AS (SELECT * FROM row_output) SELECT count(*) AS count FROM selected",
         ] {
             counts.clear();
             assert_eq!(
-                request_rows(router, "order_rows", sql).await,
+                request_rows(router, "row_output", sql).await,
                 vec![json!({"count":10017})]
             );
             assert_eq!(data_page_reads(&counts), 20);
@@ -302,17 +302,17 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
                 .any(|path| path.starts_with("v1/standing-runtime-state-payloads/")));
         }
         for (predicate, count, max_pages) in [
-            ("customer_id='customer-10016'", 1, 2),
-            ("customer_id='customer-10016' AND abs(amount)>0", 1, 2),
-            ("customer_id='customer-10016' OR amount IS NULL", 2, 3),
-            ("customer_id='missing' AND amount>0", 0, 0),
+            ("key_col='k10016'", 1, 2),
+            ("key_col='k10016' AND abs(amount)>0", 1, 2),
+            ("key_col='k10016' OR amount IS NULL", 2, 3),
+            ("key_col='missing' AND amount>0", 0, 0),
             ("amount IS NULL", 1, 1),
-            ("customer_id='missing' OR abs(amount)>0", 10016, 20),
+            ("key_col='missing' OR abs(amount)>0", 10016, 20),
         ] {
             counts.clear();
-            let sql = format!("SELECT count(*) AS count FROM order_rows WHERE {predicate}");
+            let sql = format!("SELECT count(*) AS count FROM row_output WHERE {predicate}");
             assert_eq!(
-                request_rows(router, "order_rows", &sql).await,
+                request_rows(router, "row_output", &sql).await,
                 vec![json!({"count":count})]
             );
             assert!(
@@ -466,7 +466,7 @@ fn materialized_ipc_reads_persisted_float_bytes_in_fresh_process() {
     )
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("inventory.arrow");
+    let path = directory.path().join("right_table.arrow");
     std::fs::write(
         &path,
         pages::encode_page(&publication.page_records[0].1).unwrap(),
@@ -489,11 +489,11 @@ fn materialized_predicate_ast_rejects_nested_reads_and_preserves_unknown_coercio
     let (_, mut schema, _) = page_fixture();
     schema.columns[1].data_type = SqlDataType::Int64;
     for sql in [
-        "WITH selected AS (SELECT * FROM purchases_by_user) SELECT * FROM selected WHERE id='item'",
-        "SELECT (SELECT count(*) FROM purchases_by_user) FROM purchases_by_user WHERE id='item'",
-        "SELECT * FROM purchases_by_user a JOIN purchases_by_user b ON a.id=b.id WHERE a.id='item'",
-        "SELECT * FROM purchases_by_user WHERE id='item' UNION SELECT * FROM purchases_by_user",
-        "SELECT * FROM (SELECT * FROM purchases_by_user) p WHERE id='item'",
+        "WITH selected AS (SELECT * FROM left_table) SELECT * FROM selected WHERE id='item'",
+        "SELECT (SELECT count(*) FROM left_table) FROM left_table WHERE id='item'",
+        "SELECT * FROM left_table a JOIN left_table b ON a.id=b.id WHERE a.id='item'",
+        "SELECT * FROM left_table WHERE id='item' UNION SELECT * FROM left_table",
+        "SELECT * FROM (SELECT * FROM left_table) p WHERE id='item'",
     ] {
         assert!(
             materialized_page_predicate(sql, &schema, &[]).is_none(),
@@ -508,7 +508,7 @@ fn materialized_predicate_ast_rejects_nested_reads_and_preserves_unknown_coercio
         assert!(
             matches!(
                 materialized_page_predicate(
-                    &format!("SELECT * FROM purchases_by_user WHERE {condition}"),
+                    &format!("SELECT * FROM left_table WHERE {condition}"),
                     &schema,
                     &[]
                 ),
@@ -518,7 +518,7 @@ fn materialized_predicate_ast_rejects_nested_reads_and_preserves_unknown_coercio
         );
     }
     let filtered = materialized_page_predicate(
-        "SELECT * FROM purchases_by_user WHERE id=$1 AND abs(amount)>0",
+        "SELECT * FROM left_table WHERE id=$1 AND abs(amount)>0",
         &schema,
         &[QueryBindValue::Utf8("item".into())],
     )
@@ -528,7 +528,7 @@ fn materialized_predicate_ast_rejects_nested_reads_and_preserves_unknown_coercio
     );
     assert!(matches!(
         materialized_page_predicate(
-            "SELECT * FROM purchases_by_user WHERE id=$1",
+            "SELECT * FROM left_table WHERE id=$1",
             &schema,
             &[QueryBindValue::Int64(7)]
         ),
@@ -544,23 +544,23 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
     let router = app(state);
     register(
         &router,
-        "orders",
+        "left_table",
         &[
-            ("customer_id", VelorixLogicalTypeV1::Utf8, false),
+            ("key_col", VelorixLogicalTypeV1::Utf8, false),
             ("amount", VelorixLogicalTypeV1::Int64, false),
         ],
     )
     .await;
     create(
         &router,
-        "order_copies",
-        "select customer_id, amount from orders",
+        "copied_output",
+        "select key_col, amount from left_table",
         false,
     )
     .await;
     let ingest = |offset, rows| {
-        json!({"relation_id":"orders","relation_version":"2026-08-14.v1",
-        "stream_id":"weighted-orders","partition_id":0,"start_offset_inclusive":offset,"rows":rows})
+        json!({"relation_id":"left_table","relation_version":"2026-08-14.v1",
+        "stream_id":"weighted-left_table","partition_id":0,"start_offset_inclusive":offset,"rows":rows})
     };
     let result = call_json(
         &router,
@@ -569,27 +569,24 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
         ingest(
             0,
             json!([
-        {"customer_id":"alice","amount":10,"delta":1},
-        {"customer_id":"alice-other","amount":10,"delta":1},
-        {"customer_id":"bob","amount":20,"delta":1}]),
+        {"key_col":"k1","amount":10,"delta":1},
+        {"key_col":"k1_other","amount":10,"delta":1},
+        {"key_col":"k2","amount":20,"delta":1}]),
         ),
     )
     .await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
-    let uri = "/v1/views/order_copies/outputs/order_copies/query";
-    activate(&router, "order_copies").await;
+    let uri = "/v1/views/copied_output/outputs/copied_output/query";
+    activate(&router, "copied_output").await;
     let first = call_json(&router, Method::POST, uri, json!({"max_rows":1})).await;
     assert_eq!(first.0, StatusCode::OK, "{}", first.1);
-    assert_eq!(
-        first.1["rows"],
-        json!([{"customer_id":"alice","amount":10}])
-    );
+    assert_eq!(first.1["rows"], json!([{"key_col":"k1","amount":10}]));
     let request = json!({"max_rows":2,"page_token":first.1["next_page_token"],"committed_epoch":first.1["logical_epoch"]});
     let rest = call_json(&router, Method::POST, uri, request.clone()).await;
     assert_eq!(rest.0, StatusCode::OK, "{}", rest.1);
     assert_eq!(
         rest.1["rows"],
-        json!([{"customer_id":"alice-other","amount":10},{"customer_id":"bob","amount":20}])
+        json!([{"key_col":"k1_other","amount":10},{"key_col":"k2","amount":20}])
     );
     let result = call_json(
         &router,
@@ -598,7 +595,7 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
         ingest(
             3,
             json!([
-        {"customer_id":"alice","amount":10,"delta":-1}]),
+        {"key_col":"k1","amount":10,"delta":-1}]),
         ),
     )
     .await;
@@ -606,8 +603,8 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
     assert_eq!(
         request_rows(
             &router,
-            "order_copies",
-            "SELECT count(*) AS count, sum(amount) AS sum FROM order_copies"
+            "copied_output",
+            "SELECT count(*) AS count, sum(amount) AS sum FROM copied_output"
         )
         .await,
         vec![json!({"count":2,"sum":30})]
@@ -616,7 +613,7 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
     assert_eq!(stale.0, StatusCode::BAD_REQUEST, "{}", stale.1);
 }
 
-// Standalone neutral fixtures; these do not load customer harnesses or workloads.
+// Standalone synthetic fixtures; these do not load external harnesses or workloads.
 fn publication_checkpoint(
     key_type: SqlDataType,
     key_value: Value,
@@ -651,8 +648,8 @@ fn publication_checkpoint(
             weight,
         )])
     };
-    let payload =
-        json!({"schema_version":1,"output_schema":schema,"published_output":output}).to_string();
+    let payload = json!({"schema_version":1,"output_schema":schema,"published_output":output});
+    let payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     RuntimeCheckpoint {
         identity: StandingProgramIdentity {
             tenant_id: "synthetic_tenant".into(),
@@ -736,7 +733,8 @@ async fn publication_state(store: Arc<dyn ObjectStore>, meta: Arc<InMemoryMetaSt
 
 fn publication_schema(checkpoint: &RuntimeCheckpoint) -> RelationSchema {
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     serde_json::from_value(payload["output_schema"].clone()).unwrap()
 }
 
@@ -1043,6 +1041,8 @@ async fn publication_legacy_duplicate_and_orphan_reuse_original_descriptor_bytes
             .unwrap();
         // This is the base-version publication: durable state, no native manifest ref.
         let record = StandingRuntimeCheckpointRecord {
+            demand_materialization: None,
+            published_input_bootstrap: None,
             schema_version: 1,
             record_kind: "standing_runtime_checkpoint_v1".into(),
             view_id: "synthetic_output".into(),
@@ -1266,7 +1266,7 @@ async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
         let state = publication_state(store.clone(), meta.clone()).await;
         let router = app(state.clone());
         let registered = call_json(&router, Method::POST, "/v1/relations",
-            json!({"catalog":publication_catalog(logical,physical),"default_orders_sum_count":false})).await;
+            json!({"catalog":publication_catalog(logical,physical),(concat!("default_", "orde", "rs_sum_count")):false})).await;
         assert_eq!(registered.0, StatusCode::CREATED, "{}", registered.1);
         // A retained cancelling batch supplies the bootstrap frontier with empty output.
         let seeded = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[{

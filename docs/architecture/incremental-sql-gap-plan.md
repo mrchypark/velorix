@@ -578,7 +578,7 @@ Goal: remove the current single-primary-key grouping restriction.
   persists the same `DeltaBatch` keys without narrowing. The
   `keyed_aggregate_kernel_restores_composite_null_group_state_from_wire_checkpoint`
   test uses three two-component keys (including NULL components), serializes
-  the checkpoint through JSON, restores it, applies a post-restore retraction
+  the checkpoint through typed Arrow, restores it, applies a post-restore retraction
   and insert, and proves exact equality with uninterrupted execution. All 8
   engine and 23 operator tests pass. Public multi-key admission and full runtime
   restore remain tracked separately below.

@@ -1,20 +1,26 @@
 //! Narrow metadata administration facade for API control-plane wiring.
 
 pub use velorix_meta::{
-    validate_bearer_token, AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
-    CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest,
-    CaptureRelationIngestSourceCutsRequest, CommitIngestRangeOutcome,
-    FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
-    GrpcClientTlsConfig, GrpcMetaStore, InMemoryMetaStore, IngestRangeReservation,
-    IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    validate_bearer_token, AcquireRelationPartitionAuthorityOutcome,
+    AcquireRelationPartitionAuthorityRequest, AcquireStandingRuntimeOwnerOutcome,
+    AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
+    BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest,
+    CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
+    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, GrpcClientTlsConfig, GrpcMetaStore, InMemoryMetaStore,
+    IngestRangeReservation, IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore,
+    MetaStoreCapabilities, MetaStoreError, PromoteViewBootstrapOutcome,
+    PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, PublishedInputBootstrapCursorV1,
+    PublishedInputBootstrapProgressV1, RelationAuthoritativeIngestPublication,
     RelationIngestCapability, RelationIngestPartitionCutV1, RelationIngestPublicationRefV1,
     RelationIngestSourceCutV1, RelationIngestSourceIdentityCutV1, RelationPartitionAuthorityKey,
-    ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer, StandingRuntimeFencingCapability,
-    StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
-    ViewBootstrapControlV1, ViewBootstrapLifecycleV1, INGEST_SOURCE_IDENTITY_GENERATION_V1,
+    RelationPartitionAuthorityToken, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
+    StoreRelationCatalogOutcome, ViewBootstrapControlV1, ViewBootstrapLifecycleV1,
+    INGEST_SOURCE_IDENTITY_GENERATION_V1, PUBLISHED_INPUT_BOOTSTRAP_SCHEMA_VERSION_V1,
     RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
     STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
@@ -25,3 +31,8 @@ pub use velorix_meta::{
     STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
     STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW,
 };
+
+/// gRPC server surface used by in-process test harnesses. The API crate
+/// depends on this facade instead of the metadata crate directly, so the
+/// crate boundary stays intact while tests can still host a local server.
+pub use velorix_meta::{proto, MetaGrpcService};

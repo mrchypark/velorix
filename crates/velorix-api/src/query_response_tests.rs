@@ -2,6 +2,77 @@ use super::*;
 use arrow::ipc::reader::StreamReader;
 use http_body_util::BodyExt;
 
+/// The default Arrow query response must actually apply its compression codec.
+/// `try_with_compression_level` alone only records a level and leaves the codec
+/// unset, which silently produced uncompressed bodies.
+#[tokio::test]
+async fn arrow_query_response_applies_its_default_compression_codec() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let rows = 4096usize;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(vec![
+                "repeated-compressible-payload";
+                rows
+            ])),
+        ],
+    )
+    .unwrap();
+    let body = QueryBatchResponse {
+        schema,
+        batches: vec![batch],
+        logical_epoch: 7,
+        next_page_token: None,
+    }
+    .into_http_response(QueryResponseFormat::Arrow, QueryPolicy::default(), |_| {
+        panic!("Arrow must not serialize JSON")
+    })
+    .unwrap()
+    .into_body()
+    .collect()
+    .await
+    .unwrap()
+    .to_bytes();
+    assert!(
+        body.windows(4).any(|w| w == [0x28, 0xb5, 0x2f, 0xfd]),
+        "Arrow query response must carry a ZSTD frame when compression is the default"
+    );
+    let reader = StreamReader::try_new(Cursor::new(body), None).unwrap();
+    let decoded = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(decoded.iter().map(|b| b.num_rows()).sum::<usize>(), rows);
+}
+
+#[test]
+fn arrow_compression_setting_accepts_the_documented_values() {
+    for (value, expected) in [
+        (None, ArrowCompression::Zstd(ARROW_ZSTD_LEVEL)),
+        (Some(""), ArrowCompression::Zstd(ARROW_ZSTD_LEVEL)),
+        (Some("zstd"), ArrowCompression::Zstd(ARROW_ZSTD_LEVEL)),
+        (Some("ZSTD"), ArrowCompression::Zstd(ARROW_ZSTD_LEVEL)),
+        (Some(" none "), ArrowCompression::None),
+        (Some("zstd:1"), ArrowCompression::Zstd(1)),
+        (Some("zstd:22"), ArrowCompression::Zstd(22)),
+    ] {
+        assert_eq!(parse_arrow_compression(value), Ok(expected), "{value:?}");
+    }
+}
+
+#[test]
+fn arrow_compression_setting_rejects_every_other_value() {
+    for value in ["zstd:0", "zstd:23", "zstd:x", "lz4", "gzip", "zstd:"] {
+        let error = parse_arrow_compression(Some(value)).unwrap_err();
+        assert!(
+            error.contains(value) && error.contains("zstd:<1-22>"),
+            "{value:?} must be named alongside the accepted forms, got {error:?}"
+        );
+    }
+}
+
 #[test]
 fn query_metadata_defaults_to_arrow_and_keeps_explicit_preferences() {
     let mut request: CreateViewRequest =

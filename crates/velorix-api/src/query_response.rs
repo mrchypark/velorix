@@ -1,9 +1,10 @@
 use super::*;
-use arrow::{datatypes::SchemaRef, ipc::writer::StreamWriter};
+use arrow::{datatypes::SchemaRef, ipc::writer::StreamWriter, ipc::CompressionType};
 use axum::http::{HeaderMap, HeaderValue};
 use std::io::{self, Write};
 
 pub(super) const ARROW_STREAM: &str = "application/vnd.apache.arrow.stream";
+pub(super) const ARROW_ZSTD_LEVEL: i32 = 3;
 
 pub(super) struct QueryBatchResponse {
     pub schema: SchemaRef,
@@ -87,6 +88,10 @@ impl QueryResponseFormat {
 #[path = "query_response_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "query_http_format_tests.rs"]
+mod http_tests;
+
 fn media_token(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -121,6 +126,54 @@ fn not_acceptable() -> ApiError {
     let mut error = ApiError::bad_request("Accept must allow application/vnd.apache.arrow.stream or application/json with a valid nonzero quality");
     error.status = StatusCode::NOT_ACCEPTABLE;
     error
+}
+
+/// Environment variable that overrides the Arrow IPC compression used by query
+/// responses: unset, empty, or `zstd` keeps the default ZSTD level, `none`
+/// disables compression, and `zstd:<1-22>` selects an explicit ZSTD level.
+const ARROW_COMPRESSION_ENV: &str = "VELORIX_ARROW_COMPRESSION";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrowCompression {
+    None,
+    Zstd(i32),
+}
+
+fn parse_arrow_compression(value: Option<&str>) -> Result<ArrowCompression, String> {
+    let Some(value) = value else {
+        return Ok(ArrowCompression::Zstd(ARROW_ZSTD_LEVEL));
+    };
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("zstd") {
+        return Ok(ArrowCompression::Zstd(ARROW_ZSTD_LEVEL));
+    }
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(ArrowCompression::None);
+    }
+    if let Some((codec, level)) = value.split_once(':') {
+        if codec.trim().eq_ignore_ascii_case("zstd") {
+            if let Ok(level) = level.trim().parse::<i32>() {
+                if (1..=22).contains(&level) {
+                    return Ok(ArrowCompression::Zstd(level));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "unsupported {ARROW_COMPRESSION_ENV} value {value:?}: accepted forms are \"zstd\", \"zstd:<1-22>\", or \"none\""
+    ))
+}
+
+fn arrow_compression() -> Result<ArrowCompression, ApiError> {
+    static ARROW_COMPRESSION: std::sync::OnceLock<Result<ArrowCompression, String>> =
+        std::sync::OnceLock::new();
+    let configured = ARROW_COMPRESSION.get_or_init(|| {
+        parse_arrow_compression(std::env::var(ARROW_COMPRESSION_ENV).ok().as_deref())
+    });
+    match configured {
+        Ok(compression) => Ok(*compression),
+        Err(error) => Err(ApiError::internal(error)),
+    }
 }
 
 pub(super) fn apply_response_schema(
@@ -267,8 +320,18 @@ impl QueryBatchResponse {
                     metadata.remove("velorix.next_page_token");
                 }
                 let schema = self.schema.as_ref().clone().with_metadata(metadata);
+                let compression = arrow_compression()?;
                 let encoded = (|| {
-                    let mut writer = StreamWriter::try_new(&mut output, &schema)?;
+                    let ipc_options = match compression {
+                        ArrowCompression::None => arrow::ipc::writer::IpcWriteOptions::default(),
+                        ArrowCompression::Zstd(level) => {
+                            arrow::ipc::writer::IpcWriteOptions::default()
+                                .try_with_compression(Some(CompressionType::ZSTD))?
+                                .try_with_compression_level(Some(level))?
+                        }
+                    };
+                    let mut writer =
+                        StreamWriter::try_new_with_options(&mut output, &schema, ipc_options)?;
                     for batch in &self.batches {
                         if batch.schema().fields() != schema.fields() {
                             return Err(arrow::error::ArrowError::SchemaError(

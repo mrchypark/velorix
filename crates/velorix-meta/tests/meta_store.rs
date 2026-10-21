@@ -1685,6 +1685,86 @@ async fn standing_runtime_checkpoint_pointer_preserves_validated_input_coverage(
 }
 
 #[tokio::test]
+async fn standing_runtime_checkpoint_partial_work_preserves_lineage_identity() {
+    let store = InMemoryMetaStore::default();
+    let owner = acquire_owner(&store, "owner-a").await;
+    let mut complete = checkpoint_pointer(1, "a");
+    let coverage = RuntimeCheckpointInputCoverageV1 {
+        schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+        view_generation: 3,
+        plan_hash: format!("sha256:{}", "b".repeat(64)),
+        input_catalog_epoch: 0,
+        relations: Vec::new(),
+    };
+    complete.bootstrap_generation = coverage.view_generation;
+    complete.plan_hash = coverage.plan_hash.clone();
+    complete.coverage_hash = coverage.stable_hash().unwrap();
+    complete.input_coverage = Some(coverage);
+    store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: complete.clone(),
+            owner: owner.clone(),
+            expected_relation_source_cuts: None,
+        })
+        .await
+        .unwrap();
+    let mut partial = checkpoint_pointer(2, "c");
+    partial.bootstrap_generation = complete.bootstrap_generation;
+    partial.plan_hash = complete.plan_hash.clone();
+    partial.previous_checkpoint_key = complete.checkpoint_key.clone();
+    partial.previous_manifest_hash = complete.manifest_hash.clone();
+    for changed_generation in [false, true] {
+        let mut invalid = partial.clone();
+        if changed_generation {
+            invalid.bootstrap_generation += 1;
+        } else {
+            invalid.plan_hash = format!("sha256:{}", "d".repeat(64));
+        }
+        assert!(store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: Some(complete.clone()),
+                candidate: invalid,
+                owner: owner.clone(),
+                expected_relation_source_cuts: None,
+            })
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: Some(complete.clone()),
+                candidate: partial.clone(),
+                owner: owner.clone(),
+                expected_relation_source_cuts: None,
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+    let mut next = checkpoint_pointer(3, "e");
+    next.bootstrap_generation = complete.bootstrap_generation;
+    next.plan_hash = complete.plan_hash;
+    next.coverage_hash = complete.coverage_hash;
+    next.input_coverage = complete.input_coverage;
+    next.previous_checkpoint_key = partial.checkpoint_key.clone();
+    next.previous_manifest_hash = partial.manifest_hash.clone();
+    assert_eq!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: Some(partial),
+                candidate: next,
+                owner,
+                expected_relation_source_cuts: None,
+            })
+            .await
+            .unwrap(),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    );
+}
+
+#[tokio::test]
 async fn standing_runtime_checkpoint_pointer_rejects_mismatched_coverage_hash() {
     let store = InMemoryMetaStore::default();
     let owner = acquire_owner(&store, "owner-a").await;
@@ -1959,6 +2039,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         plan_hash: String::new(),
         coverage_hash: String::new(),
         input_coverage: None,
+        published_input_bootstrap: None,
         previous_checkpoint_key: String::new(),
         previous_manifest_hash: String::new(),
     }
@@ -2186,7 +2267,7 @@ fn view_input_edge(edge_id: &str) -> velorix_meta::BeginViewDependencyEdgeV1 {
         key_descriptor_hash: "sha256:key-descriptor".to_string(),
         delta_codec_identity: "velorix-published-delta-v1".to_string(),
         frontier_kind: "producer_commit_epoch".to_string(),
-        bootstrap_cursor: velorix_core::standing_program::CausalViewCursorV1 {
+        bootstrap_cursor: Some(velorix_core::standing_program::CausalViewCursorV1 {
             input_edge: edge_id.to_string(),
             producer_tenant_id: "default".to_string(),
             producer_program_id: "producer".to_string(),
@@ -2197,7 +2278,7 @@ fn view_input_edge(edge_id: &str) -> velorix_meta::BeginViewDependencyEdgeV1 {
             commit_digest:
                 "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
-        },
+        }),
     }
 }
 
@@ -2309,3 +2390,6 @@ async fn arc_dyn_meta_store_forwarding_reads_live_graph_revision() {
         "Arc<dyn MetaStore> must forward read_view_dependency_graph_revision to the inner store"
     );
 }
+
+#[path = "cases/published_input_bootstrap.rs"]
+mod published_input_bootstrap_cases;

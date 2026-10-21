@@ -394,7 +394,7 @@ fn encode_json_ordered(value: &Value, buf: &mut Vec<u8>) {
         Value::Object(map) => {
             buf.push(b'{');
             let mut fields: Vec<_> = map.iter().collect();
-            fields.sort_by_key(|(k, _)| (*k).clone());
+            fields.sort_by_key(|(left, _)| *left);
             for (i, (key, value)) in fields.iter().enumerate() {
                 if i > 0 {
                     buf.push(b',');
@@ -557,6 +557,28 @@ impl DeltaBatch {
             })
             .collect()
     }
+
+    /// Count consolidated rows without retaining a second copy of their values.
+    /// Uses the same pair encoding and signed-weight overflow rules as net_rows.
+    pub fn net_row_count(&self) -> Result<usize, DeltaError> {
+        let mut weights: BTreeMap<TypedBinaryKey, i128> = BTreeMap::new();
+        for record in &self.records {
+            let weight = weights
+                .entry(encode_kv_ordered(&record.key.0, &record.value.0))
+                .or_default();
+            *weight = weight
+                .checked_add(i128::from(record.weight))
+                .ok_or(DeltaError::WeightOverflow)?;
+        }
+        let mut count = 0;
+        for weight in weights.into_values() {
+            if weight != 0 {
+                i64::try_from(weight).map_err(|_| DeltaError::WeightOverflow)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 /// Encodes JSON values in a deterministic semantic order for net row keys.
@@ -684,6 +706,20 @@ mod tests {
         ]);
 
         assert_eq!(batch.net_rows(), Err(DeltaError::WeightOverflow));
+        assert_eq!(batch.net_row_count(), Err(DeltaError::WeightOverflow));
+    }
+
+    #[test]
+    fn ordered_object_encoding_preserves_nested_unicode_bytes() {
+        let value = json!({
+            "é": 3,
+            "z": {"β": 2, "a": 1},
+            "a": ["line\n", true]
+        });
+        assert_eq!(
+            encode_key_ordered(&value).0,
+            "{\"a\":[\"line\\n\",true],\"z\":{\"a\":1,\"β\":2},\"é\":3}".as_bytes()
+        );
     }
 
     #[test]
@@ -802,6 +838,13 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn delta_batch_net_row_count_matches_signed_consolidation(batch in batch_strategy()) {
+            prop_assert_eq!(batch.net_row_count().unwrap(), batch.net_rows().unwrap().len());
+            let cancelled = batch.combine(&batch.inverse().unwrap());
+            prop_assert_eq!(cancelled.net_row_count().unwrap(), 0);
+        }
+
         #[test]
         fn delta_batch_combine_is_associative(
             left in batch_strategy(),

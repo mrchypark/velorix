@@ -5,25 +5,41 @@ not recompute the source relations. View admission, incremental maintenance,
 publication and query execution remain separate steps; unsupported view SQL
 must fail during admission rather than use an external execution fallback.
 
-Native read pages are an optional index over the authoritative materialized
+Materialized read pages are an optional index over the authoritative materialized
 checkpoint. If expanded output exceeds the index capacity, checkpoint publication
 retains the compact weighted output through the existing checkpoint format;
 bounded queries and restart validation remain available. This path can require
-more reads and does not provide native page pruning. Invalid typed rows or
+more reads and does not provide page pruning. Invalid typed rows or
 checkpoint commitments still fail validation. Retrying a compatible legacy
 checkpoint preserves its immutable descriptor bytes and publication references.
 
 ## Cache configuration
 
-The API uses a disposable Foyer hybrid cache for validated immutable object
-bytes. Configure it before starting the API with the environment and storage
-setup described in [the how-to guide](../how-to.md).
+The API uses Foyer 0.22.6 for a disposable memory and disk cache of verified raw
+bytes at explicitly integrated immutable materialized query read sites. S3 and
+metadata remain authoritative. The cache does not change checkpoint
+publication, durability, or recovery semantics. Production startup enables the
+cache by default, and only these three environment variables configure it.
+Configure it before starting the API with the environment and storage setup
+described in [the how-to guide](../how-to.md).
 
 | Environment variable | Default | Constraint |
 | --- | --- | --- |
 | `VELORIX_MATERIALIZED_READ_CACHE_DIR` | System temporary directory, then `velorix-materialized-read-cache/<operator-id digest>` | An explicitly empty value disables the cache. |
 | `VELORIX_MATERIALIZED_READ_CACHE_MEMORY_BYTES` | `67108864` (64 MiB) | Positive and addressable by the process. |
 | `VELORIX_MATERIALIZED_READ_CACHE_DISK_BYTES` | `536870912` (512 MiB) | At least 8 MiB, addressable, and a multiple of 4096 bytes. |
+
+For production reuse across process restarts, set an explicit absolute path on a
+persistent local filesystem, for example:
+
+```sh
+export VELORIX_MATERIALIZED_READ_CACHE_DIR=/var/lib/velorix/materialized-read-cache
+```
+
+Use a dedicated directory writable by the API service account. Two API
+processes must use separate directories; a conflicting open safely disables
+that process's cache. The default temporary directory may be cleared by the
+host.
 
 For example, choose a separate temporary directory for each API process:
 
@@ -53,6 +69,9 @@ object path, codec, content hash, checkpoint epoch and root hash. Startup
 derives the storage scope from the configured endpoint, bucket, prefix and
 authority identifier. Credentials are not part of this serialized identity.
 
+The key type is `MaterializedReadCacheKey`; the configuration type is
+`MaterializedReadCacheConfig`; the cache type is `MaterializedReadCache`.
+
 The cache can reuse immutable checkpoint descriptors, output manifests and
 data pages. Mutable metadata that selects the active view and checkpoint
 remains authoritative. Hits still pass the production codec, identity,
@@ -60,6 +79,16 @@ schema, hash and root-binding checks. Cached bytes that fail validation, or a
 cache I/O error, become misses followed by an authoritative fetch. Invalid
 authoritative bytes fail the query. Cache hits do not waive query budgets or
 checkpoint fencing.
+
+Only immutable objects selected through current authoritative state are
+eligible. Mutable heads and active metadata are not cached, and every hit
+retains the normal authority freshness and fencing checks. A cache hit cannot
+authorize an old checkpoint.
+
+Cache-open failures are logged at startup and the API continues with
+authoritative reads; these diagnostics do not include credentials or payload
+contents. Invalid capacity configuration fails startup rather than silently
+selecting another budget.
 
 Foyer uses `WriteOnInsertion`, so a verified insertion is eligible for disk
 persistence even when it fits in memory. Graceful API shutdown drains listeners
@@ -70,11 +99,49 @@ reopening the same directory. The directory lock remains held until the
 handles are dropped. An abrupt stop can lose pending cache writes; a later
 miss fetches from authoritative storage.
 
+Production startup handles Ctrl-C and, on Unix, SIGTERM: it stops accepting
+requests, drains both enabled HTTP and TLS listeners, then awaits the cache
+close while retaining the cache handle and directory lock. If either listener
+fails, the other listener still drains before cache closure, TLS connection
+watchers also finish before cache closure, and the original listener error is
+preserved. Cache-close failures are logged.
+
 Reopening persisted storage starts with an empty memory tier. Use a distinct
 process when measuring disk reuse, and record the process identity and cache
 configuration. Repeated requests in one process demonstrate memory reuse;
 they do not establish disk recovery. Removal is best effort for an insertion
 already queued to disk, so validation on every hit remains necessary.
+
+Removal is best effort in a second sense too: Foyer can still expose a queued
+insertion immediately after `remove`. Every retrieval validates the bytes, so
+delayed eviction cannot make an invalid payload serveable.
+
+There are no additional cache metrics knobs.
+
+## Read-cache integration points
+
+The cache is consulted only where an immutable published byte range is read:
+
+- bounded checkpoint fragment and descriptor reads,
+- published materialized output page reads, including their codec, hash and
+  root-binding validation,
+- demand-view output reads that resolve an immutable page or manifest.
+
+Mutable view heads, checkpoint selection metadata, and LIST-based discovery
+stay authoritative and are never served from cache. Reads that lack a fresh
+pointer commitment are not cached.
+
+Focused helper tests cover memory hits, disk hits after close and reopen,
+memory eviction, key isolation, invalid payload rejection, directory locking,
+and capacity validation.
+
+## Unsupported external family specs
+
+`VELORIX_NATIVE_FAMILY_SPEC_PATH` is rejected when it is nonempty. External
+family specifications do not prove SQL semantics, so API startup fails
+instead of running an unproven family. Unset the variable and use supported
+generic SQL views. The variable name is retained for compatibility with
+existing deployments; only its value is unsupported.
 
 See [the cache implementation](../../crates/velorix-api/src/materialized_read_cache.rs)
 for its embedding interfaces and synthetic lifecycle tests.
@@ -142,6 +209,18 @@ Both formats carry `x-velorix-logical-epoch` and, when applicable,
 can require type or shape adaptation before encoding; raw SQL uses its result
 schema. Compare the actual executed branches when measuring formatter costs.
 
+Demand-view continuation tokens authenticate a specific immutable checkpoint.
+New input and later materialization do not change the rows or logical epoch
+returned by that continuation. A fresh query sees the newer materialized cut.
+The reader verifies the token and checkpoint lineage before reading the pinned
+output; it must not substitute the latest checkpoint during a legacy fallback.
+Raw native page tokens remain bound to their output root and epoch.
+
+Arrow output pages are distinct from recovery state. Runtime checkpoint state
+bodies use a separate typed Arrow IPC codec with ZSTD level 3. Checkpoint
+descriptors and fragment manifests contain JSON metadata, without an embedded
+state body. See [the state codec contract](../architecture/checkpoint-state-arrow-v1.md).
+
 ## Synthetic validation
 
 Run the following from the repository root. These are reproduction commands,
@@ -157,13 +236,13 @@ cargo test --locked -p velorix-core --lib
 The cache tests use temporary directories and generated byte payloads to check
 key isolation, memory eviction, persisted disk hits after close/reopen,
 invalid-payload refetch, capacity validation and directory exclusion. The HTTP
-tests register synthetic `orders` and `inventory` schemas, ingest generated
+tests register synthetic `left_table` and `right_table` schemas, ingest generated
 rows, and exercise materialized filters, grouped sum/count, a two-table join,
 raw SQL, request bindings, both formats and pagination. They require no private
 source fixtures or external storage credentials.
 
 The [materialized page tests](../../crates/velorix-api/src/materialized_output_pages_tests.rs)
-use generated orders/inventory rows and a small `purchases_by_user` output
+use generated left/right rows and a small `grouped_output` output
 schema. Their assertions cover IPC float/null/weight preservation and tamper
 rejection, statistics binding and absent legacy statistics, normal public view
 publication, complete `COUNT(*)` and CTE counts over 10,017 generated rows,
@@ -172,20 +251,20 @@ after warm reads and close/reopen, persisted IPC reads in a fresh process, and
 weighted cursors with epoch fencing. The fresh-process IPC test checks file
 decoding; it is separate from the cache close/reopen test.
 
-For a small manual correctness check, register an `orders` schema with UTF-8
-`customer_id` and integer `amount` columns. Register an `inventory` schema with
-UTF-8 `customer_id` and `category` columns and an integer `quantity` column.
+For a small manual correctness check, register a `left_table` schema with UTF-8
+`key_col` and integer `amount` columns. Register a `right_table` schema with
+UTF-8 `key_col` and `category` columns and an integer `value_col` column.
 Use the API's configured weight column for generated ingest updates. Admit
 these view definitions through the normal view API before ingesting generated
 rows; give each view a distinct output relation identifier:
 
 ```sql
-SELECT customer_id, amount FROM orders WHERE amount > 0;
-SELECT customer_id, SUM(amount) AS sum, COUNT(*) AS count
-FROM orders WHERE amount > 0 GROUP BY customer_id;
-SELECT i.customer_id, SUM(o.amount) AS sum, COUNT(*) AS count
-FROM orders o JOIN inventory i ON o.customer_id = i.customer_id
-GROUP BY i.customer_id;
+SELECT key_col, amount FROM left_table WHERE amount > 0;
+SELECT key_col, SUM(amount) AS sum, COUNT(*) AS count
+FROM left_table WHERE amount > 0 GROUP BY key_col;
+SELECT r.key_col, SUM(l.amount) AS sum, COUNT(*) AS count
+FROM left_table l JOIN right_table r ON l.key_col = r.key_col
+GROUP BY r.key_col;
 ```
 
 Query the resulting output relation with a literal equality filter, a numeric

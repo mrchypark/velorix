@@ -494,7 +494,7 @@ fn invalid_causal_cut() -> StandingProgramRuntimeError {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeCheckpointStatePayload {
     pub codec_identity: String,
-    pub payload: String,
+    pub payload: crate::arrow_state::ArrowState,
 }
 
 impl RuntimeCheckpoint {
@@ -596,7 +596,7 @@ pub struct EventTimeStateRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventTimeStateObject {
     pub reference: EventTimeStateRef,
-    pub payload: String,
+    pub payload: crate::arrow_state::ArrowState,
 }
 
 /// `reference: None` requires complete retained-source replay through `logical_epoch`.
@@ -605,6 +605,28 @@ pub struct EventTimeStateRequest {
     pub window_key: String,
     pub logical_epoch: LogicalEpoch,
     pub reference: Option<EventTimeStateRef>,
+}
+
+/// Internal demand replay control. Readiness is proof supplied by the caller;
+/// it does not authorize advancing durable source coverage or expiring state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub enum DemandFrontierMode {
+    /// Stable across budgets, restart, and cut extension (generation + plan).
+    /// Readiness comes from authenticated source evidence; output remains
+    /// speculative until the API certifies scope coverage. An empty vector
+    /// leaves existing readiness unchanged (initially the committed watermark).
+    Defer {
+        replay_id: String,
+        output_readiness: Vec<InputEventTimeFrontier>,
+    },
+    /// No rows are reapplied. The caller proves complete captured coverage;
+    /// runtime verifies these frontiers match its private replay state.
+    Install {
+        replay_id: String,
+        input_frontiers: Vec<RelationFrontier>,
+        input_event_time_frontiers: Vec<InputEventTimeFrontier>,
+    },
 }
 
 pub trait StandingProgramRuntime {
@@ -638,7 +660,7 @@ pub trait StandingProgramRuntime {
     fn hydrate_event_time_state(
         &mut self,
         request: &EventTimeStateRequest,
-        payload: &str,
+        payload: &crate::arrow_state::ArrowState,
     ) -> Result<(), StandingProgramRuntimeError> {
         let _ = (request, payload);
         Err(StandingProgramRuntimeError::InvalidProgramIdentity {
@@ -714,6 +736,19 @@ pub trait StandingProgramRuntime {
         let mut commit = self.apply_changes(logical_epoch, idempotency_key, input_changes)?;
         commit.output_batches.clear();
         Ok(commit)
+    }
+
+    /// Demand callers retain their coverage proof until installation. Families
+    /// without event-time state keep their existing application semantics.
+    fn apply_demand_changes_delta_only(
+        &mut self,
+        logical_epoch: LogicalEpoch,
+        idempotency_key: EpochIdempotencyKey,
+        input_changes: Vec<RelationInputBatch>,
+        mode: DemandFrontierMode,
+    ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        let _ = mode;
+        self.apply_changes_delta_only(logical_epoch, idempotency_key, input_changes)
     }
 
     fn materialized_view_page(

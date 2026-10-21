@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 script_path="${repo_root}/scripts/run-vind-product.sh"
+bash "${repo_root}/scripts/check-vind-external-meta-contract.sh"
 gateway_manifest=$(awk '/^cat >.*\/versitygw.yaml/ { capture=1; next } capture && /^EOF$/ { exit } capture { print }' "$script_path")
 for required in 'fsGroup: 1000' 'type: RuntimeDefault' 'runAsNonRoot: true' 'runAsUser: 1000' 'runAsGroup: 1000' 'allowPrivilegeEscalation: false' 'readOnlyRootFilesystem: true' 'capabilities:' 'drop:' '- ALL' 'mountPath: /data' 'emptyDir: {}'; do
   if ! printf '%s\n' "$gateway_manifest" | grep -F -- "$required" >/dev/null; then
@@ -2917,8 +2918,8 @@ checks["standalone REST join smoke proves two-relation materialized query"] = (
     and os.access(repo_root / "scripts" / "smoke-vind-rest-join.sh", os.X_OK)
     and "VELORIX_JOIN_REST_API_SMOKE_ATTACH" in rest_join_smoke
     and "join-rest-api-smoke.json" in rest_join_smoke
-    and "rest_join_readings_" in rest_join_smoke
-    and "rest_join_devices_" in rest_join_smoke
+    and "rest_join_left_" in rest_join_smoke
+    and "rest_join_right_" in rest_join_smoke
     and "inputRelationRefs" in rest_join_smoke
     and "join " in rest_join_smoke
     and "VELORIX_API_URL/v1/relations" in rest_join_smoke

@@ -1,11 +1,33 @@
 //! Bounded immutable-page snapshot protocol over Rhiza KV.
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const ROOT_KEY: &str = "velorix/snapshot/root";
-const PAGE_BYTES: usize = 1 << 20;
-const MAX_SNAPSHOT_BYTES: usize = 16 << 20;
+// Each page is written as exactly one Rhiza KV value, and the backend
+// base64-encodes that value (~+33%) before transport. rhizadb 0.19.0 rejects
+// any replicated mutation whose encoded command exceeds
+// `MaxReplicatedValueBytes = 128 << 10`, defined at
+// native/pkg/quepaxa/types.go:19 and enforced in native/pkg/network/server.go
+// and native/pkg/quepaxa/core.go. A 64 KiB page encodes to ~86 KiB, which
+// leaves room for the key, the CAS `expected` value, and request metadata
+// inside that 128 KiB budget.
+const PAGE_BYTES: usize = 64 << 10;
+// 128 pages at 64 KiB each. Every page digest serializes as 67 bytes of JSON
+// (`"<64 hex chars>"` plus a comma), so the root manifest stays far below the
+// 16 KiB root cap enforced by `parse_manifest`.
+const MAX_SNAPSHOT_BYTES: usize = 8 << 20;
+
+// Compile-time guard: the manifest of a maximum-size snapshot must fit the
+// 16 KiB root cap checked in `parse_manifest`.
+const _: () = {
+    const PAGES: usize = MAX_SNAPSHOT_BYTES / PAGE_BYTES;
+    const DIGEST_JSON_BYTES: usize = 64 + 3;
+    const FIXED_MANIFEST_BYTES: usize = 512;
+    assert!(PAGES * DIGEST_JSON_BYTES + FIXED_MANIFEST_BYTES <= 16 * 1024);
+};
 
 #[derive(Debug, Error)]
 pub enum SnapshotError {
@@ -65,6 +87,10 @@ impl RhizaKvSnapshot {
     pub fn new(kv: super::rhiza_kv::RhizaKvStore) -> Self {
         Self { kv }
     }
+    /// The current root token, read with exactly one KV get.
+    pub async fn root(&self) -> Result<Option<RootToken>, SnapshotError> {
+        Ok(self.kv.get(ROOT_KEY).await?.map(RootToken))
+    }
     pub async fn load(&self) -> Result<Option<(RootToken, Vec<u8>)>, SnapshotError> {
         let root = self.kv.get(ROOT_KEY).await?;
         let Some(root) = root else { return Ok(None) };
@@ -119,44 +145,46 @@ impl RhizaKvSnapshot {
             return Err(SnapshotError::TooLarge);
         }
         let current = expected.as_ref().map(|t| t.0.clone());
-        if let Some(root) = current.as_deref() {
-            let _ = parse_manifest(root)?;
-        }
+        let expected_manifest = current.as_deref().map(parse_manifest).transpose()?;
+        let mut known_pages = expected_manifest
+            .as_ref()
+            .map(|manifest| manifest.pages.iter().cloned().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
         let mut pages = Vec::new();
         for chunk in bytes.chunks(PAGE_BYTES) {
             let hash = digest(chunk);
-            let page_request_id = Sha256::digest(format!("page:{request_id}:{hash}"))
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            self.kv
-                .put_if_absent(
-                    page_request_id,
-                    format!("velorix/snapshot/page/{hash}"),
-                    chunk.to_vec(),
-                )
-                .await?;
-            if self
-                .kv
-                .get(format!("velorix/snapshot/page/{hash}"))
-                .await?
-                .as_deref()
-                != Some(chunk)
-            {
-                return Err(SnapshotError::Invalid("immutable page mismatch".into()));
+            if !known_pages.contains(&hash) {
+                let page_request_id = Sha256::digest(format!("page:{request_id}:{hash}"))
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                self.kv
+                    .put_if_absent(
+                        page_request_id,
+                        format!("velorix/snapshot/page/{hash}"),
+                        chunk.to_vec(),
+                    )
+                    .await?;
+                if self
+                    .kv
+                    .get(format!("velorix/snapshot/page/{hash}"))
+                    .await?
+                    .as_deref()
+                    != Some(chunk)
+                {
+                    return Err(SnapshotError::Invalid("immutable page mismatch".into()));
+                }
+                known_pages.insert(hash.clone());
             }
             pages.push(hash);
         }
         let manifest = serde_json::to_vec(&Manifest {
             schema_version: 1,
-            generation: current
+            generation: expected_manifest
                 .as_ref()
-                .map(|r| {
-                    serde_json::from_slice::<Manifest>(r)
-                        .map_err(|e| SnapshotError::Invalid(e.to_string()))
-                })
-                .map(|m| {
-                    m?.generation
+                .map(|manifest| {
+                    manifest
+                        .generation
                         .checked_add(1)
                         .ok_or(SnapshotError::Invalid("generation overflow".into()))
                 })
@@ -200,4 +228,73 @@ fn digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rhiza_kv::MAX_REPLICATED_MUTATION_BYTES;
+
+    /// Mirrors `rhiza_kv::base64_len`: base64-encoded length of `bytes` input
+    /// bytes, rounded up to a 4-byte boundary.
+    fn encoded_len(bytes: usize) -> usize {
+        bytes.div_ceil(3) * 4
+    }
+
+    #[test]
+    fn snapshot_larger_than_one_page_splits_into_bounded_pages() {
+        let bytes = vec![0x5au8; PAGE_BYTES * 2 + 17];
+        let pages: Vec<&[u8]> = bytes.chunks(PAGE_BYTES).collect();
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages.len(), bytes.len().div_ceil(PAGE_BYTES));
+        assert!(pages.iter().all(|page| page.len() <= PAGE_BYTES));
+        assert!(pages.iter().any(|page| page.len() == PAGE_BYTES));
+        assert_eq!(
+            pages.iter().map(|page| page.len()).sum::<usize>(),
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn maximal_page_stays_within_the_replicated_mutation_bound() {
+        // Worst case key width: `velorix/snapshot/page/` plus 64 hex digests.
+        let key_bytes = "velorix/snapshot/page/".len() + 64;
+        let estimate = encoded_len(PAGE_BYTES) + encoded_len(0) + key_bytes + 1024;
+        assert!(
+            estimate <= MAX_REPLICATED_MUTATION_BYTES,
+            "{estimate} > {MAX_REPLICATED_MUTATION_BYTES}"
+        );
+        assert_eq!(encoded_len(PAGE_BYTES), 87384);
+    }
+
+    #[test]
+    fn maximum_snapshot_manifest_fits_the_root_cap() {
+        let pages = MAX_SNAPSHOT_BYTES / PAGE_BYTES;
+        assert_eq!(pages, 128);
+        assert!(pages * (64 + 3) + 512 <= 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn root_reads_only_the_root_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let kv = crate::rhiza_kv::RhizaKvStore::open_config(
+            rhizadb::Config::new(directory.path())
+                .node_id("snapshot-root")
+                .local(),
+        )
+        .await
+        .unwrap();
+        let snapshot = RhizaKvSnapshot::new(kv);
+        assert_eq!(snapshot.root().await.unwrap(), None);
+        let bytes = b"snapshot".to_vec();
+        let CompareExchange::Applied(root) = snapshot
+            .compare_exchange(None, bytes.clone(), "root-test")
+            .await
+            .unwrap()
+        else {
+            panic!("first publish must apply");
+        };
+        assert_eq!(snapshot.root().await.unwrap(), Some(root.clone()));
+        assert_eq!(snapshot.load().await.unwrap(), Some((root, bytes)));
+    }
 }

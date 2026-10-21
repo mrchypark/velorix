@@ -186,6 +186,42 @@ pub enum BuiltinScalarFunctionV1 {
     /// Temporal difference in days (Int64). Returns (ts1 - ts2) / 86_400_000_000_000
     /// where ts values are nanoseconds. Avoids month-length complexity.
     AgeDays,
+    JsonValid,
+    JsonExtractString,
+    TryCastFloat64,
+    CoalesceFloat64,
+    NullIfFloat64,
+    TimeBucketNanoseconds,
+    CaseFloat64,
+    CaseTimestampNanosecond,
+    LessScalar,
+    LessEqualScalar,
+    GreaterScalar,
+    GreaterEqualScalar,
+    EqualScalar,
+    NotEqualScalar,
+    AndBoolean,
+    OrBoolean,
+    IsNullScalar,
+    NotBoolean,
+    SubtractInt64,
+    EpochSeconds,
+    FormatTime,
+    GreatestTimestampNanosecond,
+    LeastTimestampNanosecond,
+    TryCastBoolean,
+    /// Epoch seconds to naive UTC, rounded to microseconds before nanosecond storage.
+    TimestampFromEpochSeconds,
+    ScaleIntervalNanoseconds,
+    TimestampToMicrosecondPrecision,
+    CaseBoolean,
+    Int64ToUtf8,
+    NullIfInt64,
+    CoalesceInt64,
+    CoalesceUtf8,
+    CoalesceTimestampNanosecond,
+    CoalesceBoolean,
+    CoalesceDate32,
 }
 
 impl TypedExprProgramV1 {
@@ -229,6 +265,31 @@ pub fn validate_typed_expr_node(node: &TypedExprNodeV1) -> Result<(), TypedExprE
                 return Err(TypedExprError::Invalid(format!(
                     "function {function:?} result type mismatch: expected {expected_result:?}, got {:?}",
                     node.result_type
+                )));
+            }
+            let expected_nullable = match function {
+                BuiltinScalarFunctionV1::JsonExtractString
+                | BuiltinScalarFunctionV1::TryCastFloat64
+                | BuiltinScalarFunctionV1::TryCastBoolean
+                | BuiltinScalarFunctionV1::NullIfFloat64
+                | BuiltinScalarFunctionV1::NullIfInt64 => Some(true),
+                BuiltinScalarFunctionV1::CoalesceFloat64
+                | BuiltinScalarFunctionV1::CoalesceUtf8
+                | BuiltinScalarFunctionV1::CoalesceTimestampNanosecond
+                | BuiltinScalarFunctionV1::CoalesceBoolean
+                | BuiltinScalarFunctionV1::CoalesceDate32
+                | BuiltinScalarFunctionV1::CoalesceInt64 => {
+                    Some(args.iter().all(|arg| arg.nullable))
+                }
+                BuiltinScalarFunctionV1::JsonValid
+                | BuiltinScalarFunctionV1::TimeBucketNanoseconds => {
+                    Some(args.iter().any(|arg| arg.nullable))
+                }
+                _ => None,
+            };
+            if expected_nullable.is_some_and(|nullable| nullable != node.nullable) {
+                return Err(TypedExprError::Invalid(format!(
+                    "function {function:?} result nullability mismatch"
                 )));
             }
             for arg in args {
@@ -372,7 +433,14 @@ fn validate_literal_type(
 fn builtin_call_result_type(function: BuiltinScalarFunctionV1) -> RuntimeScalarTypeV1 {
     use RuntimeScalarTypeV1::*;
     match function {
+        BuiltinScalarFunctionV1::CoalesceUtf8 => Utf8,
+        BuiltinScalarFunctionV1::CoalesceTimestampNanosecond => TimestampNanosecond,
+        BuiltinScalarFunctionV1::CoalesceBoolean => Boolean,
+        BuiltinScalarFunctionV1::CoalesceDate32 => Date32,
         BuiltinScalarFunctionV1::Concat
+        | BuiltinScalarFunctionV1::Int64ToUtf8
+        | BuiltinScalarFunctionV1::JsonExtractString
+        | BuiltinScalarFunctionV1::FormatTime
         | BuiltinScalarFunctionV1::Substring
         | BuiltinScalarFunctionV1::Upper
         | BuiltinScalarFunctionV1::Lower
@@ -385,6 +453,12 @@ fn builtin_call_result_type(function: BuiltinScalarFunctionV1) -> RuntimeScalarT
         | BuiltinScalarFunctionV1::ExtractMinute
         | BuiltinScalarFunctionV1::ExtractSecond => Int64,
         BuiltinScalarFunctionV1::DateTruncDay
+        | BuiltinScalarFunctionV1::TimeBucketNanoseconds
+        | BuiltinScalarFunctionV1::CaseTimestampNanosecond
+        | BuiltinScalarFunctionV1::TimestampFromEpochSeconds
+        | BuiltinScalarFunctionV1::TimestampToMicrosecondPrecision
+        | BuiltinScalarFunctionV1::GreatestTimestampNanosecond
+        | BuiltinScalarFunctionV1::LeastTimestampNanosecond
         | BuiltinScalarFunctionV1::DateTruncHour
         | BuiltinScalarFunctionV1::DateTruncMinute
         | BuiltinScalarFunctionV1::DateTruncSecond => TimestampNanosecond,
@@ -392,6 +466,11 @@ fn builtin_call_result_type(function: BuiltinScalarFunctionV1) -> RuntimeScalarT
         | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => TimestampNanosecond,
         BuiltinScalarFunctionV1::DateAddDays => Date32,
         BuiltinScalarFunctionV1::AbsFloat64
+        | BuiltinScalarFunctionV1::CaseFloat64
+        | BuiltinScalarFunctionV1::EpochSeconds
+        | BuiltinScalarFunctionV1::TryCastFloat64
+        | BuiltinScalarFunctionV1::CoalesceFloat64
+        | BuiltinScalarFunctionV1::NullIfFloat64
         | BuiltinScalarFunctionV1::CeilFloat64
         | BuiltinScalarFunctionV1::FloorFloat64
         | BuiltinScalarFunctionV1::RoundFloat64
@@ -401,7 +480,24 @@ fn builtin_call_result_type(function: BuiltinScalarFunctionV1) -> RuntimeScalarT
         | BuiltinScalarFunctionV1::SubtractFloat64
         | BuiltinScalarFunctionV1::MultiplyFloat64
         | BuiltinScalarFunctionV1::DivideFloat64 => Float64,
-        BuiltinScalarFunctionV1::AgeDays => Int64,
+        BuiltinScalarFunctionV1::AgeDays
+        | BuiltinScalarFunctionV1::NullIfInt64
+        | BuiltinScalarFunctionV1::CoalesceInt64
+        | BuiltinScalarFunctionV1::SubtractInt64
+        | BuiltinScalarFunctionV1::ScaleIntervalNanoseconds => Int64,
+        BuiltinScalarFunctionV1::JsonValid
+        | BuiltinScalarFunctionV1::TryCastBoolean
+        | BuiltinScalarFunctionV1::CaseBoolean
+        | BuiltinScalarFunctionV1::LessScalar
+        | BuiltinScalarFunctionV1::LessEqualScalar
+        | BuiltinScalarFunctionV1::GreaterScalar
+        | BuiltinScalarFunctionV1::GreaterEqualScalar
+        | BuiltinScalarFunctionV1::EqualScalar
+        | BuiltinScalarFunctionV1::NotEqualScalar
+        | BuiltinScalarFunctionV1::AndBoolean
+        | BuiltinScalarFunctionV1::OrBoolean
+        | BuiltinScalarFunctionV1::IsNullScalar
+        | BuiltinScalarFunctionV1::NotBoolean => Boolean,
     }
 }
 
@@ -413,6 +509,77 @@ fn validate_call_argument_types(
 
     let allowed_at = |idx: usize| -> &[RuntimeScalarTypeV1] {
         match function {
+            BuiltinScalarFunctionV1::Int64ToUtf8 => &[Int64],
+            BuiltinScalarFunctionV1::CaseBoolean => &[Boolean],
+            BuiltinScalarFunctionV1::TryCastBoolean => &[Utf8, Boolean, Int64, Float64],
+            BuiltinScalarFunctionV1::TimestampFromEpochSeconds => &[Int64, Float64],
+            BuiltinScalarFunctionV1::TimestampToMicrosecondPrecision => &[TimestampNanosecond],
+            BuiltinScalarFunctionV1::ScaleIntervalNanoseconds => {
+                if idx == 0 {
+                    &[Int64]
+                } else {
+                    &[Int64, Float64]
+                }
+            }
+            BuiltinScalarFunctionV1::CaseFloat64 => {
+                if idx < args.len() - 1 && idx.is_multiple_of(2) {
+                    &[Boolean]
+                } else {
+                    &[Float64, Int64]
+                }
+            }
+            BuiltinScalarFunctionV1::CaseTimestampNanosecond => {
+                if idx < args.len() - 1 && idx.is_multiple_of(2) {
+                    &[Boolean]
+                } else {
+                    &[TimestampNanosecond]
+                }
+            }
+            BuiltinScalarFunctionV1::LessScalar
+            | BuiltinScalarFunctionV1::LessEqualScalar
+            | BuiltinScalarFunctionV1::GreaterScalar
+            | BuiltinScalarFunctionV1::GreaterEqualScalar
+            | BuiltinScalarFunctionV1::EqualScalar
+            | BuiltinScalarFunctionV1::NotEqualScalar => {
+                &[Boolean, Utf8, Int64, Float64, TimestampNanosecond]
+            }
+            BuiltinScalarFunctionV1::AndBoolean
+            | BuiltinScalarFunctionV1::OrBoolean
+            | BuiltinScalarFunctionV1::NotBoolean => &[Boolean],
+            BuiltinScalarFunctionV1::IsNullScalar => {
+                &[Boolean, Int64, Float64, Utf8, TimestampNanosecond, Date32]
+            }
+            BuiltinScalarFunctionV1::SubtractInt64 => &[Int64, TimestampNanosecond],
+            BuiltinScalarFunctionV1::EpochSeconds
+            | BuiltinScalarFunctionV1::GreatestTimestampNanosecond
+            | BuiltinScalarFunctionV1::LeastTimestampNanosecond => &[TimestampNanosecond],
+            BuiltinScalarFunctionV1::FormatTime => {
+                if idx == 0 {
+                    &[TimestampNanosecond]
+                } else {
+                    &[Utf8]
+                }
+            }
+            BuiltinScalarFunctionV1::TimeBucketNanoseconds => match idx {
+                0 => &[Int64],
+                1 => &[TimestampNanosecond],
+                _ => &[Utf8],
+            },
+            BuiltinScalarFunctionV1::JsonValid | BuiltinScalarFunctionV1::JsonExtractString => {
+                &[Utf8]
+            }
+            BuiltinScalarFunctionV1::NullIfInt64 | BuiltinScalarFunctionV1::CoalesceInt64 => {
+                &[Int64]
+            }
+            BuiltinScalarFunctionV1::CoalesceUtf8 => &[Utf8],
+            BuiltinScalarFunctionV1::CoalesceTimestampNanosecond => &[TimestampNanosecond],
+            BuiltinScalarFunctionV1::CoalesceBoolean => &[Boolean],
+            BuiltinScalarFunctionV1::CoalesceDate32 => &[Date32],
+            BuiltinScalarFunctionV1::TryCastFloat64 => &[Utf8, Int64, Float64],
+            BuiltinScalarFunctionV1::CoalesceFloat64 | BuiltinScalarFunctionV1::NullIfFloat64 => {
+                &[Float64, Int64]
+            }
+            BuiltinScalarFunctionV1::RoundFloat64 if idx == 1 => &[Int64],
             BuiltinScalarFunctionV1::Concat | BuiltinScalarFunctionV1::Trim => &[Utf8],
             BuiltinScalarFunctionV1::Substring => match idx {
                 0 => &[Utf8],
@@ -451,7 +618,7 @@ fn validate_call_argument_types(
             | BuiltinScalarFunctionV1::FloorFloat64
             | BuiltinScalarFunctionV1::RoundFloat64
             | BuiltinScalarFunctionV1::GreatestFloat64
-            | BuiltinScalarFunctionV1::LeastFloat64 => &[Float64],
+            | BuiltinScalarFunctionV1::LeastFloat64 => &[Float64, Int64],
             BuiltinScalarFunctionV1::AddFloat64
             | BuiltinScalarFunctionV1::SubtractFloat64
             | BuiltinScalarFunctionV1::MultiplyFloat64
@@ -479,7 +646,100 @@ fn validate_call_argument_types(
         }
     }
     validate_temporal_unit_literal(function, args)?;
+    if function == BuiltinScalarFunctionV1::SubtractInt64
+        && args[0].result_type != args[1].result_type
+    {
+        return Err(TypedExprError::Invalid(
+            "subtraction requires matching integer or timestamp operands".into(),
+        ));
+    }
+    if matches!(
+        function,
+        BuiltinScalarFunctionV1::LessScalar
+            | BuiltinScalarFunctionV1::LessEqualScalar
+            | BuiltinScalarFunctionV1::GreaterScalar
+            | BuiltinScalarFunctionV1::GreaterEqualScalar
+            | BuiltinScalarFunctionV1::EqualScalar
+            | BuiltinScalarFunctionV1::NotEqualScalar
+    ) && args[0].result_type != args[1].result_type
+        && !args
+            .iter()
+            .all(|arg| matches!(arg.result_type, Int64 | Float64))
+    {
+        return Err(TypedExprError::Invalid(
+            "comparison requires matching scalar types or numeric operands".into(),
+        ));
+    }
+    if matches!(
+        function,
+        BuiltinScalarFunctionV1::CaseFloat64
+            | BuiltinScalarFunctionV1::CaseTimestampNanosecond
+            | BuiltinScalarFunctionV1::CaseBoolean
+    ) && args.len() % 2 != 1
+    {
+        return Err(TypedExprError::Invalid(
+            "CASE requires condition/result pairs and an ELSE value".into(),
+        ));
+    }
+    if function == BuiltinScalarFunctionV1::FormatTime
+        && !matches!(&args[1].kind,TypedExprKindV1::Literal {value:ScalarLiteralV1::Utf8 {value}} if value == "%H:%M:%S")
+    {
+        return Err(TypedExprError::Invalid(
+            "STRFTIME currently supports literal %H:%M:%S only".into(),
+        ));
+    }
+    if function == BuiltinScalarFunctionV1::TimeBucketNanoseconds {
+        if !matches!(args[0].kind, TypedExprKindV1::Literal { value: ScalarLiteralV1::Int64(width) } if width > 0)
+        {
+            return Err(TypedExprError::Invalid(
+                "TIME_BUCKET width must be a positive fixed-duration literal".into(),
+            ));
+        }
+        if !matches!(&args[2].kind, TypedExprKindV1::Literal { value: ScalarLiteralV1::Utf8 { value } } if value == "UTC" || value == "Asia/Seoul")
+        {
+            return Err(TypedExprError::Invalid("TIME_BUCKET supports only literal UTC or Asia/Seoul alignment of naive UTC timestamps".into()));
+        }
+    }
+    if function == BuiltinScalarFunctionV1::RoundFloat64
+        && args.len() == 2
+        && !matches!(args[1].kind, TypedExprKindV1::Literal { value: ScalarLiteralV1::Int64(digits) } if (-308..=308).contains(&digits))
+    {
+        return Err(TypedExprError::Invalid(
+            "ROUND digits must be a literal integer between -308 and 308".into(),
+        ));
+    }
+    if function == BuiltinScalarFunctionV1::JsonExtractString {
+        let TypedExprKindV1::Literal {
+            value: ScalarLiteralV1::Utf8 { value },
+        } = &args[1].kind
+        else {
+            return Err(TypedExprError::Invalid(
+                "JSON path must be a literal $.field path".into(),
+            ));
+        };
+        bounded_json_path(value)?;
+    }
     Ok(())
+}
+
+/// Bounded object-member paths only; arrays, wildcards and recursive descent fail admission.
+pub fn bounded_json_path(path: &str) -> Result<Vec<&str>, TypedExprError> {
+    let parts: Vec<_> = path.strip_prefix("$.").unwrap_or("").split('.').collect();
+    if path.len() > 256
+        || parts.len() > 16
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    {
+        return Err(TypedExprError::Invalid(
+            "JSON path requires 1..=16 object fields in $.field notation (maximum 256 bytes)"
+                .into(),
+        ));
+    }
+    Ok(parts)
 }
 
 fn validate_temporal_unit_literal(
@@ -527,6 +787,41 @@ fn validate_call_arity(
     args: &[TypedExprNodeV1],
 ) -> Result<(), TypedExprError> {
     let expected = match function {
+        BuiltinScalarFunctionV1::CaseFloat64
+        | BuiltinScalarFunctionV1::CaseTimestampNanosecond
+        | BuiltinScalarFunctionV1::CaseBoolean => 3..=17,
+        BuiltinScalarFunctionV1::LessScalar
+        | BuiltinScalarFunctionV1::LessEqualScalar
+        | BuiltinScalarFunctionV1::GreaterScalar
+        | BuiltinScalarFunctionV1::GreaterEqualScalar
+        | BuiltinScalarFunctionV1::EqualScalar
+        | BuiltinScalarFunctionV1::NotEqualScalar
+        | BuiltinScalarFunctionV1::AndBoolean
+        | BuiltinScalarFunctionV1::OrBoolean
+        | BuiltinScalarFunctionV1::SubtractInt64
+        | BuiltinScalarFunctionV1::FormatTime => 2..=2,
+        BuiltinScalarFunctionV1::NullIfInt64 => 2..=2,
+        BuiltinScalarFunctionV1::IsNullScalar
+        | BuiltinScalarFunctionV1::Int64ToUtf8
+        | BuiltinScalarFunctionV1::TryCastBoolean
+        | BuiltinScalarFunctionV1::TimestampFromEpochSeconds
+        | BuiltinScalarFunctionV1::TimestampToMicrosecondPrecision
+        | BuiltinScalarFunctionV1::NotBoolean
+        | BuiltinScalarFunctionV1::EpochSeconds => 1..=1,
+        BuiltinScalarFunctionV1::GreatestTimestampNanosecond
+        | BuiltinScalarFunctionV1::LeastTimestampNanosecond => 2..=8,
+        BuiltinScalarFunctionV1::TimeBucketNanoseconds => 3..=3,
+        BuiltinScalarFunctionV1::JsonValid | BuiltinScalarFunctionV1::TryCastFloat64 => 1..=1,
+        BuiltinScalarFunctionV1::JsonExtractString | BuiltinScalarFunctionV1::NullIfFloat64 => {
+            2..=2
+        }
+        BuiltinScalarFunctionV1::CoalesceFloat64
+        | BuiltinScalarFunctionV1::CoalesceInt64
+        | BuiltinScalarFunctionV1::CoalesceUtf8
+        | BuiltinScalarFunctionV1::CoalesceTimestampNanosecond
+        | BuiltinScalarFunctionV1::CoalesceBoolean
+        | BuiltinScalarFunctionV1::CoalesceDate32 => 2..=8,
+        BuiltinScalarFunctionV1::RoundFloat64 => 1..=2,
         BuiltinScalarFunctionV1::Concat => 1..=8,
         BuiltinScalarFunctionV1::Substring => 2..=3,
         BuiltinScalarFunctionV1::Trim => 1..=2,
@@ -543,12 +838,12 @@ fn validate_call_arity(
         | BuiltinScalarFunctionV1::DateTruncMinute
         | BuiltinScalarFunctionV1::DateTruncSecond => 1..=2,
         BuiltinScalarFunctionV1::TimestampAddNanoseconds
+        | BuiltinScalarFunctionV1::ScaleIntervalNanoseconds
         | BuiltinScalarFunctionV1::TimestampSubtractNanoseconds => 2..=2,
         BuiltinScalarFunctionV1::DateAddDays => 2..=2,
         BuiltinScalarFunctionV1::AbsFloat64
         | BuiltinScalarFunctionV1::CeilFloat64
-        | BuiltinScalarFunctionV1::FloorFloat64
-        | BuiltinScalarFunctionV1::RoundFloat64 => 1..=1,
+        | BuiltinScalarFunctionV1::FloorFloat64 => 1..=1,
         BuiltinScalarFunctionV1::GreatestFloat64 | BuiltinScalarFunctionV1::LeastFloat64 => 2..=8,
         BuiltinScalarFunctionV1::AddFloat64
         | BuiltinScalarFunctionV1::SubtractFloat64

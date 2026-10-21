@@ -118,7 +118,14 @@ fn public_exists_and_not_exists_materialize_through_restart_with_duplicate_match
         );
 
         let checkpoint = runtime.checkpoint().unwrap();
-        let payload = checkpoint.state_payload.as_ref().unwrap().payload.as_str();
+        let payload = checkpoint
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload
+            .decode::<Value>()
+            .unwrap()
+            .to_string();
         assert!(payload.contains(if negated {
             "velorix-native-anti-join-v1"
         } else {
@@ -272,7 +279,9 @@ fn runtime_materializes_global_count_empty_input_and_final_retract_across_restor
         .as_ref()
         .expect("global aggregate checkpoint payload")
         .payload
-        .as_str();
+        .decode::<Value>()
+        .unwrap()
+        .to_string();
     assert!(payload.contains("aggregate_singleton_state"));
     assert!(payload.contains("aggregate_singleton_publication"));
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
@@ -429,6 +438,9 @@ fn runtime_materializes_registered_composite_group_keys_with_null() {
         .as_ref()
         .unwrap()
         .payload
+        .decode::<Value>()
+        .unwrap()
+        .to_string()
         .contains("\"category\":null"));
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
     let retracted = restored
@@ -851,12 +863,12 @@ fn runtime_restore_rejects_legacy_single_key_checkpoint_without_group_counts() {
         .unwrap();
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload
         .as_object_mut()
         .unwrap()
         .remove("group_input_counts");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let err = match restore_standing_runtime(checkpoint) {
@@ -905,9 +917,9 @@ fn runtime_restore_rejects_single_key_group_count_key_mismatch() {
         .unwrap();
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["group_input_counts"]["records"][0]["key"] = json!("bob");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     assert!(restore_standing_runtime(checkpoint).is_err());
@@ -936,7 +948,7 @@ fn runtime_bounds_restored_idempotency_history_and_preserves_recent_duplicates()
 
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["applied_epochs"] = Value::Array(
         (1..=1_025)
             .map(|logical_epoch| {
@@ -947,12 +959,13 @@ fn runtime_bounds_restored_idempotency_history_and_preserves_recent_duplicates()
             })
             .collect(),
     );
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
     let checkpoint = restored.checkpoint().unwrap();
-    let payload: Value = serde_json::from_str(&checkpoint.state_payload.unwrap().payload).unwrap();
+    let payload: Value =
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.unwrap().payload).unwrap();
     let applied_epochs = payload["applied_epochs"].as_array().unwrap();
     assert_eq!(applied_epochs.len(), 1_024);
     assert!(applied_epochs
@@ -2772,9 +2785,9 @@ fn filter_project_delta_only_matches_snapshots_rollback_and_restore() {
         if sql.contains("where score > 0") {
             let mut torn = before.clone();
             let state = torn.state_payload.as_mut().unwrap();
-            let mut payload: Value = serde_json::from_str(&state.payload).unwrap();
+            let mut payload: Value = velorix_core::arrow_state::from_state(&state.payload).unwrap();
             payload["published_output"]["records"] = json!([]);
-            state.payload = serde_json::to_string(&payload).unwrap();
+            state.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
             torn.state_root.content_hash = stable_bytes_hash(state.payload.as_bytes());
             assert!(restore_standing_runtime(torn).is_err());
         }
@@ -3890,9 +3903,9 @@ fn runtime_restore_rejects_row_number_checkpoint_when_state_mismatches_published
 
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["state"]["rows"] = json!({});
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let err = match restore_standing_runtime(checkpoint) {
@@ -5009,11 +5022,12 @@ fn runtime_materializes_computed_filter_project_view() {
 
 #[test]
 fn runtime_materializes_filter_project_case_over_bool_predicate() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = device_status_flag_output_schema();
-    let sql = "select device_id, case when enabled = true then 1 else 0 end as enabled_flag from device_status";
-    let identity = standing_identity_with_view(sql, "device_enabled_flags");
+    let output_schema = item_status_flag_output_schema();
+    let sql =
+        "select key, case when flag = true then 1 else 0 end as enabled_flag from item_status";
+    let identity = standing_identity_with_view(sql, "item_enabled_flags");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -5031,30 +5045,31 @@ fn runtime_materializes_filter_project_case_over_bool_predicate() {
                 encoding: RelationInputEncodingV1::SourceRelationV1,
                 relation_id: catalog.relation_schema.relation_id.clone(),
                 relation_version: catalog.relation_schema.relation_version.clone(),
-                stream_id: "device-status-stream".to_string(),
+                stream_id: "item-status-stream".to_string(),
                 partition_id: 0,
                 schema_fingerprint: catalog.schema_fingerprint.to_string(),
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 101, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 101, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_device_enabled_flags_page(runtime.as_ref(), 1, &[("device-a", 1), ("device-b", 0)]);
+    assert_item_enabled_flags_page(runtime.as_ref(), 1, &[("item-a", 1), ("item-b", 0)]);
 }
 
 #[test]
 fn runtime_rejects_filter_project_case_bool_predicate_non_bool_literal() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = device_status_flag_output_schema();
-    let sql = "select device_id, case when enabled = true then 1 else 0 end as enabled_flag from device_status";
-    let identity = standing_identity_with_view(sql, "device_enabled_flags");
+    let output_schema = item_status_flag_output_schema();
+    let sql =
+        "select key, case when flag = true then 1 else 0 end as enabled_flag from item_status";
+    let identity = standing_identity_with_view(sql, "item_enabled_flags");
     let mut logical_plan =
         lower_supported_filter_project_sql_to_logical_plan(sql, &catalog, &output_schema).unwrap();
     {
@@ -6990,9 +7005,9 @@ fn runtime_restore_rejects_malformed_event_time_frontier_even_when_payload_match
     let mut checkpoint = runtime.checkpoint().unwrap();
     checkpoint.input_event_time_frontiers[0].watermark_ns = 400;
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["input_event_time_frontiers"][0]["watermark_ns"] = json!(400);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let err = match restore_standing_runtime(checkpoint) {
@@ -8149,12 +8164,12 @@ fn runtime_restored_query_reads_published_output_not_engine_state() {
     let mut checkpoint = runtime.checkpoint().unwrap();
     assert!(checkpoint.output_manifest_refs.is_empty());
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     assert!(payload
         .get("published_output")
         .is_some_and(|published_output| !published_output.is_null()));
     payload["engine"]["state"]["records"] = json!([]);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     let restored = restore_standing_runtime(checkpoint).unwrap();
 
@@ -8237,9 +8252,9 @@ fn runtime_restore_without_admitted_plan_metadata_fails_closed() {
 
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload.as_object_mut().unwrap().remove("plan");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     assert!(restore_standing_runtime(checkpoint).is_err());
@@ -8326,7 +8341,8 @@ fn runtime_materializes_two_relation_join_and_restores_epoch_consistent_state() 
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.input_frontiers, initial_frontiers);
     let scalar_payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert!(scalar_payload.get("join_key_codec_id").is_none());
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
     assert_eq!(
@@ -8430,7 +8446,8 @@ fn runtime_materializes_composite_primary_key_join_across_retract_and_restart() 
 
     let checkpoint = runtime.checkpoint().unwrap();
     let checkpoint_payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(
         checkpoint_payload["join_key_codec_id"],
         "velorix-composite-pk-positional-json-array-join-key-v1"
@@ -8438,7 +8455,8 @@ fn runtime_materializes_composite_primary_key_join_across_retract_and_restart() 
     for replacement in [None, Some("unknown-composite-key-codec-v9")] {
         let mut tampered = checkpoint.clone();
         let state_payload = tampered.state_payload.as_mut().unwrap();
-        let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+        let mut payload: Value =
+            velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
         match replacement {
             Some(codec) => {
                 payload["join_key_codec_id"] = Value::String(codec.into());
@@ -8447,16 +8465,16 @@ fn runtime_materializes_composite_primary_key_join_across_retract_and_restart() 
                 payload.as_object_mut().unwrap().remove("join_key_codec_id");
             }
         }
-        state_payload.payload = serde_json::to_string(&payload).unwrap();
+        state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
         tampered.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
         assert!(restore_standing_runtime(tampered).is_err());
     }
     let mut tampered_binding = checkpoint.clone();
     let state_payload = tampered_binding.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["execution_binding"]["implementation"]["join_key_codec_id"] =
         Value::String("unknown-composite-key-codec-v9".into());
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     tampered_binding.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(tampered_binding).is_err());
 
@@ -8570,7 +8588,8 @@ fn runtime_materializes_three_input_composite_pk_join_through_binary_dag() {
     let checkpoint = runtime.checkpoint().unwrap();
     assert_eq!(checkpoint.input_frontiers.len(), 3);
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(
         payload["logical_plan"]["execution_implementation"]["join_key_codec_id"],
         COMPOSITE_PK_POSITIONAL_JSON_ARRAY_JOIN_KEY_CODEC_V1
@@ -8697,12 +8716,14 @@ fn three_input_join_order_policy_preserves_results_state_and_legacy_restore() {
     assert_three_input_count_page(reordered.as_ref(), 1, &[("t1", "alice", 24)]);
     let canonical_checkpoint = canonical.checkpoint().unwrap();
     let reordered_checkpoint = reordered.checkpoint().unwrap();
-    let canonical_payload: Value =
-        serde_json::from_str(&canonical_checkpoint.state_payload.as_ref().unwrap().payload)
-            .unwrap();
-    let reordered_payload: Value =
-        serde_json::from_str(&reordered_checkpoint.state_payload.as_ref().unwrap().payload)
-            .unwrap();
+    let canonical_payload: Value = velorix_core::arrow_state::from_state(
+        &canonical_checkpoint.state_payload.as_ref().unwrap().payload,
+    )
+    .unwrap();
+    let reordered_payload: Value = velorix_core::arrow_state::from_state(
+        &reordered_checkpoint.state_payload.as_ref().unwrap().payload,
+    )
+    .unwrap();
     assert_eq!(canonical_payload["graph"], reordered_payload["graph"]);
     assert_eq!(
         canonical_payload["published_output"],
@@ -8849,24 +8870,24 @@ fn three_input_join_epoch_rolls_back_on_overflow_and_restore_rejects_torn_checkp
 
     let mut torn_output = committed.clone();
     let state_payload = torn_output.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["published_output"] = json!({"records": []});
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     assert!(restore_standing_runtime(torn_output).is_err());
 
     let mut torn_epoch = committed;
     let state_payload = torn_epoch.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["graph"]["logical_epoch"] = json!(2);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     assert!(restore_standing_runtime(torn_epoch).is_err());
 
     let mut unknown_policy = runtime.checkpoint().unwrap();
     let state_payload = unknown_policy.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["logical_plan"]["execution"]["plan"]["join_order_policy_id"] =
         json!("unknown-three-input-policy");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     assert!(restore_standing_runtime(unknown_policy).is_err());
 }
 
@@ -8972,17 +8993,18 @@ fn runtime_materializes_non_primary_duplicate_join_across_retract_and_restart() 
 
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(
         payload["join_key_codec_id"],
         "velorix-non-primary-non-null-scalar-join-key-v1"
     );
     let mut wrong_domain = checkpoint.clone();
     let state_payload = wrong_domain.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["join_key_codec_id"] =
         Value::String("velorix-composite-pk-positional-json-array-join-key-v1".into());
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     wrong_domain.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(wrong_domain).is_err());
 
@@ -9138,7 +9160,8 @@ fn runtime_materializes_atomic_self_join_fanout_across_retract_and_restart() {
 
     let checkpoint = checkpoint_after_insert;
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["input_schemas"].as_array().unwrap().len(), 1);
     assert_eq!(
         payload["execution_binding"]["implementation"]["input_fanout_protocol_id"],
@@ -10382,7 +10405,8 @@ fn runtime_materializes_full_join_symmetric_transitions_and_restores_state() {
 
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["plan"]["join_kind"], "full");
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
 
@@ -10591,9 +10615,9 @@ fn runtime_materializes_left_join_right_aggregate_filter_and_restores_state() {
     let checkpoint = runtime.checkpoint().unwrap();
     let mut tampered = checkpoint.clone();
     let state_payload = tampered.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["plan"]["right_value_column_ids"] = json!(["missing_right_value"]);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     tampered.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(tampered).is_err());
 
@@ -10877,7 +10901,8 @@ fn runtime_materializes_right_join_by_swapping_to_left_join_state() {
 
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["plan"]["join_kind"], "left");
     assert_eq!(
         payload["plan"]["left_input_relation_id"],
@@ -12016,7 +12041,7 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
 
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     let aggregate_outputs = payload
         .pointer_mut("/plan/aggregate_outputs")
         .and_then(Value::as_array_mut)
@@ -12027,7 +12052,7 @@ fn runtime_restores_legacy_join_checkpoint_without_aggregate_input_relation_side
             .unwrap()
             .remove("input_relation_side");
     }
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let restored = restore_standing_runtime(checkpoint).unwrap();
@@ -12098,9 +12123,9 @@ fn runtime_rejects_join_checkpoint_without_published_output() {
             && frontier.committed_offset_exclusive == 2
     }));
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload.as_object_mut().unwrap().remove("published_output");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let err = match restore_standing_runtime(checkpoint) {
@@ -13436,11 +13461,12 @@ fn runtime_materializes_two_relation_join_with_cross_relation_or_where_filter() 
 
 #[test]
 fn runtime_materializes_latest_bool_by_key_and_restores_state() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true group by all";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql =
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true group by all";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13464,20 +13490,16 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", true)]);
 
     let checkpoint = runtime.checkpoint().unwrap();
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
@@ -13495,28 +13517,24 @@ fn runtime_materializes_latest_bool_by_key_and_restores_state() {
                 start_offset_inclusive: 3,
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 105, 1),
-                    ("device-b", false, 120, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 105, 1),
+                    ("item-b", false, 120, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        restored.as_ref(),
-        2,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(restored.as_ref(), 2, &[("item-a", true), ("item-b", true)]);
 }
 
 #[test]
 fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13540,11 +13558,11 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 1,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-a", true, 100, i64::MAX)])],
+                batches: vec![item_status_batch(&[("item-a", true, 100, i64::MAX)])],
             }],
         )
         .unwrap();
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
     let checkpoint_before = runtime.checkpoint().unwrap();
     let checkpoint_bytes_before = checkpoint_before
         .state_payload
@@ -13555,9 +13573,10 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
     let frontiers_before = checkpoint_before.input_frontiers.clone();
     let event_time_frontiers_before = checkpoint_before.input_event_time_frontiers.clone();
     let output_frontiers_before = checkpoint_before.output_frontiers.clone();
-    let payload_before: Value = serde_json::from_str(&checkpoint_bytes_before).unwrap();
+    let payload_before: Value =
+        velorix_core::arrow_state::from_state(&checkpoint_bytes_before).unwrap();
 
-    // device-b mutates LatestByKey state before the same device-a
+    // item-b mutates LatestByKey state before the same item-a
     // key/order/value overflows i64::MAX + 1.
     let error = runtime
         .apply_changes(
@@ -13573,9 +13592,9 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-b", false, 200, 1),
-                    ("device-a", true, 100, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-b", false, 200, 1),
+                    ("item-a", true, 100, 1),
                 ])],
             }],
         )
@@ -13603,7 +13622,7 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
         checkpoint_after_failure.output_frontiers,
         output_frontiers_before
     );
-    let payload_after_failure: Value = serde_json::from_str(
+    let payload_after_failure: Value = velorix_core::arrow_state::from_state(
         &checkpoint_after_failure
             .state_payload
             .as_ref()
@@ -13619,7 +13638,7 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
         payload_after_failure["applied_epochs"],
         payload_before["applied_epochs"]
     );
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 
     let retry = runtime
         .apply_changes(
@@ -13635,16 +13654,12 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
                 start_offset_inclusive: 1,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-b", false, 200, 1)])],
+                batches: vec![item_status_batch(&[("item-b", false, 200, 1)])],
             }],
         )
         .unwrap();
     assert_eq!(retry.output_deltas.len(), 1);
-    assert_latest_status_page(
-        runtime.as_ref(),
-        2,
-        &[("device-a", true), ("device-b", false)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-a", true), ("item-b", false)]);
     let checkpoint_after_retry = runtime.checkpoint().unwrap();
     let duplicate = runtime
         .apply_changes(
@@ -13659,11 +13674,11 @@ fn latest_by_key_failed_epoch_rolls_back_mutation_and_allows_same_key_retry() {
 
 #[test]
 fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13687,9 +13702,9 @@ fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 200, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 200, 1),
                 ])],
             }],
         )
@@ -13709,7 +13724,7 @@ fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-c", true, 300, 1)])],
+                batches: vec![item_status_batch(&[("item-c", true, 300, 1)])],
             }],
         )
         .unwrap();
@@ -13718,25 +13733,25 @@ fn latest_by_key_second_epoch_delta_contains_only_the_epoch_change() {
     assert_eq!(
         second.output_deltas[0].delta.net_rows().unwrap(),
         vec![DeltaRecord::new(
-            DeltaKey::from_json(json!("device-c")),
-            DeltaValue::from_json(json!({ "enabled": true })),
+            DeltaKey::from_json(json!("item-c")),
+            DeltaValue::from_json(json!({ "flag": true })),
             1,
         )]
     );
     assert_latest_status_page(
         runtime.as_ref(),
         2,
-        &[("device-a", true), ("device-b", false), ("device-c", true)],
+        &[("item-a", true), ("item-b", false), ("item-c", true)],
     );
 }
 
 #[test]
 fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13760,17 +13775,17 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, i64::MAX),
-                    ("device-b", false, 200, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, i64::MAX),
+                    ("item-b", false, 200, 1),
                 ])],
             }],
         )
         .unwrap();
     let checkpoint_before = runtime.checkpoint().unwrap();
 
-    // Retracting device-b first removes its only key/order/value entry and
-    // prunes the outer key. The later device-a addition then overflows.
+    // Retracting item-b first removes its only key/order/value entry and
+    // prunes the outer key. The later item-a addition then overflows.
     let error = runtime
         .apply_changes(
             2,
@@ -13785,9 +13800,9 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-b", false, 200, -1),
-                    ("device-a", true, 100, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-b", false, 200, -1),
+                    ("item-a", true, 100, 1),
                 ])],
             }],
         )
@@ -13797,11 +13812,7 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
         "overflow must fail the epoch closed: {error}"
     );
     assert_eq!(runtime.checkpoint().unwrap(), checkpoint_before);
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", false)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", false)]);
 
     let retry = runtime
         .apply_changes(
@@ -13817,12 +13828,12 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-b", false, 200, -1)])],
+                batches: vec![item_status_batch(&[("item-b", false, 200, -1)])],
             }],
         )
         .unwrap();
     assert_eq!(retry.output_deltas.len(), 1);
-    assert_latest_status_page(runtime.as_ref(), 2, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-a", true)]);
     let checkpoint_after_retry = runtime.checkpoint().unwrap();
     let duplicate = runtime
         .apply_changes(
@@ -13837,11 +13848,12 @@ fn latest_by_key_failed_retraction_prune_rolls_back_and_allows_same_key_retry() 
 
 #[test]
 fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status where enabled = true group by all";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql =
+        "select key, arg_max(flag, ts) as flag from item_status where flag = true group by all";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13865,9 +13877,9 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
@@ -13875,9 +13887,9 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
 
     let mut checkpoint = runtime.checkpoint().unwrap();
     let state_payload = checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload.as_object_mut().unwrap().remove("published_output");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
 
     let err = match restore_standing_runtime(checkpoint) {
@@ -13889,11 +13901,11 @@ fn runtime_rejects_latest_by_key_checkpoint_without_published_output() {
 
 #[test]
 fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_min(enabled, event_time) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_min(flag, ts) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13917,21 +13929,17 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", false, 80, 1),
-                    ("device-b", true, 70, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", false, 80, 1),
+                    ("item-b", true, 70, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", true)]);
 
     runtime
         .apply_changes(
@@ -13947,28 +13955,24 @@ fn runtime_materializes_earliest_bool_by_key_with_arg_min() {
                 start_offset_inclusive: 4,
                 end_offset_exclusive: 6,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 90, 1),
-                    ("device-b", false, 120, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 90, 1),
+                    ("item-b", false, 120, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        2,
-        &[("device-a", false), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-a", false), ("item-b", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -13992,30 +13996,26 @@ fn runtime_materializes_latest_by_key_with_arg_max_filter_predicate() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 110, 1),
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 120, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 110, 1),
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 120, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(
-        runtime.as_ref(),
-        1,
-        &[("device-a", true), ("device-b", true)],
-    );
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true), ("item-b", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) filter (where enabled = true) as enabled from device_status where event_time > 95 group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) filter (where flag = true) as flag from item_status where ts > 95 group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14039,27 +14039,27 @@ fn runtime_materializes_latest_by_key_with_where_and_arg_max_filter_predicates()
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 5,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 110, 1),
-                    ("device-a", true, 100, 1),
-                    ("device-b", true, 90, 1),
-                    ("device-c", false, 120, 1),
-                    ("device-c", true, 80, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 110, 1),
+                    ("item-a", true, 100, 1),
+                    ("item-b", true, 90, 1),
+                    ("item-c", false, 120, 1),
+                    ("item-c", true, 80, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_cte_source_filters() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "with status_source as (select * from device_status where event_time > 95) select device_id, arg_max(enabled, event_time) as enabled from status_source where enabled = true group by device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "with status_source as (select * from item_status where ts > 95) select key, arg_max(flag, ts) as flag from status_source where flag = true group by key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14083,25 +14083,25 @@ fn runtime_materializes_latest_by_key_cte_source_filters() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_derived_table_source_filters() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select s.device_id, arg_max(s.enabled, s.event_time) as enabled from (select * from device_status where event_time > 95) s where s.enabled = true group by s.device_id";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select s.key, arg_max(s.flag, s.ts) as flag from (select * from item_status where ts > 95) s where s.flag = true group by s.key";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14125,25 +14125,25 @@ fn runtime_materializes_latest_by_key_derived_table_source_filters() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-a", false, 110, 1),
-                    ("device-b", true, 90, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-a", false, 110, 1),
+                    ("item-b", true, 90, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-a", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-a", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device_id desc limit 1";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key order by key desc limit 1";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14167,15 +14167,15 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 110, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 110, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", false)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-b", false)]);
 
     let checkpoint = runtime.checkpoint().unwrap();
     let mut restored = restore_standing_runtime(checkpoint).unwrap();
@@ -14193,21 +14193,21 @@ fn runtime_materializes_latest_by_key_order_by_limit_top_k_and_restores_state() 
                 start_offset_inclusive: 2,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-c", true, 120, 1)])],
+                batches: vec![item_status_batch(&[("item-c", true, 120, 1)])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(restored.as_ref(), 2, &[("device-c", true)]);
+    assert_latest_status_page(restored.as_ref(), 2, &[("item-c", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by device_id desc limit 1 offset 1";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key order by key desc limit 1 offset 1";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14231,15 +14231,15 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 3,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", true, 100, 1),
-                    ("device-b", false, 110, 1),
-                    ("device-c", true, 120, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", true, 100, 1),
+                    ("item-b", false, 110, 1),
+                    ("item-c", true, 120, 1),
                 ])],
             }],
         )
         .unwrap();
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", false)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-b", false)]);
 
     runtime
         .apply_changes(
@@ -14255,20 +14255,20 @@ fn runtime_materializes_latest_by_key_order_by_limit_offset_top_k() {
                 start_offset_inclusive: 3,
                 end_offset_exclusive: 4,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[("device-d", false, 130, 1)])],
+                batches: vec![item_status_batch(&[("item-d", false, 130, 1)])],
             }],
         )
         .unwrap();
-    assert_latest_status_page(runtime.as_ref(), 2, &[("device-c", true)]);
+    assert_latest_status_page(runtime.as_ref(), 2, &[("item-c", true)]);
 }
 
 #[test]
 fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
-    let catalog = device_status_catalog();
+    let catalog = item_status_catalog();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
-    let output_schema = latest_device_status_output_schema();
-    let sql = "select device_id, arg_max(enabled, event_time) as enabled from device_status group by device_id order by arg_max(enabled, event_time) desc limit 1";
-    let identity = standing_identity_with_view(sql, "latest_device_status");
+    let output_schema = latest_item_status_output_schema();
+    let sql = "select key, arg_max(flag, ts) as flag from item_status group by key order by arg_max(flag, ts) desc limit 1";
+    let identity = standing_identity_with_view(sql, "latest_item_status");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
         std::slice::from_ref(&catalog),
@@ -14292,15 +14292,15 @@ fn runtime_materializes_latest_by_key_order_by_arg_max_function_top_k() {
                 start_offset_inclusive: 0,
                 end_offset_exclusive: 2,
                 event_time_watermark: None,
-                batches: vec![device_status_batch(&[
-                    ("device-a", false, 100, 1),
-                    ("device-b", true, 110, 1),
+                batches: vec![item_status_batch(&[
+                    ("item-a", false, 100, 1),
+                    ("item-b", true, 110, 1),
                 ])],
             }],
         )
         .unwrap();
 
-    assert_latest_status_page(runtime.as_ref(), 1, &[("device-b", true)]);
+    assert_latest_status_page(runtime.as_ref(), 1, &[("item-b", true)]);
 }
 
 #[test]
@@ -16109,9 +16109,11 @@ fn assert_join_checkpoint_canonical_equivalent(
     );
     assert_eq!(selected.output_frontiers, reference.output_frontiers);
     let selected_payload: Value =
-        serde_json::from_str(&selected.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&selected.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     let reference_payload: Value =
-        serde_json::from_str(&reference.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&reference.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(
         selected_payload.get("published_output"),
         reference_payload.get("published_output")
@@ -16165,7 +16167,7 @@ fn runtime_join_checkpoint_state(
     DeltaBatch,
 ) {
     let checkpoint = runtime.checkpoint().unwrap();
-    let payload: Value = serde_json::from_str(
+    let payload: Value = velorix_core::arrow_state::from_state(
         &checkpoint
             .state_payload
             .as_ref()
@@ -17566,7 +17568,7 @@ fn assert_latest_status_page(
             ScopedViewId {
                 tenant_id: "tenant-a".to_string(),
                 program_id: "program-purchases".to_string(),
-                view_id: "latest_device_status".to_string(),
+                view_id: "latest_item_status".to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -17577,25 +17579,25 @@ fn assert_latest_status_page(
         .unwrap();
 
     let batch = &page.batches[0];
-    let device_ids = batch
+    let keys = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    let enabled = batch
+    let flag = batch
         .column(1)
         .as_any()
         .downcast_ref::<BooleanArray>()
         .unwrap();
 
     assert_eq!(batch.num_rows(), expected.len());
-    for (index, (device_id, is_enabled)) in expected.iter().enumerate() {
-        assert_eq!(device_ids.value(index), *device_id);
-        assert_eq!(enabled.value(index), *is_enabled);
+    for (index, (key, is_enabled)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
+        assert_eq!(flag.value(index), *is_enabled);
     }
 }
 
-fn assert_device_enabled_flags_page(
+fn assert_item_enabled_flags_page(
     runtime: &(dyn velorix_core::standing_program::StandingProgramRuntime + Send),
     epoch: u64,
     expected: &[(&str, i64)],
@@ -17605,7 +17607,7 @@ fn assert_device_enabled_flags_page(
             ScopedViewId {
                 tenant_id: "tenant-a".to_string(),
                 program_id: "program-purchases".to_string(),
-                view_id: "device_enabled_flags".to_string(),
+                view_id: "item_enabled_flags".to_string(),
             },
             SnapshotPageRequest {
                 committed_epoch: Some(epoch),
@@ -17616,7 +17618,7 @@ fn assert_device_enabled_flags_page(
         .unwrap();
 
     let batch = &page.batches[0];
-    let device_ids = batch
+    let keys = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
@@ -17628,8 +17630,8 @@ fn assert_device_enabled_flags_page(
         .unwrap();
 
     assert_eq!(batch.num_rows(), expected.len());
-    for (index, (device_id, enabled_flag)) in expected.iter().enumerate() {
-        assert_eq!(device_ids.value(index), *device_id);
+    for (index, (key, enabled_flag)) in expected.iter().enumerate() {
+        assert_eq!(keys.value(index), *key);
         assert_eq!(flags.value(index), *enabled_flag);
     }
 }
@@ -18118,15 +18120,15 @@ fn accounts_catalog_with_user_id_key() -> VelorixRelationCatalogV1 {
     catalog
 }
 
-fn device_status_catalog() -> VelorixRelationCatalogV1 {
+fn item_status_catalog() -> VelorixRelationCatalogV1 {
     let relation_schema = VelorixRelationSchemaV1 {
-        relation_id: "device_status".to_string(),
-        relation_name: "device_status".to_string(),
+        relation_id: "item_status".to_string(),
+        relation_name: "item_status".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
         columns: vec![
             RelationColumnV1 {
-                column_id: "device_id".to_string(),
-                name: "device_id".to_string(),
+                column_id: "key".to_string(),
+                name: "key".to_string(),
                 logical_type: VelorixLogicalTypeV1::Utf8,
                 physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
                 nullable: false,
@@ -18134,8 +18136,8 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::PrimaryKey,
             },
             RelationColumnV1 {
-                column_id: "enabled".to_string(),
-                name: "enabled".to_string(),
+                column_id: "flag".to_string(),
+                name: "flag".to_string(),
                 logical_type: VelorixLogicalTypeV1::Bool,
                 physical_arrow_type: ArrowPhysicalTypeV1::Boolean,
                 nullable: false,
@@ -18143,8 +18145,8 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Value,
             },
             RelationColumnV1 {
-                column_id: "event_time".to_string(),
-                name: "event_time".to_string(),
+                column_id: "ts".to_string(),
+                name: "ts".to_string(),
                 logical_type: VelorixLogicalTypeV1::Int64,
                 physical_arrow_type: ArrowPhysicalTypeV1::Int64,
                 nullable: false,
@@ -18161,10 +18163,10 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
                 semantic_role: RelationSemanticRoleV1::Weight,
             },
         ],
-        primary_key_column_ids: vec!["device_id".to_string()],
+        primary_key_column_ids: vec!["key".to_string()],
         weight_column_id: "delta".to_string(),
         allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
-        event_time_column_id: Some("event_time".to_string()),
+        event_time_column_id: Some("ts".to_string()),
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
 
@@ -18174,11 +18176,11 @@ fn device_status_catalog() -> VelorixRelationCatalogV1 {
         relation_schema,
         schema_fingerprint: schema_fingerprint.clone(),
         datafusion_registration: DataFusionRegistrationV1 {
-            name: "device_status".to_string(),
+            name: "item_status".to_string(),
             mode: DataFusionRegistrationModeV1::Table,
         },
         incremental_relation: IncrementalRelationBindingV1 {
-            relation_id: "device_status".to_string(),
+            relation_id: "item_status".to_string(),
             schema_fingerprint,
         },
         incremental_adapter: IncrementalAdapterBindingV1 {
@@ -19234,38 +19236,38 @@ fn purchases_window_stats_output_schema() -> RelationSchema {
     }
 }
 
-fn latest_device_status_output_schema() -> RelationSchema {
+fn latest_item_status_output_schema() -> RelationSchema {
     RelationSchema {
-        relation_id: "latest_device_status".to_string(),
-        relation_name: "latest_device_status".to_string(),
+        relation_id: "latest_item_status".to_string(),
+        relation_name: "latest_item_status".to_string(),
         relation_version: "v1".to_string(),
         schema_fingerprint:
             "sha256:0000000000000000000000000000000000000000000000000000000000000007".to_string(),
         columns: vec![
             ColumnSchema {
-                name: "device_id".to_string(),
+                name: "key".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: false,
             },
             ColumnSchema {
-                name: "enabled".to_string(),
+                name: "flag".to_string(),
                 data_type: SqlDataType::Bool,
                 nullable: false,
             },
         ],
-        primary_key: vec!["device_id".to_string()],
+        primary_key: vec!["key".to_string()],
     }
 }
 
-fn device_status_flag_output_schema() -> RelationSchema {
+fn item_status_flag_output_schema() -> RelationSchema {
     RelationSchema {
-        relation_id: "device_enabled_flags".to_string(),
-        relation_name: "device_enabled_flags".to_string(),
+        relation_id: "item_enabled_flags".to_string(),
+        relation_name: "item_enabled_flags".to_string(),
         relation_version: "2026-05-24.v1".to_string(),
-        schema_fingerprint: "device-status-flag-v1".to_string(),
+        schema_fingerprint: "item-status-flag-v1".to_string(),
         columns: vec![
             ColumnSchema {
-                name: "device_id".to_string(),
+                name: "key".to_string(),
                 data_type: SqlDataType::Utf8,
                 nullable: false,
             },
@@ -19275,7 +19277,7 @@ fn device_status_flag_output_schema() -> RelationSchema {
                 nullable: false,
             },
         ],
-        primary_key: vec!["device_id".to_string()],
+        primary_key: vec!["key".to_string()],
     }
 }
 
@@ -19750,29 +19752,23 @@ fn row_number_logical_plan(
     logical_plan
 }
 
-fn device_status_batch(rows: &[(&str, bool, i64, i64)]) -> RecordBatch {
+fn item_status_batch(rows: &[(&str, bool, i64, i64)]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("device_id", DataType::Utf8, false),
-            Field::new("enabled", DataType::Boolean, false),
-            Field::new("event_time", DataType::Int64, false),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("ts", DataType::Int64, false),
             Field::new("delta", DataType::Int64, false),
         ])),
         vec![
             Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|(device_id, _, _, _)| *device_id)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|(key, _, _, _)| *key).collect::<Vec<_>>(),
             )),
             Arc::new(BooleanArray::from(
-                rows.iter()
-                    .map(|(_, enabled, _, _)| *enabled)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|(_, flag, _, _)| *flag).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
-                rows.iter()
-                    .map(|(_, _, event_time, _)| *event_time)
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|(_, _, ts, _)| *ts).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(
                 rows.iter()
@@ -20600,7 +20596,8 @@ fn late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence() {
     // Evidence is part of the durable checkpoint payload.
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: serde_json::Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["state"]["late_rows_dropped"], 1);
 
     // Restart replays the same evidence and stays exact.
@@ -20646,7 +20643,8 @@ fn late_row_policy_drop_with_evidence_drops_late_rows_and_persists_evidence() {
     );
     let checkpoint = restored.checkpoint().unwrap();
     let payload: serde_json::Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["state"]["late_rows_dropped"], 2);
 }
 
@@ -20711,7 +20709,8 @@ fn drop_with_evidence_failed_overflow_rolls_back_evidence_and_allows_same_key_re
         .payload
         .clone();
     let frontiers_before = checkpoint_before.input_event_time_frontiers.clone();
-    let payload_before: serde_json::Value = serde_json::from_str(&checkpoint_bytes_before).unwrap();
+    let payload_before: serde_json::Value =
+        velorix_core::arrow_state::from_state(&checkpoint_bytes_before).unwrap();
 
     // The late row records evidence first; the following on-time row then
     // overflows SUM(i64::MAX + 1), so both mutations must roll back.
@@ -20754,7 +20753,7 @@ fn drop_with_evidence_failed_overflow_rolls_back_evidence_and_allows_same_key_re
         checkpoint_after_failure.input_event_time_frontiers,
         frontiers_before
     );
-    let payload_after_failure: serde_json::Value = serde_json::from_str(
+    let payload_after_failure: serde_json::Value = velorix_core::arrow_state::from_state(
         &checkpoint_after_failure
             .state_payload
             .as_ref()
@@ -22421,7 +22420,7 @@ fn scalar_aggregate_filter_materializes_and_restores() {
     let checkpoint = runtime.checkpoint().unwrap();
     let mut tampered_checkpoint = checkpoint.clone();
     let state_payload = tampered_checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     let comparison_column = payload["plan"]["outer_comparison_column_id"]
         .as_str()
         .unwrap()
@@ -22436,7 +22435,7 @@ fn scalar_aggregate_filter_materializes_and_restores() {
         .as_object_mut()
         .unwrap()
         .remove(&comparison_column);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     tampered_checkpoint.state_root.content_hash =
         stable_bytes_hash(state_payload.payload.as_bytes());
     let restore_error = match restore_standing_runtime(tampered_checkpoint) {
@@ -22450,7 +22449,7 @@ fn scalar_aggregate_filter_materializes_and_restores() {
 
     let mut nullable_checkpoint = checkpoint.clone();
     let state_payload = nullable_checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     let comparison_column = payload["plan"]["outer_comparison_column_id"]
         .as_str()
         .unwrap()
@@ -22465,7 +22464,7 @@ fn scalar_aggregate_filter_materializes_and_restores() {
         .as_object_mut()
         .unwrap()
         .insert(comparison_column, Value::Null);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     nullable_checkpoint.state_root.content_hash =
         stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(nullable_checkpoint).is_ok());
@@ -23826,7 +23825,7 @@ fn assert_equivalent_lowering(
 
 fn checkpoint_payload_normalized(checkpoint: &RuntimeCheckpoint) -> Value {
     let payload = checkpoint.state_payload.as_ref().unwrap().payload.clone();
-    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&payload).unwrap();
     if let Some(plan) = payload
         .get_mut("logical_plan")
         .and_then(Value::as_object_mut)
@@ -25311,7 +25310,7 @@ fn recursive_cte_restore_rejects_unreachable_state_contamination() {
 
     let mut contaminated = checkpoint.clone();
     let state_payload = contaminated.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     let reverse_key = serde_json::to_string(&json!({"dst": "a", "src": "b"})).unwrap();
     payload["derived_set"][reverse_key] = json!({"src": "b", "dst": "a"});
     payload["published_output"]["records"]
@@ -25322,16 +25321,16 @@ fn recursive_cte_restore_rejects_unreachable_state_contamination() {
             "value": {},
             "weight": 1
         }));
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     contaminated.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(contaminated).is_err());
 
     let mut tampered_output = checkpoint;
     let state_payload = tampered_output.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["published_output"]["records"][0]["value"] = json!({"tampered": true});
     assert!(serde_json::from_value::<DeltaBatch>(payload["published_output"].clone()).is_ok());
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     tampered_output.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(tampered_output).is_err());
 }
@@ -25690,9 +25689,9 @@ fn temporal_join_materializes_asof_match_and_retracts() {
 
     let mut tampered_plan = checkpoint.clone();
     let state_payload = tampered_plan.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["plan"]["left_join_column_id"] = json!("not_the_primary_key");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     tampered_plan.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(tampered_plan)
         .err()
@@ -25701,9 +25700,9 @@ fn temporal_join_materializes_asof_match_and_retracts() {
 
     let mut tampered_output_schema = checkpoint.clone();
     let state_payload = tampered_output_schema.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["output_schema"]["columns"][0]["name"] = json!("wrong_name");
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     tampered_output_schema.state_root.content_hash =
         stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(tampered_output_schema)
@@ -25715,9 +25714,9 @@ fn temporal_join_materializes_asof_match_and_retracts() {
     let mut legacy_checkpoint = checkpoint.clone();
     legacy_checkpoint.identity.sql_hash = stable_bytes_hash(legacy_sql.as_bytes());
     let state_payload = legacy_checkpoint.state_payload.as_mut().unwrap();
-    let mut payload: Value = serde_json::from_str(&state_payload.payload).unwrap();
+    let mut payload: Value = velorix_core::arrow_state::from_state(&state_payload.payload).unwrap();
     payload["view_sql"] = json!(legacy_sql);
-    state_payload.payload = serde_json::to_string(&payload).unwrap();
+    state_payload.payload = velorix_core::arrow_state::to_state(&payload).unwrap();
     legacy_checkpoint.state_root.content_hash = stable_bytes_hash(state_payload.payload.as_bytes());
     assert!(restore_standing_runtime(legacy_checkpoint)
         .err()
@@ -27079,7 +27078,7 @@ fn correction_input(
 
 fn archive_window_state(
     runtime: &mut dyn StandingProgramRuntime,
-    objects: &mut std::collections::BTreeMap<String, String>,
+    objects: &mut std::collections::BTreeMap<String, velorix_core::arrow_state::ArrowState>,
 ) {
     loop {
         let exported = runtime.export_event_time_state().unwrap();
@@ -27103,7 +27102,7 @@ fn archive_window_state(
 fn hydrate_window_state(
     runtime: &mut dyn StandingProgramRuntime,
     inputs: &[RelationInputBatch],
-    objects: &std::collections::BTreeMap<String, String>,
+    objects: &std::collections::BTreeMap<String, velorix_core::arrow_state::ArrowState>,
 ) -> usize {
     let requests = runtime.event_time_state_requests(inputs).unwrap();
     for request in &requests {
@@ -27222,7 +27221,8 @@ fn late_correction_publishes_retracts_expires_and_restores_retained_output() {
     archive_window_state(runtime.as_mut(), &mut objects);
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: serde_json::Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["state"]["rows"].as_object().unwrap().len(), 0);
     assert_eq!(
         payload["published_output"]["records"]
@@ -27511,7 +27511,8 @@ fn late_correction_boundary_noop_last_retraction_and_checkpoint_validation() {
     ] {
         let mut damaged = before.clone();
         let mut payload: serde_json::Value =
-            serde_json::from_str(&damaged.state_payload.as_ref().unwrap().payload).unwrap();
+            velorix_core::arrow_state::from_state(&damaged.state_payload.as_ref().unwrap().payload)
+                .unwrap();
         match damage {
             "missing-output" => payload["published_output"]["records"] = serde_json::json!([]),
             "missing-state" => payload["state"]["rows"] = serde_json::json!({}),
@@ -27528,7 +27529,7 @@ fn late_correction_boundary_noop_last_retraction_and_checkpoint_validation() {
             }
             _ => unreachable!(),
         }
-        let text = serde_json::to_string(&payload).unwrap();
+        let text = velorix_core::arrow_state::to_state(&payload).unwrap();
         damaged.state_root.content_hash = stable_bytes_hash(text.as_bytes());
         damaged.state_payload.as_mut().unwrap().payload = text;
         assert!(
@@ -27812,7 +27813,8 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
     archive_window_state(runtime.as_mut(), &mut durable);
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert!(payload["state"]["rows"].as_object().unwrap().is_empty());
     assert_eq!(payload["cold_state_refs"].as_object().unwrap().len(), 2);
     runtime = restore_standing_runtime(checkpoint.clone()).unwrap();
@@ -27846,17 +27848,18 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
         .unwrap();
     // Rehashed but misbound objects still fail the key/epoch/plan checks.
     for field in ["window_key", "logical_epoch", "runtime_binding"] {
-        let mut object: Value = serde_json::from_str(payload).unwrap();
+        let mut object: Value = velorix_core::arrow_state::from_state(payload).unwrap();
         object[field] = if field == "logical_epoch" {
             json!(0)
         } else {
             json!("wrong")
         };
-        let object = serde_json::to_string(&object).unwrap();
+        let object = velorix_core::arrow_state::to_state(&object).unwrap();
         let hash = stable_bytes_hash(object.as_bytes());
         let mut altered = checkpoint.clone();
         let mut checkpoint_payload: Value =
-            serde_json::from_str(&altered.state_payload.as_ref().unwrap().payload).unwrap();
+            velorix_core::arrow_state::from_state(&altered.state_payload.as_ref().unwrap().payload)
+                .unwrap();
         let reference = &mut checkpoint_payload["cold_state_refs"][&request.window_key];
         let prefix = reference["state_root"]["object_key"]
             .as_str()
@@ -27866,11 +27869,14 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
             .0
             .to_string();
         reference["state_root"]["content_hash"] = json!(hash);
-        reference["state_root"]["object_key"] = json!(format!("{prefix}/{hash}"));
-        let text = serde_json::to_string(&checkpoint_payload).unwrap();
+        reference["state_root"]["object_key"] = json!(format!("{prefix}/{hash}.arrow"));
+        let text = velorix_core::arrow_state::to_state(&checkpoint_payload).unwrap();
         altered.state_root.content_hash = stable_bytes_hash(text.as_bytes());
         altered.state_payload.as_mut().unwrap().payload = text;
         let mut altered_runtime = restore_standing_runtime(altered.clone()).unwrap();
+        // The crafted value tree may use a different lossless integer type.
+        // Compare rollback against the restored runtime's own typed snapshot.
+        let before_hydration = altered_runtime.checkpoint().unwrap();
         let altered_request = altered_runtime
             .event_time_state_requests(&inputs)
             .unwrap()
@@ -27880,9 +27886,14 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
             .unwrap_err()
             .to_string()
             .contains("event_time_state_identity"));
-        assert_eq!(altered_runtime.checkpoint().unwrap(), altered);
+        assert_eq!(altered_runtime.checkpoint().unwrap(), before_hydration);
     }
-    assert!(runtime.hydrate_event_time_state(request, "{}").is_err());
+    assert!(runtime
+        .hydrate_event_time_state(
+            request,
+            &velorix_core::arrow_state::to_state(&json!({})).unwrap()
+        )
+        .is_err());
     assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
     let mut stale = request.clone();
     stale.logical_epoch += 1;
@@ -27959,8 +27970,10 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
         "wrong-version",
     ] {
         let mut checkpoint = checkpoint.clone();
-        let mut payload: Value =
-            serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        let mut payload: Value = velorix_core::arrow_state::from_state(
+            &checkpoint.state_payload.as_ref().unwrap().payload,
+        )
+        .unwrap();
         let key = payload["cold_state_refs"]
             .as_object()
             .unwrap()
@@ -27985,7 +27998,7 @@ fn cold_correction_expired_extrema_avg_missing_corrupt_and_fault_rollback() {
             "wrong-version" => payload["cold_state_version"] = json!(99),
             _ => unreachable!(),
         }
-        let text = serde_json::to_string(&payload).unwrap();
+        let text = velorix_core::arrow_state::to_state(&payload).unwrap();
         checkpoint.state_root.content_hash = stable_bytes_hash(text.as_bytes());
         checkpoint.state_payload.as_mut().unwrap().payload = text;
         assert!(
@@ -28026,7 +28039,8 @@ fn cold_correction_legacy_expired_auxiliary_state_replays_only_requested_window(
         .unwrap();
     let mut checkpoint = runtime.checkpoint().unwrap();
     let mut payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     payload["state"]["rows"] = json!({});
     payload
         .as_object_mut()
@@ -28037,7 +28051,7 @@ fn cold_correction_legacy_expired_auxiliary_state_replays_only_requested_window(
         .as_object_mut()
         .unwrap()
         .remove("legacy_replay_before_ns");
-    let text = serde_json::to_string(&payload).unwrap();
+    let text = velorix_core::arrow_state::to_state(&payload).unwrap();
     checkpoint.state_root.content_hash = stable_bytes_hash(text.as_bytes());
     checkpoint.state_payload.as_mut().unwrap().payload = text;
     runtime = restore_standing_runtime(checkpoint).unwrap();
@@ -28058,9 +28072,10 @@ fn cold_correction_legacy_expired_auxiliary_state_replays_only_requested_window(
     runtime
         .reconstruct_event_time_state(&request, std::slice::from_ref(&original))
         .unwrap();
-    let payload: Value =
-        serde_json::from_str(&runtime.checkpoint().unwrap().state_payload.unwrap().payload)
-            .unwrap();
+    let payload: Value = velorix_core::arrow_state::from_state(
+        &runtime.checkpoint().unwrap().state_payload.unwrap().payload,
+    )
+    .unwrap();
     assert_eq!(payload["state"]["rows"].as_object().unwrap().len(), 1);
     assert!(payload["state"]["rows"]
         .as_object()
@@ -28130,7 +28145,8 @@ fn cold_correction_exports_bounded_chunks_and_keeps_pending_rows_in_rollback_che
     runtime.stage_event_time_state(&refs).unwrap();
     let checkpoint = runtime.checkpoint().unwrap();
     let payload: Value =
-        serde_json::from_str(&checkpoint.state_payload.as_ref().unwrap().payload).unwrap();
+        velorix_core::arrow_state::from_state(&checkpoint.state_payload.as_ref().unwrap().payload)
+            .unwrap();
     assert_eq!(payload["state"]["rows"].as_object().unwrap().len(), 86);
     assert_eq!(payload["cold_state_refs"].as_object().unwrap().len(), 64);
     assert_eq!(runtime.export_event_time_state().unwrap().len(), 64);
@@ -28261,4 +28277,149 @@ fn legacy_none_accepts_unlimited_late_tumble_hop_session_and_top_k() {
             assert!(runtime.export_event_time_state().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn arrow_checkpoint_and_cold_correction_survive_fresh_processes() {
+    use std::{collections::BTreeMap, path::Path};
+    use velorix_core::{arrow_state::ArrowState, standing_program::RuntimeCheckpointStatePayload};
+    const DIR: &str = "VELORIX_RUNTIME_RESTART_TEST_DIR";
+    const PHASE: &str = "VELORIX_RUNTIME_RESTART_TEST_PHASE";
+    const TEST: &str = "arrow_checkpoint_and_cold_correction_survive_fresh_processes";
+    fn save(
+        runtime: &mut dyn StandingProgramRuntime,
+        objects: &mut BTreeMap<String, ArrowState>,
+        path: &Path,
+    ) {
+        archive_window_state(runtime, objects);
+        let mut checkpoint = runtime.checkpoint().unwrap();
+        let body = checkpoint.state_payload.take().unwrap();
+        std::fs::write(path.join("state.arrow"), body.payload.as_bytes()).unwrap();
+        std::fs::write(
+            path.join("descriptor.json"),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+        let mut index = Vec::new();
+        for (i, (key, state)) in objects.iter().enumerate() {
+            let file = format!("retained-{i}.arrow");
+            std::fs::write(path.join(&file), state.as_bytes()).unwrap();
+            index.push((key.clone(), file));
+        }
+        std::fs::write(
+            path.join("retained-index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+    }
+    fn run_child(path: &Path, phase: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(DIR, path)
+            .env(PHASE, phase)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fresh process recovery phase {phase}");
+    }
+    let catalog = purchases_event_time_catalog();
+    if let Some(path) = std::env::var_os(DIR) {
+        let path = std::path::PathBuf::from(path);
+        let mut checkpoint: RuntimeCheckpoint =
+            serde_json::from_slice(&std::fs::read(path.join("descriptor.json")).unwrap()).unwrap();
+        assert!(checkpoint.state_payload.is_none());
+        let state = ArrowState::from_ipc(
+            &std::fs::read(path.join("state.arrow")).unwrap(),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: checkpoint.checkpoint_codec_identity.clone(),
+            payload: state,
+        });
+        let mut runtime = restore_standing_runtime(checkpoint).unwrap();
+        if std::env::var(PHASE).unwrap() == "2" {
+            assert_window_stats_page(
+                runtime.as_ref(),
+                2,
+                &[("alice", 0, 60_000_000_000, 15, 2, 5, 10, 7.5)],
+            );
+            return;
+        }
+        assert_window_stats_page(
+            runtime.as_ref(),
+            1,
+            &[("alice", 0, 60_000_000_000, 10, 1, 10, 10, 10.0)],
+        );
+        let index: Vec<(String, String)> =
+            serde_json::from_slice(&std::fs::read(path.join("retained-index.json")).unwrap())
+                .unwrap();
+        let mut objects = index
+            .into_iter()
+            .map(|(key, file)| {
+                (
+                    key,
+                    ArrowState::from_ipc(
+                        &std::fs::read(path.join(file)).unwrap(),
+                        16 * 1024 * 1024,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let input = vec![correction_input(
+            &catalog,
+            2,
+            600_000_000_000,
+            &[("alice", 5, 10_000_000_000, 1)],
+        )];
+        assert_eq!(hydrate_window_state(runtime.as_mut(), &input, &objects), 1);
+        let commit = runtime
+            .apply_changes(
+                2,
+                EpochIdempotencyKey::new("fresh-process-late-2").unwrap(),
+                input,
+            )
+            .unwrap();
+        assert_eq!(commit.output_deltas[0].delta.records().len(), 2);
+        assert_window_stats_page(
+            runtime.as_ref(),
+            2,
+            &[("alice", 0, 60_000_000_000, 15, 2, 5, 10, 7.5)],
+        );
+        save(runtime.as_mut(), &mut objects, &path);
+        drop(runtime);
+        run_child(&path, "2");
+        return;
+    }
+    let output = purchases_window_stats_output_schema();
+    let sql="select user_id, window_start, window_end, sum(amount) as total_amount, count(*) as event_count, min(amount) as minimum_amount, max(amount) as maximum_amount, avg(amount) as average_amount from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end";
+    let mut runtime = window_runtime_with_policy(
+        &catalog,
+        sql,
+        &output,
+        Some(LateRowPolicy::CorrectWithinHorizon {
+            horizon_ns: 60_000_000_000,
+        }),
+    );
+    runtime
+        .apply_changes(
+            1,
+            EpochIdempotencyKey::new("fresh-process-initial-1").unwrap(),
+            vec![correction_input(
+                &catalog,
+                1,
+                600_000_000_000,
+                &[("alice", 10, 30_000_000_000, 1)],
+            )],
+        )
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().to_path_buf();
+    let mut objects = BTreeMap::new();
+    save(runtime.as_mut(), &mut objects, &path);
+    assert_eq!(objects.len(), 1);
+    drop(runtime);
+    run_child(&path, "1");
+    directory.close().unwrap();
+    assert!(!path.exists());
 }

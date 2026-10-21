@@ -6,7 +6,42 @@ use velorix_runtime::runtime_contract::{
     QueryExecutionPermit,
 };
 
+#[cfg(test)]
+#[path = "query_admission_tests.rs"]
+mod admission_tests;
+
+#[path = "demand_pagination.rs"]
+mod demand_pagination;
+
+#[path = "demand_query_scope.rs"]
+mod demand_query_scope;
+
 pub(super) const DEFAULT_TENANT_ID: &str = "default";
+
+fn uses_demand_query(epoch: Option<u64>, token: Option<&str>) -> bool {
+    token.map_or(epoch.is_none(), demand_pagination::is_continuation)
+}
+
+fn validate_explicit_materialization(
+    state: &ApiState,
+    request: &QueryViewRequest,
+    explicit: bool,
+) -> Result<(), ApiError> {
+    if !explicit {
+        return Ok(());
+    }
+    if !state.authoritative_relation_ingest_enabled() {
+        return Err(ApiError::bad_request(
+            "explicit materialization requires authoritative relation ingest",
+        ));
+    }
+    if request.epoch.is_some() || request.page_token.is_some() {
+        return Err(ApiError::bad_request(
+            "explicit materialization cannot be combined with an epoch or page token; continue the pinned result without materialization controls",
+        ));
+    }
+    Ok(())
+}
 
 pub(super) async fn create_query_policy(
     State(state): State<ApiState>,
@@ -70,6 +105,28 @@ pub(super) async fn query_view_rows_get(
         .await
         .map_err(materialized_view_registry_error_to_api)?;
     validate_direct_view_query_parameter_sources(&active, &parameters)?;
+    if ingest_epoch::is_demand_managed_view(&state, &active).await?
+        && uses_demand_query(
+            page_request.committed_epoch,
+            page_request.page_token.as_deref(),
+        )
+    {
+        return query_physical_demand(
+            state,
+            active,
+            QueryViewRequest {
+                sql: request_sql,
+                parameters,
+                epoch: page_request.committed_epoch,
+                page_token: page_request.page_token,
+                max_rows: page_request.max_rows,
+            },
+            demand_materialization::DemandRequest::default(),
+            format,
+            None,
+        )
+        .await;
+    }
     query_active_view_output_batches_impl(
         state,
         active,
@@ -101,6 +158,28 @@ pub(super) async fn query_view_output_rows_get(
         .read_active(&view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
+    if ingest_epoch::is_demand_managed_view(&state, &active).await?
+        && uses_demand_query(
+            page_request.committed_epoch,
+            page_request.page_token.as_deref(),
+        )
+    {
+        return query_physical_demand(
+            state,
+            active,
+            QueryViewRequest {
+                sql: request_sql,
+                parameters,
+                epoch: page_request.committed_epoch,
+                page_token: page_request.page_token,
+                max_rows: page_request.max_rows,
+            },
+            demand_materialization::DemandRequest::default(),
+            format,
+            Some(output_id),
+        )
+        .await;
+    }
     query_active_view_output_batches_impl(
         state,
         active,
@@ -176,6 +255,28 @@ pub(super) async fn query_view_api_get(
             }
         }
     }
+    if ingest_epoch::is_demand_managed_view(&state, &active).await?
+        && uses_demand_query(
+            page_request.committed_epoch,
+            page_request.page_token.as_deref(),
+        )
+    {
+        return query_physical_demand(
+            state,
+            active,
+            QueryViewRequest {
+                sql: None,
+                parameters,
+                epoch: page_request.committed_epoch,
+                page_token: page_request.page_token,
+                max_rows: page_request.max_rows,
+            },
+            demand_materialization::DemandRequest::default(),
+            format,
+            api.output_relation_id.clone(),
+        )
+        .await;
+    }
     query_active_view_output_batches_impl(
         state,
         active,
@@ -221,8 +322,13 @@ pub(super) async fn query_view_rows_post(
     State(state): State<ApiState>,
     AxumPath(view_id): AxumPath<String>,
     headers: HeaderMap,
-    Json(request): Json<QueryViewRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
+    let explicit_materialization = body.get("materialization").is_some();
+    let envelope: demand_materialization::DemandQueryRequest =
+        serde_json::from_value(body).map_err(ApiError::bad_request)?;
+    let request = envelope.query;
+    validate_explicit_materialization(&state, &request, explicit_materialization)?;
     let format = QueryResponseFormat::negotiate(&headers)?;
     let active = state
         .view_registry()?
@@ -231,6 +337,56 @@ pub(super) async fn query_view_rows_post(
         .map_err(materialized_view_registry_error_to_api)?;
     if request.sql.is_none() {
         validate_direct_view_query_parameter_sources(&active, &request.parameters)?;
+    }
+    if (explicit_materialization || ingest_epoch::is_demand_managed_view(&state, &active).await?)
+        && uses_demand_query(request.epoch, request.page_token.as_deref())
+    {
+        return query_physical_demand(
+            state,
+            active,
+            request,
+            envelope.materialization,
+            format,
+            None,
+        )
+        .await;
+    }
+    if request.page_token.is_some() {
+        if let Some(identity) = active_standing_runtime_identity(&active) {
+            let checkpoint =
+                checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
+                    &state,
+                    identity,
+                    &active.spec.view_id,
+                )
+                .await?;
+            if let Some(record) = checkpoint.filter(|record| {
+                record
+                    .demand_materialization
+                    .as_ref()
+                    .is_some_and(|progress| progress.full_complete)
+            }) {
+                return query_active_view_output_batches_certified(
+                    state,
+                    active,
+                    None,
+                    request.sql,
+                    request.parameters,
+                    QueryReadAuthority {
+                        page: SnapshotPageRequest {
+                            committed_epoch: request.epoch,
+                            page_token: request.page_token,
+                            max_rows: request.max_rows,
+                        },
+                        certified_epoch: Some(record.checkpoint.logical_epoch),
+                        admitted: None,
+                    },
+                    true,
+                )
+                .await?
+                .into_http(format);
+            }
+        }
     }
     query_active_view_output_batches_impl(
         state,
@@ -249,18 +405,246 @@ pub(super) async fn query_view_rows_post(
     .into_http(format)
 }
 
+async fn query_physical_demand(
+    state: ApiState,
+    active: ActiveMaterializedView,
+    request: QueryViewRequest,
+    mut demand: demand_materialization::DemandRequest,
+    format: QueryResponseFormat,
+    requested_output_id: Option<String>,
+) -> Result<Response, ApiError> {
+    if active.lifecycle.admission_status != MaterializedViewAdmissionStatus::Admitted {
+        return Err(ApiError::service_unavailable("view is not admitted"));
+    }
+    let output = resolve_view_query_output_id(&active, requested_output_id.as_deref())?;
+    let schema = active
+        .spec
+        .output_relations
+        .iter()
+        .find(|schema| schema.relation_id == output)
+        .ok_or_else(|| ApiError::bad_request("query output schema missing"))?;
+    let api = active.api.clone().unwrap_or_default();
+    let query_policy =
+        query_policy_for_view_api(&state, &active.api.clone().unwrap_or_default()).await?;
+    let permit = acquire_query_permit(query_policy.policy, query_policy.limiter.as_ref())
+        .map_err(ApiError::bad_request)?;
+    let parameters = if request.sql.is_some() {
+        request.parameters.clone()
+    } else {
+        resolve_request_parameters(&api.request, &request.parameters)?
+    };
+    // Validate and bind the selector before any durable materialization work.
+    validate_standing_runtime_query_contract(
+        &active.spec.view_id,
+        request.sql.as_ref(),
+        &api,
+        &parameters,
+        &SnapshotPageRequest::default(),
+    )?;
+    let (selector, binds) = if let Some(sql) = &request.sql {
+        let bound = render_caller_sql_as_parameterized_bound_sql(sql, &parameters)?;
+        (bound.sql, bound.bind_values)
+    } else if let Some(template) = &api.sql_template {
+        let bound = render_view_sql_template(
+            &normalize_view_query_sql(template, &output),
+            &api.request,
+            &parameters,
+        )?;
+        (bound.sql, bound.bind_values)
+    } else {
+        (
+            format!("SELECT * FROM \"{}\"", output.replace('"', "\"\"")),
+            Vec::new(),
+        )
+    };
+    let continuation_token = request
+        .page_token
+        .as_deref()
+        .filter(|token| demand_pagination::is_continuation(token));
+    if let Some(token) = continuation_token {
+        // A continuation request carries only the signed token. Replay the
+        // scope certified with that token so the next page stays inside the
+        // same certified result instead of re-inferring a different scope.
+        let certified = demand_pagination::continuation_scope_sql(token)?;
+        if demand.scope.is_none() {
+            demand.scope =
+                certified.map(|predicate| demand_materialization::DemandScope { predicate });
+        } else if demand.scope.as_ref().map(|scope| scope.predicate.as_str())
+            != certified.as_deref()
+        {
+            return Err(ApiError::bad_request(
+                "continuation scope does not match the certified demand scope",
+            ));
+        }
+    } else if demand.scope.is_none() {
+        demand.scope = demand_query_scope::infer_scope(
+            &normalize_view_query_sql(&selector, &output),
+            &binds,
+            schema,
+        )
+        .map(|predicate| demand_materialization::DemandScope { predicate });
+    }
+    let page_predicate =
+        demand_scope_page_predicate(demand.scope.as_ref(), &selector, &binds, schema);
+    let source_pageable =
+        request.sql.is_none() && api.sql_template.is_none() && demand.scope.is_none();
+    let scoped_sql = match demand.scope.as_ref() {
+        Some(scope) => format!(
+            "WITH \"{}\" AS (SELECT * FROM \"{}\" WHERE ({})) {}",
+            output.replace('"', "\"\""),
+            output.replace('"', "\"\""),
+            scope.predicate,
+            selector
+        ),
+        None => selector,
+    };
+    let scoped_sql = normalize_view_query_sql(&scoped_sql, &output);
+    query_record_batches_table_with_bindings_and_policy_and_permit(
+        &output,
+        vec![RecordBatch::new_empty(
+            arrow_schema_from_incremental_relation_schema(schema)?,
+        )],
+        &scoped_sql,
+        &binds,
+        query_policy.policy,
+        &permit,
+    )
+    .await
+    .map_err(ApiError::bad_request)?;
+    let continuation = request
+        .page_token
+        .as_deref()
+        .is_some_and(demand_pagination::is_continuation);
+    let first_record = if continuation {
+        None
+    } else {
+        let _turn = state.demand_scheduler.query_turn().await;
+        let outcome = demand_materialization::materialize_demand(
+            &state,
+            &active,
+            &demand,
+            demand_materialization::DemandOrder::Forward,
+            true,
+        )
+        .await?;
+        if !outcome.complete {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"materialization": outcome})),
+            )
+                .into_response());
+        }
+        let identity = active_standing_runtime_identity(&active)
+            .ok_or_else(|| ApiError::bad_request("demand runtime identity unavailable"))?;
+        let record = checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
+            &state,
+            identity,
+            &active.spec.view_id,
+        )
+        .await?
+        .ok_or_else(|| ApiError::conflict("completed demand checkpoint unavailable"))?;
+        if outcome.checkpoint_epoch != Some(record.checkpoint.logical_epoch) {
+            return Err(ApiError::conflict(
+                "demand checkpoint changed before query pinning",
+            ));
+        }
+        Some(record)
+    };
+    let prepared = demand_pagination::prepare_page(
+        &state,
+        &active,
+        &output,
+        &request,
+        demand.scope.as_ref().map(|scope| scope.predicate.as_str()),
+        first_record,
+        query_policy.policy,
+    )
+    .await?;
+    let row_range = source_pageable.then(|| prepared.row_range());
+    let (page, native_page) = demand_pagination::read_output_record(
+        &state,
+        &active,
+        &prepared.record,
+        &output,
+        page_predicate.as_ref(),
+        row_range,
+        query_policy.policy,
+    )
+    .await?;
+    let has_more_native_pages = page.next_page_token.is_some();
+    let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
+        &output,
+        page.batches,
+        &scoped_sql,
+        &binds,
+        query_policy.policy,
+        &permit,
+    )
+    .await
+    .map_err(ApiError::bad_request)?;
+    let result_schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| ApiError::internal("query returned no typed result schema"))?;
+    let response = ViewQueryBatches {
+        response: QueryBatchResponse {
+            schema: result_schema,
+            batches,
+            logical_epoch: page.logical_epoch,
+            next_page_token: None,
+        },
+        policy: query_policy.policy,
+        json_view_schema: if request.sql.is_none() && api.sql_template.is_none() {
+            Some(schema.clone())
+        } else {
+            None
+        },
+        response_schema: if request.sql.is_none() {
+            api.response_schema
+        } else {
+            None
+        },
+        permit,
+    };
+    if source_pageable && native_page {
+        demand_pagination::finish_native_page(prepared, response, has_more_native_pages)?
+    } else {
+        demand_pagination::finish_page(prepared, response)?
+    }
+    .into_http(format)
+}
+
 pub(super) async fn query_view_output_rows_post(
     State(state): State<ApiState>,
     AxumPath((view_id, output_id)): AxumPath<(String, String)>,
     headers: HeaderMap,
-    Json(request): Json<QueryViewRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
+    let explicit_materialization = body.get("materialization").is_some();
+    let envelope: demand_materialization::DemandQueryRequest =
+        serde_json::from_value(body).map_err(ApiError::bad_request)?;
+    let request = envelope.query;
+    validate_explicit_materialization(&state, &request, explicit_materialization)?;
     let format = QueryResponseFormat::negotiate(&headers)?;
     let active = state
         .view_registry()?
         .read_active(&view_id)
         .await
         .map_err(materialized_view_registry_error_to_api)?;
+    resolve_view_query_output_id(&active, Some(&output_id))?;
+    if (explicit_materialization || ingest_epoch::is_demand_managed_view(&state, &active).await?)
+        && uses_demand_query(request.epoch, request.page_token.as_deref())
+    {
+        return query_physical_demand(
+            state,
+            active,
+            request,
+            envelope.materialization,
+            format,
+            Some(output_id),
+        )
+        .await;
+    }
     query_active_view_output_batches_impl(
         state,
         active,
@@ -353,8 +737,56 @@ async fn query_active_view_output_batches_impl(
     page_request: SnapshotPageRequest,
     use_view_api_metadata: bool,
 ) -> Result<ViewQueryBatches, ApiError> {
-    let active = ensure_view_query_ready(&state, active).await?;
-    ensure_view_execution_allowed(&active)?;
+    query_active_view_output_batches_certified(
+        state,
+        active,
+        requested_output_id,
+        request_sql,
+        parameters,
+        QueryReadAuthority {
+            page: page_request,
+            certified_epoch: None,
+            admitted: None,
+        },
+        use_view_api_metadata,
+    )
+    .await
+}
+
+struct QueryReadAuthority {
+    page: SnapshotPageRequest,
+    certified_epoch: Option<u64>,
+    admitted: Option<(ViewQueryPolicy, QueryExecutionPermit)>,
+}
+
+async fn query_active_view_output_batches_certified(
+    state: ApiState,
+    active: ActiveMaterializedView,
+    requested_output_id: Option<String>,
+    request_sql: Option<String>,
+    parameters: BTreeMap<String, Value>,
+    authority: QueryReadAuthority,
+    use_view_api_metadata: bool,
+) -> Result<ViewQueryBatches, ApiError> {
+    let QueryReadAuthority {
+        page: page_request,
+        certified_epoch,
+        admitted,
+    } = authority;
+    let active = if let Some(epoch) = certified_epoch {
+        if (page_request.page_token.is_none() && page_request.committed_epoch != Some(epoch))
+            || active.lifecycle.admission_status != MaterializedViewAdmissionStatus::Admitted
+        {
+            return Err(ApiError::conflict(
+                "demand query does not match certified checkpoint",
+            ));
+        }
+        active
+    } else {
+        let active = ensure_view_query_ready(&state, active).await?;
+        ensure_view_execution_allowed(&active)?;
+        active
+    };
     let output_id = resolve_view_query_output_id(&active, requested_output_id.as_deref())?;
     let active_api = active.api.clone().unwrap_or_default();
     let raw_sql_query = request_sql.is_some();
@@ -369,10 +801,16 @@ async fn query_active_view_output_batches_impl(
     } else {
         resolve_request_parameters(&api.request, &parameters)?
     };
-    let query_policy = query_policy_for_view_api(&state, &active_api).await?;
+    let (query_policy, permit) = match admitted {
+        Some(admitted) => admitted,
+        None => {
+            let policy = query_policy_for_view_api(&state, &active_api).await?;
+            let permit = acquire_query_permit(policy.policy, policy.limiter.as_ref())
+                .map_err(ApiError::bad_request)?;
+            (policy, permit)
+        }
+    };
     let policy = query_policy.policy;
-    let permit = acquire_query_permit(policy, query_policy.limiter.as_ref())
-        .map_err(ApiError::bad_request)?;
     let json_view_schema = if !raw_sql_query && api.sql_template.is_none() {
         active
             .spec
@@ -536,6 +974,7 @@ pub(super) async fn ensure_view_query_ready(
                 )));
             }
         }
+        ensure_published_input_cursors_current(state, &active).await?;
         return Ok(active);
     }
     if view_has_backfill_required_lag(&active) {
@@ -544,6 +983,55 @@ pub(super) async fn ensure_view_query_ready(
 
     ensure_view_execution_allowed(&active)?;
     Ok(active)
+}
+
+/// Producer epochs are local to each dependency; a consumer's own checkpoint
+/// sequence cannot establish freshness. Validate the complete durable cut and
+/// each cursor against that producer's authoritative published head.
+async fn ensure_published_input_cursors_current(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+) -> Result<(), ApiError> {
+    let Some(runtime) = &active.runtime else {
+        return Ok(());
+    };
+    if !runtime
+        .input_bindings
+        .iter()
+        .any(|input| matches!(input, StandingInputBindingV1::PublishedView { .. }))
+    {
+        return Ok(());
+    }
+    let identity = active_standing_runtime_identity(active)
+        .ok_or_else(|| materialization_lag_error(active))?;
+    let record = read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+        .await?
+        .ok_or_else(|| materialization_lag_error(active))?;
+    let inputs = consumer_direct_view_inputs(active, &record)?;
+    for input in inputs {
+        let cursor = &input.cursor;
+        let producer = latest_checkpoint_record_for_scope(
+            state,
+            &cursor.producer_tenant_id,
+            &cursor.producer_program_id,
+            &cursor.producer_view_id,
+        )
+        .await?
+        .ok_or_else(|| materialization_lag_error(active))?;
+        if cursor.output_epoch < producer.checkpoint.logical_epoch {
+            return Err(materialization_lag_error(active));
+        }
+        // Includes equality of epoch, producer identity, stream, schema and
+        // authoritative digest. An ahead/conflicting cursor fails closed.
+        validate_authoritative_view_cursor_commit(
+            state,
+            &input.published_relation,
+            cursor,
+            &producer,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub(super) fn materialization_lag_error(active: &ActiveMaterializedView) -> ApiError {
@@ -567,134 +1055,6 @@ pub(super) fn materialization_lag_error(active: &ActiveMaterializedView) -> ApiE
             "recovery_action": format!("/v1/views/{}/backfill", active.spec.view_id)
         }),
     )
-}
-
-pub(super) struct ActiveViewBackfillStepOutcome {
-    active: ActiveMaterializedView,
-    replay: StandingRuntimeBackfillReplayOutcome,
-}
-
-pub(super) async fn run_view_backfill_step(
-    state: &ApiState,
-    view_id: &str,
-    batch_limit: Option<usize>,
-    range: Option<&BackfillRangeRequest>,
-    scope: Option<&BackfillScopeRequest>,
-) -> Result<BackfillViewResponse, ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    let outcome = run_active_view_backfill_step(state, active, batch_limit, range, scope).await?;
-    let progress = committed_backfill_progress(state, &outcome.active).await?;
-    Ok(backfill_view_response(
-        &outcome.active,
-        if outcome.replay.remaining_batches == 0 {
-            "completed"
-        } else {
-            "advanced"
-        },
-        "sync",
-        outcome.replay.applied_batches,
-        outcome.replay.remaining_batches,
-        progress,
-        state.experimental_advanced_view_features,
-    ))
-}
-
-pub(super) async fn run_active_view_backfill_step(
-    state: &ApiState,
-    active: ActiveMaterializedView,
-    batch_limit: Option<usize>,
-    range: Option<&BackfillRangeRequest>,
-    scope: Option<&BackfillScopeRequest>,
-) -> Result<ActiveViewBackfillStepOutcome, ApiError> {
-    let relations = active
-        .spec
-        .input_relations
-        .iter()
-        .map(|input| (input.relation_id.as_str(), input.relation_version.as_str()))
-        .collect::<BTreeSet<_>>();
-    let mut _relation_guards = Vec::new();
-    for (relation_id, relation_version) in relations {
-        _relation_guards.push(
-            state
-                .relation_operation_lock(relation_id, relation_version)?
-                .lock_owned()
-                .await,
-        );
-    }
-    if view_query_availability(&active.lifecycle) {
-        let progress = committed_backfill_progress(state, &active).await?;
-        if progress.remaining_batches == 0 {
-            if let Some(identity) = active_standing_runtime_identity(&active) {
-                activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id)
-                    .await?;
-            }
-            return Ok(ActiveViewBackfillStepOutcome {
-                active,
-                replay: StandingRuntimeBackfillReplayOutcome::default(),
-            });
-        }
-    } else if !view_has_backfill_required_lag(&active) {
-        ensure_view_execution_allowed(&active)?;
-        return Ok(ActiveViewBackfillStepOutcome {
-            active,
-            replay: StandingRuntimeBackfillReplayOutcome::default(),
-        });
-    }
-    let Some(identity) = active_standing_runtime_identity(&active) else {
-        return Err(ApiError::service_unavailable(format!(
-            "standing_runtime_not_deployed: view `{}` is backfill pending but has no runtime binding",
-            active.spec.view_id
-        )));
-    };
-    let replay_plan = if state
-        .standing_runtime(identity, &active.spec.view_id)?
-        .is_some()
-    {
-        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
-            .await?
-            .as_ref()
-            .map(standing_runtime_replay_plan_from_record_ref)
-            .unwrap_or_default()
-    } else {
-        ensure_standing_runtime_for_active_view(state, &active)
-            .await?
-            .unwrap_or_default()
-    };
-    let replay = replay_committed_ingest_into_standing_runtime_limited(
-        state,
-        &active,
-        &replay_plan,
-        batch_limit,
-        range,
-        scope,
-    )
-    .await?;
-    if range.is_none() && scope.is_none() && replay.remaining_batches == 0 {
-        activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id).await?;
-        state
-            .view_registry()?
-            .update_standing_runtime_lifecycle(
-                &active.spec.view_id,
-                &active.spec_hash,
-                MaterializedViewLifecycleStatus::standing_runtime(),
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-    }
-
-    let refreshed = state
-        .view_registry()?
-        .read_active(&active.spec.view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    Ok(ActiveViewBackfillStepOutcome {
-        active: refreshed,
-        replay,
-    })
 }
 
 pub(super) async fn activate_authoritative_view_bootstrap(
@@ -838,7 +1198,7 @@ async fn query_standing_runtime_batches_with_sql(
     }
 }
 
-async fn standing_runtime_sql_page(
+pub(super) async fn standing_runtime_sql_page(
     state: &ApiState,
     active: &ActiveMaterializedView,
     output_id: &str,
@@ -881,6 +1241,21 @@ fn materialized_sql_predicate(
         .iter()
         .find(|s| s.relation_id == output_id)?;
     velorix_core::query::materialized_page_predicate(sql, schema, binds)
+}
+
+fn demand_scope_page_predicate(
+    scope: Option<&demand_materialization::DemandScope>,
+    selector: &str,
+    binds: &[QueryBindValue],
+    schema: &RelationSchema,
+) -> Option<velorix_core::query::PagePredicate> {
+    match scope {
+        Some(scope) => Some(
+            scope_dependencies::parse_predicate(&scope.predicate, binds, schema)
+                .unwrap_or(velorix_core::query::PagePredicate::Unknown),
+        ),
+        None => velorix_core::query::materialized_page_predicate(selector, schema, binds),
+    }
 }
 
 pub(super) fn validate_standing_runtime_full_snapshot_page(
@@ -1100,10 +1475,17 @@ pub(super) async fn standing_runtime_checkpoint_output_manifest(
         ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
             .map_err(ApiError::bad_request)?
             .0;
-    let Some(publication) = standing_runtime_output_manifest_record_for_checkpoint(
+    if is_materialized_bag_checkpoint(&record.checkpoint) {
+        return Err(ApiError::service_unavailable(
+            "materialized bag materialized output manifest is unavailable",
+        ));
+    }
+    let Some(publication) = standing_runtime_output_manifest_record_for_checkpoint_with_limits(
         &record.checkpoint,
         output_id,
         &checkpoint_key,
+        state.runtime_resource_limits(),
+        state.meta_store.is_some(),
     )?
     else {
         return Ok(None);
@@ -1129,8 +1511,15 @@ pub(super) async fn standing_runtime_page_from_checkpoint_published_output(
     else {
         return Ok(None);
     };
-    let Some(published_output) = standing_runtime_checkpoint_published_output(&record.checkpoint)
-    else {
+    if is_materialized_bag_checkpoint(&record.checkpoint) {
+        return Err(ApiError::service_unavailable(
+            "materialized bag queries require persisted materialized output",
+        ));
+    }
+    let Some(published_output) = standing_runtime_checkpoint_published_output_with_limits(
+        &record.checkpoint,
+        state.runtime_resource_limits(),
+    ) else {
         return Ok(None);
     };
     let output_schema = active
@@ -1153,15 +1542,17 @@ pub(super) async fn standing_runtime_page_from_checkpoint_published_output(
         program_id: identity.program_id.clone(),
         view_id: output_id.to_string(),
     };
-    let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
-        output_schema,
-        &published_output,
-        scoped_view,
-        record.checkpoint.logical_epoch,
-        page_request,
-        aggregate_outputs.as_deref(),
-    )
-    .map_err(ApiError::bad_request)?;
+    let page =
+        velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
+            output_schema,
+            &published_output,
+            scoped_view,
+            record.checkpoint.logical_epoch,
+            page_request,
+            aggregate_outputs.as_deref(),
+            &record.checkpoint,
+        )
+        .map_err(ApiError::bad_request)?;
     Ok(Some(page))
 }
 
@@ -1210,7 +1601,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
     let Some(state_payload) = &checkpoint.state_payload else {
         return Ok(None);
     };
-    let payload: Value = serde_json::from_str(&state_payload.payload)
+    let payload: Value = state_payload
+        .payload
+        .project(&["runtime_kind", "plan", "logical_plan"])
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
     match payload.get("runtime_kind").and_then(Value::as_str) {
         Some(
@@ -1219,6 +1612,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
             | "latest_by_key"
             | "scalar_aggregate_filter"
             | "analytic_window_frame"
+            | "ordered_window"
+            | "generic_set_ops_v1"
+            | "typed_join_project_v1"
             | "two_input_semi_anti_join_project_v1",
         ) => return Ok(None),
         Some(
@@ -1294,6 +1690,229 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
     Ok(Some(supported_view_plan_aggregate_outputs(&plan)))
 }
 
+fn is_materialized_bag_checkpoint(checkpoint: &RuntimeCheckpoint) -> bool {
+    checkpoint
+        .state_payload
+        .as_ref()
+        .and_then(|state| {
+            state
+                .payload
+                .project(&["runtime_kind", "plan", "logical_plan"])
+                .ok()
+        })
+        .and_then(|state| {
+            state
+                .get("runtime_kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|kind| {
+            matches!(
+                kind.as_str(),
+                "generic_set_ops_v1" | "typed_join_project_v1"
+            )
+        })
+}
+pub(super) struct ActiveViewBackfillStepOutcome {
+    active: ActiveMaterializedView,
+    replay: StandingRuntimeBackfillReplayOutcome,
+}
+
+pub(super) async fn run_view_backfill_step(
+    state: &ApiState,
+    view_id: &str,
+    batch_limit: Option<usize>,
+    range: Option<&BackfillRangeRequest>,
+    scope: Option<&BackfillScopeRequest>,
+) -> Result<BackfillViewResponse, ApiError> {
+    let active = state
+        .view_registry()?
+        .read_active(view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    let outcome = run_active_view_backfill_step(state, active, batch_limit, range, scope).await?;
+    let progress = committed_backfill_progress(state, &outcome.active).await?;
+    Ok(backfill_view_response(
+        &outcome.active,
+        if outcome.replay.remaining_batches == 0 {
+            "completed"
+        } else {
+            "advanced"
+        },
+        "sync",
+        outcome.replay.applied_batches,
+        outcome.replay.remaining_batches,
+        progress,
+        state.experimental_advanced_view_features,
+    ))
+}
+
+pub(super) async fn run_active_view_backfill_step(
+    state: &ApiState,
+    active: ActiveMaterializedView,
+    batch_limit: Option<usize>,
+    range: Option<&BackfillRangeRequest>,
+    scope: Option<&BackfillScopeRequest>,
+) -> Result<ActiveViewBackfillStepOutcome, ApiError> {
+    let relations = active
+        .spec
+        .input_relations
+        .iter()
+        .map(|input| (input.relation_id.as_str(), input.relation_version.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut _relation_guards = Vec::new();
+    for (relation_id, relation_version) in relations {
+        _relation_guards.push(
+            state
+                .relation_operation_lock(relation_id, relation_version)?
+                .lock_owned()
+                .await,
+        );
+    }
+    upgrade_existing_published_bootstrap(state, &active).await?;
+    let published_replay = replay_existing_published_commits(state, &active, batch_limit).await?;
+    if published_replay.remaining_batches != 0 {
+        return Ok(ActiveViewBackfillStepOutcome {
+            active,
+            replay: published_replay,
+        });
+    }
+    if view_query_availability(&active.lifecycle) {
+        let progress = committed_backfill_progress(state, &active).await?;
+        if progress.remaining_batches != 0
+            && batch_limit.is_some_and(|limit| published_replay.applied_batches >= limit)
+        {
+            return Ok(ActiveViewBackfillStepOutcome {
+                active,
+                replay: StandingRuntimeBackfillReplayOutcome {
+                    applied_batches: published_replay.applied_batches,
+                    remaining_batches: progress.remaining_batches,
+                },
+            });
+        }
+        if progress.remaining_batches == 0 {
+            if let Some(identity) = active_standing_runtime_identity(&active) {
+                activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id)
+                    .await?;
+            }
+            return Ok(ActiveViewBackfillStepOutcome {
+                active,
+                replay: published_replay,
+            });
+        }
+    } else if !view_has_backfill_required_lag(&active) {
+        ensure_view_execution_allowed(&active)?;
+        return Ok(ActiveViewBackfillStepOutcome {
+            active,
+            replay: StandingRuntimeBackfillReplayOutcome::default(),
+        });
+    }
+    let Some(identity) = active_standing_runtime_identity(&active) else {
+        return Err(ApiError::service_unavailable(format!(
+            "standing_runtime_not_deployed: view `{}` is backfill pending but has no runtime binding",
+            active.spec.view_id
+        )));
+    };
+    let replay_plan = if state
+        .standing_runtime(identity, &active.spec.view_id)?
+        .is_some()
+    {
+        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+            .await?
+            .as_ref()
+            .map(standing_runtime_replay_plan_from_record_ref)
+            .unwrap_or_default()
+    } else {
+        ensure_standing_runtime_for_active_view(state, &active)
+            .await?
+            .unwrap_or_default()
+    };
+    let mut replay = replay_committed_ingest_into_standing_runtime_limited(
+        state,
+        &active,
+        &replay_plan,
+        batch_limit.map(|limit| limit.saturating_sub(published_replay.applied_batches)),
+        range,
+        scope,
+    )
+    .await?;
+    replay.applied_batches += published_replay.applied_batches;
+    if range.is_none() && scope.is_none() && replay.remaining_batches == 0 {
+        activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id).await?;
+        state
+            .view_registry()?
+            .update_standing_runtime_lifecycle(
+                &active.spec.view_id,
+                &active.spec_hash,
+                MaterializedViewLifecycleStatus::standing_runtime(),
+            )
+            .await
+            .map_err(materialized_view_registry_error_to_api)?;
+    }
+
+    let refreshed = state
+        .view_registry()?
+        .read_active(&active.spec.view_id)
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    Ok(ActiveViewBackfillStepOutcome {
+        active: refreshed,
+        replay,
+    })
+}
+
+async fn replay_existing_published_commits(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    batch_limit: Option<usize>,
+) -> Result<StandingRuntimeBackfillReplayOutcome, ApiError> {
+    if batch_limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "backfill batch_limit must be a positive integer",
+        ));
+    }
+    let mut outcome = StandingRuntimeBackfillReplayOutcome::default();
+    if !active
+        .runtime
+        .as_ref()
+        .is_some_and(view_has_published_view_inputs)
+    {
+        return Ok(outcome);
+    }
+    let identity = active_standing_runtime_identity(active)
+        .ok_or_else(|| ApiError::bad_request("consumer runtime identity missing"))?;
+    let Some(record) =
+        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
+    else {
+        return Ok(outcome);
+    };
+    for input in consumer_direct_view_inputs(active, &record)? {
+        let mut cursor = input.cursor;
+        let commits =
+            read_validated_producer_commits_after_cursor(state, &input.published_relation, &cursor)
+                .await?;
+        for commit in commits {
+            if batch_limit.is_some_and(|limit| outcome.applied_batches >= limit) {
+                outcome.remaining_batches += 1;
+                continue;
+            }
+            apply_validated_producer_commit_to_consumer(
+                state,
+                active,
+                &input.published_relation,
+                &cursor.input_edge,
+                &cursor,
+                &commit,
+            )
+            .await?;
+            cursor.output_epoch = commit.logical_epoch;
+            cursor.commit_digest = commit.commit_digest;
+            outcome.applied_batches += 1;
+        }
+    }
+    Ok(outcome)
+}
+
 // Legacy JSON checkpoints still use the established proof/hydration readers.
 // This request-local store bounds their reads before JSON decoding and charges
 // the preceding native-format probe, including warm metadata cache hits.
@@ -1336,12 +1955,11 @@ impl LegacyQueryStore {
         }
         usage.bytes = usage.bytes.saturating_add(bytes);
         if let Some(path) = path {
+            // Scan files are output pages, as in the native reader. State
+            // hydration remains charged against requests and bytes.
             if path
                 .as_ref()
                 .starts_with("v1/standing-runtime-output-pages/")
-                || path
-                    .as_ref()
-                    .starts_with("v1/standing-runtime-state-payloads/")
             {
                 usage.files.insert(path.to_string());
             }
@@ -1511,6 +2129,22 @@ pub(super) async fn legacy_materialized_page(
     })?;
     let mut bounded = state.clone();
     bounded.store = store.clone();
+    // Compressed state can be much larger than its fetched bytes. Enforce the
+    // query memory allowance on the decoded body before Arrow allocates it.
+    if let Some(memory_bytes) = policy.memory_limit_bytes {
+        bounded.max_standing_runtime_state_payload_bytes = bounded
+            .max_standing_runtime_state_payload_bytes
+            // State length already charges expanded typed nodes and strings.
+            // Reserve compressed copies, Arrow buffers and restored state together.
+            .min(usize::try_from(memory_bytes.saturating_sub(16 * 1024) / 8).unwrap_or(usize::MAX));
+    }
+    let cache_hit_store = store.clone();
+    bounded.materialized_read_cache_hit_accountant = Some(Arc::new(move |path, bytes| {
+        let path = ObjectPath::from(path.to_string());
+        cache_hit_store
+            .charge(Some(&path), bytes, true)
+            .map_err(ApiError::bad_request)
+    }));
     let result = async {
         let expected_head = match &state.meta_store {
             Some(meta) => meta
@@ -1543,6 +2177,11 @@ pub(super) async fn legacy_materialized_page(
             }
             standing_runtime_published_output_from_manifest_page(&bounded, &manifest).await?
         } else {
+            // A checkpoint-only publication has one logical output source.
+            // Hydration is metadata for a paged publication, but here the
+            // checkpoint itself supplies the scanned rows.
+            store.usage.lock().unwrap().files.insert(record.checkpoint_key.clone());
+            store.charge(None, 0, false).map_err(ApiError::bad_request)?;
             serde_json::from_value(
                 standing_runtime_checkpoint_published_output(&record.checkpoint)
                     .ok_or_else(|| ApiError::conflict("materialized output is unavailable"))?,
@@ -1569,7 +2208,8 @@ pub(super) async fn legacy_materialized_page(
                 "legacy materialized expansion exceeds query memory budget",
             ));
         }
-        let page = velorix_runtime::materialized_view_runtime::materialized_delta_to_page(
+        let page =
+            velorix_runtime::materialized_view_runtime::materialized_delta_to_page_with_checkpoint(
             schema,
             &published,
             ScopedViewId {
@@ -1580,6 +2220,7 @@ pub(super) async fn legacy_materialized_page(
             record.checkpoint.logical_epoch,
             request,
             aggregates.as_deref(),
+            &record.checkpoint,
         )
         .map_err(ApiError::bad_request)?;
         let retained = store.usage.lock().unwrap().bytes.saturating_mul(16);

@@ -424,7 +424,8 @@ impl StandingProgramRuntime for CrossJoinRuntime {
                 .collect(),
             logical_epoch: self.logical_epoch,
         };
-        let payload = serde_json::to_string(&payload).map_err(|_| invalid_checkpoint())?;
+        let payload =
+            velorix_core::arrow_state::to_state(&payload).map_err(|_| invalid_checkpoint())?;
         let content_hash = stable_bytes_hash(payload.as_bytes());
         Ok(RuntimeCheckpoint {
             identity: self.identity.clone(),
@@ -471,7 +472,8 @@ impl StandingProgramRuntime for CrossJoinRuntime {
             });
         }
         let payload: CrossJoinCheckpointPayloadV2 =
-            serde_json::from_str(&state_payload.payload).map_err(|_| invalid_checkpoint())?;
+            velorix_core::arrow_state::from_state(&state_payload.payload)
+                .map_err(|_| invalid_checkpoint())?;
         if payload.schema_version != CHECKPOINT_PAYLOAD_SCHEMA_VERSION
             || payload.runtime_kind != CROSS_JOIN_RUNTIME_KIND
         {
