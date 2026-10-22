@@ -8,6 +8,7 @@ pub mod collision_audit;
 pub mod delta;
 pub mod delta_to_arrow;
 pub mod engine;
+pub mod example_fixtures;
 pub mod native_operator;
 pub mod operator;
 pub mod operator_contract;

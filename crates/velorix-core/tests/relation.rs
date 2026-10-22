@@ -10,20 +10,23 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
+use velorix_core::example_fixtures::{
+    orders_sum_count_relation_catalog, ORDERS_SUM_COUNT_ADAPTER_ID,
+    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_RELATION_ID,
+    ORDERS_SUM_COUNT_RELATION_VERSION,
+};
 use velorix_core::relation::{
     arrow_record_batches_to_key_value_delta_batch,
     arrow_record_batches_to_orders_sum_count_delta_batch,
     arrow_record_batches_to_single_key_sum_count_delta_batch, datafusion_schema_from_catalog,
-    orders_sum_count_relation_catalog, validate_record_batch_matches_catalog, ArrowPhysicalTypeV1,
-    DataFusionRegistrationModeV1, DataFusionRegistrationV1, DictionaryKeyTypeV1,
-    IncrementalAdapterBindingV1, IncrementalInputAdapterError, IncrementalRelationBindingV1,
-    RelationColumnV1, RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1,
-    SchemaFingerprintV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
+    validate_record_batch_matches_catalog, ArrowPhysicalTypeV1, DataFusionRegistrationModeV1,
+    DataFusionRegistrationV1, DictionaryKeyTypeV1, IncrementalAdapterBindingV1,
+    IncrementalInputAdapterError, IncrementalRelationBindingV1, RelationColumnV1,
+    RelationOperationV1, RelationSchemaError, RelationSemanticRoleV1, SchemaFingerprintV1,
+    VelorixLogicalTypeV1, VelorixRelationCatalogV1, VelorixRelationSchemaV1,
     VelorixRelationSourceV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
     CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_ADAPTER_ID,
-    ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_RELATION_ID,
-    ORDERS_SUM_COUNT_RELATION_VERSION, RELATION_SCHEMA_VERSION_V1,
+    CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 
 const ORDERS_RELATION_SCHEMA_FINGERPRINT: &str =

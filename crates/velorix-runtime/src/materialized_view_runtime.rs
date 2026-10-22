@@ -527,18 +527,16 @@ pub fn materialized_delta_to_page(
     page: SnapshotPageRequest,
     aggregate_outputs: Option<&[SupportedAggregateOutput]>,
 ) -> Result<MaterializedViewPage, StandingProgramRuntimeError> {
-    let (batch, next_page_token) = if aggregate_outputs.is_none()
-        && !looks_like_default_sum_count_output(output_schema)
-    {
-        materialized_generic_delta_page_batch(output_schema, published_output, logical_epoch, page)?
-    } else {
+    let (batch, next_page_token) = if let Some(aggregate_outputs) = aggregate_outputs {
         materialized_delta_page_batch(
             output_schema,
             published_output,
             logical_epoch,
             page,
-            aggregate_outputs,
+            Some(aggregate_outputs),
         )?
+    } else {
+        materialized_generic_delta_page_batch(output_schema, published_output, logical_epoch, page)?
     };
     Ok(MaterializedViewPage {
         view: scoped_view,
@@ -547,13 +545,6 @@ pub fn materialized_delta_to_page(
         batches: vec![batch],
         next_page_token,
     })
-}
-
-fn looks_like_default_sum_count_output(output_schema: &RelationSchema) -> bool {
-    matches!(
-        output_schema.columns.as_slice(),
-        [_, sum, count] if sum.name == "sum" && count.name == "count"
-    )
 }
 
 fn reject_removed_runtime_kind(kind: Option<&str>) -> Result<(), StandingProgramRuntimeError> {
@@ -9613,25 +9604,6 @@ fn validate_published_output(output: &DeltaBatch) -> Result<(), StandingProgramR
         }
     }
     Ok(())
-}
-
-fn fixed_sum_count_outputs() -> Vec<SupportedAggregateOutput> {
-    vec![
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Sum,
-            input_column_id: None,
-            input_relation_side: None,
-            input_expression: None,
-            output_column_id: "sum".to_string(),
-        },
-        SupportedAggregateOutput {
-            function: LogicalPlanAggregateFunctionV1::Count,
-            input_column_id: None,
-            input_relation_side: None,
-            input_expression: None,
-            output_column_id: "count".to_string(),
-        },
-    ]
 }
 
 fn project_aggregate_value(

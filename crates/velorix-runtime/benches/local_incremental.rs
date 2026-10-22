@@ -29,10 +29,11 @@ use serde_json::json;
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
-    relation::{
-        orders_sum_count_relation_catalog, VelorixRelationCatalogV1, ORDERS_SUM_COUNT_RELATION_ID,
+    example_fixtures::{
+        orders_sum_count_relation_catalog, ORDERS_SUM_COUNT_RELATION_ID,
         ORDERS_SUM_COUNT_RELATION_VERSION,
     },
+    relation::VelorixRelationCatalogV1,
     standing_program::{
         BuiltinRuntimeIdentity, EpochIdempotencyKey, NativeCodePolicy, RelationInputBatch,
         RelationInputEncodingV1, RuntimeCheckpoint, ScopedViewId, SnapshotPageRequest,

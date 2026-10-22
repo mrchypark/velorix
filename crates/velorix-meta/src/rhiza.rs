@@ -1,7 +1,7 @@
 //! Minimal embedded Rhiza SQL transport.
 //!
 //! This SQL transport intentionally does not implement `MetaStore`. Rhiza
-//! 0.12 SQL has no engine-assigned authority timestamp; the separate KV
+//! SQL has no engine-assigned authority timestamp; the separate KV
 //! snapshot path carries one proposer-sampled time inside each root-CAS
 //! transition and relies on epoch/token predicates for stale-writer safety.
 
@@ -236,7 +236,7 @@ impl RhizaSqlStore {
         .map_err(|e| RhizaSqlError::Task(format!("Rhiza close task failed: {e}")))?
     }
 
-    /// Rhiza 0.12 has no replicated authority timestamp API.
+    /// Rhiza SQL has no replicated authority timestamp API.
     pub const fn server_serialized_timestamp_available() -> bool {
         false
     }
