@@ -1,4 +1,5 @@
 use super::*;
+use crate::example_fixtures::default_scores_relation_catalog;
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 
 #[tokio::test]

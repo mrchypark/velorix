@@ -30,7 +30,7 @@ async fn authoritative_staged_families_backfill_and_restart_preserve_rows() {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":test_scores_catalog(),"default_orders_sum_count":false}),
+        json!({"catalog":test_scores_catalog()}),
         StatusCode::CREATED,
     )
     .await;
@@ -179,7 +179,7 @@ async fn authoritative_replay_skips_covered_payload_gets_but_rejects_uncovered_c
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
+        json!({"catalog":catalog}),
     )
     .await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");

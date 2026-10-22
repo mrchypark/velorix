@@ -1,4 +1,5 @@
 use super::*;
+use crate::example_fixtures::default_positive_scores_view_request;
 #[path = "generic_demand_materialization_tests.rs"]
 mod generic_demand_materialization_tests;
 #[path = "generic_demand_migration_tests.rs"]
@@ -2381,8 +2382,7 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -3873,8 +3873,7 @@ async fn rest_latest_by_key_cte_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_item_status_catalog()
         }),
     )
     .await;
@@ -3973,8 +3972,7 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog,
-            "default_orders_sum_count": false
+            "catalog": catalog
         }),
     )
     .await;
@@ -4161,8 +4159,7 @@ async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_re
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_item_status_catalog()
         }),
     )
     .await;
@@ -4312,8 +4309,7 @@ async fn rest_latest_by_key_order_by_limit_top_k_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_item_status_catalog()
         }),
     )
     .await;
@@ -4405,8 +4401,7 @@ async fn rest_latest_by_key_order_by_limit_offset_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_item_status_catalog()
         }),
     )
     .await;
@@ -4484,8 +4479,7 @@ async fn rest_ingest_event_time_watermark_requires_declared_event_time_column() 
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -4534,8 +4528,7 @@ async fn rest_ingest_event_time_watermark_rejects_max_below_batch_event_time() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_item_status_catalog()
         }),
     )
     .await;
@@ -4586,8 +4579,7 @@ async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_afte
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -4743,8 +4735,7 @@ async fn rest_tumbling_window_cte_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -4837,8 +4828,7 @@ async fn rest_tumbling_window_order_by_limit_top_k_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -4929,8 +4919,7 @@ async fn rest_tumbling_window_order_by_sum_function_top_k_view_materializes_outp
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -5022,8 +5011,7 @@ async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -5137,8 +5125,7 @@ async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs(
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -5268,8 +5255,7 @@ async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() 
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog,
-            "default_orders_sum_count": false
+            "catalog": catalog
         }),
     )
     .await;
@@ -5394,8 +5380,7 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog,
-            "default_orders_sum_count": false
+            "catalog": catalog
         }),
     )
     .await;
@@ -5512,8 +5497,7 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -5685,8 +5669,7 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog_with_nullable_score()
         }),
     )
     .await;
@@ -5878,8 +5861,7 @@ async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -5996,8 +5978,7 @@ async fn rest_hopping_and_session_window_views_materialize_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -6125,8 +6106,7 @@ async fn rest_session_window_view_materialized_output_survives_api_restart() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -6230,8 +6210,7 @@ async fn rest_late_tumbling_window_view_reports_materialization_lag_on_first_que
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -6400,8 +6379,7 @@ async fn rest_late_hopping_and_session_window_views_report_materialization_lag_o
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -6547,8 +6525,7 @@ async fn rest_unsupported_single_input_sql_admission_fails_closed_without_creati
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -6619,8 +6596,7 @@ async fn rest_unsupported_join_sql_admission_fails_closed_without_creating_view(
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -6701,8 +6677,7 @@ async fn rest_unsupported_three_table_join_admission_fails_closed_without_active
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -6798,8 +6773,7 @@ async fn rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_bind
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -7048,8 +7022,7 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -7182,8 +7155,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -7231,8 +7203,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -7329,8 +7300,7 @@ async fn rest_ingest_commits_metadata_source_cut_only_after_durable_append() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog,
-            "default_orders_sum_count": false
+            "catalog": catalog
         }),
     )
     .await;
@@ -7388,8 +7358,7 @@ async fn rest_ingest_does_not_commit_source_cut_when_durable_append_fails() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog,
-            "default_orders_sum_count": false
+            "catalog": catalog
         }),
     )
     .await;
@@ -7446,8 +7415,7 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -7752,8 +7720,7 @@ async fn rest_relation_scoped_ingest_materializes_views_automatically() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -7843,8 +7810,7 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_order_facts_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_order_facts_catalog()
         }),
     )
     .await;
@@ -8023,8 +7989,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -8086,8 +8051,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -8214,8 +8178,7 @@ async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_r
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_accounts_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_accounts_catalog()
         }),
     )
     .await;
@@ -8319,8 +8282,7 @@ async fn rest_late_filter_project_view_reports_materialization_lag_on_first_quer
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -8402,8 +8364,7 @@ async fn rest_between_predicate_aggregate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_catalog()
         }),
     )
     .await;
@@ -8486,8 +8447,7 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -8723,8 +8683,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9062,8 +9021,7 @@ async fn rest_materialization_rejects_output_delta_over_runtime_budget() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9152,8 +9110,7 @@ async fn rest_epoch_ingest_appends_batches_concurrently() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9228,8 +9185,7 @@ async fn rest_sum_arithmetic_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9320,8 +9276,7 @@ async fn rest_cast_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9406,8 +9361,7 @@ async fn rest_nested_double_colon_cast_int64_aggregate_expression_view_materiali
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9495,8 +9449,7 @@ async fn rest_try_and_safe_cast_int64_aggregate_expression_view_materializes_out
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9584,8 +9537,7 @@ async fn rest_abs_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9675,8 +9627,7 @@ async fn rest_greatest_least_int64_aggregate_expression_view_materializes_output
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -9767,8 +9718,7 @@ async fn rest_coalesce_nullable_int64_aggregate_expression_view_materializes_out
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog_with_nullable_score()
         }),
     )
     .await;
@@ -9859,8 +9809,7 @@ async fn rest_is_not_distinct_from_null_predicate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog_with_nullable_score()
         }),
     )
     .await;
@@ -9948,8 +9897,7 @@ async fn rest_case_when_distinct_from_null_predicate_view_materializes_outputs()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog_with_nullable_score()
         }),
     )
     .await;
@@ -10039,8 +9987,7 @@ async fn rest_case_when_is_null_predicate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog_with_nullable_score()
         }),
     )
     .await;
@@ -10130,8 +10077,7 @@ async fn rest_case_when_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10222,8 +10168,7 @@ async fn rest_case_when_between_and_in_predicate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10315,8 +10260,7 @@ async fn rest_if_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10407,8 +10351,7 @@ async fn rest_multi_branch_case_when_int64_aggregate_expression_view_materialize
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10498,8 +10441,7 @@ async fn rest_simple_case_when_int64_aggregate_expression_view_materializes_outp
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10589,8 +10531,7 @@ async fn rest_min_max_arithmetic_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10681,8 +10622,7 @@ async fn rest_avg_arithmetic_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10770,8 +10710,7 @@ async fn rest_filter_project_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10848,8 +10787,7 @@ async fn rest_filter_project_union_distinct_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -10930,8 +10868,7 @@ async fn rest_filter_project_order_by_limit_view_materializes_top_k_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -11047,8 +10984,7 @@ async fn rest_filter_project_case_over_bool_predicate_materializes_relation_scop
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_item_status_catalog()
         }),
     )
     .await;
@@ -11129,8 +11065,7 @@ async fn rest_filter_project_cte_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -11208,8 +11143,7 @@ async fn rest_filter_project_derived_table_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -11287,8 +11221,7 @@ async fn rest_filter_project_view_materializes_nullable_value_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog_with_nullable_score()
         }),
     )
     .await;
@@ -11371,8 +11304,7 @@ async fn rest_computed_filter_project_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -11449,8 +11381,7 @@ async fn rest_aggregate_having_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -11527,8 +11458,7 @@ async fn rest_count_distinct_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -11635,8 +11565,7 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -12205,6 +12134,24 @@ fn standing_runtime_output_decoder_routes_native_scalar_and_temporal_payloads() 
     )
     .expect_err("unknown explicit runtime kinds must fail closed");
     assert!(error.to_string().contains("future_runtime_kind"));
+
+    for runtime_kind in [
+        "single_key_sum_count",
+        "two_input_join_sum_count",
+        "tumbling_event_time_aggregate",
+    ] {
+        let mut checkpoint = test_runtime_checkpoint(Vec::new());
+        checkpoint.state_payload = Some(RuntimeCheckpointStatePayload {
+            codec_identity: checkpoint.checkpoint_codec_identity.clone(),
+            payload: velorix_core::arrow_state::to_state(&json!({"runtime_kind": runtime_kind}))
+                .unwrap(),
+        });
+        let error = crate::query_serving::standing_runtime_output_aggregate_outputs_for_checkpoint(
+            &checkpoint,
+        )
+        .expect_err("aggregate runtime kinds must not decode as generic without plan metadata");
+        assert!(error.to_string().contains(runtime_kind), "{error:?}");
+    }
 }
 
 #[tokio::test]
@@ -12279,7 +12226,7 @@ async fn rest_scalar_decimal_aggregate_admission_rejects_nullable_and_nonnullabl
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -12355,8 +12302,7 @@ async fn rest_having_count_distinct_function_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -12435,8 +12381,7 @@ async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -12515,8 +12460,7 @@ async fn rest_order_by_limit_top_k_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_catalog()
         }),
     )
     .await;
@@ -12618,8 +12562,7 @@ async fn rest_order_by_limit_offset_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_catalog()
         }),
     )
     .await;
@@ -12698,8 +12641,7 @@ async fn rest_order_by_function_top_k_view_materializes_relation_scoped_ingest()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -12773,8 +12715,7 @@ async fn rest_concurrent_ingest_replays_from_fresh_checkpoint_per_view() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -13220,7 +13161,7 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":test_scores_catalog(),"default_orders_sum_count":false}),
+        json!({"catalog":test_scores_catalog()}),
     )
     .await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -13396,7 +13337,7 @@ async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_scores_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -13505,7 +13446,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_scores_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -13872,7 +13813,7 @@ async fn authoritative_concurrent_same_scope_ingest_reuses_registry_publisher() 
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_scores_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -13945,8 +13886,7 @@ async fn rest_late_view_query_reports_materialization_lag_without_blocking_later
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -14413,7 +14353,7 @@ async fn backfill_progress_counts_weighted_batches_across_packed_epochs_without_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(), "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -14526,8 +14466,7 @@ async fn rest_late_view_backfill_api_reports_coverage_and_runs_limited_steps() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -14685,8 +14624,7 @@ async fn rest_late_single_relation_stats_having_top_k_backfill_api_runs_limited_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -14826,8 +14764,7 @@ async fn rest_late_view_backfill_rejects_offset_range_scope() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -14952,8 +14889,7 @@ async fn rest_late_view_backfill_rejects_predicate_request_scope() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15073,8 +15009,7 @@ async fn rest_late_view_background_backfill_request_fails_closed() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15186,8 +15121,7 @@ async fn rest_view_query_fails_closed_without_published_checkpoint_output() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15260,8 +15194,7 @@ async fn rest_select_star_backfill_activates_authoritative_bootstrap_when_ingest
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15381,8 +15314,7 @@ async fn rest_standing_runtime_output_query_without_sql_reads_materialized_rows_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15472,8 +15404,7 @@ async fn rest_view_compaction_and_openapi_paths_are_available_after_materializat
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15588,8 +15519,7 @@ async fn raw_sql_count_and_sum_use_complete_materialized_input_despite_page_caps
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -15746,7 +15676,7 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -15912,8 +15842,7 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -16054,7 +15983,7 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -16414,7 +16343,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": scores, "default_orders_sum_count": false}),
+        json!({"catalog": scores}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -16731,7 +16660,7 @@ async fn run_join_differential_api_trace(
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -16985,7 +16914,7 @@ async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -17121,7 +17050,7 @@ async fn rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_scores_catalog()}),
     )
     .await;
     assert_eq!(relation_response.0, StatusCode::CREATED);
@@ -17153,7 +17082,7 @@ async fn rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": decimal_scores, "default_orders_sum_count": false}),
+        json!({"catalog": decimal_scores}),
     )
     .await;
     assert_eq!(decimal_relation_response.0, StatusCode::CREATED);
@@ -17253,8 +17182,7 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -17384,8 +17312,7 @@ async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -17489,7 +17416,7 @@ async fn rest_right_join_swaps_operands_and_materializes_unmatched_right_rows() 
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED);
@@ -17591,8 +17518,7 @@ async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -17699,8 +17625,7 @@ async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -17806,8 +17731,7 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -17950,8 +17874,7 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18079,8 +18002,7 @@ async fn rest_two_relation_join_having_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18187,8 +18109,7 @@ async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18295,8 +18216,7 @@ async fn rest_two_relation_join_filtered_count_distinct_view_materializes_output
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18407,8 +18327,7 @@ async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outp
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18513,8 +18432,7 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18638,8 +18556,7 @@ async fn rest_two_relation_join_alias_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18739,8 +18656,7 @@ async fn rest_two_relation_join_where_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18844,8 +18760,7 @@ async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -18948,8 +18863,7 @@ async fn rest_two_relation_join_right_cte_source_filter_view_materializes_output
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -19051,8 +18965,7 @@ async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs(
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -19158,8 +19071,7 @@ async fn rest_two_relation_join_derived_table_source_filter_view_materializes_ou
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog,
-                "default_orders_sum_count": false
+                "catalog": catalog
             }),
         )
         .await;
@@ -19985,8 +19897,7 @@ async fn public_1_0_rejects_experimental_view_surfaces_by_default() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -20280,8 +20191,7 @@ async fn public_1_0_admits_event_time_window_sql_by_default() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_purchases_event_time_catalog()
         }),
     )
     .await;
@@ -20337,7 +20247,7 @@ async fn rest_http_two_writers_materialize_exact_aggregate_with_latency_diagnost
     for (path, body) in [
         (
             "/v1/relations",
-            json!({"catalog":test_order_facts_catalog(),"default_orders_sum_count":false}),
+            json!({"catalog":test_order_facts_catalog()}),
         ),
         (
             "/v1/views",
@@ -20500,7 +20410,7 @@ async fn rest_join_families_materialize_retract_and_restart() {
                 &router,
                 Method::POST,
                 "/v1/relations",
-                json!({"catalog":catalog,"default_orders_sum_count":false}),
+                json!({"catalog":catalog}),
             )
             .await;
             assert_eq!(
@@ -20606,7 +20516,7 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog, "default_orders_sum_count": false}),
+            json!({"catalog": catalog}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -20798,8 +20708,7 @@ async fn rest_relation_admission_rejects_internal_published_view_output_source_k
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog,
-            "default_orders_sum_count": false
+            "catalog": catalog
         }),
     )
     .await;
@@ -20826,7 +20735,7 @@ async fn rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_resto
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": catalog, "default_orders_sum_count": false}),
+        json!({"catalog": catalog}),
     )
     .await;
     assert_eq!(
@@ -21424,8 +21333,7 @@ async fn scenario_relation_view_ingest_query_aggregate() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -21504,8 +21412,7 @@ async fn scenario_multi_epoch_incremental() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -21616,8 +21523,7 @@ async fn scenario_list_views_empty_then_create() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -21654,8 +21560,7 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -22029,8 +21934,7 @@ async fn view_on_view_admission_rejects_cycles_missing_producers_and_ambiguity()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -22123,8 +22027,7 @@ async fn view_on_view_admission_rejects_cycles_missing_producers_and_ambiguity()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": competing_catalog,
-            "default_orders_sum_count": false
+            "catalog": competing_catalog
         }),
     )
     .await;
@@ -22164,8 +22067,7 @@ async fn view_on_view_chain_rejects_cycles_at_admission() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog(),
-            "default_orders_sum_count": false
+            "catalog": test_scores_catalog()
         }),
     )
     .await;
@@ -22520,7 +22422,7 @@ async fn rest_correction_configuration_rejects_invalid_horizons_and_shapes() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -22704,7 +22606,7 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -23066,7 +22968,7 @@ async fn rest_default_session_accepts_late_input_after_closure() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -23096,7 +22998,7 @@ async fn rest_window_archival_drains_multiple_bounded_export_chunks() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -23181,7 +23083,7 @@ async fn correction_restart_regression(authoritative: bool) {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -23507,7 +23409,7 @@ async fn correction_source_commit_fences_concurrent_view_creation_and_backfill()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -23590,7 +23492,7 @@ async fn deploying_correction_view_accepts_far_late_input_after_partial_backfill
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog(), "default_orders_sum_count": false}),
+        json!({"catalog": test_purchases_event_time_catalog()}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -23772,10 +23674,7 @@ async fn explicit_http_scope_migrates_an_existing_eager_checkpoint() {
         .with_experimental_advanced_view_features(true);
     let router = app(state.clone());
     for (path, body) in [
-        (
-            "/v1/relations",
-            json!({"catalog":test_scores_catalog(),"default_orders_sum_count":false}),
-        ),
+        ("/v1/relations", json!({"catalog":test_scores_catalog()})),
         (
             "/v1/views",
             json!({"view_id":"http_scope","input_relation_id":"scores",

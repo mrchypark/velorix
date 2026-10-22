@@ -1532,9 +1532,8 @@ mod tests {
 
     #[test]
     fn source_projection_uses_catalog_ids_and_preserves_artifact_ordinals() {
-        use velorix_core::relation::{
-            orders_sum_count_relation_catalog, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
-        };
+        use crate::example_fixtures::orders_sum_count_relation_catalog;
+        use velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID;
         let mut physical = orders_sum_count_relation_catalog().unwrap().relation_schema;
         physical.columns[0].name = "physical_key".into();
         let catalog = VelorixRelationCatalogV1::from_relation_schema(
@@ -1595,9 +1594,8 @@ mod tests {
 
     #[test]
     fn physical_tumbling_bounds_preserve_ordinals_and_unknown_null_time() {
-        use velorix_core::relation::{
-            orders_sum_count_relation_catalog, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
-        };
+        use crate::example_fixtures::orders_sum_count_relation_catalog;
+        use velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID;
         let mut physical = orders_sum_count_relation_catalog().unwrap().relation_schema;
         let key_id = physical.columns[0].column_id.clone();
         let event_id = physical.columns[1].column_id.clone();

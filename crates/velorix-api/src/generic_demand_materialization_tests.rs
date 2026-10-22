@@ -561,12 +561,7 @@ async fn fixture_with_meta(
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    let response = post(
-        &router,
-        "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
-    )
-    .await;
+    let response = post(&router, "/v1/relations", json!({"catalog":catalog})).await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
     (state, router, store, meta, counts)
 }
@@ -1910,12 +1905,7 @@ async fn reverse_sparse_source_defers_watermark_until_full_closure_after_restart
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    let registered = post(
-        &router,
-        "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
-    )
-    .await;
+    let registered = post(&router, "/v1/relations", json!({"catalog":catalog})).await;
     assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
     let watermark = 120_000_000_000i64;
     let batch = |offset, rows| {
@@ -2128,12 +2118,7 @@ async fn window_replay_preserves_commit_order_across_source_partitions() {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    let registered = post(
-        &router,
-        "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
-    )
-    .await;
+    let registered = post(&router, "/v1/relations", json!({"catalog":catalog})).await;
     assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
     // The earlier commit deliberately has the larger partition ID. Sorting by
     // partition would replay the high watermark before the older, valid row.
@@ -2298,7 +2283,7 @@ async fn fixed_tumbling_scopes_are_available_before_full_coverage_and_survive_re
         &router,
         "/v1/relations",
         json!({
-            "catalog":catalog,"default_orders_sum_count":false
+            "catalog":catalog
         }),
     )
     .await;

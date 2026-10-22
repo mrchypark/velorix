@@ -138,7 +138,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog(),"default_orders_sum_count":false}),
+        json!({"catalog":append_only_scores_catalog()}),
         StatusCode::CREATED,
     )
     .await;
@@ -569,8 +569,7 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog(),
-        "default_orders_sum_count":false}),
+        json!({"catalog":append_only_scores_catalog()}),
         StatusCode::CREATED,
     )
     .await;
@@ -893,7 +892,7 @@ async fn empty_root_global_aggregate_chain_bootstraps_and_updates_automatically(
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog(),"default_orders_sum_count":false}),
+        json!({"catalog":append_only_scores_catalog()}),
         StatusCode::CREATED,
     )
     .await;
@@ -994,7 +993,7 @@ async fn shared_root_history_case(authoritative: bool) {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog(),"default_orders_sum_count":false}),
+        json!({"catalog":append_only_scores_catalog()}),
         StatusCode::CREATED,
     )
     .await;
