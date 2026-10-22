@@ -28,10 +28,6 @@ pub const CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-single-key-sum-count-v1";
 pub const CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str =
     "incremental-adapter-row-key-sum-count-v1";
-pub const ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-orders-sum-count-v1";
-pub const ORDERS_SUM_COUNT_RELATION_ID: &str = "orders";
-pub const ORDERS_SUM_COUNT_RELATION_VERSION: &str = "2026-05-05.v1";
-pub const ORDERS_SUM_COUNT_ADAPTER_ID: &str = ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID;
 pub const CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID: &str = "incremental-adapter-generic-v1";
 const MAX_RELATION_TYPE_NESTING_DEPTH: usize = 16;
 const MAX_RELATION_STRUCT_FIELDS: usize = 256;
@@ -46,17 +42,32 @@ pub enum SupportedIncrementalAdapterSpec {
 pub fn supported_incremental_adapter_spec(
     adapter_id: &str,
 ) -> Option<SupportedIncrementalAdapterSpec> {
-    match adapter_id {
-        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID
-        | ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
-            Some(SupportedIncrementalAdapterSpec::ScalarSumCount)
-        }
-        CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID => {
-            Some(SupportedIncrementalAdapterSpec::RowKeySumCount)
-        }
-        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID => Some(SupportedIncrementalAdapterSpec::Generic),
-        _ => None,
+    if adapter_id == CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID {
+        Some(SupportedIncrementalAdapterSpec::RowKeySumCount)
+    } else if adapter_id == CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID {
+        Some(SupportedIncrementalAdapterSpec::Generic)
+    } else if is_scalar_sum_count_adapter_id(adapter_id) {
+        Some(SupportedIncrementalAdapterSpec::ScalarSumCount)
+    } else {
+        None
     }
+}
+
+/// Scalar sum-count adapters follow the `incremental-adapter-<name>-sum-count-v1`
+/// family so operators can name their own single-key sum/count relations.
+fn is_scalar_sum_count_adapter_id(adapter_id: &str) -> bool {
+    let Some(name) = adapter_id
+        .strip_prefix("incremental-adapter-")
+        .and_then(|rest| rest.strip_suffix("-sum-count-v1"))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,52 +234,6 @@ impl VelorixRelationCatalogV1 {
             }
         }
     }
-}
-
-pub fn orders_sum_count_relation_catalog() -> Result<VelorixRelationCatalogV1, RelationSchemaError>
-{
-    let relation_schema = VelorixRelationSchemaV1 {
-        relation_id: ORDERS_SUM_COUNT_RELATION_ID.to_string(),
-        relation_name: "orders".to_string(),
-        relation_version: ORDERS_SUM_COUNT_RELATION_VERSION.to_string(),
-        columns: vec![
-            RelationColumnV1 {
-                column_id: "account_id".to_string(),
-                name: "account_id".to_string(),
-                logical_type: VelorixLogicalTypeV1::Utf8,
-                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
-                nullable: false,
-                ordinal: 0,
-                semantic_role: RelationSemanticRoleV1::PrimaryKey,
-            },
-            RelationColumnV1 {
-                column_id: "amount".to_string(),
-                name: "amount".to_string(),
-                logical_type: VelorixLogicalTypeV1::Int64,
-                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
-                nullable: false,
-                ordinal: 1,
-                semantic_role: RelationSemanticRoleV1::Value,
-            },
-            RelationColumnV1 {
-                column_id: "weight".to_string(),
-                name: "weight".to_string(),
-                logical_type: VelorixLogicalTypeV1::Int64,
-                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
-                nullable: false,
-                ordinal: 2,
-                semantic_role: RelationSemanticRoleV1::Weight,
-            },
-        ],
-        primary_key_column_ids: vec!["account_id".to_string()],
-        weight_column_id: "weight".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
-        event_time_column_id: None,
-    };
-    VelorixRelationCatalogV1::from_relation_schema(
-        relation_schema,
-        ORDERS_SUM_COUNT_ADAPTER_ID.to_string(),
-    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1872,9 +1837,9 @@ fn incremental_key_column<'a>(
         | ArrowPhysicalTypeV1::Map { .. } => {
             Err(IncrementalInputAdapterError::MalformedArrowInput {
                 reason: format!(
-                "`{}` column uses a nested Arrow type that is not supported as an incremental key",
-                column.name
-            ),
+                    "`{}` column uses a nested Arrow type that is not supported as an incremental key",
+                    column.name
+                ),
             })
         }
     }
@@ -2322,4 +2287,52 @@ fn validate_timezone(timezone: Option<&str>) -> Result<(), RelationSchemaError> 
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod adapter_family_tests {
+    use super::{
+        supported_incremental_adapter_spec, SupportedIncrementalAdapterSpec,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    };
+
+    #[test]
+    fn scalar_sum_count_family_accepts_operator_named_relations() {
+        assert_eq!(
+            supported_incremental_adapter_spec(CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID),
+            Some(SupportedIncrementalAdapterSpec::ScalarSumCount)
+        );
+        assert_eq!(
+            supported_incremental_adapter_spec("incremental-adapter-meter-events-sum-count-v1"),
+            Some(SupportedIncrementalAdapterSpec::ScalarSumCount)
+        );
+        assert_eq!(
+            supported_incremental_adapter_spec(CATALOG_ROW_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID),
+            Some(SupportedIncrementalAdapterSpec::RowKeySumCount)
+        );
+        assert_eq!(
+            supported_incremental_adapter_spec(CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID),
+            Some(SupportedIncrementalAdapterSpec::Generic)
+        );
+    }
+
+    #[test]
+    fn scalar_sum_count_family_rejects_malformed_and_unknown_ids() {
+        for adapter_id in [
+            "incremental-adapter--sum-count-v1",
+            "incremental-adapter-sum-count-v1",
+            "incremental-adapter-Meter-sum-count-v1",
+            "incremental-adapter-meter_sum_count-v1",
+            "incremental-adapter-meter-sum-count-v2",
+            "meter-sum-count-v1",
+            "incremental-adapter-meter-v1",
+        ] {
+            assert_eq!(
+                supported_incremental_adapter_spec(adapter_id),
+                None,
+                "{adapter_id}"
+            );
+        }
+    }
 }

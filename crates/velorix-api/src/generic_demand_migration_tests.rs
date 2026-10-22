@@ -261,12 +261,7 @@ async fn run_case(derived: bool) {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    request(
-        &router,
-        "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
-    )
-    .await;
+    request(&router, "/v1/relations", json!({"catalog":catalog})).await;
     declare(&router, "migration_source", "scores", "2026-05-24.v1").await;
     seed_legacy_eager_checkpoint_for_compatibility(&state, "migration_source").await;
     append(&router, 0, 7).await;
@@ -423,12 +418,7 @@ async fn derived_pause_resume_preserves_cursors_without_physical_source_cut() {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    request(
-        &router,
-        "/v1/relations",
-        json!({"catalog":catalog,"default_orders_sum_count":false}),
-    )
-    .await;
+    request(&router, "/v1/relations", json!({"catalog":catalog})).await;
     append(&router, 0, 9).await;
     declare(&router, "control_source", "scores", "2026-05-24.v1").await;
     finish(&state, "control_source").await;

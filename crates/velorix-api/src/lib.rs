@@ -95,12 +95,9 @@ use velorix_core::{
     delta::DeltaBatch,
     query::{QueryBindValue, QueryPolicy},
     relation::{
-        datafusion_schema_from_catalog, orders_sum_count_relation_catalog, ArrowPhysicalTypeV1,
-        DataFusionRegistrationModeV1, DataFusionRegistrationV1, DictionaryKeyTypeV1,
-        IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
-        RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
-        VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
-        CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
+        datafusion_schema_from_catalog, ArrowPhysicalTypeV1, DictionaryKeyTypeV1, RelationColumnV1,
+        RelationOperationV1, VelorixLogicalTypeV1, VelorixRelationCatalogV1,
+        VelorixRelationSourceV1,
     },
     standing_program::{
         BuiltinRuntimeIdentity, CausalCutV1, CausalViewCursorV1, EpochIdempotencyKey,
@@ -147,6 +144,17 @@ use velorix_core::{
         OUTPUT_PUBLICATION_PROTOCOL_VERSION_V1,
     },
 };
+
+#[cfg(test)]
+use velorix_core::relation::{
+    DataFusionRegistrationModeV1, DataFusionRegistrationV1, IncrementalAdapterBindingV1,
+    IncrementalRelationBindingV1, RelationSemanticRoleV1, SchemaFingerprintV1,
+    VelorixRelationSchemaV1, CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
+    RELATION_SCHEMA_VERSION_V1,
+};
+
+#[cfg(test)]
+mod example_fixtures;
 use velorix_runtime::{
     query_policy_catalog::{
         QueryPolicyCatalogError, QueryPolicyCatalogRecord, QueryPolicyCatalogStore,
@@ -1829,14 +1837,6 @@ pub fn app(state: ApiState) -> Router {
     let protected_routes = Router::new()
         .route("/v1/relations", post(create_relation))
         .route(
-            "/v1/relations/orders-default",
-            post(create_default_orders_relation),
-        )
-        .route(
-            "/v1/relations/scores-default",
-            post(create_default_scores_relation),
-        )
-        .route(
             "/v1/relations/{relation_id}/ingest",
             post(ingest_relation_rows),
         )
@@ -1847,10 +1847,6 @@ pub fn app(state: ApiState) -> Router {
             get(get_query_policy),
         )
         .route("/v1/views", get(list_views).post(create_view))
-        .route(
-            "/v1/views/scores-positive-default",
-            post(create_default_positive_scores_view),
-        )
         .route("/v1/views/{view_id}", get(get_view))
         .route(
             "/v1/views/{view_id}/backfill",
@@ -1940,95 +1936,6 @@ fn require_bearer_token(
     } else {
         Err(ApiError::unauthorized(error))
     }
-}
-
-const DEFAULT_SCORES_RELATION_ID: &str = "scores";
-const DEFAULT_SCORES_RELATION_VERSION: &str = "2026-05-24.v1";
-const DEFAULT_POSITIVE_SCORES_VIEW_ID: &str = "positive_scores_by_user";
-const DEFAULT_POSITIVE_SCORES_SQL: &str = "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id";
-
-fn default_scores_relation_catalog() -> Result<VelorixRelationCatalogV1, ApiError> {
-    let relation_schema = VelorixRelationSchemaV1 {
-        relation_id: DEFAULT_SCORES_RELATION_ID.to_string(),
-        relation_name: DEFAULT_SCORES_RELATION_ID.to_string(),
-        relation_version: DEFAULT_SCORES_RELATION_VERSION.to_string(),
-        columns: vec![
-            RelationColumnV1 {
-                column_id: "user_id".to_string(),
-                name: "user_id".to_string(),
-                logical_type: VelorixLogicalTypeV1::Utf8,
-                physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
-                nullable: false,
-                ordinal: 0,
-                semantic_role: RelationSemanticRoleV1::PrimaryKey,
-            },
-            RelationColumnV1 {
-                column_id: "score".to_string(),
-                name: "score".to_string(),
-                logical_type: VelorixLogicalTypeV1::Int64,
-                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
-                nullable: false,
-                ordinal: 1,
-                semantic_role: RelationSemanticRoleV1::Value,
-            },
-            RelationColumnV1 {
-                column_id: "delta".to_string(),
-                name: "delta".to_string(),
-                logical_type: VelorixLogicalTypeV1::Int64,
-                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
-                nullable: false,
-                ordinal: 2,
-                semantic_role: RelationSemanticRoleV1::Weight,
-            },
-        ],
-        primary_key_column_ids: vec!["user_id".to_string()],
-        weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
-        event_time_column_id: None,
-    };
-    let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
-        .map_err(ApiError::bad_request)?;
-    Ok(VelorixRelationCatalogV1 {
-        relation_source: VelorixRelationSourceV1::SourceRelation,
-        schema_version: RELATION_SCHEMA_VERSION_V1,
-        relation_schema,
-        schema_fingerprint: schema_fingerprint.clone(),
-        datafusion_registration: DataFusionRegistrationV1 {
-            name: DEFAULT_SCORES_RELATION_ID.to_string(),
-            mode: DataFusionRegistrationModeV1::Table,
-        },
-        incremental_relation: IncrementalRelationBindingV1 {
-            relation_id: DEFAULT_SCORES_RELATION_ID.to_string(),
-            schema_fingerprint,
-        },
-        incremental_adapter: IncrementalAdapterBindingV1 {
-            adapter_id: CATALOG_SINGLE_KEY_SUM_COUNT_INCREMENTAL_ADAPTER_ID.to_string(),
-        },
-    })
-}
-
-fn default_positive_scores_view_request(
-    _catalog: &VelorixRelationCatalogV1,
-) -> Result<CreateViewRequest, ApiError> {
-    Ok(CreateViewRequest {
-        view_id: DEFAULT_POSITIVE_SCORES_VIEW_ID.to_string(),
-        url_path: Some("/scores/positive".to_string()),
-        output_relation_id: None,
-        input_relation_id: DEFAULT_SCORES_RELATION_ID.to_string(),
-        input_relation_version: DEFAULT_SCORES_RELATION_VERSION.to_string(),
-        input_relation_refs: Vec::new(),
-        input_relations: Vec::new(),
-        sql: DEFAULT_POSITIVE_SCORES_SQL.to_string(),
-        source_kind: SqlSourceKind::StandingView,
-        output_relation_ids: Vec::new(),
-        sql_template: None,
-        description: Some("Positive score totals by user".to_string()),
-        request: Vec::new(),
-        response_schema: None,
-        response_formats: vec!["json".to_string()],
-        query_policy_id: None,
-        correction_horizon_ns: None,
-    })
 }
 
 pub async fn run_from_env() -> anyhow::Result<()> {
@@ -2343,10 +2250,7 @@ mod api_shutdown_tests {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateRelationRequest {
-    #[serde(default)]
-    pub catalog: Option<VelorixRelationCatalogV1>,
-    #[serde(default)]
-    pub default_orders_sum_count: bool,
+    pub catalog: VelorixRelationCatalogV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2931,33 +2835,11 @@ fn standing_runtime_fencing_capability_json(
     })
 }
 
-async fn create_default_orders_relation(
-    State(state): State<ApiState>,
-) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
-    let catalog = orders_sum_count_relation_catalog().map_err(ApiError::bad_request)?;
-    create_relation_catalog(state, catalog).await
-}
-
-async fn create_default_scores_relation(
-    State(state): State<ApiState>,
-) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
-    create_relation_catalog(state, default_scores_relation_catalog()?).await
-}
-
 async fn create_relation(
     State(state): State<ApiState>,
     Json(request): Json<CreateRelationRequest>,
 ) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
-    let catalog = match (request.catalog, request.default_orders_sum_count) {
-        (Some(catalog), false) | (Some(catalog), true) => catalog,
-        (None, true) => orders_sum_count_relation_catalog().map_err(ApiError::bad_request)?,
-        (None, false) => {
-            return Err(ApiError::bad_request(
-                "request must include `catalog` or set `default_orders_sum_count`",
-            ))
-        }
-    };
-    create_relation_catalog(state, catalog).await
+    create_relation_catalog(state, request.catalog).await
 }
 
 async fn create_relation_catalog(
@@ -3017,20 +2899,6 @@ async fn materialize_relation_catalog_to_object_store(
         .create(catalog)
         .await
         .map_err(ApiError::internal)
-}
-
-async fn create_default_positive_scores_view(
-    State(state): State<ApiState>,
-) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
-    let catalog = read_relation_catalog(
-        &state,
-        DEFAULT_SCORES_RELATION_ID,
-        DEFAULT_SCORES_RELATION_VERSION,
-    )
-    .await?;
-    let request = default_positive_scores_view_request(&catalog)?;
-
-    create_view(State(state), Json(request)).await
 }
 
 async fn get_standing_runtime_owners(
@@ -4290,7 +4158,10 @@ fn validate_response_schema_template_column(
     }
     Err(ApiError::bad_request(format!(
         "standing runtime view `{view_id}` response schema column `{}` type `{}` is incompatible with template result source `{}` type `{:?}`",
-        column.name, column.r#type, column.source, field.data_type()
+        column.name,
+        column.r#type,
+        column.source,
+        field.data_type()
     )))
 }
 
@@ -5916,12 +5787,12 @@ fn typed_sql_literal_bind_value_for_json_value(
             "is_date" => {
                 return canonical_date_literal(name, value)
                     .map(QueryBindValue::Date)
-                    .map(Some)
+                    .map(Some);
             }
             "is_time" => {
                 return canonical_time_literal(name, value)
                     .map(QueryBindValue::Time)
-                    .map(Some)
+                    .map(Some);
             }
             "is_timestamp" => {
                 return canonical_timestamp_literal(name, value)
@@ -5931,7 +5802,7 @@ fn typed_sql_literal_bind_value_for_json_value(
             "is_uuid" => {
                 return canonical_uuid_literal(name, value)
                     .map(QueryBindValue::Uuid)
-                    .map(Some)
+                    .map(Some);
             }
             "is_decimal" => {
                 return canonical_decimal_literal(name, value)

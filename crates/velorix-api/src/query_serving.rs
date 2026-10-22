@@ -1626,7 +1626,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
         ) => return Ok(Some(Vec::new())),
         Some("two_input_join_sum_count" | "two_input_join_common_dag_reference_v1") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-                return Ok(None);
+                return Err(ApiError::bad_request(
+                    "two_input_join_sum_count checkpoint is missing its admitted plan",
+                ));
             };
             let plan: SupportedJoinViewPlan = serde_json::from_value(plan.clone())
                 .map_err(|source| ApiError::bad_request(source.to_string()))?;
@@ -1661,7 +1663,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
         }
         Some("tumbling_event_time_aggregate") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-                return Ok(None);
+                return Err(ApiError::bad_request(
+                    "tumbling_event_time_aggregate checkpoint is missing its admitted plan",
+                ));
             };
             let plan: SupportedTumblingWindowPlan = serde_json::from_value(plan.clone())
                 .map_err(|source| ApiError::bad_request(source.to_string()))?;
@@ -1669,7 +1673,9 @@ pub(super) fn standing_runtime_output_aggregate_outputs_for_checkpoint(
         }
         Some("single_key_sum_count") => {
             let Some(plan) = payload.get("plan").filter(|plan| !plan.is_null()) else {
-                return Ok(None);
+                return Err(ApiError::bad_request(
+                    "single_key_sum_count checkpoint is missing its admitted plan",
+                ));
             };
             let plan: SupportedViewPlan = serde_json::from_value(plan.clone())
                 .map_err(|source| ApiError::bad_request(source.to_string()))?;

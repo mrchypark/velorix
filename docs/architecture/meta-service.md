@@ -4,7 +4,9 @@ The metadata service owns hot control-plane metadata. Object storage owns large
 artifacts, checkpoint payloads, and the durable recovery archive. Foyer remains a
 non-authoritative local cache only.
 
-The product path is the embedded Rhiza KV backend. It is not production
+The product path is the embedded Rhiza KV backend, implemented against the
+`rhizadb = { version = "=0.19.0", optional = true }` API pinned by
+`crates/velorix-meta`. It is not production
 multi-writer safe and does not provide bounded wall-clock failover: the backend
 reports `authoritative_backend_time=false`,
 `backend_time_source_kind=process_clock`,
@@ -15,6 +17,13 @@ Those values are the current product truth and must not be relabeled to clear a
 release gate. What exists today is a no-PVC manual generation replacement shown
 by the official operator's `RhizaRecovery`; automatic operator fencing is not
 part of that evidence.
+
+The operator-managed runtime opens `RhizaKvMetaStore` from the native
+`RHIZA_*` environment and starts the operator recovery listener on the same
+database handle. The separate Rhiza SQL transport does not implement `MetaStore`
+and Rhiza SQL does not supply an engine-assigned authority timestamp; metadata
+uses the KV root-CAS path, whose proposer-sampled clock does not establish
+bounded failover.
 
 ## First Meta API Slice
 

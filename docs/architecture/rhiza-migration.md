@@ -1,16 +1,16 @@
-# Rhiza KV MetaStore Migration (0.12.0)
+# Rhiza KV MetaStore Migration (0.19.0)
 
 Status: the embedded Rhiza KV transport, bounded root/page snapshot path, and
-all 33 `RhizaKvMetaStore` methods are implemented. Native library tests pass;
-the full runtime wiring and
-production migration remain unverified. This is not a production-readiness or
-end-to-end success claim.
+all 35 `RhizaKvMetaStore` methods are implemented. The runtime/meta service is
+wired to open the operator-managed store; production migration remains
+unverified. This is not a production-readiness or end-to-end success claim.
 
 The library user enables `rhiza-backend`, opens a `rhizadb::Config` with its
 local working `DataDir`, and constructs `RhizaKvMetaStore::new(kv)`.
 Local restart tests retain this directory; no-PVC deployments instead need
-verified recovery from shared object storage. The runtime CLI/Meta service
-is not wired to this backend yet.
+verified recovery from shared object storage. In operator-managed mode the
+meta service opens `RhizaKvMetaStore` from the native `RHIZA_*` environment and
+starts the recovery listener on that same database handle.
 
 Local verification for this KV increment: 14 library tests, 5 SQL transport
 tests, 5 KV/snapshot tests, and 3 MetaStore integration tests passed. The latter
@@ -22,12 +22,8 @@ clippy pass with `-D warnings`; the runtime regression suites pass 54 unit and
 
 ## Verified published artifact
 
-The published dependency is `rhizadb = "0.12.0"`. The source was inspected
-from Cargo's registry cache and cross-checked against the [official v0.12.0
-README](https://github.com/mrchypark/rhiza/blob/v0.12.0/sdk/rust/README.md),
-[embedded example](https://raw.githubusercontent.com/mrchypark/rhiza/v0.12.0/sdk/rust/examples/embedded.rs),
-and source commit
-[`3b5a5a07aaf83b5ed279f75b920395bda7179577`](https://github.com/mrchypark/rhiza/commit/3b5a5a07aaf83b5ed279f75b920395bda7179577).
+The crate pins `rhizadb = "=0.19.0"`; the Rhiza KV implementation targets
+that version's API.
 
 Usable Rust surface:
 
@@ -49,6 +45,12 @@ multi-statement SQL transaction. Each statement can carry `args`,
 references. `INSERT OR REPLACE`, guarded updates, and `PRAGMA table_info`
 were exercised successfully in an isolated create/write/read/close/reopen
 probe. The probe used no server.
+
+The SQL transport is separate from the KV-backed metadata store: it does not
+implement `MetaStore`, and Rhiza SQL does not provide an engine-assigned
+authority timestamp. The KV metadata path instead stores proposer-sampled time
+with each root-CAS transition; that does not provide bounded wall-clock
+failover.
 
 The adapter's small async boundary delegates blocking SDK calls to Tokio's
 blocking pool; the underlying SDK remains synchronous:
@@ -73,10 +75,13 @@ not an authority clock and cannot replace the atomic epoch-safety primitive;
 expiry should therefore be treated as a liveness hint until an engine-sampled
 consensus timestamp is available.
 
-The snapshot codec bounds each page at 1 MiB and the complete snapshot at 16
-MiB. Page writes precede root publication, so failed or superseded attempts
-can leave orphan pages. Retention/garbage collection of those pages is an
-explicit tradeoff and is not yet a no-PVC recovery proof.
+The KV snapshot stores its root manifest at `velorix/snapshot/root` and pages
+under `velorix/snapshot/page/<sha256-hex-digest>`. Pages are at most 64 KiB;
+the complete KV snapshot is at most 8 MiB (128 pages), and the root manifest
+is capped at 16 KiB. The snapshot codec is canonical JSON and independently
+caps its encoded snapshot at 16 MiB. Page writes precede root publication, and
+there is no page garbage collection: failed or superseded writes can leave
+orphan pages, a current storage limitation.
 
 ## Evidence and remaining gates
 

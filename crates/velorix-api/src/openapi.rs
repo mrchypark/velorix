@@ -840,9 +840,11 @@ mod openapi_spec_verification {
         ));
         let router = crate::app(state);
         // Register one view so the spec also contains generated view query paths.
-        for uri in [
-            "/v1/relations/scores-default",
-            "/v1/views/scores-positive-default",
+        let catalog = crate::example_fixtures::default_scores_relation_catalog().unwrap();
+        let view = crate::example_fixtures::default_positive_scores_view_request(&catalog).unwrap();
+        for (uri, body) in [
+            ("/v1/relations", json!({ "catalog": catalog })),
+            ("/v1/views", json!(view)),
         ] {
             let response = router
                 .clone()
@@ -852,7 +854,7 @@ mod openapi_spec_verification {
                         .uri(uri)
                         .header(header::CONTENT_TYPE, "application/json")
                         .header(header::ACCEPT, "application/json")
-                        .body(Body::from("{}"))
+                        .body(Body::from(body.to_string()))
                         .unwrap(),
                 )
                 .await

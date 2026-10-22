@@ -116,7 +116,8 @@ const REQUIRED_RELEASE_CONTRACTS: &[&str] = &[
     "dependency governance",
 ];
 
-const ORDERS_SUM_COUNT_OWNER: &str = "orders_sum_count";
+mod example_fixtures;
+use example_fixtures::ORDERS_SUM_COUNT_OWNER;
 
 #[derive(Debug, Parser)]
 #[command(name = "velorix-cli")]

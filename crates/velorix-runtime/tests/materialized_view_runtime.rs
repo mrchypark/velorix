@@ -7861,6 +7861,68 @@ fn materialized_delta_to_page_paginates_manifest_output_when_serving_checkpoint_
 }
 
 #[test]
+fn generic_projection_sum_count_names_decode_as_canonical_values() {
+    let output_schema = RelationSchema {
+        relation_id: "generic_output".to_string(),
+        relation_name: "generic_output".to_string(),
+        relation_version: "v1".to_string(),
+        schema_fingerprint:
+            "sha256:0000000000000000000000000000000000000000000000000000000000000042".to_string(),
+        columns: vec![
+            ColumnSchema {
+                name: "key".to_string(),
+                data_type: SqlDataType::Utf8,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "sum".to_string(),
+                data_type: SqlDataType::Json,
+                nullable: false,
+            },
+            ColumnSchema {
+                name: "count".to_string(),
+                data_type: SqlDataType::Int64,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["key".to_string()],
+    };
+    let published_output = DeltaBatch::from_records([DeltaRecord::new(
+        DeltaKey::from_json(json!("row-1")),
+        DeltaValue::from_json(json!({"sum": {"count": 1, "sum": 17}, "count": 2})),
+        1,
+    )]);
+
+    let page = materialized_delta_to_page(
+        &output_schema,
+        &published_output,
+        ScopedViewId {
+            tenant_id: "tenant".to_string(),
+            program_id: "program".to_string(),
+            view_id: "generic_output".to_string(),
+        },
+        1,
+        SnapshotPageRequest::default(),
+        None,
+    )
+    .unwrap();
+
+    let batch = &page.batches[0];
+    let sum = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let count = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(sum.value(0), r#"{"count":1,"sum":17}"#);
+    assert_eq!(count.value(0), 2);
+}
+
+#[test]
 fn runtime_materializes_min_max_and_recomputes_after_extreme_delete() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();

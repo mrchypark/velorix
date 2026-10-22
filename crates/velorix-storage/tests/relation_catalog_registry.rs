@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use object_store::{local::LocalFileSystem, ObjectStore};
 use tempfile::TempDir;
+use velorix_core::example_fixtures::ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID;
 use velorix_core::relation::{
     ArrowPhysicalTypeV1, DataFusionRegistrationModeV1, DataFusionRegistrationV1,
     IncrementalAdapterBindingV1, IncrementalRelationBindingV1, RelationColumnV1,
     RelationOperationV1, RelationSemanticRoleV1, SchemaFingerprintV1, VelorixLogicalTypeV1,
     VelorixRelationCatalogV1, VelorixRelationSchemaV1, VelorixRelationSourceV1,
-    CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, ORDERS_SUM_COUNT_INCREMENTAL_ADAPTER_ID,
-    RELATION_SCHEMA_VERSION_V1,
+    CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID, RELATION_SCHEMA_VERSION_V1,
 };
 use velorix_storage::{
     capability::{ObjectStoreCapabilityProfile, RequiredObjectStoreCapability},

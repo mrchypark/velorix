@@ -21,9 +21,7 @@ use velorix_core::{
 
 use velorix_core::delta::DeltaRecord;
 
-use super::{
-    canonical_json, fixed_sum_count_outputs, invalid_runtime_state, project_aggregate_value,
-};
+use super::{canonical_json, invalid_runtime_state, project_aggregate_value};
 use velorix_core::delta::encode_kv_ordered;
 
 pub(super) fn materialized_delta_to_record_batch(
@@ -36,13 +34,7 @@ pub(super) fn materialized_delta_to_record_batch(
         return Err(invalid_runtime_state());
     }
     let (key_columns, aggregate_columns) = output_schema.columns.split_at(key_count);
-    let default_outputs;
-    let aggregate_outputs = if let Some(aggregate_outputs) = aggregate_outputs {
-        aggregate_outputs
-    } else {
-        default_outputs = fixed_sum_count_outputs();
-        default_outputs.as_slice()
-    };
+    let aggregate_outputs = aggregate_outputs.ok_or_else(invalid_runtime_state)?;
     if aggregate_columns.len() != aggregate_outputs.len() {
         return Err(invalid_runtime_state());
     }

@@ -152,7 +152,7 @@ for the cache lifecycle and validation rules.
 
 ## 3. Create a Relation and a View
 
-The quickstart uses the built-in `scores` relation. It has these columns:
+This quickstart registers a `scores` relation. It has these columns:
 
 | Column | Type | Role |
 | --- | --- | --- |
@@ -164,19 +164,56 @@ Create the relation:
 
 ```bash
 curl -fsS -X POST \
-  http://127.0.0.1:8080/v1/relations/scores-default
+  http://127.0.0.1:8080/v1/relations \
+  -H 'content-type: application/json' \
+  -d '{
+    "catalog": {
+      "schema_version": 1,
+      "relation_schema": {
+        "relation_id": "scores",
+        "relation_name": "scores",
+        "relation_version": "2026-05-24.v1",
+        "columns": [
+          {"column_id":"user_id","name":"user_id","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0,"semantic_role":"primary_key"},
+          {"column_id":"score","name":"score","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1,"semantic_role":"value"},
+          {"column_id":"delta","name":"delta","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":2,"semantic_role":"weight"}
+        ],
+        "primary_key_column_ids": ["user_id"],
+        "weight_column_id": "delta",
+        "allowed_operations": ["insert", "delete"],
+        "event_time_column_id": null
+      },
+      "schema_fingerprint": "sha256:1e257147b96f379bbe4bfc98782f8cd1f019ed0bdd17532fb72901126000cc77",
+      "datafusion_registration": {"name":"scores","mode":"table"},
+      "incremental_relation": {
+        "relation_id": "scores",
+        "schema_fingerprint": "sha256:1e257147b96f379bbe4bfc98782f8cd1f019ed0bdd17532fb72901126000cc77"
+      },
+      "incremental_adapter": {"adapter_id":"incremental-adapter-single-key-sum-count-v1"}
+    }
+  }'
 ```
 
 Create a standing materialized view that keeps positive-score totals by user:
 
 ```bash
 curl -fsS -X POST \
-  http://127.0.0.1:8080/v1/views/scores-positive-default
+  http://127.0.0.1:8080/v1/views \
+  -H 'content-type: application/json' \
+  -d '{
+    "view_id": "positive_scores_by_user",
+    "urlPath": "/scores/positive",
+    "input_relation_id": "scores",
+    "input_relation_version": "2026-05-24.v1",
+    "sql": "select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id",
+    "source_kind": "standing_view",
+    "description": "Positive score totals by user",
+    "response_formats": ["json"]
+  }'
 ```
 
-This shortcut uses the built-in default query policy; no separate query-policy
-registration is needed. Creating the view does not complete authoritative
-activation: ingest the first batch, then backfill before querying.
+Creating the view does not complete authoritative activation: ingest the first
+batch, then backfill before querying.
 
 The view response should contain:
 
