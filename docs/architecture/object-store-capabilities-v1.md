@@ -15,8 +15,7 @@ manifest publication.
 | `v1/ingest` | Create-only object writes; no overwrite fallback. | Read-after-create, partition/range listing, metadata or ETag. |
 | `v1/ingest-admission` | Create-only serialized admission evidence writes; no overwrite fallback. | Read-after-create and stream/partition/range listing. |
 | `v1/ingest-admission-index` | Create-only range-admission index transition writes; no overwrite fallback. | Read-after-create and stream/partition index listing. |
-| `v1/state/raw` | Create-only raw bootstrap state writes. | Read-after-create, metadata or ETag. |
-| SlateDB state | SlateDB-required object semantics. | Owned by the SlateDB adapter. |
+| `v1/state` | Create-only Arrow checkpoint-state object writes. | Read-after-create, metadata or ETag. |
 | `v1/outputs` | Create-only output writes. | Read-after-create, metadata or ETag. |
 | `v1/checkpoints` | Create-only manifest writes. | Read-after-create, listing, full reads. |
 | `v1/checkpoint-index` | Create-only or compare-safe advisory index writes. | Read-after-create and listing for diagnostics. |
@@ -39,9 +38,8 @@ activation must not fall back to last-writer-wins on shared Versity Gateway/S3-c
 storage.
 
 All storage users must be created through one shared object-store registry.
-Velorix storage, DataFusion scans, SlateDB integration, and Foyer fetch-through
-must not silently use different endpoints, credentials, retry policies, or
-telemetry.
+Velorix storage, DataFusion scans, and Foyer fetch-through must not silently use
+different endpoints, credentials, retry policies, or telemetry.
 
 ## Acceptance Criteria
 
@@ -81,15 +79,11 @@ durability capabilities for every authoritative namespace.
 - Complete namespace declarations pass validation.
 - Legacy persisted-source query surfaces and their compatibility feature have
   been removed. Public queries read materialized output only.
-- Checked production SlateDB recovery opens the state store only through shared
-  startup `AuthoritativeObjectStoreCapabilitiesV1` evidence and requires both
-  checkpoint and state namespaces before opening SlateDB.
-- Env-gated S3-compatible `slatedb_state_reopen` benchmark evidence uses the
-  same already-probed startup capability object before the initial SlateDB open
-  and before reopening SlateDB.
+- Checked checkpoint recovery requires shared startup
+  `AuthoritativeObjectStoreCapabilitiesV1` evidence for checkpoint and state
+  namespaces before reading state objects.
 - Production leased checkpoint publishing requires the checked leased-publisher
-  constructor, which reuses the checked SlateDB checkpoint publisher and
-  additionally requires output and ownership namespace evidence before
+  constructor and requires output and ownership namespace evidence before
   production publication can proceed.
 - Kubernetes stream-watch runtime construction can reuse validated operator
   startup evidence before patching status, and Kubernetes worker-shard
@@ -112,5 +106,5 @@ durability capabilities for every authoritative namespace.
 - Runtime probes reject backends without create-only support.
 - Runtime probes reject overwrite-permitting backends for authoritative writes.
 - Local emulation cannot run under production configuration.
-- Shared registry tests prove DataFusion, SlateDB, Foyer, and Velorix storage use
-  the same configured store identity.
+- Shared registry tests prove DataFusion, Foyer, and Velorix storage use the
+  same configured store identity.

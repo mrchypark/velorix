@@ -61,7 +61,6 @@ const LOCAL_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "materialized_output_delete_vector",
     "materialized_output_ttl_vector",
     "materialized_output_late_materialization",
-    "slatedb_state_reopen",
     "gc_dry_run_planning",
     "gc_execution_denied",
 ];
@@ -77,7 +76,6 @@ const S3_COMPATIBLE_BENCHMARK_GATE_WORKLOADS: &[&str] = &[
     "materialized_output_delete_vector",
     "materialized_output_ttl_vector",
     "materialized_output_late_materialization",
-    "slatedb_state_reopen",
     "gc_dry_run_planning",
 ];
 const INGEST_WRITER_LIFECYCLE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
@@ -7285,7 +7283,6 @@ const REQUIRED_PACKAGE_REVIEW_SUBJECTS: &[&str] = &[
     "object_store",
     "kube",
     "k8s-openapi",
-    "slatedb",
     "foyer",
     "rhizadb",
     "materialized_view_runtime",

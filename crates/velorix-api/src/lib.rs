@@ -169,6 +169,7 @@ use velorix_runtime::{
 mod checkpoint_arrow;
 mod checkpoint_fragments;
 mod checkpoint_publication;
+mod checkpoint_record;
 mod cold_window_state;
 mod demand_materialization;
 mod demand_publication;
@@ -178,6 +179,7 @@ mod ingest_epoch;
 mod materialized_output_pages;
 pub mod materialized_read_cache;
 mod openapi;
+mod output_delta_record;
 mod owner_lease;
 mod query_response;
 mod query_serving;
@@ -530,48 +532,8 @@ struct StandingRuntimeCheckpointRecord {
 
 pub(crate) fn standing_runtime_checkpoint_record_from_slice(
     bytes: &[u8],
-) -> Result<StandingRuntimeCheckpointRecord, serde_json::Error> {
-    let mut value: Value = serde_json::from_slice(bytes)?;
-    if let Some(identity) = value.pointer_mut("/checkpoint/identity") {
-        normalize_legacy_standing_program_identity_value(identity);
-    }
-    let mut record: StandingRuntimeCheckpointRecord = serde_json::from_value(value)?;
-    if let Some(demand) = &record.demand_materialization {
-        demand
-            .validate_checkpoint(&record.checkpoint)
-            .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))?;
-    }
-    record.manifest_hash = stable_bytes_hash(bytes);
-    Ok(record)
-}
-
-fn normalize_legacy_standing_program_identity_value(value: &mut Value) {
-    let Some(identity) = value.as_object_mut() else {
-        return;
-    };
-    move_legacy_key(identity, "compiler", "_identity", "planner_identity");
-    move_legacy_key(
-        identity,
-        "runtime",
-        "_packages",
-        "builtin_runtime_identities",
-    );
-    move_legacy_key(identity, "package", "_feature_set", "runtime_capabilities");
-}
-
-fn move_legacy_key(
-    object: &mut serde_json::Map<String, Value>,
-    old_prefix: &str,
-    old_suffix: &str,
-    new_key: &str,
-) {
-    if object.contains_key(new_key) {
-        return;
-    }
-    let old_key = format!("{old_prefix}{old_suffix}");
-    if let Some(value) = object.remove(old_key.as_str()) {
-        object.insert(new_key.to_string(), value);
-    }
+) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+    checkpoint_record::decode(bytes, checkpoint_record::MAX_ENCODED_RECORD_BYTES)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1042,21 +1004,14 @@ impl ApiState {
 
     pub async fn from_validated_authority(
         validated: ValidatedOperatorAuthority,
-        state_path: impl Into<String>,
         operator_id: impl Into<String>,
     ) -> Result<Self, ApiError> {
-        Self::from_validated_authority_with_ingest_admission_startup(
-            validated,
-            state_path,
-            operator_id,
-            true,
-        )
-        .await
+        Self::from_validated_authority_with_ingest_admission_startup(validated, operator_id, true)
+            .await
     }
 
     pub async fn from_validated_authority_with_ingest_admission_startup(
         validated: ValidatedOperatorAuthority,
-        _state_path: impl Into<String>,
         operator_id: impl Into<String>,
         reconstruct_ingest_admission: bool,
     ) -> Result<Self, ApiError> {
@@ -1993,7 +1948,6 @@ pub async fn run_from_env() -> anyhow::Result<()> {
     let reconstruct_ingest_admission = config.meta_grpc_endpoint.is_none();
     let mut state = ApiState::from_validated_authority_with_ingest_admission_startup(
         validated,
-        config.state_path,
         config.operator_id.clone(),
         reconstruct_ingest_admission,
     )
@@ -8540,7 +8494,6 @@ struct ApiConfig {
     force_path_style: bool,
     authority_store_id: String,
     authority_namespace: String,
-    state_path: String,
     operator_id: String,
     backend_name: String,
     meta_grpc_endpoint: Option<String>,
@@ -8594,8 +8547,6 @@ impl ApiConfig {
             .unwrap_or_else(|_| default_authority_store_id(&bucket, &prefix));
         let authority_namespace =
             std::env::var("VELORIX_AUTHORITY_NAMESPACE").unwrap_or_else(|_| "velorix".to_string());
-        let state_path =
-            std::env::var("VELORIX_STATE_PATH").unwrap_or_else(|_| "v1/state/slatedb".to_string());
         let operator_id =
             std::env::var("VELORIX_OPERATOR_ID").unwrap_or_else(|_| "velorix-api".to_string());
         let materialized_read_cache_directory =
@@ -8705,7 +8656,6 @@ impl ApiConfig {
             force_path_style,
             authority_store_id,
             authority_namespace,
-            state_path,
             operator_id,
             backend_name,
             meta_grpc_endpoint,

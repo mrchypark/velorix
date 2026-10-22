@@ -4,14 +4,14 @@
 //! bytes which are evaluated and published, so a decoded snapshot is never a
 //! hidden authoritative cache.
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::hash::Hash;
 
+#[cfg(any(test, feature = "rhiza-backend"))]
 use super::InMemoryMetaState;
+#[cfg(any(test, feature = "rhiza-backend"))]
+use serde_json::{Map, Value};
 
 pub(crate) mod map_pairs {
     use super::*;
@@ -56,12 +56,19 @@ pub(crate) mod map_pairs {
     }
 }
 
+#[cfg(any(test, feature = "rhiza-backend"))]
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+/// Bound compressed snapshot bytes independently of the expanded state budget.
+#[cfg(any(test, feature = "rhiza-backend"))]
+pub const MAX_SNAPSHOT_ENCODED_BYTES: usize = 16 * 1024 * 1024;
+/// Arrow's logical typed-tree budget is independent of compressed IPC size.
+#[cfg(any(test, feature = "rhiza-backend"))]
+pub const MAX_SNAPSHOT_EXPANDED_BYTES: usize = 64 * 1024 * 1024;
 
+#[cfg(any(test, feature = "rhiza-backend"))]
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotCodecError {
-    #[error("snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes")]
+    #[error("snapshot exceeds its encoded or expanded byte limit")]
     TooLarge,
     #[error("unsupported snapshot schema version {0}")]
     UnsupportedSchema(u32),
@@ -69,15 +76,16 @@ pub enum SnapshotCodecError {
     Invalid(String),
 }
 
+#[cfg(any(test, feature = "rhiza-backend"))]
 #[derive(Debug, Serialize, Deserialize)]
-struct Envelope {
+struct Envelope<T> {
     schema_version: u32,
-    state: Value,
+    state: T,
 }
 
-/// Encodes state using canonical JSON (object keys are recursively sorted).
-/// The canonical representation makes root/page digests stable across
-/// HashMap iteration order and process restarts.
+#[cfg(any(test, feature = "rhiza-backend"))]
+/// Encodes the normalized metadata state as bounded, ZSTD-compressed Arrow IPC.
+/// Sorting map keys before encoding keeps snapshot bytes stable across restarts.
 pub(crate) fn encode(state: &InMemoryMetaState) -> Result<Vec<u8>, SnapshotCodecError> {
     let state =
         serde_json::to_value(state).map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
@@ -85,20 +93,49 @@ pub(crate) fn encode(state: &InMemoryMetaState) -> Result<Vec<u8>, SnapshotCodec
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         state: canonicalize(state),
     };
-    let bytes =
-        serde_json::to_vec(&envelope).map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
-    if bytes.len() > MAX_SNAPSHOT_BYTES {
+    let expanded_bytes =
+        velorix_core::arrow_state::ArrowState::measure_serializable(&envelope, usize::MAX)
+            .map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
+    if expanded_bytes > MAX_SNAPSHOT_EXPANDED_BYTES {
         return Err(SnapshotCodecError::TooLarge);
     }
-    Ok(bytes)
+    let arrow_state = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+        &envelope,
+        MAX_SNAPSHOT_EXPANDED_BYTES,
+    )
+    .map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
+    if arrow_state.as_bytes().len() > MAX_SNAPSHOT_ENCODED_BYTES {
+        return Err(SnapshotCodecError::TooLarge);
+    }
+    Ok(arrow_state.as_bytes().to_vec())
 }
 
+#[cfg(any(test, feature = "rhiza-backend"))]
 pub(crate) fn decode(bytes: &[u8]) -> Result<InMemoryMetaState, SnapshotCodecError> {
-    if bytes.len() > MAX_SNAPSHOT_BYTES {
+    decode_bounded(
+        bytes,
+        MAX_SNAPSHOT_ENCODED_BYTES,
+        MAX_SNAPSHOT_EXPANDED_BYTES,
+    )
+}
+
+#[cfg(any(test, feature = "rhiza-backend"))]
+fn decode_bounded(
+    bytes: &[u8],
+    encoded_limit: usize,
+    expanded_limit: usize,
+) -> Result<InMemoryMetaState, SnapshotCodecError> {
+    if bytes.len() > encoded_limit {
         return Err(SnapshotCodecError::TooLarge);
     }
-    let envelope: Envelope =
-        serde_json::from_slice(bytes).map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
+    let arrow_state = velorix_core::arrow_state::ArrowState::from_ipc(bytes, expanded_limit)
+        .map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
+    if arrow_state.len() > expanded_limit {
+        return Err(SnapshotCodecError::TooLarge);
+    }
+    let envelope: Envelope<Value> = arrow_state
+        .decode()
+        .map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
     if envelope.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(SnapshotCodecError::UnsupportedSchema(
             envelope.schema_version,
@@ -115,6 +152,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<InMemoryMetaState, SnapshotCodecErr
     Ok(state)
 }
 
+#[cfg(any(test, feature = "rhiza-backend"))]
 fn canonicalize(value: Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -165,13 +203,20 @@ mod tests {
 
     #[test]
     fn rejects_unknown_schema_and_oversized_input() {
-        let unknown = br#"{"schema_version":99,"state":{}}"#;
+        let unknown = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+            &Envelope {
+                schema_version: 99,
+                state: Value::Object(Map::new()),
+            },
+            MAX_SNAPSHOT_EXPANDED_BYTES,
+        )
+        .unwrap();
         assert!(matches!(
-            decode(unknown),
+            decode(unknown.as_bytes()),
             Err(SnapshotCodecError::UnsupportedSchema(99))
         ));
         assert!(matches!(
-            decode(&vec![b' '; MAX_SNAPSHOT_BYTES + 1]),
+            decode(&vec![b' '; MAX_SNAPSHOT_ENCODED_BYTES + 1]),
             Err(SnapshotCodecError::TooLarge)
         ));
     }
@@ -226,24 +271,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_unknown_envelope_fields_are_rejected() {
-        let canonical = String::from_utf8(encode(&InMemoryMetaState::default()).unwrap()).unwrap();
-        let duplicate = canonical.replacen(
-            "{\"schema_version\":1,",
-            "{\"schema_version\":1,\"schema_version\":1,",
-            1,
+    fn stored_snapshot_body_is_arrow_ipc_and_roundtrips_canonically() {
+        let bytes = encode(&InMemoryMetaState::default()).unwrap();
+        assert!(velorix_core::arrow_state::ArrowState::from_ipc(
+            &bytes,
+            MAX_SNAPSHOT_EXPANDED_BYTES
+        )
+        .is_ok());
+        assert!(!bytes.starts_with(b"{"));
+        assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rejects_highly_compressible_oversized_state_before_decompression() {
+        let oversized = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+            &Envelope {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                state: "x".repeat(3 * 1024 * 1024),
+            },
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(oversized.as_bytes().len() < 64 * 1024);
+        assert!(
+            velorix_core::arrow_state::ArrowState::metadata(oversized.as_bytes(), 1024 * 1024)
+                .is_err()
         );
         assert!(matches!(
-            decode(duplicate.as_bytes()),
-            Err(SnapshotCodecError::Invalid(_))
-        ));
-        let unknown = canonical.replacen(
-            "{\"schema_version\":1,",
-            "{\"unknown\":0,\"schema_version\":1,",
-            1,
-        );
-        assert!(matches!(
-            decode(unknown.as_bytes()),
+            decode_bounded(oversized.as_bytes(), 64 * 1024, 1024 * 1024),
             Err(SnapshotCodecError::Invalid(_))
         ));
     }

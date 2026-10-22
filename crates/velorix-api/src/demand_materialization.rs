@@ -1310,9 +1310,11 @@ async fn commit_demand_unit_inner(
     .await?;
     let publication = async {
         lease.ensure_owned()?;
-        let progress_bytes = serde_json::to_vec(&progress)
-            .map_err(ApiError::internal)?
-            .len();
+        let progress_bytes = velorix_core::arrow_state::ArrowState::measure_serializable(
+            &progress,
+            state.max_standing_runtime_state_payload_bytes,
+        )
+        .map_err(ApiError::bad_request)?;
         let state_bytes = applied
             .checkpoint
             .state_payload

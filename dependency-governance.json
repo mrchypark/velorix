@@ -38,20 +38,12 @@
       "replacement_plan": "Advance with kube compatibility requirements and regenerate CRD evidence when supported cluster APIs change."
     },
     {
-      "subject": "slatedb",
-      "owner": "state",
-      "reviewed_on": "2026-09-27",
-      "audit_status": "local_reviewed_official_release_with_accepted_cost_tradeoff",
-      "feature_policy": "Use exact crates.io SlateDB 0.16.0 with default-features=false, default GC, and durable commit acknowledgments. The user accepts the measured upstream storage-cost increase over the former fork. See docs/development/slatedb-upstream-comparison-2026-09-27.md for the original failed gate, scoped baseline recalibration, durability and bidirectional compatibility evidence. This is not an external audit. Do not duplicate SlateDB storage internals in Velorix.",
-      "replacement_plan": "Review future official releases against durability, persisted-state compatibility, default-config cost gates and dependency checks. Preserve the 25% gate budget and require documented measured evidence for baseline changes."
-    },
-    {
       "subject": "foyer",
       "owner": "runtime",
       "reviewed_on": "2026-05-07",
       "audit_status": "local_reviewed_until_external_audit",
       "feature_policy": "Use Foyer only as a non-authoritative cache; never use it as durable database state.",
-      "replacement_plan": "Replace or disable Foyer if cache behavior conflicts with authority-path object storage or SlateDB ownership."
+      "replacement_plan": "Replace or disable Foyer if cache behavior conflicts with authority-path object storage."
     },
     {
       "subject": "rhizadb",
@@ -100,19 +92,10 @@
     },
     {
       "kind": "duplicate",
-      "crate": "heck",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "Build-time-only duplicate: heck 0.4.1 via ouroboros_macro 0.18.5; heck 0.5.0 via clap_derive 4.6.7 and the prost-build 0.14.4 build dependency. None of these are linked into a Velorix binary.",
-      "replacement_plan": "ouroboros_macro is the last heck 0.4 consumer. Re-check the version-qualified inverse heck trees and retire the exception when ouroboros_macro is replaced, upgraded to heck 0.5, or dropped from the graph.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
       "crate": "object_store",
       "owner": "runtime",
       "expires_on": "2027-01-08",
-      "reason": "Velorix authority paths and slatedb 0.16.0 select object_store 0.14.2, while DataFusion's object_store 0.13 (0.13.2) comes via datafusion 55.1.0 and parquet 59.3.0. The scan boundary receives SQL text, so no object_store type crosses it.",
+      "reason": "Velorix authority paths select object_store 0.14.2, while DataFusion's object_store 0.13 (0.13.2) comes via datafusion 55.1.0 and parquet 59.3.0. The scan boundary receives SQL text, so no object_store type crosses it.",
       "replacement_plan": "Unify authority and scan object_store clients when DataFusion widens its object_store requirement to 0.14; then delete this exception and keep only the authority-path pin. Until then keep 0.14 on authority create/read/list/range behavior without weakening create-only semantics.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
@@ -121,8 +104,8 @@
       "crate": "rand",
       "owner": "runtime",
       "expires_on": "2027-01-08",
-      "reason": "rand 0.9.5 comes from DataFusion 55.1.0 crates, fail-parallel 0.6.0, slatedb 0.16.0, slatedb-common 0.16.0, and ulid 1.2.1; rand 0.10.3 comes from object_store 0.14.2.",
-      "replacement_plan": "Both lines are pinned by release trains. Re-check the version-qualified inverse rand trees after the SlateDB and object_store upgrades and delete the exception when the DataFusion and SlateDB families reach 0.10.",
+      "reason": "rand 0.9.5 comes from DataFusion 55.1.0 crates, fail-parallel 0.6.0, and ulid 1.2.1; rand 0.10.3 comes from object_store 0.14.2.",
+      "replacement_plan": "Both lines are pinned by release trains. Re-check the version-qualified inverse rand trees after the DataFusion and object_store upgrades and delete the exception when those families converge.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -132,33 +115,6 @@
       "expires_on": "2027-01-08",
       "reason": "rand_core 0.9.5 comes from rand 0.9.5, rand_chacha 0.9.0, and rand_xoshiro 0.7.0; rand_core 0.10.1 comes from chacha20 0.10.2, getrandom 0.4.3, and rand 0.10.3.",
       "replacement_plan": "Converges with the rand exception. Re-check the version-qualified inverse rand_core trees alongside the rand trees and delete this entry when a single rand_core line remains.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "thiserror",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "thiserror 1.0.69 comes only from slatedb 0.16.0 and slatedb-txn-obj 0.16.0; thiserror 2.0.20 is used by kube-client, kube-core, and kube-runtime 4.2.0, object_store 0.13.2 and 0.14.2, duration-str 0.11.3, json-patch 4.2.0, jsonpath-rust 1.0.11, and the Velorix workspace crates.",
-      "replacement_plan": "Track the next SlateDB 0.16.x patch that moves to thiserror 2. Re-run `cargo tree -i thiserror` after each SlateDB update and delete the entry once slatedb and slatedb-txn-obj select 2.0.20.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "thiserror-impl",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "thiserror-impl 1.0.69 and 2.0.20 follow the thiserror 1.0.69 (slatedb) and 2.0.20 (kube, object_store, Velorix crates) split. Both are build-time proc macros and are not linked into Velorix binaries.",
-      "replacement_plan": "Remove together with the thiserror exception once SlateDB advances. Re-check with `cargo tree -i thiserror-impl` in the same pass as `cargo tree -i thiserror`.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "winnow",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "winnow 0.6.26 comes from duration-str 0.11.3; winnow 0.7.15 comes from toml_edit 0.22.27 via toml 0.8.23.",
-      "replacement_plan": "duration-str is the only 0.6 consumer. Re-run `cargo tree -i winnow` after a duration-str release and delete the entry when duration-str selects 0.7.15.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
@@ -249,15 +205,6 @@
       "expires_on": "2027-01-08",
       "reason": "foyer-memory 0.22.6 uses paste 1.0.15 for compile-time macros; RUSTSEC-2024-0436 reports it unmaintained. Foyer is confined to disposable, non-authoritative caching, while the unmaintained build dependency still requires a bounded review exception.",
       "replacement_plan": "Track upstream foyer-memory removal or replacement of paste with a maintained macro dependency. Upgrade or remove the Foyer integration if this exception cannot be renewed before expiry, and remove this record once cargo-deny no longer reports the warning.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "unmaintained",
-      "crate": "unsafe-libyaml",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "unsafe-libyaml 0.2.11 is an archived unsafe transliteration of libyaml's C code reached through serde_yaml 0.9.34+deprecated via figment 0.10.19 and slatedb 0.16.0 in velorix-storage. It sits on the storage configuration parsing path rather than the query or checkpoint authority path, and RUSTSEC-2024-0449 states that no safe upgrade exists.",
-      "replacement_plan": "Track the upstream serde_yaml deprecation removal or the slatedb/figment line dropping serde_yaml. If this exception cannot be renewed before expiry, replace the storage configuration parsing path.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     }
   ]

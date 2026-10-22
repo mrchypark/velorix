@@ -51,9 +51,8 @@ permanently hide the last known good checkpoint.
 The public CLI no longer starts engine recovery directly. It exposes local
 inspection and admin metadata repair commands only; runtime recovery must happen
 inside the runtime/API process that owns the materializer and checkpoint
-authority. SlateDB-backed checkpoint state remains explicit in checkpoint refs:
-the stored object-store database path is opened by the runtime recovery path,
-not by a separate CLI engine instance.
+authority. Runtime recovery reads the Arrow state objects named by the
+validated checkpoint manifest through the shared object-store configuration.
 
 ## Lifecycle Status
 
@@ -178,9 +177,6 @@ Versity Gateway-only checkpoint evidence does not satisfy this release gate.
   record and validates referenced state/output payload visibility.
 - Checked recovery writes digest-bound append-only recovery transition evidence
   after successful recovery from a published checkpoint.
-- SlateDB selected-checkpoint local recovery opens state through
-  `--slatedb-state-path` and rejects raw state paths on the SlateDB recovery
-  path.
-- Local raw-object recovery requires the explicit
-  `--allow-bootstrap-raw-state` bootstrap/migration flag.
+- Selected-checkpoint recovery reads manifest-bound Arrow state objects from
+  object storage and validates their identity and commitment before restore.
 - Large-manifest-count benchmark records lookup memory and latency.

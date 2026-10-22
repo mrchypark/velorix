@@ -29,11 +29,10 @@ use crate::{
     },
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
-        StateRefType,
     },
     object_key::{ObjectKey, ObjectKeyError},
     ownership::{OwnershipEpochRecord, OwnershipEpochRecordError},
-    state_store::{RawObjectStateStore, SlateDbStateStore, StateObjectStore},
+    state_store::{RawObjectStateStore, StateObjectStore},
 };
 
 const CHECKPOINT_PREFIX: &str = "v1/checkpoints";
@@ -188,33 +187,6 @@ pub enum CheckpointPublishError {
     },
     #[error("referenced state object `{0}` is missing")]
     MissingStateObject(ObjectKey),
-    #[error("invalid SlateDB state reference `{object_key}`: {reason}")]
-    InvalidSlateDbStateRef {
-        object_key: ObjectKey,
-        reason: &'static str,
-    },
-    #[error("SlateDB state payload mismatch for `{object_key}`: expected {expected_bytes} bytes/{expected_digest}, actual {actual_bytes} bytes/{actual_digest}")]
-    SlateDbStatePayloadMismatch {
-        object_key: ObjectKey,
-        expected_digest: String,
-        actual_digest: String,
-        expected_bytes: u64,
-        actual_bytes: u64,
-    },
-    #[error("production manifest state object `{object_id}` must reference a SlateDB checkpoint, found `{ref_type:?}`")]
-    ProductionStateRefNotSlateDbCheckpoint {
-        object_id: String,
-        ref_type: StateRefType,
-    },
-    #[error(
-        "production checkpoint {checkpoint_version} cannot extend checkpoint {parent_checkpoint} with state object `{object_id}` using `{ref_type:?}` lineage"
-    )]
-    ProductionMixedRawSlateDbLineage {
-        checkpoint_version: u64,
-        parent_checkpoint: u64,
-        object_id: String,
-        ref_type: StateRefType,
-    },
     #[error("referenced output object `{0}` is missing")]
     MissingOutputObject(ObjectKey),
     #[error("state object `{object_key}` owner claim mismatch: expected `{expected}`, actual `{actual:?}`")]
@@ -247,8 +219,6 @@ pub enum CheckpointPublishError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     ObjectStore(#[from] object_store::Error),
-    #[error(transparent)]
-    SlateDb(#[from] slatedb::Error),
 }
 
 impl CheckpointPublisher {
@@ -307,63 +277,11 @@ impl CheckpointPublisher {
         Ok(Self::with_state_store(store, state_store))
     }
 
-    /// Constructs a checkpoint publisher with a SlateDB state store without
-    /// object-store capability validation. Production callers should use
-    /// [`Self::with_slatedb_state_store_authoritative`] so both checkpoint and
-    /// state namespaces are validated from shared startup evidence.
-    pub async fn with_slatedb_state_store(
-        store: Arc<dyn ObjectStore>,
-        db_path: impl Into<Path>,
-    ) -> Result<Self, CheckpointPublishError> {
-        let state_store = SlateDbStateStore::open(db_path, Arc::clone(&store)).await?;
-
-        Ok(Self::with_state_store(store, Arc::new(state_store)))
-    }
-
-    /// Constructs a checkpoint publisher with a SlateDB state store after
-    /// validating one supplied object-store profile. This remains useful for
-    /// bootstrap or compatibility callers that do not yet have namespace-scoped
-    /// startup evidence; production callers should use
-    /// [`Self::with_slatedb_state_store_authoritative`].
-    pub async fn with_slatedb_state_store_checked(
-        store: Arc<dyn ObjectStore>,
-        db_path: impl Into<Path>,
-        profile: &ObjectStoreCapabilityProfile,
-    ) -> Result<Self, CheckpointPublishError> {
-        profile.validate_for_velorix_durability()?;
-
-        Self::with_slatedb_state_store(store, db_path).await
-    }
-
-    /// Constructs a production checkpoint publisher with a SlateDB state store
-    /// after validating both checkpoint-manifest and state-substrate
-    /// authoritative namespaces from the shared startup capability evidence.
-    pub async fn with_slatedb_state_store_authoritative(
-        store: Arc<dyn ObjectStore>,
-        db_path: impl Into<Path>,
-        capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-    ) -> Result<Self, CheckpointPublishError> {
-        capabilities.validate_namespace(AuthoritativeNamespace::Checkpoint)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::State)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointIndex)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointLifecycle)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointRetention)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointGcTransition)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::CheckpointRecovery)?;
-        capabilities.validate_namespace(AuthoritativeNamespace::GcRuns)?;
-
-        Self::with_slatedb_state_store(store, db_path).await
-    }
-
     pub async fn write_state_object(
         &self,
         state: &StateObjectWrite,
     ) -> Result<StateObjectRef, CheckpointPublishError> {
         self.state_store.write_state_object(state).await
-    }
-
-    pub fn produced_state_ref_type(&self) -> StateRefType {
-        self.state_store.produced_state_ref_type()
     }
 
     pub async fn write_state_object_fenced(
@@ -387,16 +305,6 @@ impl CheckpointPublisher {
         self.validate_state_write_owner_claim(state, owner_claim)?;
         self.validate_production_owner_claim_current(stream_id, state.partition_id(), owner_claim)
             .await?;
-
-        let ref_type = self.produced_state_ref_type();
-        if ref_type != StateRefType::SlateDbCheckpoint {
-            return Err(
-                CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint {
-                    object_id: state.object_id().to_string(),
-                    ref_type,
-                },
-            );
-        }
 
         self.write_state_object(state).await
     }
@@ -559,10 +467,6 @@ impl CheckpointPublisher {
         self.validate_fenced_manifest_progress_claimed(manifest, owner_claim)?;
         self.validate_manifest_production_owner_claims_current(manifest, owner_claim)
             .await?;
-        self.validate_production_state_refs_are_slatedb_checkpoints(manifest)?;
-        self.validate_production_lineage_state_refs_are_slatedb_checkpoints(manifest)
-            .await?;
-
         self.publish_manifest(manifest).await
     }
 
@@ -1154,7 +1058,6 @@ impl CheckpointPublisher {
             .len()
             .saturating_sub(policy.retain_latest_manifests);
         let retained_manifests = &manifests[retained_from..];
-        let retired_manifests = &manifests[..retained_from];
 
         let mut referenced = HashSet::new();
         let mut retained_manifest_versions = Vec::with_capacity(retained_manifests.len());
@@ -1174,18 +1077,14 @@ impl CheckpointPublisher {
             );
         }
 
-        let mut raw_state_referenced = referenced.clone();
-        raw_state_referenced.extend(Self::slatedb_state_keys(&manifests));
-
         let mut candidates = Vec::new();
         self.add_unreferenced_candidates(
             STATE_PREFIX,
             GarbageCollectionCandidateKind::RawStateObject,
-            &raw_state_referenced,
+            &referenced,
             &mut candidates,
         )
         .await?;
-        Self::add_retired_slatedb_state_candidates(retired_manifests, &referenced, &mut candidates);
         self.add_unreferenced_candidates(
             OUTPUT_PREFIX,
             GarbageCollectionCandidateKind::OutputObject,
@@ -1749,36 +1648,6 @@ impl CheckpointPublisher {
         }
     }
 
-    fn slatedb_state_keys(manifests: &[CheckpointManifest]) -> HashSet<ObjectKey> {
-        manifests
-            .iter()
-            .flat_map(|manifest| &manifest.state_objects)
-            .filter(|state_ref| state_ref.ref_type == StateRefType::SlateDbCheckpoint)
-            .map(|state_ref| state_ref.object_key.clone())
-            .collect()
-    }
-
-    fn add_retired_slatedb_state_candidates(
-        manifests: &[CheckpointManifest],
-        referenced: &HashSet<ObjectKey>,
-        candidates: &mut Vec<GarbageCollectionCandidate>,
-    ) {
-        let mut seen = HashSet::new();
-        for manifest in manifests {
-            for state_ref in &manifest.state_objects {
-                if state_ref.ref_type == StateRefType::SlateDbCheckpoint
-                    && !referenced.contains(&state_ref.object_key)
-                    && seen.insert(state_ref.object_key.clone())
-                {
-                    candidates.push(GarbageCollectionCandidate {
-                        object_key: state_ref.object_key.clone(),
-                        kind: GarbageCollectionCandidateKind::SlateDbStateRef,
-                    });
-                }
-            }
-        }
-    }
-
     pub async fn latest_manifest(
         &self,
     ) -> Result<Option<CheckpointManifest>, CheckpointPublishError> {
@@ -1841,52 +1710,6 @@ impl CheckpointPublisher {
             if kind.matches_key(&object_key) && !referenced.contains(&object_key) {
                 candidates.push(GarbageCollectionCandidate { object_key, kind });
             }
-        }
-
-        Ok(())
-    }
-
-    fn validate_production_state_refs_are_slatedb_checkpoints(
-        &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<(), CheckpointPublishError> {
-        for state_ref in &manifest.state_objects {
-            if state_ref.ref_type != StateRefType::SlateDbCheckpoint {
-                return Err(
-                    CheckpointPublishError::ProductionStateRefNotSlateDbCheckpoint {
-                        object_id: state_ref.object_id.clone(),
-                        ref_type: state_ref.ref_type,
-                    },
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn validate_production_lineage_state_refs_are_slatedb_checkpoints(
-        &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<(), CheckpointPublishError> {
-        let mut ancestor_checkpoint = manifest.parent_checkpoint;
-
-        while let Some(parent_checkpoint) = ancestor_checkpoint {
-            let parent = self
-                .read_parent_manifest(manifest.checkpoint_version, parent_checkpoint)
-                .await?;
-
-            for state_ref in &parent.state_objects {
-                if state_ref.ref_type != StateRefType::SlateDbCheckpoint {
-                    return Err(CheckpointPublishError::ProductionMixedRawSlateDbLineage {
-                        checkpoint_version: manifest.checkpoint_version,
-                        parent_checkpoint,
-                        object_id: state_ref.object_id.clone(),
-                        ref_type: state_ref.ref_type,
-                    });
-                }
-            }
-
-            ancestor_checkpoint = parent.parent_checkpoint;
         }
 
         Ok(())
@@ -2879,6 +2702,7 @@ fn validate_checkpoint_publisher_authoritative_namespaces(
 ) -> Result<(), AuthoritativeObjectStoreCapabilityError> {
     for namespace in [
         AuthoritativeNamespace::Checkpoint,
+        AuthoritativeNamespace::State,
         AuthoritativeNamespace::CheckpointIndex,
         AuthoritativeNamespace::CheckpointLifecycle,
         AuthoritativeNamespace::CheckpointRetention,
@@ -3059,8 +2883,6 @@ impl StateObjectWrite {
             owner: self.owner.clone(),
             partition_id: self.partition_id,
             checkpoint_version: self.checkpoint_version,
-            ref_type: StateRefType::RawObject,
-            slatedb: None,
             owner_claim: self.owner_claim.clone(),
         }
     }

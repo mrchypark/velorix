@@ -7137,8 +7137,6 @@ $(image_pull_secrets_yaml)
               value: "${api_authoritative_relation_ingest}"
             - name: VELORIX_RELATION_INGEST_OWNER_ID
               value: "${relation_ingest_owner_id}"
-            - name: VELORIX_STATE_PATH
-              value: "v1/state/slatedb"
             - name: VELORIX_API_BIND
               value: "0.0.0.0:8080"
 ${api_tls_env}

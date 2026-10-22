@@ -5,7 +5,7 @@ use object_store::{local::LocalFileSystem, ObjectStore};
 use tempfile::TempDir;
 use velorix_control::lease::{
     validate_production_ownership_backend, InMemoryPartitionLeaseClient, LeaseAcquireRequest,
-    LeaseBackendKind, LeaseError, PartitionLeaseClient, PartitionLeaseGrant, PartitionLeaseKey,
+    LeaseBackendKind, LeaseError, PartitionLeaseClient, PartitionLeaseKey,
     ProductionOwnershipBackendConfig,
 };
 use velorix_storage::{
@@ -334,9 +334,4 @@ fn production_ownership_backend_accepts_kubernetes_lease_with_durable_epoch_reco
         supports_durable_epoch_records: true,
     })
     .unwrap();
-}
-
-#[allow(dead_code)]
-fn assert_grant_is_storage_compatible(grant: PartitionLeaseGrant) -> PartitionOwnerClaim {
-    grant.into()
 }

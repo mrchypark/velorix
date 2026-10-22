@@ -7,7 +7,6 @@ use velorix_storage::{
     capability::{AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1},
     manifest::{
         CheckpointManifest, ManifestError, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
-        StateRefType,
     },
     object_key::ObjectKey,
     state::{CheckpointPublishError, CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
@@ -63,11 +62,6 @@ pub enum LeasedCheckpointError {
         expected: Vec<OutputObjectRef>,
         actual: Vec<OutputObjectRef>,
     },
-    #[error("production state store produces `{actual:?}` state refs, expected `{expected:?}`")]
-    ProductionStateStoreRefTypeMismatch {
-        expected: StateRefType,
-        actual: StateRefType,
-    },
     #[error(
         "production leased checkpoint publisher requires shared startup object-store capability evidence"
     )]
@@ -87,9 +81,8 @@ impl LeasedCheckpointPublisher {
     /// Constructs the production leased checkpoint publisher from shared
     /// startup capability evidence instead of accepting an unchecked
     /// checkpoint publisher.
-    pub async fn with_slatedb_state_store_authoritative(
+    pub fn new_authoritative(
         store: Arc<dyn ObjectStore>,
-        db_path: impl Into<object_store::path::Path>,
         capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
     ) -> Result<Self, LeasedCheckpointError> {
         capabilities
@@ -98,12 +91,7 @@ impl LeasedCheckpointPublisher {
         capabilities
             .validate_namespace(AuthoritativeNamespace::Ownership)
             .map_err(CheckpointPublishError::from)?;
-        let publisher = CheckpointPublisher::with_slatedb_state_store_authoritative(
-            store,
-            db_path,
-            capabilities,
-        )
-        .await?;
+        let publisher = CheckpointPublisher::new_authoritative(store, capabilities)?;
 
         Ok(Self {
             publisher,
@@ -171,13 +159,7 @@ impl LeasedCheckpointPublisher {
         validate_input_stream(&grant, &manifest)?;
         validate_state_writes(&grant, &owner_claim, &state_objects)?;
         validate_output_writes(&grant, &owner_claim, &output_objects)?;
-        validate_production_state_store_ref_type(self.publisher.produced_state_ref_type())?;
-        validate_manifest_refs_match_writes_with_state_ref_type(
-            &manifest,
-            &state_objects,
-            &output_objects,
-            StateRefType::SlateDbCheckpoint,
-        )?;
+        validate_manifest_refs_match_writes(&manifest, &state_objects, &output_objects)?;
         self.publisher
             .preflight_manifest_publication(&manifest)
             .await?;
@@ -338,23 +320,9 @@ fn validate_manifest_refs_match_writes(
     state_objects: &[StateObjectWrite],
     output_objects: &[OutputObjectWrite],
 ) -> Result<(), LeasedCheckpointError> {
-    validate_manifest_refs_match_writes_with_state_ref_type(
-        manifest,
-        state_objects,
-        output_objects,
-        StateRefType::RawObject,
-    )
-}
-
-fn validate_manifest_refs_match_writes_with_state_ref_type(
-    manifest: &CheckpointManifest,
-    state_objects: &[StateObjectWrite],
-    output_objects: &[OutputObjectWrite],
-    state_ref_type: StateRefType,
-) -> Result<(), LeasedCheckpointError> {
     let expected_state_refs = state_objects
         .iter()
-        .map(|state| state_object_ref(state, state_ref_type))
+        .map(state_object_ref)
         .collect::<Vec<_>>();
     if manifest.state_objects != expected_state_refs {
         return Err(LeasedCheckpointError::StateRefsMismatch {
@@ -377,29 +345,13 @@ fn validate_manifest_refs_match_writes_with_state_ref_type(
     Ok(())
 }
 
-fn validate_production_state_store_ref_type(
-    actual: StateRefType,
-) -> Result<(), LeasedCheckpointError> {
-    let expected = StateRefType::SlateDbCheckpoint;
-    if actual != expected {
-        return Err(LeasedCheckpointError::ProductionStateStoreRefTypeMismatch {
-            expected,
-            actual,
-        });
-    }
-
-    Ok(())
-}
-
-fn state_object_ref(state: &StateObjectWrite, ref_type: StateRefType) -> StateObjectRef {
+fn state_object_ref(state: &StateObjectWrite) -> StateObjectRef {
     StateObjectRef {
         object_id: state.object_id().to_string(),
         object_key: state.object_key().clone(),
         owner: state.owner().to_string(),
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
-        ref_type,
-        slatedb: None,
         owner_claim: state.owner_claim().cloned(),
     }
 }

@@ -8,7 +8,7 @@ Reviewed source:
 
 OpenData is highly relevant to Velorix because it is explicitly organized as a
 set of object-native databases over a shared storage and infrastructure
-foundation. Its README names SlateDB as the common object-store-native storage
+foundation. Its README describes a common object-store-native storage
 layer and OpenData as the common infrastructure layer for service
 infrastructure, catalog, admin tooling, distributed state infrastructure,
 configuration, and testing.
@@ -85,7 +85,7 @@ Velorix should map these concepts onto its own vocabulary:
 | --- | --- |
 | Epoch | Engine logical epoch or ingest sequence, not necessarily manifest checkpoint version |
 | Durable watermark | Manifest-published checkpoint version plus referenced state/output objects |
-| Snapshot | Latest valid checkpoint manifest and SlateDB-backed state boundary |
+| Snapshot | Latest valid checkpoint manifest and referenced state objects |
 | Frozen delta | Engine checkpoint payload or object-backed output batch |
 | Backpressure | Query/write resource policy, pending flush size, object-store write lag |
 
@@ -93,7 +93,7 @@ Velorix should map these concepts onto its own vocabulary:
 
 OpenData's common-encodings RFC is valuable because object-native systems need
 stable byte encodings for ordered storage. Velorix currently uses deterministic
-object keys and JSON-heavy bootstrap payloads. As SlateDB usage deepens,
+object keys and JSON-heavy bootstrap payloads. As persisted state usage grows,
 Velorix will need shared binary encodings for state keys and values.
 
 Adopt the principle, not the exact format yet:
@@ -124,8 +124,8 @@ copy that shape for production readiness:
   frameworks, distributed mode, and shared ingest as roadmap or bigger ideas.
 - Importing large OpenData crates could create a second storage authority if
   Velorix does not align object keys, manifests, and checkpoints first.
-- OpenData currently uses SlateDB and Foyer versions that may not match
-  Velorix's workspace versions. Direct dependency reuse should wait for a
+- OpenData's persistence and cache dependencies may not match Velorix's
+  workspace versions. Direct dependency reuse should wait for a
   concrete integration target.
 - OpenData's Buffer delivery semantics require the downstream database to
   atomically commit batch sequence with data. Velorix's exactly-once manifests
@@ -143,8 +143,8 @@ implementation milestones:
    manifest-backed queue semantics.
 2. Write coordinator design with explicit epoch assignment, backpressure, and
    durability watermarks.
-3. State key/value binary encoding specification before broader SlateDB layout
-   work.
+3. State key/value binary encoding specification before broader persisted-state
+   layout work.
 4. Object-store-backed benchmark framework with machine-readable output.
 5. Admin inspection commands for queue manifests, checkpoint manifests,
    unreferenced objects, and state lifecycle.

@@ -2588,34 +2588,6 @@ pub(super) async fn reserve_ingest_range(
     }
 }
 
-#[allow(dead_code)]
-async fn commit_ingest_range(
-    state: &ApiState,
-    request: &IngestRowsRequest,
-    catalog: &VelorixRelationCatalogV1,
-    end_offset_exclusive: u64,
-    envelope: &bytes::Bytes,
-) -> Result<(), ApiError> {
-    let Some(meta_store) = state.meta_store.as_ref() else {
-        return Ok(());
-    };
-    let reservation = ingest_range_reservation(request, catalog, end_offset_exclusive, envelope)?;
-    match meta_store
-        .commit_ingest_range(reservation)
-        .await
-        .map_err(meta_error_to_api)?
-    {
-        CommitIngestRangeOutcome::Committed | CommitIngestRangeOutcome::Duplicate => Ok(()),
-        CommitIngestRangeOutcome::Conflict => Err(ApiError::conflict(format!(
-            "ingest commit conflict from metadata service for stream={} partition={} offsets={}-{}",
-            request.stream_id,
-            request.partition_id,
-            request.start_offset_inclusive,
-            end_offset_exclusive
-        ))),
-    }
-}
-
 fn ingest_range_reservation(
     request: &IngestRowsRequest,
     catalog: &VelorixRelationCatalogV1,

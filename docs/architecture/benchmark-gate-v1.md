@@ -31,17 +31,9 @@ threshold derived from repeated local measurements. The initial documented
 calibration used the component-wise conservative envelope of seven runs at commit
 `fec9e8cce84a96c2747a700430f9091f172f550a` on 2026-08-09: minimum throughput
 and maximum latency, resource, scan, and object-request values. All seven source
-runs passed the resulting baseline with the PR gate's 25% budget. The current
-baseline has mixed provenance: on 2026-09-27, explicit acceptance of official
-SlateDB 0.16.0 recalibrated only `slatedb_state_reopen` bytes written (8,660 to
-10,984) and LIST count (9 to 12), using the maxima of one preserved official
-full-workload run plus seven fixed additional runs. All eight pass the resulting
-gate. Every other field, including the historical baseline commit, remains
-unchanged; that commit does not identify the later two-field recalibration.
-The [comparison report](../development/slatedb-upstream-comparison-2026-09-27.md)
-and [per-run evidence](../development/slatedb-upstream-calibration-2026-09-27.json)
-record source hashes, the original failures and exact scope. The 25% budget is
-unchanged. The local PR
+runs passed the resulting baseline with the PR gate's 25% budget. The retired
+state-store reopen workload has been removed from active baselines; remaining
+measurements and the 25% budget are unchanged. The local PR
 gate blocks on deterministic structural and cost metrics: bytes per row, PUTs
 per GiB, object request counts and bytes, spill bytes, and scan bytes. It still
 records throughput, latency, and peak RSS, but those host-sensitive values are
@@ -69,13 +61,10 @@ runtime application, checkpoint publication, checkpoint recovery, and
 materialized-output read primitives. It does not benchmark the removed legacy
 persisted-source DataFusion scan surface. Checkpoint publication and recovery
 each use nine samples so their reported p50/p95 values are not single-operation
-timings. The SlateDB workload writes a small checkpoint state
-payload through `SlateDbStateStore`, closes and drops the store, reopens the
-same object-store path, reads the state back, and records elapsed latency plus
-the local metered object-store requests visible through the harness wrapper.
-This does not expose SlateDB internals or make object-request metering part of
-the state-store API. The GC dry-run workload prepares a small retained/orphan
-state-output set, calls `CheckpointPublisher::plan_garbage_collection`, asserts
+timings. Checkpoint recovery reads manifest-bound Arrow state objects from the
+authoritative object store. The GC dry-run workload prepares a small
+retained/orphan state-output set, calls
+`CheckpointPublisher::plan_garbage_collection`, asserts
 the retained checkpoint and candidates, and records local metered object-store
 requests. The local GC containment workload reuses that fixture, calls
 `execute_garbage_collection_plan_with_evidence`, and verifies the typed
@@ -102,7 +91,6 @@ benchmark results:
 - `materialized_output_delete_vector`
 - `materialized_output_ttl_vector`
 - `materialized_output_late_materialization`
-- `slatedb_state_reopen`
 - `gc_dry_run_planning`
 - `gc_execution_denied`
 
@@ -132,13 +120,11 @@ production deletion evidence can be emitted only after that coordinator gate.
 - Recovery after many checkpoints.
 - Checkpoint publication latency.
 - Materialized-output query and bounded segment reads.
-- SlateDB state write/read/reopen latency.
 - GC dry-run planning latency.
 - Local-only GC execution evidence latency.
 - Many-small-file scan.
 - Duplicate retry latency.
 - Corrupt payload detection.
-- SlateDB checkpoint recovery path when enabled.
 
 ## Materialized Output Segment Gates
 

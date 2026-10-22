@@ -650,7 +650,6 @@ fn is_object_backed_workload(name: &str) -> bool {
             | "materialized_output_delete_vector"
             | "materialized_output_ttl_vector"
             | "materialized_output_late_materialization"
-            | "slatedb_state_reopen"
             | "gc_dry_run_planning"
             | "gc_execution_denied"
     )

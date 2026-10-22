@@ -405,7 +405,7 @@ mod tests {
             program_id: "program".to_string(),
             view_id: "view".to_string(),
             checkpoint_key: format!(
-                "v1/standing-runtime-checkpoints/default/program/view/epochs/{:020}/sha256/{}.checkpoint.json",
+                "v1/standing-runtime-checkpoints/default/program/view/epochs/{:020}/sha256/{}.checkpoint.arrow",
                 1,
                 "a".repeat(64)
             ),

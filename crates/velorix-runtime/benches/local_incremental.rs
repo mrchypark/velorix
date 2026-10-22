@@ -61,7 +61,6 @@ use velorix_storage::{
     manifest::{CheckpointManifest, InputRange},
     relation_catalog_registry::RelationCatalogRegistry,
     state::{CheckpointPublisher, OutputObjectWrite, StateObjectWrite},
-    state_store::{SlateDbStateStore, StateObjectStore},
 };
 
 const STREAM_ID: &str = "orders";
@@ -321,12 +320,6 @@ async fn run() -> BenchResult<()> {
     .await?;
     let gc_execution_denied =
         gc_execution_denied(&publisher, &metered_store, &gc_dry_run_planning).await?;
-    let slatedb_state_reopen = slatedb_state_reopen(
-        Arc::clone(&store),
-        Arc::clone(&metered_store),
-        &capabilities,
-    )
-    .await?;
     let materialized_output_workloads =
         materialized_output_workloads::run_materialized_output_workloads(
             Arc::clone(&store),
@@ -390,12 +383,6 @@ async fn run() -> BenchResult<()> {
                     &recovery_samples,
                     recovery_requests,
                     0,
-                ),
-                workload_metric(
-                    "slatedb_state_reopen",
-                    &slatedb_state_reopen.samples,
-                    slatedb_state_reopen.object_requests,
-                    slatedb_state_reopen.scan_bytes,
                 ),
                 workload_metric(
                     "gc_dry_run_planning",
@@ -562,53 +549,6 @@ async fn gc_execution_denied(
         error,
         velorix_storage::state::CheckpointPublishError::GarbageCollectionCoordinationRequired
     ));
-
-    Ok(MeasuredWorkload {
-        samples: vec![elapsed],
-        object_requests: request_delta(&metered_store.snapshot(), &requests_before),
-        scan_bytes: 0,
-    })
-}
-
-async fn slatedb_state_reopen(
-    object_store: Arc<dyn ObjectStore>,
-    metered_store: Arc<MeteredObjectStore>,
-    capabilities: &AuthoritativeObjectStoreCapabilitiesV1,
-) -> BenchResult<MeasuredWorkload> {
-    let payload = Bytes::from_static(br#"{"state":"slatedb-reopen-smoke","version":1}"#);
-    let state = StateObjectWrite::new(
-        STATE_OWNER,
-        PARTITION_ID,
-        CHECKPOINT_VERSION + 1,
-        "slatedb-state-reopen",
-        payload.clone(),
-    )?;
-    let requests_before = metered_store.snapshot();
-    let started = Instant::now();
-
-    let state_ref = {
-        let state_store = SlateDbStateStore::open_authoritative(
-            "v1/slatedb/benchmark-state",
-            Arc::clone(&object_store),
-            capabilities,
-        )
-        .await?;
-        let state_ref = state_store.write_state_object(&state).await?;
-        state_store.close().await?;
-        state_ref
-    };
-
-    let reopened = SlateDbStateStore::open_authoritative(
-        "v1/slatedb/benchmark-state",
-        Arc::clone(&object_store),
-        capabilities,
-    )
-    .await?;
-    let recovered = reopened.read_state_object(&state_ref).await?;
-    reopened.close().await?;
-    let elapsed = started.elapsed();
-
-    assert_eq!(recovered, payload);
 
     Ok(MeasuredWorkload {
         samples: vec![elapsed],

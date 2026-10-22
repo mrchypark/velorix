@@ -22,7 +22,7 @@ segment.
 | Ingest admission record | `v1/ingest-admission/{stream_id}/p={partition_id:010}/ranges/{start:020}-{end:020}.admission.json` | Velorix-owned serialized admission evidence; object storage is evidence authority, deployed coordinator is serialization authority |
 | Ingest admission expiry decision | `v1/ingest-admission/{stream_id}/p={partition_id:010}/ranges/{start:020}-{end:020}/expiry-decisions/{decision_id}.expiry.json` | Operator-authored decision evidence for admission-before-batch orphan release; bound to the admission record digest and not admission evidence for committed replay |
 | Ingest admission index transition | `v1/ingest-admission-index/{stream_id}/p={partition_id:010}/advances/{previous_state_digest}.transition.json` | Create-only partition admission index transition; object storage is the cross-process fence authority |
-| State object | `v1/state/{owner}/p={partition_id:010}/chk={checkpoint_version:020}/{object_id}.state` | Checkpoint-referenced state payload |
+| State object | `v1/state/{owner}/p={partition_id:010}/chk={checkpoint_version:020}/{object_id}.state` | Checkpoint-referenced Arrow IPC state payload |
 | Output object | `v1/outputs/{stream_id}/p={partition_id:010}/chk={checkpoint_version:020}/{start:020}-{end:020}/{object_id}.output` | Manifest-referenced internal materialized output |
 | Temporary publish object | `v1/tmp/{checkpoint_version:020}/{attempt_or_object_id}/{kind}` | Non-authoritative staging location |
 | Checkpoint manifest | `v1/checkpoints/{checkpoint_version:020}.manifest` | Authoritative progress marker |
@@ -205,11 +205,9 @@ digest-mismatched `published` lifecycle records for those validated manifests
 and rebuild the advisory latest-candidate marker from the latest validated
 manifest. It does not repair or delete immutable checkpoint manifests and does
 not create retention, GC transition, or recovery transition records.
-After a
-GC run evidence object is written and read back successfully, GC also writes
-append-only retention evidence for non-retained checkpoints whose raw
-state/output payloads were deleted or whose SlateDB logical state refs were
-released:
+After a GC run evidence object is written and read back successfully, GC also
+writes append-only retention evidence for non-retained checkpoints whose state
+or output payloads were deleted:
 
 ```text
 v1/checkpoint-retention/{checkpoint_version:020}.retention.json
@@ -244,12 +242,10 @@ durable or monotonic.
 
 The manifest checkpoint version is a publication/progress version. It is
 separate from the incremental engine logical epoch. Current engine checkpoint
-state is serialized as a versioned payload with `schema_version`,
-`logical_epoch`, and `state`. Any remaining recovery path for legacy raw
-`DeltaBatch` state objects is bootstrap-only disposable scaffolding, not a
-production compatibility promise. The SlateDB/raw-state breaking slice must
-delete that fallback or hide it behind an explicit migration flag before
-production publication.
+state is serialized as a versioned Arrow IPC payload with `schema_version`,
+`logical_epoch`, and `state`. Readers validate the Arrow format and state
+commitment before restoring the runtime. The checkpoint-state format and bounds
+are defined in [Checkpoint State Arrow V1](checkpoint-state-arrow-v1.md).
 
 ## Publication and Crash Windows
 
@@ -333,10 +329,9 @@ immutable batch.
 Velorix owns object key policy, manifest validation, exactly-once publication,
 stream progress, and stateless recovery orchestration.
 
-SlateDB backs the current minimal experimental state-store path for
-checkpoint-versioned payloads. Production state references must distinguish
-bootstrap raw state objects from SlateDB checkpoint/root handles. Velorix GC
-must not delete SlateDB internal objects by prefix walking. See
+Checkpoint state is stored as immutable Arrow IPC objects in object storage.
+Rhiza is the metadata authority and stores metadata snapshots using the shared
+Arrow snapshot format; it does not replace the runtime state objects. See
 [State Substrate Contract](state-substrate-contract.md).
 
 DataFusion owns SQL/query planning, validation, and Arrow execution. The
@@ -360,15 +355,11 @@ operators until direct integration gates are satisfied.
 ## Garbage Collection
 
 The current implementation can build a deterministic manifest-aware GC plan and
-execute that plan for Velorix-owned raw state objects under `v1/state/...`,
-output objects under `v1/outputs/...`, and manifest-retired
-`SlateDbCheckpointRefV1` state refs. Raw state/output candidates are deleted
-through the object-store API. SlateDB candidates release only the logical state
-key and Velorix marker key through the SlateDB state store; GC still does not
-walk or delete SlateDB internal object-store prefixes. The plan retains objects
-referenced by the latest N published manifests, where N must be at least one,
-and classifies only unreferenced raw state/output objects and retired SlateDB
-state refs as candidates. Executed runs can
+execute it for Velorix-owned state objects under `v1/state/...` and output
+objects under `v1/outputs/...`. Candidates are deleted through the object-store
+API. The plan retains objects referenced by the latest N published manifests,
+where N must be at least one, and classifies only unreferenced state/output
+objects as candidates. Executed runs can
 write a stable `GcRunV1` evidence object under `v1/gc-runs/...` with the policy,
 plan, deleted candidates, and skipped candidates. The execute path reports
 success only after reading the persisted run evidence back and validating its
@@ -404,7 +395,5 @@ from the internal materialized-output compaction maintenance path described in
 `materialized-view-runtime-roadmap.md`.
 
 This is not a broad production GC service. It does not collect staging
-`v1/tmp/...` objects, does not add object-store listing-consistency controls,
-and does not delete SlateDB internal objects by prefix walking. Broader SlateDB
-retention handles, manifest deletion, and checkpoint-GC compaction policy
-remain future work.
+`v1/tmp/...` objects or add object-store listing-consistency controls. Broader
+manifest deletion and checkpoint-GC compaction policy remain future work.

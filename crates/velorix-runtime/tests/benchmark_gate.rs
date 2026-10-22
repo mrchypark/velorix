@@ -237,7 +237,6 @@ fn benchmark_gate_can_require_specific_workload_names() {
             "materialized_output_delete_vector",
             "materialized_output_ttl_vector",
             "materialized_output_late_materialization",
-            "slatedb_state_reopen",
             "gc_dry_run_planning",
             "gc_execution_denied",
             "aggregate_composite_high_cardinality",
@@ -600,20 +599,6 @@ fn local_workload_metrics() -> Vec<BenchmarkWorkloadMetricsV1> {
         materialized_output_metric("materialized_output_ttl_vector"),
         materialized_output_metric("materialized_output_late_materialization"),
         BenchmarkWorkloadMetricsV1 {
-            name: "slatedb_state_reopen".to_string(),
-            p50_ms: 8.0,
-            p95_ms: 9.0,
-            object_requests: Some(ObjectRequestMetricsV1 {
-                put_count: 1,
-                get_count: 1,
-                list_count: 1,
-                range_read_count: 0,
-                bytes_written: 256,
-                bytes_read: 256,
-            }),
-            scan_bytes: 0,
-        },
-        BenchmarkWorkloadMetricsV1 {
             name: "gc_dry_run_planning".to_string(),
             p50_ms: 4.0,
             p95_ms: 5.0,
@@ -878,20 +863,6 @@ const VALID_LOCAL_SMOKE_JSON: &str = r#"{
                 "bytes_read": 512
             },
             "scan_bytes": 128
-        },
-        {
-            "name": "slatedb_state_reopen",
-            "p50_ms": 8.0,
-            "p95_ms": 9.0,
-            "object_requests": {
-                "put_count": 1,
-                "get_count": 1,
-                "list_count": 1,
-                "range_read_count": 0,
-                "bytes_written": 256,
-                "bytes_read": 256
-            },
-            "scan_bytes": 0
         },
         {
             "name": "gc_dry_run_planning",
