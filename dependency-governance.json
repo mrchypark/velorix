@@ -92,15 +92,6 @@
     },
     {
       "kind": "duplicate",
-      "crate": "heck",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "Build-time-only duplicate: heck 0.4.1 via ouroboros_macro 0.18.5; heck 0.5.0 via clap_derive 4.6.7 and the prost-build 0.14.4 build dependency. None of these are linked into a Velorix binary.",
-      "replacement_plan": "ouroboros_macro is the last heck 0.4 consumer. Re-check the version-qualified inverse heck trees and retire the exception when ouroboros_macro is replaced, upgraded to heck 0.5, or dropped from the graph.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
       "crate": "object_store",
       "owner": "runtime",
       "expires_on": "2027-01-08",
@@ -124,15 +115,6 @@
       "expires_on": "2027-01-08",
       "reason": "rand_core 0.9.5 comes from rand 0.9.5, rand_chacha 0.9.0, and rand_xoshiro 0.7.0; rand_core 0.10.1 comes from chacha20 0.10.2, getrandom 0.4.3, and rand 0.10.3.",
       "replacement_plan": "Converges with the rand exception. Re-check the version-qualified inverse rand_core trees alongside the rand trees and delete this entry when a single rand_core line remains.",
-      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
-    },
-    {
-      "kind": "duplicate",
-      "crate": "winnow",
-      "owner": "runtime",
-      "expires_on": "2027-01-08",
-      "reason": "winnow 0.6.26 comes from duration-str 0.11.3; winnow 0.7.15 comes from toml_edit 0.22.27 via toml 0.8.23.",
-      "replacement_plan": "duration-str is the only 0.6 consumer. Re-run `cargo tree -i winnow` after a duration-str release and delete the entry when duration-str selects 0.7.15.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {
