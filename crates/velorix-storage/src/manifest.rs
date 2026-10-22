@@ -159,36 +159,15 @@ pub struct InputRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateObjectRef {
     pub object_id: String,
     pub object_key: ObjectKey,
     pub owner: String,
     pub partition_id: u32,
     pub checkpoint_version: u64,
-    #[serde(default = "legacy_raw_state_ref_type")]
-    pub ref_type: StateRefType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slatedb: Option<SlateDbCheckpointRefV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_claim: Option<PartitionOwnerClaim>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SlateDbCheckpointRefV1 {
-    pub db_path: String,
-    pub state_key: String,
-    pub state_digest: String,
-    pub state_bytes: u64,
-    pub created_by_checkpoint_version: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StateRefType {
-    LegacyRawObject,
-    RawObject,
-    SlateDbCheckpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,10 +518,6 @@ fn legacy_missing_output_checkpoint_version() -> u64 {
     u64::MAX
 }
 
-fn legacy_raw_state_ref_type() -> StateRefType {
-    StateRefType::LegacyRawObject
-}
-
 enum ObjectRef<'a> {
     State(&'a StateObjectRef),
     Output(&'a OutputObjectRef),
@@ -568,7 +543,7 @@ impl<'a> ObjectRef<'a> {
 mod tests {
     use super::{
         CheckpointManifest, InputRange, ManifestError, OutputObjectRef, PartitionOwnerClaim,
-        StateObjectRef, StateRefType,
+        StateObjectRef,
     };
     use crate::object_key::ObjectKey;
 
@@ -579,10 +554,20 @@ mod tests {
             owner: "balances_by_account".to_string(),
             partition_id: 0,
             checkpoint_version: 1,
-            ref_type: StateRefType::LegacyRawObject,
-            slatedb: None,
             owner_claim: None,
         }
+    }
+
+    #[test]
+    fn state_object_ref_rejects_unknown_backend_metadata() {
+        let state_ref = state_ref(
+            "state-0001",
+            ObjectKey::state_object("balances_by_account", 0, 1, "state-0001").unwrap(),
+        );
+        let mut value = serde_json::to_value(state_ref).unwrap();
+        value["unknown_backend"] = serde_json::json!("unsupported");
+
+        assert!(serde_json::from_value::<StateObjectRef>(value).is_err());
     }
 
     fn output_ref(object_id: &str, object_key: ObjectKey) -> OutputObjectRef {

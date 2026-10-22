@@ -1513,7 +1513,7 @@ async fn latest_checkpoint_record_for_scope_inner(
     let mut latest_checkpoint: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
     while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
         let location = meta.location.to_string();
-        if location.ends_with(".checkpoint.json") {
+        if location.ends_with(".checkpoint.arrow") {
             let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(location.clone())
                 .map_err(ApiError::bad_request)?;
             latest_checkpoint = Some(match latest_checkpoint {

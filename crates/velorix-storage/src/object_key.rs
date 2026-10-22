@@ -394,7 +394,7 @@ impl ObjectKey {
         let hash = parse_sha256_hash_segment(content_hash)?;
 
         Ok(Self(format!(
-            "v1/standing-runtime-checkpoints/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.checkpoint.json"
+            "v1/standing-runtime-checkpoints/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.checkpoint.arrow"
         )))
     }
 
@@ -460,7 +460,7 @@ impl ObjectKey {
         let hash = parse_sha256_hash_segment(page_content_hash)?;
 
         Ok(Self(format!(
-            "v1/standing-runtime-output-pages/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/pages/{page_index:0PARTITION_WIDTH$}/sha256/{hash}.output-page.json"
+            "v1/standing-runtime-output-pages/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/pages/{page_index:0PARTITION_WIDTH$}/sha256/{hash}.output-page.arrow"
         )))
     }
 
@@ -477,7 +477,7 @@ impl ObjectKey {
         let hash = parse_sha256_hash_segment(delta_content_hash)?;
 
         Ok(Self(format!(
-            "v1/standing-runtime-output-deltas/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.output-delta.json"
+            "v1/standing-runtime-output-deltas/{tenant_id}/{program_id}/{view_id}/epochs/{logical_epoch:0CHECKPOINT_WIDTH$}/sha256/{hash}.output-delta.arrow"
         )))
     }
 
@@ -1072,7 +1072,7 @@ fn parse_standing_runtime_checkpoint_parts(
     validate_segment("view_id", view_id)?;
     let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
     let hash = checkpoint_file
-        .strip_suffix(".checkpoint.json")
+        .strip_suffix(".checkpoint.arrow")
         .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
     validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
 
@@ -1152,7 +1152,7 @@ fn parse_standing_runtime_output_page_parts(
     let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
     let page_index = parse_fixed_u32("page_index", page_index, PARTITION_WIDTH)?;
     let hash = output_page_file
-        .strip_suffix(".output-page.json")
+        .strip_suffix(".output-page.arrow")
         .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
     validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
 
@@ -1179,7 +1179,7 @@ fn parse_standing_runtime_output_delta_parts(
     validate_segment("view_id", view_id)?;
     let logical_epoch = parse_fixed_u64("logical_epoch", logical_epoch, CHECKPOINT_WIDTH)?;
     let hash = output_delta_file
-        .strip_suffix(".output-delta.json")
+        .strip_suffix(".output-delta.arrow")
         .ok_or_else(|| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
     validate_sha256_hex(hash).map_err(|_| ObjectKeyError::InvalidExternalKey(value.to_string()))?;
 
@@ -1728,7 +1728,7 @@ mod tests {
 
         assert_eq!(
             checkpoint.as_str(),
-            "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.checkpoint.json"
+            "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.checkpoint.arrow"
         );
         assert_eq!(checkpoint, restarted);
         assert_ne!(checkpoint, same_state_next_epoch);
@@ -1739,6 +1739,12 @@ mod tests {
         assert_eq!(parts.view_id, "scores-by-user");
         assert_eq!(parts.logical_epoch, 42);
         assert_eq!(parts.content_hash, content_hash);
+        assert!(ObjectKey::parse_standing_runtime_checkpoint(
+            checkpoint
+                .as_str()
+                .replace(".checkpoint.arrow", ".checkpoint.json")
+        )
+        .is_err());
         assert_eq!(
             latest.as_str(),
             "v1/standing-runtime-checkpoints/tenant-a/program-a/scores-by-user/latest.json"
@@ -1843,7 +1849,7 @@ mod tests {
 
         assert_eq!(
             page.as_str(),
-            "v1/standing-runtime-output-pages/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/pages/0000000007/sha256/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.output-page.json"
+            "v1/standing-runtime-output-pages/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/pages/0000000007/sha256/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff.output-page.arrow"
         );
         assert_eq!(page, restarted);
         assert_eq!(ObjectKey::parse(page.as_str()).unwrap(), page);
@@ -1854,6 +1860,11 @@ mod tests {
         assert_eq!(parts.logical_epoch, 42);
         assert_eq!(parts.page_index, 7);
         assert_eq!(parts.page_content_hash, page_content_hash);
+        assert!(ObjectKey::parse_standing_runtime_output_page(
+            page.as_str()
+                .replace(".output-page.arrow", ".output-page.json")
+        )
+        .is_err());
     }
 
     #[test]
@@ -1878,7 +1889,7 @@ mod tests {
 
         assert_eq!(
             delta.as_str(),
-            "v1/standing-runtime-output-deltas/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.output-delta.json"
+            "v1/standing-runtime-output-deltas/tenant-a/program-a/scores-by-user/epochs/00000000000000000042/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.output-delta.arrow"
         );
         assert_eq!(delta, restarted);
         assert_eq!(ObjectKey::parse(delta.as_str()).unwrap(), delta);
@@ -1888,6 +1899,12 @@ mod tests {
         assert_eq!(parts.view_id, "scores-by-user");
         assert_eq!(parts.logical_epoch, 42);
         assert_eq!(parts.delta_content_hash, delta_content_hash);
+        assert!(ObjectKey::parse_standing_runtime_output_delta(
+            delta
+                .as_str()
+                .replace(".output-delta.arrow", ".output-delta.json")
+        )
+        .is_err());
     }
 
     #[test]

@@ -4,18 +4,21 @@ use velorix_core::delta::encode_kv_ordered;
 use velorix_core::query::{PageComparison, PagePredicate, PageScalar};
 
 /// The general materialized output page codec.
-pub(super) const CODEC: &str = "velorix-materialized-arrow-pages-v2";
+pub(super) const CODEC: &str = "velorix-materialized-arrow-pages-v3";
 /// The generic/demand bag page codec.
-pub(super) const BAG_CODEC: &str = "velorix-materialized-bag-arrow-pages-v1";
-/// The legacy generic/demand bag page codec (JSON pages).
-pub(super) const BAG_LEGACY_CODEC: &str = "velorix-materialized-bag-pages-v1";
-/// The general legacy materialized output codec (JSON pages).
-pub(super) const LEGACY_CODEC: &str = "velorix-delta-batch-json-v1";
+pub(super) const BAG_CODEC: &str = "velorix-materialized-bag-arrow-pages-v2";
+pub(super) const GENERIC_ARROW_CODEC: &str = "velorix-delta-batch-arrow-v1";
+//
 pub(super) fn is_materialized_codec(codec: &str) -> bool {
-    matches!(codec, CODEC | BAG_CODEC | BAG_LEGACY_CODEC)
+    matches!(codec, CODEC | BAG_CODEC)
 }
 pub(super) fn is_bag_codec(codec: &str) -> bool {
-    matches!(codec, BAG_CODEC | BAG_LEGACY_CODEC)
+    codec == BAG_CODEC
+}
+
+#[derive(Serialize, Deserialize)]
+struct GenericPageArrowEnvelope {
+    page: StandingRuntimeOutputPageRecord,
 }
 
 /// The published page identity of one codec.
@@ -32,57 +35,30 @@ struct CodecSpec {
     ipc_header: &'static str,
     /// The bag codec binds a family; the general codec has no family binding.
     bag: bool,
-    /// Arrow codecs encode their pages as Arrow IPC; JSON codecs keep the
-    /// serde payload and hash it as JSON.
-    arrow: bool,
 }
 
 const GENERAL_CODEC_SPEC: CodecSpec = CodecSpec {
     codec: CODEC,
-    schema_version: 2,
-    manifest_kind: "standing_runtime_materialized_output_manifest_v2",
-    page_kind: "standing_runtime_materialized_output_page_v2",
-    ipc_header: "velorix.materialized.page",
+    schema_version: 3,
+    manifest_kind: "standing_runtime_materialized_output_manifest_v3",
+    page_kind: "standing_runtime_materialized_output_page_v3",
+    ipc_header: "velorix.materialized.page.v3",
     bag: false,
-    arrow: true,
 };
 
 const BAG_CODEC_SPEC: CodecSpec = CodecSpec {
     codec: BAG_CODEC,
-    schema_version: 3,
-    manifest_kind: "standing_runtime_native_output_manifest_v3",
-    page_kind: "standing_runtime_native_output_page_v3",
-    ipc_header: "velorix.native.page",
+    schema_version: 4,
+    manifest_kind: "standing_runtime_native_output_manifest_v4",
+    page_kind: "standing_runtime_native_output_page_v4",
+    ipc_header: "velorix.native.page.v2",
     bag: true,
-    arrow: true,
-};
-
-const LEGACY_CODEC_SPEC: CodecSpec = CodecSpec {
-    codec: LEGACY_CODEC,
-    schema_version: 2,
-    manifest_kind: "standing_runtime_materialized_output_manifest_v2",
-    page_kind: "standing_runtime_materialized_output_page_v2",
-    ipc_header: "",
-    bag: false,
-    arrow: false,
-};
-
-const BAG_LEGACY_CODEC_SPEC: CodecSpec = CodecSpec {
-    codec: BAG_LEGACY_CODEC,
-    schema_version: 2,
-    manifest_kind: "standing_runtime_native_output_manifest_v2",
-    page_kind: "standing_runtime_native_output_page_v2",
-    ipc_header: "",
-    bag: true,
-    arrow: false,
 };
 
 fn codec_spec(codec: &str) -> Option<&'static CodecSpec> {
     match codec {
         CODEC => Some(&GENERAL_CODEC_SPEC),
         BAG_CODEC => Some(&BAG_CODEC_SPEC),
-        LEGACY_CODEC => Some(&LEGACY_CODEC_SPEC),
-        BAG_LEGACY_CODEC => Some(&BAG_LEGACY_CODEC_SPEC),
         _ => None,
     }
 }
@@ -251,7 +227,7 @@ pub(super) async fn discover_checkpoint_head(
             return Err(invalid());
         }
         let path = meta.location.to_string();
-        if !path.ends_with(".checkpoint.json") {
+        if !path.ends_with(".checkpoint.arrow") {
             continue;
         }
         let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(path.clone())
@@ -415,48 +391,19 @@ fn root_hash(record: &StandingRuntimeOutputManifestRecord) -> Result<String, Api
 }
 
 fn page_hash(record: &StandingRuntimeOutputPageRecord) -> Result<String, ApiError> {
-    if codec_spec(&record.output_encoding).is_some_and(|spec| spec.arrow) {
-        return ipc_hash(record, &compact_batch(record)?);
-    }
-    // Exclude the manifest root to avoid a circular root -> page -> root digest.
-    // The root binds this page digest, and readers require the page's root equality.
-    // The codec is part of the tuple so the bag JSON codec and the general JSON
-    // codec never hash to the same digest.
-    let bytes = serde_json::to_vec(&(
-        &record.output_encoding,
-        record.schema_version,
-        &record.record_kind,
-        &record.tenant_id,
-        &record.program_id,
-        &record.view_id,
-        record.logical_epoch,
-        record.page_index,
-        record.row_count,
-        &record.output_encoding,
-        &record.source_kind,
-        &record.published_output,
-    ))
-    .map_err(ApiError::internal)?;
-    Ok(stable_bytes_hash(&bytes))
+    ipc_hash(record, &compact_batch(record)?)
 }
 
-const BAG_FIELDS: [&str; 3] = [
-    "__velorix_key_json",
-    "__velorix_value_json",
-    "__velorix_weight",
-];
+const ROW_STATE_FIELD: &str = "__velorix_rows_arrow_state";
 
 fn compact_batch(record: &StandingRuntimeOutputPageRecord) -> Result<RecordBatch, ApiError> {
-    use arrow::array::{Int64Array, StringArray};
+    codec_spec(&record.output_encoding).ok_or_else(invalid)?;
+    use arrow::array::BinaryArray;
     use arrow::datatypes::{DataType, Field, Schema};
     let payload: PageRows =
         serde_json::from_value(record.published_output.clone()).map_err(ApiError::bad_request)?;
     let schema = payload.schema.as_ref().ok_or_else(invalid)?;
-    if schema
-        .columns
-        .iter()
-        .any(|c| BAG_FIELDS.contains(&c.name.as_str()))
-    {
+    if schema.columns.iter().any(|c| c.name == ROW_STATE_FIELD) {
         return Err(invalid());
     }
     let rows = payload.rows.records();
@@ -477,30 +424,23 @@ fn compact_batch(record: &StandingRuntimeOutputPageRecord) -> Result<RecordBatch
         )
     }
     .map_err(ApiError::bad_request)?;
+    let state = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+        &payload.rows,
+        MAX_INDEX_BYTES,
+    )
+    .map_err(ApiError::bad_request)?;
+    let mut row_states = vec![None; batch.num_rows()];
+    if let Some(first) = row_states.first_mut() {
+        *first = Some(state.as_bytes());
+    }
     let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
-    fields.extend(
-        [
-            Field::new(BAG_FIELDS[0], DataType::Utf8, false),
-            Field::new(BAG_FIELDS[1], DataType::Utf8, false),
-            Field::new(BAG_FIELDS[2], DataType::Int64, false),
-        ]
-        .into_iter()
-        .map(Arc::new),
-    );
-    let keys = rows
-        .iter()
-        .map(|r| serde_json::to_string(r.key.as_json()).map_err(ApiError::internal))
-        .collect::<Result<Vec<_>, _>>()?;
-    let values = rows
-        .iter()
-        .map(|r| serde_json::to_string(r.value.as_json()).map_err(ApiError::internal))
-        .collect::<Result<Vec<_>, _>>()?;
+    fields.push(Arc::new(Field::new(
+        ROW_STATE_FIELD,
+        DataType::Binary,
+        true,
+    )));
     let mut columns = batch.columns().to_vec();
-    columns.extend([
-        Arc::new(StringArray::from(keys)) as ArrayRef,
-        Arc::new(StringArray::from(values)) as ArrayRef,
-        Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.weight))) as ArrayRef,
-    ]);
+    columns.push(Arc::new(BinaryArray::from_iter(row_states)) as ArrayRef);
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(ApiError::bad_request)
 }
 
@@ -533,9 +473,16 @@ fn ipc_bytes(
     .map_err(ApiError::bad_request)?;
     let mut bytes = Vec::new();
     {
-        let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut bytes, batch.schema().as_ref())
-                .map_err(ApiError::internal)?;
+        let options = arrow::ipc::writer::IpcWriteOptions::default()
+            .try_with_compression(Some(arrow::ipc::CompressionType::ZSTD))
+            .and_then(|options| options.try_with_compression_level(Some(3)))
+            .map_err(ApiError::internal)?;
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+            &mut bytes,
+            batch.schema().as_ref(),
+            options,
+        )
+        .map_err(ApiError::internal)?;
         writer.write(&batch).map_err(ApiError::internal)?;
         writer.finish().map_err(ApiError::internal)?;
     }
@@ -550,17 +497,34 @@ fn ipc_hash(
 }
 
 pub(super) fn encode_page(record: &StandingRuntimeOutputPageRecord) -> Result<Vec<u8>, ApiError> {
-    if codec_spec(&record.output_encoding).is_some_and(|spec| spec.arrow) {
+    if record.output_encoding == GENERIC_ARROW_CODEC {
+        let state = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+            &GenericPageArrowEnvelope {
+                page: record.clone(),
+            },
+            MAX_INDEX_BYTES,
+        )
+        .map_err(ApiError::bad_request)?;
+        return Ok(state.as_bytes().to_vec());
+    }
+    if codec_spec(&record.output_encoding).is_some() {
         ipc_bytes(record, &compact_batch(record)?, false)
     } else {
-        serde_json::to_vec(record).map_err(ApiError::internal)
+        Err(invalid())
     }
 }
 
+#[cfg(test)]
 fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBatch), ApiError> {
-    use arrow::array::{Array, Int64Array, StringArray};
-    use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
-    validate_ipc_frames(bytes)?;
+    decode_ipc_bounded(bytes, MAX_INDEX_BYTES)
+}
+
+fn decode_ipc_bounded(
+    bytes: &[u8],
+    max_expanded_bytes: usize,
+) -> Result<(StandingRuntimeOutputPageRecord, RecordBatch), ApiError> {
+    use arrow::array::{Array, BinaryArray};
+    let compressed = validate_ipc_frames(bytes, max_expanded_bytes)?;
     let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(ApiError::bad_request)?;
     // The IPC header identifies the codec family; read it before the record
@@ -570,16 +534,10 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
         .metadata()
         .keys()
         .find(|key| {
-            key.as_str() == GENERAL_CODEC_SPEC.ipc_header
-                || key.as_str() == BAG_CODEC_SPEC.ipc_header
+            [GENERAL_CODEC_SPEC.ipc_header, BAG_CODEC_SPEC.ipc_header].contains(&key.as_str())
         })
         .cloned()
         .ok_or_else(invalid)?;
-    let spec = if ipc_header == GENERAL_CODEC_SPEC.ipc_header {
-        &GENERAL_CODEC_SPEC
-    } else {
-        &BAG_CODEC_SPEC
-    };
     let header = reader
         .schema()
         .metadata()
@@ -588,6 +546,7 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
         .ok_or_else(invalid)?;
     let mut record: StandingRuntimeOutputPageRecord =
         serde_json::from_str(&header).map_err(ApiError::bad_request)?;
+    let spec = codec_spec(&record.output_encoding).ok_or_else(invalid)?;
     if record.output_encoding != spec.codec
         || record.schema_version != spec.schema_version
         || record.record_kind != spec.page_kind
@@ -595,6 +554,7 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
         || !record.output_content_hash.is_empty()
         || !record.page_content_hash.is_empty()
         || reader.schema().metadata().len() != 1
+        || !compressed
     {
         return Err(invalid());
     }
@@ -622,44 +582,34 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
     }
     let output_schema = arrow_schema_from_incremental_relation_schema(schema)?;
     let n = schema.columns.len();
-    if batch.num_columns() != n + 3 || batch.schema().fields()[..n] != output_schema.fields()[..] {
+    if batch.num_columns() < n + 1 {
         return Err(invalid());
     }
-    let keys = batch
+    if batch.schema().fields()[..n] != output_schema.fields()[..] {
+        return Err(invalid());
+    }
+    if batch.num_columns() != n + 1 || batch.schema().field(n).name() != ROW_STATE_FIELD {
+        return Err(invalid());
+    }
+    let row_states = batch
         .column(n)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<BinaryArray>()
         .ok_or_else(invalid)?;
-    let values = batch
-        .column(n + 1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(invalid)?;
-    let weights = batch
-        .column(n + 2)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(invalid)?;
-    if keys.null_count() != 0
-        || values.null_count() != 0
-        || weights.null_count() != 0
-        || (0..3).any(|i| batch.schema().field(n + i).name() != BAG_FIELDS[i])
-    {
-        return Err(invalid());
+    if batch.num_rows() == 0 {
+        payload.rows = DeltaBatch::default();
+    } else {
+        if row_states.is_null(0) || (1..batch.num_rows()).any(|i| !row_states.is_null(i)) {
+            return Err(invalid());
+        }
+        let state = velorix_core::arrow_state::ArrowState::from_ipc(
+            row_states.value(0),
+            max_expanded_bytes,
+        )
+        .map_err(ApiError::bad_request)?;
+        payload.rows =
+            velorix_core::arrow_state::from_state(&state).map_err(ApiError::bad_request)?;
     }
-    payload.rows = DeltaBatch::from_records(
-        (0..batch.num_rows())
-            .map(|i| {
-                let key = serde_json::from_str(keys.value(i)).map_err(ApiError::bad_request)?;
-                let value = serde_json::from_str(values.value(i)).map_err(ApiError::bad_request)?;
-                Ok(DeltaRecord::new(
-                    DeltaKey::from_json(key),
-                    DeltaValue::from_json(value),
-                    weights.value(i),
-                ))
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?,
-    );
     if canonical_count(&payload.rows)? != record.row_count {
         return Err(invalid());
     }
@@ -678,8 +628,13 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
     Ok((record, typed))
 }
 
-fn validate_ipc_frames(mut bytes: &[u8]) -> Result<(), ApiError> {
+fn validate_ipc_frames(mut bytes: &[u8], limit: usize) -> Result<bool, ApiError> {
+    if bytes.len() > limit.saturating_mul(2).saturating_add(16 * 1024) {
+        return Err(invalid());
+    }
     let mut messages = 0usize;
+    let mut expanded = 0usize;
+    let mut compressed = false;
     loop {
         let prefix = bytes.get(..8).ok_or_else(invalid)?;
         if prefix[..4] != [255; 4] {
@@ -689,7 +644,7 @@ fn validate_ipc_frames(mut bytes: &[u8]) -> Result<(), ApiError> {
         bytes = &bytes[8..];
         if length == 0 {
             return if bytes.is_empty() && messages == 2 {
-                Ok(())
+                Ok(compressed)
             } else {
                 Err(invalid())
             };
@@ -697,16 +652,54 @@ fn validate_ipc_frames(mut bytes: &[u8]) -> Result<(), ApiError> {
         let metadata = bytes.get(..length).ok_or_else(invalid)?;
         let message = arrow::ipc::root_as_message(metadata).map_err(ApiError::bad_request)?;
         if messages == 0 {
-            if message.header_as_schema().is_none() {
+            if message.header_as_schema().is_none() || message.bodyLength() != 0 {
                 return Err(invalid());
             }
         } else if messages == 1 {
             let batch = message.header_as_record_batch().ok_or_else(invalid)?;
             if batch.length() < 0
                 || batch.length() > PAGE_ROWS as i64
-                || batch.compression().is_some()
+                || batch.compression().is_some_and(|compression| {
+                    compression.codec() != arrow::ipc::CompressionType::ZSTD
+                        || compression.method() != arrow::ipc::BodyCompressionMethod::BUFFER
+                })
             {
                 return Err(invalid());
+            }
+            compressed = batch.compression().is_some();
+            let body_len = usize::try_from(message.bodyLength()).map_err(ApiError::bad_request)?;
+            let body = bytes
+                .get(length..length.checked_add(body_len).ok_or_else(invalid)?)
+                .ok_or_else(invalid)?;
+            for buffer in batch.buffers().ok_or_else(invalid)? {
+                let start = usize::try_from(buffer.offset()).map_err(ApiError::bad_request)?;
+                let size = usize::try_from(buffer.length()).map_err(ApiError::bad_request)?;
+                let frame = body
+                    .get(start..start.checked_add(size).ok_or_else(invalid)?)
+                    .ok_or_else(invalid)?;
+                if size == 0 {
+                    continue;
+                }
+                let size = if batch.compression().is_some() {
+                    let expanded_size = i64::from_le_bytes(
+                        frame
+                            .get(..8)
+                            .ok_or_else(invalid)?
+                            .try_into()
+                            .map_err(|_| invalid())?,
+                    );
+                    if expanded_size == -1 {
+                        size - 8
+                    } else {
+                        usize::try_from(expanded_size).map_err(ApiError::bad_request)?
+                    }
+                } else {
+                    size
+                };
+                expanded = expanded
+                    .checked_add(size)
+                    .filter(|expanded| *expanded <= limit)
+                    .ok_or_else(invalid)?;
             }
         } else {
             return Err(invalid());
@@ -722,10 +715,37 @@ pub(super) fn decode_page(
     bytes: &[u8],
     codec: &str,
 ) -> Result<StandingRuntimeOutputPageRecord, ApiError> {
-    if codec_spec(codec).is_some_and(|spec| spec.arrow) {
-        decode_ipc(bytes).map(|(record, _)| record)
+    decode_page_bounded(bytes, codec, MAX_INDEX_BYTES)
+}
+
+fn decode_page_bounded(
+    bytes: &[u8],
+    codec: &str,
+    max_expanded_bytes: usize,
+) -> Result<StandingRuntimeOutputPageRecord, ApiError> {
+    if codec == GENERIC_ARROW_CODEC {
+        let state = velorix_core::arrow_state::ArrowState::from_ipc(bytes, max_expanded_bytes)
+            .map_err(ApiError::bad_request)?;
+        let envelope = state
+            .field::<StandingRuntimeOutputPageRecord>("page")
+            .map_err(ApiError::bad_request)?
+            .ok_or_else(invalid)?;
+        let canonical = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+            &GenericPageArrowEnvelope {
+                page: envelope.clone(),
+            },
+            max_expanded_bytes,
+        )
+        .map_err(ApiError::bad_request)?;
+        if canonical.as_bytes() != bytes {
+            return Err(invalid());
+        }
+        return Ok(envelope);
+    }
+    if codec_spec(codec).is_some() {
+        decode_ipc_bounded(bytes, max_expanded_bytes).map(|(record, _)| record)
     } else {
-        serde_json::from_slice(bytes).map_err(ApiError::bad_request)
+        Err(invalid())
     }
 }
 
@@ -733,9 +753,15 @@ fn decode_query_page(
     bytes: &[u8],
     manifest: &StandingRuntimeOutputManifestRecord,
     reference: &StandingRuntimeOutputPageRef,
+    max_expanded_bytes: usize,
 ) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>), ApiError> {
-    let (record, batch) = if codec_spec(&reference.output_encoding).is_some_and(|spec| spec.arrow) {
-        let (r, b) = decode_ipc(bytes)?;
+    let (record, batch) = if reference.output_encoding == GENERIC_ARROW_CODEC {
+        (
+            decode_page_bounded(bytes, &reference.output_encoding, max_expanded_bytes)?,
+            None,
+        )
+    } else if codec_spec(&reference.output_encoding).is_some() {
+        let (r, b) = decode_ipc_bounded(bytes, max_expanded_bytes)?;
         (r, Some(b))
     } else {
         (decode_page(bytes, &reference.output_encoding)?, None)
@@ -743,7 +769,7 @@ fn decode_query_page(
     let (key, parts) = ObjectKey::parse_standing_runtime_output_page(&reference.page_key)
         .map_err(ApiError::bad_request)?;
     if batch.is_none() {
-        validate_page(&key, &record)?;
+        super::checkpoint_publication::validate_standing_runtime_output_page_record(&key, &record)?;
     }
     if record.page_index != reference.page_index
         || record.page_content_hash != reference.page_content_hash
@@ -766,10 +792,12 @@ async fn read_query_page(
     state: &ApiState,
     manifest: &StandingRuntimeOutputManifestRecord,
     reference: &StandingRuntimeOutputPageRef,
-    max_bytes: Option<u64>,
+    max_encoded_bytes: Option<u64>,
+    max_expanded_bytes: usize,
 ) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>, u64), ApiError> {
-    read_query_page_with_decoder(state, manifest, reference, max_bytes, |bytes| {
-        decode_query_page(bytes, manifest, reference)
+    let max_expanded_bytes = max_expanded_bytes.min(state.max_standing_runtime_expansion_bytes);
+    read_query_page_with_decoder(state, manifest, reference, max_encoded_bytes, |bytes| {
+        decode_query_page(bytes, manifest, reference, max_expanded_bytes)
     })
     .await
 }
@@ -1287,49 +1315,15 @@ pub(super) fn validate_manifest(
     Ok(())
 }
 
-/// Test/benchmark legacy v2 publication through the same page and root codecs.
+/// Test publication without optional statistics using the current page codec.
 #[cfg(test)]
-pub(super) fn publication_legacy(
+pub(super) fn publication_without_stats(
     checkpoint: &RuntimeCheckpoint,
     view_id: &str,
     checkpoint_key: &ObjectKey,
     output: DeltaBatch,
 ) -> Result<StandingRuntimeOutputPublication, ApiError> {
     let mut p = publication(checkpoint, view_id, checkpoint_key, output)?;
-    // The legacy publication mirrors the source codec: the general Arrow codec
-    // falls back to the general JSON codec, the bag Arrow codec to the bag JSON
-    // codec. The record kinds come from the same spec table so the legacy
-    // manifest keeps the identity of its source codec.
-    let legacy_spec = match p.manifest_record.output_encoding.as_str() {
-        codec if codec == BAG_CODEC => &BAG_LEGACY_CODEC_SPEC,
-        _ => &LEGACY_CODEC_SPEC,
-    };
-    for (key, page) in &mut p.page_records {
-        page.schema_version = legacy_spec.schema_version;
-        page.record_kind = legacy_spec.page_kind.into();
-        page.output_encoding = legacy_spec.codec.into();
-        page.published_output
-            .as_object_mut()
-            .ok_or_else(invalid)?
-            .remove("schema");
-        page.page_content_hash = page_hash(page)?;
-        *key = ObjectKey::standing_runtime_output_page(
-            &page.tenant_id,
-            &page.program_id,
-            &page.view_id,
-            page.logical_epoch,
-            page.page_index,
-            &page.page_content_hash,
-        )
-        .map_err(ApiError::bad_request)?;
-        let reference = &mut p.manifest_record.pages[page.page_index as usize];
-        reference.page_key = key.as_str().into();
-        reference.page_content_hash = page.page_content_hash.clone();
-        reference.output_encoding = legacy_spec.codec.into();
-    }
-    p.manifest_record.schema_version = legacy_spec.schema_version;
-    p.manifest_record.record_kind = legacy_spec.manifest_kind.into();
-    p.manifest_record.output_encoding = legacy_spec.codec.into();
     p.manifest_record
         .published_output
         .as_object_mut()
@@ -1417,7 +1411,7 @@ fn validate_page_binding_metadata(
     // Only the Arrow codecs carry a decoded page root and the inlined schema;
     // the JSON codecs keep the whole payload in the record and bind the root
     // hash directly.
-    let arrow = codec_spec(&page.output_encoding).is_some_and(|spec| spec.arrow);
+    let arrow = codec_spec(&page.output_encoding).is_some();
     if page.tenant_id != manifest.tenant_id
         || page.program_id != manifest.program_id
         || page.view_id != manifest.view_id
@@ -1784,7 +1778,7 @@ async fn query_bound_selected_policy_at_pointer(
                 output_id: output_id.into(),
                 object_path: pointer.checkpoint_key.clone(),
                 content_hash: pointer.manifest_hash.clone(),
-                codec: "standing-runtime-checkpoint-json".into(),
+                codec: "velorix-arrow-ipc-zstd3-v1".into(),
                 root_hash: pointer.content_hash.clone(),
                 checkpoint_epoch: pointer.logical_epoch,
             },
@@ -2051,19 +2045,22 @@ async fn query_bound_selected_policy_at_pointer(
         let count = page_ref.row_count;
         let stop = start.checked_add(count).ok_or_else(invalid)?;
         if (start < end && stop > offset) || (filter.is_none() && manifest.output_row_count == 0) {
-            let budget = {
-                let scan_remaining = policy.max_scan_bytes.map(|n| n.saturating_sub(scan_bytes));
-                // JSON decoding, BAG copies and Arrow expansion need room before allocation.
-                let memory_remaining = policy
-                    .memory_limit_bytes
-                    .map(|n| n.saturating_sub(retained_bytes) / 16);
-                match (scan_remaining, memory_remaining) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                }
-            };
-            let (page, typed, byte_count) =
-                read_query_page(state, &manifest, page_ref, budget).await?;
+            let scan_remaining = policy.max_scan_bytes.map(|n| n.saturating_sub(scan_bytes));
+            // Charge encoded bytes to scan policy and independently bound
+            // decompression by remaining query memory and the state ceiling.
+            let expanded_remaining = policy
+                .memory_limit_bytes
+                .map(|n| n.saturating_sub(retained_bytes) / 16)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(state.max_standing_runtime_expansion_bytes);
+            let (page, typed, byte_count) = read_query_page(
+                state,
+                &manifest,
+                page_ref,
+                scan_remaining,
+                expanded_remaining,
+            )
+            .await?;
             {
                 scan_bytes = scan_bytes.checked_add(byte_count).ok_or_else(invalid)?;
                 let payload: PageRows = serde_json::from_value(page.published_output.clone())
@@ -2394,7 +2391,12 @@ pub(crate) mod tests {
             "SELECT * FROM purchases_by_user WHERE id='same' AND EXISTS (SELECT 1 FROM purchases_by_user)",
             "SELECT * FROM (SELECT * FROM purchases_by_user) t WHERE id='same'",
             "SELECT * FROM other WHERE id='same'",
-        ] { assert!(velorix_core::query::materialized_page_predicate(sql,&schema,&[]).is_none(),"{sql}"); }
+        ] {
+            assert!(
+                velorix_core::query::materialized_page_predicate(sql, &schema, &[]).is_none(),
+                "{sql}"
+            );
+        }
         let filter = velorix_core::query::materialized_page_predicate(
             "SELECT sum(power), count(*) FROM purchases_by_user p WHERE p.id=$1 AND abs(power)>0",
             &schema,
@@ -3061,7 +3063,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn generic_family_without_output_schema_keeps_legacy_json_path() {
+    fn generic_family_without_output_schema_uses_arrow_state_page() {
         let (mut checkpoint, schema) = fixture();
         let output = DeltaBatch::from_records([row(json!(1.), 2)]);
         let payload = json!({"runtime_kind": "ordered_window", "published_output": output});
@@ -3086,8 +3088,16 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             publication.manifest_record.output_encoding,
-            "velorix-delta-batch-json-v1"
+            GENERIC_ARROW_CODEC
         );
+        let page = &publication.page_records[0].1;
+        let encoded = encode_page(page).unwrap();
+        let decoded = decode_page(&encoded, GENERIC_ARROW_CODEC).unwrap();
+        assert_eq!(decoded.published_output, page.published_output);
+        let mut malformed = encoded;
+        let middle = malformed.len() / 2;
+        malformed[middle] ^= 0x40;
+        assert!(decode_page(&malformed, GENERIC_ARROW_CODEC).is_err());
 
         let output = DeltaBatch::from_records([row(json!(1.), 2)]);
         let payload = json!({
@@ -3106,6 +3116,37 @@ pub(crate) mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn generic_arrow_page_hashes_nested_maps_after_canonicalization() {
+        let (checkpoint, schema) = fixture();
+        let batch = DeltaBatch::from_records([row(json!(1.), 1)]);
+        let mut published_output = serde_json::to_value(batch).unwrap();
+        published_output["records"][0]["value"] = json!({"z": 1, "nested": {"y": 2, "a": 3}});
+        let mut canonical = published_output.clone();
+        canonical.sort_all_objects();
+        let expected_hash = stable_bytes_hash(&serde_json::to_vec(&canonical).unwrap());
+
+        let publication =
+            super::super::checkpoint_publication::standing_runtime_output_publication(
+                &checkpoint,
+                &schema.relation_id,
+                &key(&checkpoint),
+                published_output,
+            )
+            .unwrap();
+        assert_eq!(
+            publication.manifest_record.output_content_hash,
+            expected_hash
+        );
+        let (page_key, page) = &publication.page_records[0];
+        let decoded = decode_page(&encode_page(page).unwrap(), GENERIC_ARROW_CODEC).unwrap();
+        assert_eq!(decoded.published_output, canonical);
+        super::super::checkpoint_publication::validate_standing_runtime_output_page_record(
+            page_key, &decoded,
+        )
+        .unwrap();
     }
 
     async fn installed(
@@ -3160,7 +3201,7 @@ pub(crate) mod tests {
         let publication = if stats {
             publication(&checkpoint, &view_id, &key(&checkpoint), output)
         } else {
-            publication_legacy(&checkpoint, &view_id, &key(&checkpoint), output)
+            publication_without_stats(&checkpoint, &view_id, &key(&checkpoint), output)
         }
         .unwrap();
         checkpoint.output_manifest_refs = vec![format!(
@@ -3215,7 +3256,8 @@ pub(crate) mod tests {
             replay_checkpoints: vec![],
             manifest_hash: String::new(),
         };
-        let bytes = serde_json::to_vec(&record).unwrap();
+        let bytes = checkpoint_record::encode(&record, checkpoint_record::MAX_ENCODED_RECORD_BYTES)
+            .unwrap();
         state
             .store
             .put(
@@ -3387,16 +3429,65 @@ pub(crate) mod tests {
             counts.clone(),
         ));
         for (sql, binds, expected, pages) in [
-            ("SELECT count(*) AS n FROM purchases_by_user WHERE timestamp >= TIMESTAMP '1970-01-01 00:00:00.000000001' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000000002'",vec![],512,1),
-            ("SELECT count(*) AS n FROM purchases_by_user WHERE timestamp=$1",vec![QueryBindValue::Timestamp("1970-01-01T00:00:00.000000001".into())],512,1),
-            ("SELECT count(*) AS n FROM purchases_by_user WHERE id IN ('a','z')",vec![],1024,2),
+            (
+                "SELECT count(*) AS n FROM purchases_by_user WHERE timestamp >= TIMESTAMP '1970-01-01 00:00:00.000000001' AND timestamp < TIMESTAMP '1970-01-01 00:00:00.000000002'",
+                vec![],
+                512,
+                1,
+            ),
+            (
+                "SELECT count(*) AS n FROM purchases_by_user WHERE timestamp=$1",
+                vec![QueryBindValue::Timestamp(
+                    "1970-01-01T00:00:00.000000001".into(),
+                )],
+                512,
+                1,
+            ),
+            (
+                "SELECT count(*) AS n FROM purchases_by_user WHERE id IN ('a','z')",
+                vec![],
+                1024,
+                2,
+            ),
         ] {
             counts.clear();
-            let predicate = velorix_core::query::materialized_page_predicate(sql,&schema,&binds).unwrap();
-            let page = query_bound_selected(&state,&schema.relation_id,&checkpoint.identity,&schema.relation_id,"generic_set_ops_v1",&schema,SnapshotPageRequest::default(),Some((&predicate,QueryPolicy::default()))).await.unwrap().unwrap();
-            assert_eq!(counts.get_paths().iter().filter(|p| p.starts_with("v1/standing-runtime-output-pages/")).count(),pages);
-            let result = query_record_batches_table_with_bindings_and_policy_and_limiter(&schema.relation_id,page.batches,sql,&binds,QueryPolicy::default(),None).await.unwrap();
-            assert_eq!(record_batches_to_json_rows(&result).unwrap(),vec![json!({"n":expected})]);
+            let predicate =
+                velorix_core::query::materialized_page_predicate(sql, &schema, &binds).unwrap();
+            let page = query_bound_selected(
+                &state,
+                &schema.relation_id,
+                &checkpoint.identity,
+                &schema.relation_id,
+                "generic_set_ops_v1",
+                &schema,
+                SnapshotPageRequest::default(),
+                Some((&predicate, QueryPolicy::default())),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                counts
+                    .get_paths()
+                    .iter()
+                    .filter(|p| p.starts_with("v1/standing-runtime-output-pages/"))
+                    .count(),
+                pages
+            );
+            let result = query_record_batches_table_with_bindings_and_policy_and_limiter(
+                &schema.relation_id,
+                page.batches,
+                sql,
+                &binds,
+                QueryPolicy::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                record_batches_to_json_rows(&result).unwrap(),
+                vec![json!({"n":expected})]
+            );
         }
         for predicate in [
             "timestamp >= '1970-01-01 00:00:00'",
@@ -3416,7 +3507,14 @@ pub(crate) mod tests {
         schema.columns[2].data_type = SqlDataType::Timestamp {
             timezone: Some("UTC".into()),
         };
-        assert_eq!(velorix_core::query::materialized_page_predicate("SELECT * FROM purchases_by_user WHERE timestamp >= TIMESTAMP '1970-01-01 00:00:00'",&schema,&[]),Some(PagePredicate::Unknown));
+        assert_eq!(
+            velorix_core::query::materialized_page_predicate(
+                "SELECT * FROM purchases_by_user WHERE timestamp >= TIMESTAMP '1970-01-01 00:00:00'",
+                &schema,
+                &[]
+            ),
+            Some(PagePredicate::Unknown)
+        );
     }
 
     #[tokio::test]
@@ -3430,9 +3528,10 @@ pub(crate) mod tests {
         let calls = AtomicUsize::new(0);
         let manifest = &publication.manifest_record;
         let reference = &manifest.pages[0];
+        let max_expanded_bytes = state.max_standing_runtime_expansion_bytes;
         let decode = |bytes: &[u8]| {
             calls.fetch_add(1, Ordering::Relaxed);
-            decode_query_page(bytes, manifest, reference)
+            decode_query_page(bytes, manifest, reference, max_expanded_bytes)
         };
         read_query_page_with_decoder(&state, manifest, reference, None, decode)
             .await
@@ -3465,6 +3564,43 @@ pub(crate) mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0, "byte guard before decode");
         cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compressed_page_uses_separate_scan_and_expansion_limits() {
+        let output = DeltaBatch::from_records((0..PAGE_ROWS).map(|i| {
+            DeltaRecord::new(
+                DeltaKey::from_json(json!(format!("id-{i:04}"))),
+                DeltaValue::from_json(json!({"power": 1.0})),
+                1,
+            )
+        }));
+        let (state, _, _, publication, _) = installed(output).await;
+        let manifest = &publication.manifest_record;
+        let reference = &manifest.pages[0];
+        let encoded = encode_page(&publication.page_records[0].1).unwrap();
+        let encoded_cap = u64::try_from(encoded.len()).unwrap();
+        assert!(decode_ipc_bounded(&encoded, encoded.len()).is_err());
+
+        read_query_page(
+            &state,
+            manifest,
+            reference,
+            Some(encoded_cap),
+            state.max_standing_runtime_expansion_bytes,
+        )
+        .await
+        .unwrap();
+
+        assert!(read_query_page(
+            &state,
+            manifest,
+            reference,
+            Some(encoded_cap),
+            encoded.len(),
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -3902,6 +4038,18 @@ pub(crate) mod tests {
             );
             assert_eq!(record.published_output, page.published_output);
             validate_page_binding(&p.manifest_record, &record).unwrap();
+            let n = page.published_output["schema"]["columns"]
+                .as_array()
+                .unwrap()
+                .len();
+            let truncated = RecordBatch::try_new(
+                Arc::new(arrow::datatypes::Schema::new(
+                    batch.schema().fields()[..n].to_vec(),
+                )),
+                batch.columns()[..n].to_vec(),
+            )
+            .unwrap();
+            assert!(decode_ipc(&ipc_bytes(page, &truncated, false).unwrap()).is_err());
             let mut corrupt = bytes.clone();
             let end = corrupt.len() - 16;
             corrupt[end] ^= 1;
@@ -3927,23 +4075,24 @@ pub(crate) mod tests {
                 "typed column alteration is content-bound"
             );
         }
-        let legacy = publication_legacy(
+        let without_stats = publication_without_stats(
             &checkpoint,
             &schema.relation_id,
             &key(&checkpoint),
             DeltaBatch::from_records([row(json!(1.), 1)]),
         )
         .unwrap();
-        assert_eq!(legacy.manifest_record.output_encoding, BAG_LEGACY_CODEC);
-        assert!(legacy
+        assert_eq!(without_stats.manifest_record.output_encoding, BAG_CODEC);
+        assert!(without_stats
             .manifest_record
             .published_output
             .get("page_stats")
             .is_none());
-        assert!(
-            serde_json::from_slice::<Value>(&encode_page(&legacy.page_records[0].1).unwrap())
-                .is_ok()
-        );
+        assert!(decode_page(
+            &encode_page(&without_stats.page_records[0].1).unwrap(),
+            BAG_CODEC
+        )
+        .is_ok());
     }
 
     #[tokio::test]

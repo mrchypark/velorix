@@ -1549,10 +1549,10 @@ async fn standing_runtime_checkpoint_pointer_preserves_output_manifest_refs() {
         "{}v1/standing-runtime-output-manifests/default/program/view/epochs/00000000000000000001/sha256/{output_hash}.output-manifest.json",
         velorix_meta::STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX,
     ), format!(
-        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{delta_hash}.output-delta.json",
+        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{delta_hash}.output-delta.arrow",
         velorix_meta::STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX,
     ), format!(
-        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{commit_hash}.output-delta.json",
+        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000001/sha256/{commit_hash}.output-delta.arrow",
         velorix_meta::STANDING_RUNTIME_OUTPUT_COMMIT_REF_PREFIX,
     )];
 
@@ -1831,7 +1831,7 @@ async fn standing_runtime_checkpoint_pointer_rejects_invalid_output_manifest_ref
     let mut wrong_delta_epoch = checkpoint_pointer(1, "a");
     let delta_hash = "c".repeat(64);
     wrong_delta_epoch.output_manifest_refs = vec![format!(
-        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000002/sha256/{delta_hash}.output-delta.json",
+        "{}v1/standing-runtime-output-deltas/default/program/view/epochs/00000000000000000002/sha256/{delta_hash}.output-delta.arrow",
         velorix_meta::STANDING_RUNTIME_OUTPUT_DELTA_REF_PREFIX,
     )];
 
@@ -2029,7 +2029,7 @@ fn checkpoint_pointer(epoch: u64, hash_seed: &str) -> StandingRuntimeCheckpointP
         program_id: "program".to_string(),
         view_id: "view".to_string(),
         checkpoint_key: format!(
-            "v1/standing-runtime-checkpoints/default/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.json"
+            "v1/standing-runtime-checkpoints/default/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.arrow"
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),
@@ -2065,7 +2065,7 @@ fn checkpoint_pointer_for_cut(
     pointer.view_id = "orders-view".to_string();
     let content_hex = pointer.content_hash.strip_prefix("sha256:").unwrap();
     pointer.checkpoint_key = format!(
-        "v1/standing-runtime-checkpoints/default/orders-view/orders-view/epochs/{epoch:020}/sha256/{content_hex}.checkpoint.json"
+        "v1/standing-runtime-checkpoints/default/orders-view/orders-view/epochs/{epoch:020}/sha256/{content_hex}.checkpoint.arrow"
     );
     let coverage = RuntimeCheckpointInputCoverageV1 {
         schema_version: RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,

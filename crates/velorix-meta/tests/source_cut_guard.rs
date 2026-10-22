@@ -39,7 +39,7 @@ fn pointer(epoch: u64, seed: char) -> StandingRuntimeCheckpointPointer {
         program_id: "program".into(),
         view_id: "view".into(),
         checkpoint_key: format!(
-            "v1/standing-runtime-checkpoints/default/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.json"
+            "v1/standing-runtime-checkpoints/default/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.arrow"
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),

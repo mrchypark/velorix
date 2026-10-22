@@ -828,7 +828,6 @@ mod openapi_spec_verification {
         .unwrap();
         let state = ApiState::from_validated_authority_with_ingest_admission_startup(
             validated,
-            "ignored",
             "api-test-openapi-spec-owner",
             false,
         )

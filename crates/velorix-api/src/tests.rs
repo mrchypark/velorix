@@ -505,7 +505,7 @@ fn standing_runtime_output_manifest_record_hashes_published_output_payload() {
         .as_str()
     );
     assert_eq!(record.checkpoint_key, checkpoint_key.as_str());
-    assert_eq!(record.output_encoding, "velorix-delta-batch-json-v1");
+    assert_eq!(record.output_encoding, "velorix-delta-batch-arrow-v1");
     assert_eq!(
         record.source_kind,
         "standing_runtime_checkpoint_published_output"
@@ -585,8 +585,7 @@ async fn standing_runtime_checkpoint_persistence_writes_output_delta_manifest_re
         .bytes()
         .await
         .unwrap();
-    let record: StandingRuntimeCheckpointRecord =
-        serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let record = standing_runtime_checkpoint_record_from_slice(&checkpoint_bytes).unwrap();
     assert!(
         record
             .checkpoint
@@ -613,8 +612,9 @@ async fn standing_runtime_checkpoint_persistence_writes_output_delta_manifest_re
         .bytes()
         .await
         .unwrap();
-    let delta_record: StandingRuntimeOutputDeltaRecord =
-        serde_json::from_slice(&delta_bytes).unwrap();
+    let delta_record =
+        output_delta_record::decode(&delta_bytes, state.max_standing_runtime_state_payload_bytes)
+            .unwrap();
     let (parsed_delta_key, _) = ObjectKey::parse_standing_runtime_output_delta(delta_key).unwrap();
 
     validate_standing_runtime_output_delta_record(&parsed_delta_key, &delta_record).unwrap();
@@ -2013,8 +2013,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_
         .bytes()
         .await
         .unwrap();
-    let record: StandingRuntimeCheckpointRecord =
-        serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let record = standing_runtime_checkpoint_record_from_slice(&checkpoint_bytes).unwrap();
     let delta_ref = record
         .checkpoint
         .output_manifest_refs
@@ -2069,8 +2068,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_
         .bytes()
         .await
         .unwrap();
-    let record: StandingRuntimeCheckpointRecord =
-        serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let record = standing_runtime_checkpoint_record_from_slice(&checkpoint_bytes).unwrap();
     let delta_ref = record
         .checkpoint
         .output_manifest_refs
@@ -2088,14 +2086,22 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_
         .bytes()
         .await
         .unwrap();
-    let mut delta_record: StandingRuntimeOutputDeltaRecord =
-        serde_json::from_slice(&delta_bytes).unwrap();
+    let mut delta_record =
+        output_delta_record::decode(&delta_bytes, state.max_standing_runtime_state_payload_bytes)
+            .unwrap();
     delta_record.output_delta = json!({"records": []});
     state
         .store
         .put(
             &Path::from(delta_key),
-            bytes::Bytes::from(serde_json::to_vec(&delta_record).unwrap()).into(),
+            bytes::Bytes::from(
+                output_delta_record::encode(
+                    &delta_record,
+                    state.max_standing_runtime_state_payload_bytes,
+                )
+                .unwrap(),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -2156,11 +2162,13 @@ async fn standing_runtime_output_compaction_rewrites_fragmented_pages_as_single_
         )]),
     ];
     let full_output = page_outputs[0].combine(&page_outputs[1]);
-    let full_value = serde_json::to_value(&full_output).unwrap();
+    let mut full_value = serde_json::to_value(&full_output).unwrap();
+    full_value.sort_all_objects();
     let full_hash = stable_bytes_hash(&serde_json::to_vec(&full_value).unwrap());
     let mut pages = Vec::new();
     for (index, output) in page_outputs.into_iter().enumerate() {
-        let output_value = serde_json::to_value(output).unwrap();
+        let mut output_value = serde_json::to_value(output).unwrap();
+        output_value.sort_all_objects();
         let page_hash = stable_bytes_hash(&serde_json::to_vec(&output_value).unwrap());
         let page_key = ObjectKey::standing_runtime_output_page(
             "tenant-a",
@@ -2176,7 +2184,7 @@ async fn standing_runtime_output_compaction_rewrites_fragmented_pages_as_single_
             page_key: page_key.as_str().to_string(),
             page_content_hash: page_hash.clone(),
             row_count: 1,
-            output_encoding: "velorix-delta-batch-json-v1".to_string(),
+            output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
         };
         let page_record = StandingRuntimeOutputPageRecord {
             schema_version: 1,
@@ -2189,7 +2197,7 @@ async fn standing_runtime_output_compaction_rewrites_fragmented_pages_as_single_
             page_index: index as u32,
             page_content_hash: page_hash,
             row_count: 1,
-            output_encoding: "velorix-delta-batch-json-v1".to_string(),
+            output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
             source_kind: "standing_runtime_checkpoint_published_output".to_string(),
             published_output: output_value,
         };
@@ -2208,7 +2216,7 @@ async fn standing_runtime_output_compaction_rewrites_fragmented_pages_as_single_
         logical_epoch: checkpoint.logical_epoch,
         checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
         output_content_hash: full_hash,
-        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
         output_row_count: 2,
         source_kind: "standing_runtime_checkpoint_published_output".to_string(),
         pages,
@@ -2259,11 +2267,13 @@ async fn standing_runtime_output_compaction_crash_windows_publish_only_complete_
         )]),
     ];
     let full_output = page_outputs[0].combine(&page_outputs[1]);
-    let full_value = serde_json::to_value(&full_output).unwrap();
+    let mut full_value = serde_json::to_value(&full_output).unwrap();
+    full_value.sort_all_objects();
     let full_hash = stable_bytes_hash(&serde_json::to_vec(&full_value).unwrap());
     let mut pages = Vec::new();
     for (index, output) in page_outputs.into_iter().enumerate() {
-        let output_value = serde_json::to_value(output).unwrap();
+        let mut output_value = serde_json::to_value(output).unwrap();
+        output_value.sort_all_objects();
         let page_hash = stable_bytes_hash(&serde_json::to_vec(&output_value).unwrap());
         let page_key = ObjectKey::standing_runtime_output_page(
             "tenant-a",
@@ -2279,7 +2289,7 @@ async fn standing_runtime_output_compaction_crash_windows_publish_only_complete_
             page_key: page_key.as_str().to_string(),
             page_content_hash: page_hash.clone(),
             row_count: 1,
-            output_encoding: "velorix-delta-batch-json-v1".to_string(),
+            output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
         };
         let page_record = StandingRuntimeOutputPageRecord {
             schema_version: 1,
@@ -2292,7 +2302,7 @@ async fn standing_runtime_output_compaction_crash_windows_publish_only_complete_
             page_index: index as u32,
             page_content_hash: page_hash,
             row_count: 1,
-            output_encoding: "velorix-delta-batch-json-v1".to_string(),
+            output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
             source_kind: "standing_runtime_checkpoint_published_output".to_string(),
             published_output: output_value,
         };
@@ -2311,7 +2321,7 @@ async fn standing_runtime_output_compaction_crash_windows_publish_only_complete_
         logical_epoch: checkpoint.logical_epoch,
         checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
         output_content_hash: full_hash.clone(),
-        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
         output_row_count: 2,
         source_kind: "standing_runtime_checkpoint_published_output".to_string(),
         pages,
@@ -2513,7 +2523,7 @@ async fn standing_runtime_output_serving_fails_closed_when_page_object_is_corrup
     let (page_key, page_record) = &publication.page_records[0];
     let mut corrupt = page_record.clone();
     corrupt.published_output = serde_json::json!({"records": [{"key": "other", "value": {"sum": 1, "count": 1}, "weight": 1}]});
-    let corrupt_bytes = serde_json::to_vec(&corrupt).unwrap();
+    let corrupt_bytes = materialized_output_pages::encode_page(&corrupt).unwrap();
     state
         .store
         .put(
@@ -2621,8 +2631,7 @@ async fn standing_runtime_checkpoint_persistence_writes_state_object_and_strips_
         .bytes()
         .await
         .unwrap();
-    let raw_record: StandingRuntimeCheckpointRecord =
-        serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let raw_record = standing_runtime_checkpoint_record_from_slice(&checkpoint_bytes).unwrap();
     assert!(raw_record.checkpoint.state_payload.is_none());
     let (state_key, state_key_parts) = ObjectKey::parse_standing_runtime_state_payload(
         raw_record.checkpoint.state_root.object_key.clone(),
@@ -2680,7 +2689,7 @@ async fn standing_runtime_checkpoint_read_hydrates_state_payload_from_state_obje
 }
 
 #[tokio::test]
-async fn standing_runtime_checkpoint_read_migrates_legacy_identity_keys() {
+async fn standing_runtime_checkpoint_read_rejects_legacy_identity_keys() {
     let state = test_api_state().await;
     let checkpoint = test_runtime_checkpoint(Vec::new());
     persist_standing_runtime_checkpoint(
@@ -2702,7 +2711,14 @@ async fn standing_runtime_checkpoint_read_migrates_legacy_identity_keys() {
         .bytes()
         .await
         .unwrap();
-    let mut record: Value = serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let mut record: Value = velorix_core::arrow_state::from_state(
+        &velorix_core::arrow_state::ArrowState::from_ipc(
+            &checkpoint_bytes,
+            checkpoint_record::MAX_ENCODED_RECORD_BYTES,
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let identity = record
         .pointer_mut("/checkpoint/identity")
         .and_then(Value::as_object_mut)
@@ -2713,21 +2729,43 @@ async fn standing_runtime_checkpoint_read_migrates_legacy_identity_keys() {
     identity.insert(legacy_key("runtime", "_packages"), runtimes);
     let capabilities = identity.remove("runtime_capabilities").unwrap();
     identity.insert(legacy_key("package", "_feature_set"), capabilities);
+    let metadata = velorix_core::arrow_state::ArrowState::metadata(
+        &checkpoint_bytes,
+        checkpoint_record::MAX_ENCODED_RECORD_BYTES,
+    )
+    .unwrap();
+    let arrow_state = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+        &record,
+        checkpoint_record::MAX_ENCODED_RECORD_BYTES,
+    )
+    .unwrap();
+    let checkpoint_bytes = velorix_core::arrow_state::ArrowState::replace_metadata(
+        arrow_state.as_bytes(),
+        metadata,
+        checkpoint_record::MAX_ENCODED_RECORD_BYTES,
+    )
+    .unwrap();
     object_store::ObjectStoreExt::put(
         &*state.store,
         &Path::from(checkpoint_key.as_str()),
-        serde_json::to_vec(&record).unwrap().into(),
+        checkpoint_bytes.into(),
     )
     .await
     .unwrap();
 
-    let restored =
-        read_latest_standing_runtime_checkpoint(&state, &checkpoint.identity, "purchases_by_user")
-            .await
-            .unwrap()
-            .unwrap();
+    // This malformed legacy alias payload is deliberately discovered without
+    // the metadata pointer so the rejection exercises checkpoint decoding.
+    let mut state_without_metadata = state.clone();
+    state_without_metadata.meta_store = None;
+    let error = read_latest_standing_runtime_checkpoint(
+        &state_without_metadata,
+        &checkpoint.identity,
+        "purchases_by_user",
+    )
+    .await
+    .unwrap_err();
 
-    assert_eq!(restored.checkpoint.identity, checkpoint.identity);
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -2862,8 +2900,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_miss
         .bytes()
         .await
         .unwrap();
-    let raw_record: StandingRuntimeCheckpointRecord =
-        serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let raw_record = standing_runtime_checkpoint_record_from_slice(&checkpoint_bytes).unwrap();
     state
         .store
         .delete(&Path::from(raw_record.checkpoint.state_root.object_key))
@@ -2887,7 +2924,30 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_checkpoint_object_is
         .store
         .put(
             &Path::from(checkpoint_key.as_str()),
-            bytes::Bytes::from_static(b"{not-json").into(),
+            bytes::Bytes::from_static(b"not a checkpoint Arrow record").into(),
+        )
+        .await
+        .unwrap();
+
+    let error =
+        read_latest_standing_runtime_checkpoint(&state, &checkpoint.identity, "purchases_by_user")
+            .await
+            .unwrap_err();
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn standing_runtime_checkpoint_read_rejects_legacy_json_record_bodies() {
+    let state = test_api_state().await;
+    let checkpoint = test_runtime_checkpoint(Vec::new());
+    let checkpoint_key = test_checkpoint_key(&checkpoint);
+    let legacy_record = test_checkpoint_record(&checkpoint_key, checkpoint.clone());
+    state
+        .store
+        .put(
+            &Path::from(checkpoint_key.as_str()),
+            serde_json::to_vec(&legacy_record).unwrap().into(),
         )
         .await
         .unwrap();
@@ -3348,8 +3408,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_corr
         .bytes()
         .await
         .unwrap();
-    let raw_record: StandingRuntimeCheckpointRecord =
-        serde_json::from_slice(&checkpoint_bytes).unwrap();
+    let raw_record = standing_runtime_checkpoint_record_from_slice(&checkpoint_bytes).unwrap();
     let state_key = ObjectKey::parse_standing_runtime_state_payload(
         raw_record.checkpoint.state_root.object_key.clone(),
     )
@@ -13103,7 +13162,6 @@ async fn test_authoritative_api_state_with_store(
     .unwrap();
     ApiState::from_validated_authority_with_ingest_admission_startup(
         validated,
-        "ignored",
         "api-authoritative-process",
         false,
     )
@@ -13561,7 +13619,9 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
     store
         .put(
             &Path::from(legacy_checkpoint_object.as_str()),
-            serde_json::to_vec(&legacy_record).unwrap().into(),
+            checkpoint_record::encode(&legacy_record, checkpoint_record::MAX_ENCODED_RECORD_BYTES)
+                .unwrap()
+                .into(),
         )
         .await
         .unwrap();
@@ -19584,7 +19644,6 @@ async fn test_public_api_state_with_store(
     .unwrap();
     ApiState::from_validated_authority_with_ingest_admission_startup(
         validated,
-        "ignored",
         owner_id,
         reconstruct_ingest_admission,
     )

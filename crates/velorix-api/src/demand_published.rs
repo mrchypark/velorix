@@ -596,8 +596,10 @@ pub(super) async fn load_demand_published_artifact(
         }
         ArtifactPayload::Delta { object_key } => {
             let bytes = budget.read(state, object_key).await?;
-            let record: StandingRuntimeOutputDeltaRecord =
-                serde_json::from_slice(&bytes).map_err(ApiError::bad_request)?;
+            let record = output_delta_record::decode(
+                &bytes,
+                state.max_standing_runtime_state_payload_bytes,
+            )?;
             let (key, _) = ObjectKey::parse_standing_runtime_output_delta(object_key.clone())
                 .map_err(ApiError::bad_request)?;
             publication::validate_standing_runtime_output_delta_record(&key, &record)?;

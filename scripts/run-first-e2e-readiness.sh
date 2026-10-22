@@ -1024,8 +1024,8 @@ readiness = {
     },
     "state_status": {
         "status": "pass",
-        "evidence": "SlateDB checkpoint ref and checked recovery evidence from Versity Gateway runtime recovery harness",
-        "evidence_kind": ["slate_db_checkpoint_ref", "slate_db_checked_recovery"],
+        "evidence": "authoritative raw checkpoint reference and checked recovery evidence from the Versity Gateway runtime recovery harness",
+        "evidence_kind": ["authoritative_raw_checkpoint_ref", "checked_raw_checkpoint_recovery"],
     },
     "query_policy_status": {
         "status": "pass",

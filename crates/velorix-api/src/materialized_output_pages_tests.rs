@@ -722,7 +722,6 @@ async fn publication_state(store: Arc<dyn ObjectStore>, meta: Arc<InMemoryMetaSt
     .unwrap();
     ApiState::from_validated_authority_with_ingest_admission_startup(
         authority,
-        "ignored",
         "synthetic-owner",
         false,
     )
@@ -1022,7 +1021,7 @@ async fn publication_above_page_capacity_preserves_bag_checkpoint_pointer_and_bo
 }
 
 #[tokio::test]
-async fn publication_legacy_duplicate_and_orphan_reuse_original_descriptor_bytes() {
+async fn publication_duplicate_and_orphan_reuse_original_descriptor_bytes() {
     for published in [false, true] {
         let meta = Arc::new(InMemoryMetaStore::default());
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1057,7 +1056,9 @@ async fn publication_legacy_duplicate_and_orphan_reuse_original_descriptor_bytes
             replay_checkpoints: Vec::new(),
             manifest_hash: String::new(),
         };
-        let original = serde_json::to_vec(&record).unwrap();
+        let original =
+            checkpoint_record::encode(&record, checkpoint_record::MAX_ENCODED_RECORD_BYTES)
+                .unwrap();
         let path = Path::from(record.checkpoint_key.clone());
         store
             .put_opts(&path, original.clone().into(), PutMode::Create.into())

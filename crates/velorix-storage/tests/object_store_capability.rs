@@ -28,7 +28,7 @@ use velorix_storage::{
     log::{IngestAdmissionCoordinator, IngestBatch, IngestLog, IngestLogError},
     manifest::{CheckpointManifest, InputRange, StateObjectRef},
     state::{CheckpointPublishError, CheckpointPublisher, StateObjectWrite},
-    state_store::{RawObjectStateStore, SlateDbStateStore},
+    state_store::RawObjectStateStore,
 };
 
 fn temp_store() -> (TempDir, Arc<dyn ObjectStore>) {
@@ -853,6 +853,25 @@ fn authoritative_capability_gate_rejects_missing_checkpoint_gc_transition_namesp
 }
 
 #[test]
+fn authoritative_capability_gate_rejects_missing_state_namespace_for_checkpoint_publisher() {
+    let (_temp_dir, store) = temp_store();
+    let mut profiles = all_namespace_profiles();
+    profiles.remove(&AuthoritativeNamespace::State);
+    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
+
+    let err = CheckpointPublisher::new_authoritative(store, &capabilities).unwrap_err();
+
+    assert!(matches!(
+        err,
+        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
+            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
+                namespace: AuthoritativeNamespace::State
+            }
+        )
+    ));
+}
+
+#[test]
 fn capability_gate_rejects_missing_ingest_capability_for_ingest_admission_coordinator() {
     let (_temp_dir, store) = temp_store();
     let mut profiles = all_namespace_profiles();
@@ -980,113 +999,6 @@ fn capability_gate_rejects_custom_state_store_checkpoint_publisher() {
         &profile,
         RequiredObjectStoreCapability::ConditionalCreate,
     );
-}
-
-#[tokio::test]
-async fn capability_gate_rejects_slatedb_checkpoint_publisher_before_opening_state_store() {
-    let (_temp_dir, store) = temp_store();
-    let profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
-
-    let err = CheckpointPublisher::with_slatedb_state_store_checked(
-        store,
-        Path::from("state-db"),
-        &profile,
-    )
-    .await
-    .unwrap_err();
-
-    match err {
-        CheckpointPublishError::ObjectStoreCapability(err) => assert_capability_error(
-            err,
-            &profile,
-            RequiredObjectStoreCapability::ConditionalCreate,
-        ),
-        other => panic!("expected object-store capability error, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn authoritative_capability_gate_rejects_slatedb_state_namespace_before_opening_state_store()
-{
-    let (_temp_dir, store) = temp_store();
-    let mut profiles = all_namespace_profiles();
-    profiles.remove(&AuthoritativeNamespace::State);
-    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
-
-    let err = CheckpointPublisher::with_slatedb_state_store_authoritative(
-        store,
-        Path::from("state-db"),
-        &capabilities,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        err,
-        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
-            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-                namespace: AuthoritativeNamespace::State
-            }
-        )
-    ));
-}
-
-#[tokio::test]
-async fn authoritative_state_store_opener_rejects_missing_state_namespace_before_opening_state_store(
-) {
-    let (_temp_dir, store) = temp_store();
-    let mut profiles = all_namespace_profiles();
-    profiles.remove(&AuthoritativeNamespace::State);
-    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
-
-    let err = SlateDbStateStore::open_authoritative(
-        Path::from("state-db"),
-        Arc::clone(&store),
-        &capabilities,
-    )
-    .await
-    .unwrap_err();
-
-    assert!(matches!(
-        err,
-        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
-            AuthoritativeObjectStoreCapabilityError::MissingNamespace {
-                namespace: AuthoritativeNamespace::State
-            }
-        )
-    ));
-}
-
-#[tokio::test]
-async fn authoritative_state_store_opener_rejects_weak_state_namespace_before_opening_state_store()
-{
-    let (_temp_dir, store) = temp_store();
-    let mut profiles = all_namespace_profiles();
-    let profile = profile_missing(RequiredObjectStoreCapability::ConditionalCreate);
-    profiles.insert(AuthoritativeNamespace::State, profile.clone());
-    let capabilities = AuthoritativeObjectStoreCapabilitiesV1::new(profiles);
-
-    let err = SlateDbStateStore::open_authoritative(
-        Path::from("state-db"),
-        Arc::clone(&store),
-        &capabilities,
-    )
-    .await
-    .unwrap_err();
-
-    match err {
-        CheckpointPublishError::AuthoritativeObjectStoreCapabilities(
-            AuthoritativeObjectStoreCapabilityError::NamespaceProfile { namespace, source },
-        ) => {
-            assert_eq!(namespace, AuthoritativeNamespace::State);
-            assert_capability_error(
-                source,
-                &profile,
-                RequiredObjectStoreCapability::ConditionalCreate,
-            );
-        }
-        other => panic!("expected authoritative state namespace error, got {other:?}"),
-    }
 }
 
 #[tokio::test]

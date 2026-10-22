@@ -1,15 +1,28 @@
 # Runtime and durable checkpoint state: Arrow IPC with ZSTD 3
 
-Runtime snapshots and durable state bodies use `velorix-runtime-arrow-v2`.
-`RuntimeCheckpointStatePayload.payload` and retained correction-state objects
-carry the shared `ArrowState` type, not a JSON string. Every runtime family uses
-the same Serde-to-Arrow representation. Snapshot creation, restore and cold
-window hydration do not serialize or parse JSON text.
+Persisted checkpoint state, output pages and deltas use typed Arrow bodies with
+ZSTD level 3. Runtime state payloads use `velorix-runtime-arrow-v2`; the
+checkpoint record containing `DemandCheckpoint` is stored as
+`.checkpoint.arrow`. Native versioned pages use the current Arrow codecs, while
+schema-less generic pages use `velorix-delta-batch-arrow-v1`. Output deltas are
+typed Arrow records stored as `.output-delta.arrow`.
 
-Primary object keys end in `.state-payload.arrow`; retained state keys end in
-`.arrow`. There is no JSON state-body reader or writer. Checkpoint descriptors
-and fragment manifests remain JSON metadata containing references and
-commitments, with no embedded state body.
+Small reference manifests and pointers remain JSON, including the output
+manifest and latest pointer. JSON control metadata and semantic JSON values
+retain their existing representations. This is a greenfield format: readers do
+not support legacy JSON state bodies, and no live data is migrated or removed.
+
+The full Rhiza metadata snapshot is also a persisted state body: its canonical
+normalized `InMemoryMetaState` is now encoded as this Arrow IPC tree with ZSTD
+level 3. Its Arrow body has a 16 MiB encoded-byte ceiling and a separate 64 MiB
+expanded typed-tree budget; the Rhiza KV page protocol imposes a lower 8 MiB
+aggregate encoded-body ceiling. Only the small KV root/page manifest remains
+JSON. Relation catalogs, view specs, SQL JSON values, RPC requests/responses,
+and other small control descriptors keep their existing JSON representations.
+The 64 MiB limit is logical typed-tree accounting, not a peak-memory or RSS
+cap. Arrow IPC preflight permits declared buffer expansion up to twice that
+limit plus 1 KiB before final typed-tree validation; callers should not treat
+the logical budget as a strict decompression-memory bound.
 
 ## General representation
 
@@ -72,13 +85,14 @@ bounds; a cache is never an authority for accepting a different checkpoint.
 Decoded arrays are shared within a hydrated checkpoint. This is not a new
 unbounded global decoded-state cache.
 
-## Format transition and verification
+## Greenfield format and verification
 
-Earlier JSON bodies and the previous storage-only Arrow v1 tree are rejected.
-Neither old state objects nor input objects are deleted or migrated by this
-change. Installations with those checkpoints need an explicit migration or
-rebuild before using the new reader. A storage-format transition is distinct
-from ingestion; no real datasets were re-ingested during local verification.
+New stores write and read the current Arrow formats only; old JSON and previous
+Arrow bodies have no compatibility readers. Existing objects and Rhiza KV
+snapshots remain untouched, and no migration or rebuild is performed by this
+change. Reusing an existing store requires a separately planned migration or
+rebuild before the new readers can use its old bodies. A storage-format change
+does not re-ingest source data.
 
 Tests cover typed data, enums and numeric keys, nested snapshots, a fresh
 process reading persisted IPC bytes, identity/commitment failures, compressed

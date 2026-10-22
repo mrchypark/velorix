@@ -194,20 +194,6 @@
       "scan_bytes": 4096
     },
     {
-      "name": "slatedb_state_reopen",
-      "p50_ms": 168.557125,
-      "p95_ms": 168.557125,
-      "object_requests": {
-        "put_count": 15,
-        "get_count": 22,
-        "list_count": 32,
-        "range_read_count": 13,
-        "bytes_written": 2000,
-        "bytes_read": 3430
-      },
-      "scan_bytes": 0
-    },
-    {
       "name": "gc_dry_run_planning",
       "p50_ms": 6.342417,
       "p95_ms": 6.342417,

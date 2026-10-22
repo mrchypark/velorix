@@ -86,98 +86,6 @@ and epoch publication before promising production-scale throughput. The input
 uses 90% composite-group skew, but aggregation collapses categories to four
 customer groups; this is not a 256-output-group aggregate measurement.
 
-## Open performance gate
-
-The full cost gate did **not** pass consistently: two measured runs before and
-one after failed because `slatedb_state_reopen` issued 12 LISTs versus baseline
-9 (33.3% above baseline; allowed regression 25%). The failure existed before
-the storage change. Baselines, thresholds and production maintenance defaults
-were not changed. Lifecycle phase/prefix tracing is needed before choosing a
-fix; a successful request-count optimization does not make this gate green.
-Source inspection confirms SlateDB's first ticker tick fires immediately, so
-short open/close samples can include different amounts of startup GC/compactor
-work. Existing deferred LIST trace artifacts attribute calls to startup manifest
-loading, compactor fencing and GC. This identifies a plausible source of
-variation, not a completed deterministic-gate fix.
-
-No production deployment, abrupt-crash recovery or provider-loss certification
-is claimed by this report.
-
-## Isolated three-node recovery
-
-`scripts/check-rhiza-recovery.sh` passed against its own local MinIO container
-and three native Rhiza nodes (17.93 seconds test runtime). Evidence:
-`target/rhiza-recovery-evidence/20260922T071445Z-54049/rhiza-recovery.json`.
-The test checks cross-node read/CAS, retaining quorum after one node loss,
-failing closed after quorum loss, and recovery with empty working directories.
-Shutdown/quorum-loss warnings remain in the retained log; the recovery oracle
-passed. The disposable MinIO container was removed by the script after the run.
-This is graceful cold restart, not SIGKILL/power-loss or Kubernetes/provider
-failure evidence.
-
-## Follow-up: retained-state filter/projection
-
-The full-snapshot path no longer clones/consolidates unchanged output merely to
-derive its visible delta. It still returns the complete epoch snapshot, and its
-work therefore remains proportional to retained output. A separate explicit
-`apply_changes_delta_only` contract preserves deltas/frontiers/idempotency but
-omits those snapshots. Plain key-preserving filter/projection stages only the
-touched rows before committing an ordered map update. DISTINCT and Top-K retain
-their existing algorithms. Checkpoint format and ordinary callers are preserved.
-The API ingest caller now uses the delta-only hook because it consumes deltas,
-not epoch snapshots. It still takes full checkpoints for rollback/durability;
-no end-to-end O(batch-size) API claim is made.
-
-Initial fixed schedules (one warmup + three measured runs, all retained):
-
-| Filter/projection mode | Input rows | Median rows/s | Median per-run p95 |
-| --- | ---: | ---: | ---: |
-| Optimized full snapshot | 4,096 | 404,957 | 1.909 ms |
-| Optimized full snapshot | 65,536 | 27,830 | 36.511 ms |
-| Delta only | 4,096 | 853,504 | 0.836 ms |
-| Delta only | 65,536 | 915,264 | 0.686 ms |
-
-Evidence directories are `sql-family-filter-optimized` and
-`sql-family-delta-only` under `target/development-validation`. These are sequential
-local diagnostics, not CPU-isolated trials or an SLA. The modes have different
-output contracts: do not report their ratio as a like-for-like speedup. Every
-final output value/page matched the independent oracle. These initial measurements
-precede the final dependency pin; final integrated evidence is recorded separately.
-
-Regression tests compare full-snapshot and delta-only deltas/checkpoints for plain,
-computed, DISTINCT and Top-K queries, including mixed retractions, restore,
-duplicate epochs, rejected ordinary-mode calls, failed-epoch retry and switching
-back to snapshots. Plain restore rejects mismatched full/published state.
-
-## Follow-up: SlateDB startup maintenance
-
-The fork now pins `4b0a95a86c68b94d2fd368db76a0b75791951d5f`. Its change defers only
-the first positive-minimum-age background GC tick for a freshly created database
-using the default builder. Existing databases still perform immediate catch-up;
-custom collectors, zero-age cleanup and manual collection retain their behavior.
-Recurring intervals and deletion policies are unchanged. Fresh databases have no
-clone parent to detach. Failed-bootstrap orphan objects may wait until the next
-interval or reopen, which is an explicit tradeoff, not eliminated maintenance cost.
-
-This changes production startup scheduling; it is not a benchmark-only switch.
-The dependency's GC tests (63), full library tests (2,015 passed, one ignored),
-library Clippy, and a builder test covering fresh/next-interval/reopen behavior
-passed. The builder test initially used an incorrect metric label and failed;
-correcting `op=list` to the actual `op=get, api=list` made the measurement valid.
-No cost baseline or threshold was changed.
-
-### Integrated gate result
-
-`target/development-validation/query-perf-final/summary.json` passed all 17
-functional cases, one warmup and all three measured runs. SlateDB reopen LIST
-counts were **5, 4, 5, 7** (warmup first), versus the unchanged baseline of 9 and
-25% allowed regression. Source fingerprints matched before/after; baseline
-SHA-256 remained `3f93de1454275ec493b076f2f26d77ba6b30a7c9033a70824cc582df32cb7e96`.
-The local gate failure was not reproduced in this complete fixed schedule.
-Background maintenance still creates count variation; four passes are not proof
-of invariant call counts under every scheduler or workload. This is a dirty-tree
-diagnostic result, not release certification or production latency evidence.
-
 ### Final integrated native SQL measurements
 
 Evidence: `target/development-validation/sql-family-final`, using the exact
@@ -220,8 +128,8 @@ this patch. No security, provider-loss or abrupt-crash certification is implied.
 ### Final regression and recovery checks
 
 - Runtime: 54 unit and 251 integration tests passed; API: 209 library tests passed.
-- Storage: checkpoint publication 108, ingest envelope 56, multi-process admission
-  10, SlateDB durability 4 and SlateDB state 10 tests passed (188 total).
+- Storage: checkpoint publication (108), ingest envelope (56), and
+  multi-process admission (10) tests passed.
 - Workspace/all-targets Clippy with `-D warnings`, `cargo fmt --check`, diff
   whitespace checks and the development-validation script contract passed.
 - The integrated three-node no-PVC drill passed in 18.32 seconds, with 30 shared
@@ -232,8 +140,6 @@ this patch. No security, provider-loss or abrupt-crash certification is implied.
   remain in the log; the oracle passed. This remains a graceful cold-restart
   experiment using isolated local MinIO, not an abrupt-crash/provider-loss test.
 
-At the end of local validation, the SlateDB dependency commit had been pushed
-to the existing fork branch, while Velorix changes were still uncommitted.
 These validation results do not themselves certify a merge or deployment.
 Existing unrelated edits in the two product-runner
 scripts were preserved byte-for-byte.

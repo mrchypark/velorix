@@ -581,39 +581,6 @@ impl DeltaBatch {
     }
 }
 
-/// Encodes JSON values in a deterministic semantic order for net row keys.
-///
-/// Object fields are sorted here instead of relying on serde_json map iteration
-/// order, which keeps checkpoint-facing net output stable across input order.
-#[allow(dead_code)]
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            serde_json::to_string(value).expect("serializing JSON scalar cannot fail")
-        }
-        Value::Array(values) => {
-            let items = values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",");
-            format!("[{items}]")
-        }
-        Value::Object(values) => {
-            let mut fields = values
-                .iter()
-                .map(|(key, value)| {
-                    let key = serde_json::to_string(key).expect("serializing JSON key cannot fail");
-                    format!("{key}:{}", canonical_json(value))
-                })
-                .collect::<Vec<_>>();
-            fields.sort();
-            let fields = fields.join(",");
-            format!("{{{fields}}}")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

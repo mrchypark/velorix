@@ -615,22 +615,15 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
             assert_eq!(ids.len(), 10017);
         }
     }
-    for checkpoint_only in [false, true] {
-        let legacy = install_legacy_checkpoint(&state, "large_output", checkpoint_only).await;
-        let router = app(legacy);
-        for sql in [
-            "SELECT COUNT(*) AS n FROM large_output",
-            "WITH input_rows AS (SELECT * FROM large_output) SELECT COUNT(*) AS n FROM input_rows",
-        ] {
-            for accept in [None, Some("application/json")] {
-                let result =
-                    wire_query(&router, Method::POST, uri, json!({"sql":sql}), accept).await;
-                assert_eq!(
-                    wire_rows(&result),
-                    vec![json!({"n":10017})],
-                    "checkpoint_only={checkpoint_only}"
-                );
-            }
+    let current = publish_current_checkpoint_fixture(&state, "large_output").await;
+    let router = app(current);
+    for sql in [
+        "SELECT COUNT(*) AS n FROM large_output",
+        "WITH input_rows AS (SELECT * FROM large_output) SELECT COUNT(*) AS n FROM input_rows",
+    ] {
+        for accept in [None, Some("application/json")] {
+            let result = wire_query(&router, Method::POST, uri, json!({"sql":sql}), accept).await;
+            assert_eq!(wire_rows(&result), vec![json!({"n":10017})]);
         }
     }
 }
@@ -712,13 +705,8 @@ async fn generic_direct_http_source_budgets_reject_before_page_reads() {
     }
 }
 
-// Re-encode the real admitted runtime checkpoint in its supported JSON v1
-// storage format. This is a storage compatibility fixture, not a SQL fallback.
-async fn install_legacy_checkpoint(
-    state: &ApiState,
-    view: &str,
-    checkpoint_only: bool,
-) -> ApiState {
+// Publish a second checkpoint with the current checkpoint and output codecs.
+async fn publish_current_checkpoint_fixture(state: &ApiState, view: &str) -> ApiState {
     let active = state
         .view_registry()
         .unwrap()
@@ -760,51 +748,46 @@ async fn install_legacy_checkpoint(
     .unwrap();
     record.checkpoint_key = key.as_str().into();
     record.checkpoint.output_manifest_refs.clear();
-    let publication = standing_runtime_output_publication(
+    let publication = standing_runtime_output_manifest_record_for_checkpoint_with_limits(
         &record.checkpoint,
         view,
         &key,
-        standing_runtime_checkpoint_published_output(&record.checkpoint).unwrap(),
+        state.runtime_resource_limits(),
+        true,
     )
-    .unwrap();
-    if checkpoint_only {
-        match state
-            .store
-            .delete(&Path::from(publication.manifest_key.as_str()))
+    .unwrap()
+    .expect("generic checkpoint should use the native Arrow page publication");
+    assert!(matches!(
+        publication.manifest_record.output_encoding.as_str(),
+        materialized_output_pages::CODEC | materialized_output_pages::BAG_CODEC
+    ));
+    for (key, page) in &publication.page_records {
+        put_standing_runtime_output_page(state, key, page)
             .await
-        {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(error) => panic!("delete synthetic legacy manifest: {error}"),
-        }
-    } else {
-        assert_eq!(
-            publication.manifest_record.output_encoding,
-            "velorix-delta-batch-json-v1"
-        );
-        for (key, page) in &publication.page_records {
-            put_standing_runtime_output_page(state, key, page)
-                .await
-                .unwrap();
-        }
-        put_standing_runtime_output_manifest(
-            state,
-            &publication.manifest_key,
-            &publication.manifest_record,
-        )
-        .await
-        .unwrap();
-        record.checkpoint.output_manifest_refs.push(format!(
-            "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
-            publication.manifest_key.as_str()
-        ));
+            .unwrap();
     }
+    put_standing_runtime_output_manifest(
+        state,
+        &publication.manifest_key,
+        &publication.manifest_record,
+    )
+    .await
+    .unwrap();
+    record.checkpoint.output_manifest_refs.push(format!(
+        "{STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX}{}",
+        publication.manifest_key.as_str()
+    ));
     record.previous_checkpoint = Some(previous.clone());
     record.manifest_hash.clear();
     state
         .store
         .put(
             &Path::from(record.checkpoint_key.as_str()),
-            bytes::Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
+            bytes::Bytes::from(
+                checkpoint_record::encode(&record, checkpoint_record::MAX_ENCODED_RECORD_BYTES)
+                    .unwrap(),
+            )
+            .into(),
         )
         .await
         .unwrap();
@@ -827,120 +810,118 @@ async fn install_legacy_checkpoint(
 }
 
 #[tokio::test]
-async fn legacy_http_source_budgets_apply_with_cache_disabled_and_warmed() {
-    for checkpoint_only in [false, true] {
-        let (original, _, counts) = generic_fixture().await;
-        let legacy = install_legacy_checkpoint(&original, "format_group", checkpoint_only).await;
-        let directory = tempfile::tempdir().unwrap();
-        let cache = Arc::new(
-            crate::materialized_read_cache::MaterializedReadCache::open(
-                crate::materialized_read_cache::MaterializedReadCacheConfig {
-                    directory: directory.path().to_owned(),
-                    memory_bytes: 1024 * 1024,
-                    disk_bytes: 8 * 1024 * 1024,
-                },
-            )
-            .await
-            .unwrap(),
-        );
-        for cached in [false, true] {
-            let mut state = legacy.clone();
-            if cached {
-                state = state.with_materialized_read_cache(cache.clone());
-            }
-            let key = Path::from("v1/views/format_group/active.json");
-            let original = state.store.get(&key).await.unwrap().bytes().await.unwrap();
-            // Two successful reads populate and hit the descriptor/manifest cache.
-            let router = app(state.clone());
-            for _ in 0..2 {
-                assert_eq!(
-                    wire_rows(
-                        &wire_query(
-                            &router,
-                            Method::GET,
-                            "/v1/views/format_group/query",
-                            json!({}),
-                            None
-                        )
-                        .await
-                    )
-                    .len(),
-                    3
-                );
-            }
-            for (index, policy) in [
-                QueryPolicy {
-                    max_scan_files: Some(0),
-                    ..QueryPolicy::default()
-                },
-                QueryPolicy {
-                    max_object_requests: Some(2),
-                    ..QueryPolicy::default()
-                },
-                QueryPolicy {
-                    max_scan_bytes: Some(1),
-                    ..QueryPolicy::default()
-                },
-                QueryPolicy {
-                    memory_limit_bytes: Some(32),
-                    ..QueryPolicy::default()
-                },
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let id = format!("legacy-budget-{checkpoint_only}-{cached}-{index}");
-                state
-                    .query_policy_catalog()
-                    .unwrap()
-                    .create_for_production_table_scan("default", &id, policy)
-                    .await
-                    .unwrap();
-                let mut active: Value = serde_json::from_slice(&original).unwrap();
-                active["api"]["query_policy_id"] = json!(id);
-                state
-                    .store
-                    .put(
-                        &key,
-                        bytes::Bytes::from(serde_json::to_vec(&active).unwrap()).into(),
+async fn generic_http_source_budgets_apply_with_cache_disabled_and_warmed() {
+    let (original, _, counts) = generic_fixture().await;
+    let current = publish_current_checkpoint_fixture(&original, "format_group").await;
+    let directory = tempfile::tempdir().unwrap();
+    let cache = Arc::new(
+        crate::materialized_read_cache::MaterializedReadCache::open(
+            crate::materialized_read_cache::MaterializedReadCacheConfig {
+                directory: directory.path().to_owned(),
+                memory_bytes: 1024 * 1024,
+                disk_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    for cached in [false, true] {
+        let mut state = current.clone();
+        if cached {
+            state = state.with_materialized_read_cache(cache.clone());
+        }
+        let key = Path::from("v1/views/format_group/active.json");
+        let original = state.store.get(&key).await.unwrap().bytes().await.unwrap();
+        // Two successful reads populate and hit the descriptor/manifest cache.
+        let router = app(state.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                wire_rows(
+                    &wire_query(
+                        &router,
+                        Method::GET,
+                        "/v1/views/format_group/query",
+                        json!({}),
+                        None
                     )
                     .await
-                    .unwrap();
-                for method in [Method::GET, Method::POST] {
-                    for accept in [None, Some("application/json")] {
-                        counts.clear();
-                        let result = wire_query(
-                            &router,
-                            method.clone(),
-                            "/v1/views/format_group/query",
-                            json!({}),
-                            accept,
-                        )
-                        .await;
-                        assert_eq!(
-                            result.0,
-                            StatusCode::BAD_REQUEST,
-                            "checkpoint_only={checkpoint_only} cached={cached} policy={index}: {}",
-                            String::from_utf8_lossy(&result.2)
-                        );
-                        assert!(!counts
-                            .get_paths()
-                            .iter()
-                            .any(|p| p.starts_with("v1/standing-runtime-output-pages/")));
-                    }
+                )
+                .len(),
+                3
+            );
+        }
+        for (index, policy) in [
+            QueryPolicy {
+                max_scan_files: Some(0),
+                ..QueryPolicy::default()
+            },
+            QueryPolicy {
+                max_object_requests: Some(2),
+                ..QueryPolicy::default()
+            },
+            QueryPolicy {
+                max_scan_bytes: Some(1),
+                ..QueryPolicy::default()
+            },
+            QueryPolicy {
+                memory_limit_bytes: Some(32),
+                ..QueryPolicy::default()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("current-budget-{cached}-{index}");
+            state
+                .query_policy_catalog()
+                .unwrap()
+                .create_for_production_table_scan("default", &id, policy)
+                .await
+                .unwrap();
+            let mut active: Value = serde_json::from_slice(&original).unwrap();
+            active["api"]["query_policy_id"] = json!(id);
+            state
+                .store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&active).unwrap()).into(),
+                )
+                .await
+                .unwrap();
+            for method in [Method::GET, Method::POST] {
+                for accept in [None, Some("application/json")] {
+                    counts.clear();
+                    let result = wire_query(
+                        &router,
+                        method.clone(),
+                        "/v1/views/format_group/query",
+                        json!({}),
+                        accept,
+                    )
+                    .await;
+                    assert_eq!(
+                        result.0,
+                        StatusCode::BAD_REQUEST,
+                        "cached={cached} policy={index}: {}",
+                        String::from_utf8_lossy(&result.2)
+                    );
+                    assert!(!counts
+                        .get_paths()
+                        .iter()
+                        .any(|p| p.starts_with("v1/standing-runtime-output-pages/")));
                 }
             }
-            state.store.put(&key, original.into()).await.unwrap();
         }
-        cache.close().await.unwrap();
+        state.store.put(&key, original.into()).await.unwrap();
     }
+    cache.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn legacy_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
+async fn generic_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
     let (original, _, counts) = generic_fixture().await;
-    let legacy = install_legacy_checkpoint(&original, "format_group", true).await;
-    let active = legacy
+    let current = publish_current_checkpoint_fixture(&original, "format_group").await;
+    let active = current
         .view_registry()
         .unwrap()
         .read_active("format_group")
@@ -948,9 +929,9 @@ async fn legacy_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
     let schema = &active.spec.output_relations[0];
-    let mut no_meta = legacy.clone();
+    let mut no_meta = current.clone();
     no_meta.meta_store = None;
-    // The legacy helper must account for every discovery poll, not just LIST creation.
+    // Discovery must account for every poll, not just LIST creation.
     for budget in [1, 2] {
         counts.clear();
         let error = crate::query_serving::legacy_materialized_page(
@@ -1002,7 +983,7 @@ async fn legacy_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
     // The producer publishes through the existing owner/CAS path while the reader
     // is still consuming the previous immutable checkpoint.
     no_meta.store = Arc::new(object_store::throttle::ThrottledStore::new(
-        legacy.store.clone(),
+        current.store.clone(),
         object_store::throttle::ThrottleConfig {
             wait_get_per_call: Duration::from_millis(20),
             ..Default::default()
@@ -1027,7 +1008,7 @@ async fn legacy_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
                 if counts
                     .get_paths()
                     .iter()
-                    .any(|p| p.ends_with(".checkpoint.json"))
+                    .any(|p| p.ends_with(".checkpoint.arrow"))
                 {
                     break;
                 }
@@ -1036,7 +1017,7 @@ async fn legacy_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
         })
         .await
         .unwrap();
-        install_legacy_checkpoint(&legacy, "format_group", true).await;
+        publish_current_checkpoint_fixture(&current, "format_group").await;
     };
     let (result, ()) = tokio::join!(reader, producer);
     assert_eq!(result.unwrap_err().status, StatusCode::CONFLICT);

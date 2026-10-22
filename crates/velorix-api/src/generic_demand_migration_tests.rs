@@ -30,7 +30,11 @@ async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_pa
         .unwrap();
     let checkpoint_record = test_runtime_checkpoint(Vec::new());
     let checkpoint = test_checkpoint_key(&checkpoint_record);
-    let body = serde_json::to_vec(&test_checkpoint_record(&checkpoint, checkpoint_record)).unwrap();
+    let body = checkpoint_record::encode(
+        &test_checkpoint_record(&checkpoint, checkpoint_record),
+        checkpoint_record::MAX_ENCODED_RECORD_BYTES,
+    )
+    .unwrap();
     let checkpoint_path = ObjectPath::from(checkpoint.as_str());
     store
         .put(&checkpoint_path, body.clone().into())

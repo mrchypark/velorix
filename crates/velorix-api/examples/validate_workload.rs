@@ -478,7 +478,6 @@ async fn router(
     .await?;
     let mut state = ApiState::from_validated_authority_with_ingest_admission_startup(
         authority,
-        "unused",
         "workload-driver",
         !authoritative,
     )

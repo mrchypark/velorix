@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 8;
+const PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 9;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,8 +61,8 @@ pub enum ReadinessEvidenceKind {
     RelationCatalogRegistry,
     RelationCatalogClosedAdapterScope,
     RelationCatalogUnsupportedAdapterFailClosed,
-    SlateDbCheckpointRef,
-    SlateDbCheckedRecovery,
+    AuthoritativeRawCheckpointRef,
+    CheckedRawCheckpointRecovery,
     QueryPolicyCatalog,
     RegistryBackedTableCatalog,
     DependencyGovernanceValidated,
@@ -364,17 +364,17 @@ impl ProductionReadinessEvidenceV1 {
         }
         if !self
             .state_status
-            .has_evidence(ReadinessEvidenceKind::SlateDbCheckpointRef)
+            .has_evidence(ReadinessEvidenceKind::AuthoritativeRawCheckpointRef)
         {
             blocking_reasons
-                .push("state_status missing slate_db_checkpoint_ref evidence".to_string());
+                .push("state_status missing authoritative_raw_checkpoint_ref evidence".to_string());
         }
         if !self
             .state_status
-            .has_evidence(ReadinessEvidenceKind::SlateDbCheckedRecovery)
+            .has_evidence(ReadinessEvidenceKind::CheckedRawCheckpointRecovery)
         {
             blocking_reasons
-                .push("state_status missing slate_db_checked_recovery evidence".to_string());
+                .push("state_status missing checked_raw_checkpoint_recovery evidence".to_string());
         }
         if !self
             .query_policy_status
@@ -626,8 +626,8 @@ mod tests {
                 ReadinessEvidenceKind::RelationCatalogUnsupportedAdapterFailClosed,
             ]),
             state_status: passing_check(vec![
-                ReadinessEvidenceKind::SlateDbCheckpointRef,
-                ReadinessEvidenceKind::SlateDbCheckedRecovery,
+                ReadinessEvidenceKind::AuthoritativeRawCheckpointRef,
+                ReadinessEvidenceKind::CheckedRawCheckpointRecovery,
             ]),
             query_policy_status: passing_check(vec![
                 ReadinessEvidenceKind::QueryPolicyCatalog,

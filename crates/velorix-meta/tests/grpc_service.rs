@@ -780,7 +780,7 @@ async fn grpc_meta_store_reserves_commits_and_captures_ingest_source_cut() {
     pointer.program_id = "orders-view".to_string();
     pointer.view_id = "orders-view".to_string();
     pointer.checkpoint_key = format!(
-        "v1/standing-runtime-checkpoints/default/orders-view/orders-view/epochs/{:020}/sha256/{}.checkpoint.json",
+        "v1/standing-runtime-checkpoints/default/orders-view/orders-view/epochs/{:020}/sha256/{}.checkpoint.arrow",
         pointer.logical_epoch,
         pointer.content_hash.strip_prefix("sha256:").unwrap()
     );
@@ -1755,7 +1755,7 @@ fn proto_checkpoint_pointer(epoch: u64, hash_seed: &str) -> ProtoCheckpointPoint
         program_id: "program".to_string(),
         view_id: "view".to_string(),
         checkpoint_key: format!(
-            "v1/standing-runtime-checkpoints/default/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.json"
+            "v1/standing-runtime-checkpoints/default/program/view/epochs/{epoch:020}/sha256/{hash}.checkpoint.arrow"
         ),
         logical_epoch: epoch,
         content_hash: format!("sha256:{hash}"),

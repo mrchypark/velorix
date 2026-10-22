@@ -601,7 +601,7 @@ Verification:
 
 * **“Object-storage-first.”** Object storage is the artifact store, but Hiqlite is the hot admission/progress authority and process memory is described as a query surface. The authority model is hybrid, not object-store-first in the strong sense.
 
-* **“Ultra-lightweight.”** Nine crates plus DataFusion, Arrow, Parquet, Foyer, SlateDB, Hiqlite, Kubernetes, gRPC and Sigstore is not an ultra-lightweight operational footprint.
+* **“Ultra-lightweight.”** Nine crates plus DataFusion, Arrow, Parquet, Foyer, Hiqlite, Kubernetes, gRPC and Sigstore is not an ultra-lightweight operational footprint.
 
 * **“Two-relation joins are epoch-consistent.”** Current docs define a per-relation frontier-vector contract, but release still needs live crash/retry/recovery evidence that output manifests and checkpoints preserve it.
 

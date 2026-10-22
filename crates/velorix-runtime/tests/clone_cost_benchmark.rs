@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 
 /// Simulates a runtime row with column values (like CrossJoinRow).
 #[derive(Clone)]
-#[allow(dead_code)]
 struct SimRow {
     values: BTreeMap<String, Value>,
     weight: i64,
@@ -87,6 +86,12 @@ fn benchmark_clone_cost() {
 
     for &n in &sizes {
         let state = make_state(n, cols);
+        let (key, row) = state
+            .first_key_value()
+            .expect("benchmark state is non-empty");
+        assert_eq!(row.values.get("key"), Some(&json!(key)));
+        assert_eq!(row.values.len(), cols + 1);
+        assert_eq!(row.weight, 1);
         let arc_state = Arc::new(state.clone());
 
         let deep_ns = bench_clone_deep(&state, iters);

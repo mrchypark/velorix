@@ -103,7 +103,6 @@ pub enum CheckpointGcTransition {
 pub enum CheckpointRecoveryMode {
     LatestCandidate,
     SelectedCheckpoint,
-    SlateDbLatest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

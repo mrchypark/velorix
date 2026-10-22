@@ -419,8 +419,12 @@ async fn persist_standing_runtime_checkpoint_inner(
     };
     if let Some(demand) = &demand_materialization {
         demand.validate_checkpoint(&checkpoint_for_record)?;
-        let bytes = serde_json::to_vec(demand).map_err(ApiError::internal)?;
-        if bytes.len() > state.max_standing_runtime_state_payload_bytes {
+        let bytes = velorix_core::arrow_state::ArrowState::measure_serializable(
+            demand,
+            state.max_standing_runtime_state_payload_bytes,
+        )
+        .map_err(ApiError::bad_request)?;
+        if bytes > state.max_standing_runtime_state_payload_bytes {
             return Err(ApiError::bad_request(
                 "demand coverage exceeds checkpoint resource budget",
             ));
@@ -438,12 +442,11 @@ async fn persist_standing_runtime_checkpoint_inner(
         replay_checkpoints,
         manifest_hash: String::new(),
     };
-    let bytes =
-        serde_json::to_vec(&record).map_err(|source| ApiError::internal(source.to_string()))?;
+    let bytes = checkpoint_record::encode(&record, checkpoint_record::MAX_ENCODED_RECORD_BYTES)?;
     let candidate = if let Some(existing) = existing_legacy_record {
-        if serde_json::to_value(&existing).map_err(ApiError::internal)?
-            != serde_json::to_value(&record).map_err(ApiError::internal)?
-        {
+        let existing_bytes =
+            checkpoint_record::encode(&existing, checkpoint_record::MAX_ENCODED_RECORD_BYTES)?;
+        if existing_bytes != bytes {
             return Err(ApiError::conflict(format!(
                 "standing runtime checkpoint conflict at {}",
                 checkpoint_key.as_str()
@@ -573,8 +576,8 @@ async fn authenticated_demand_retry_output(
         Some(state.max_standing_runtime_expansion_bytes as u64),
     )
     .await?;
-    let record: StandingRuntimeOutputDeltaRecord =
-        serde_json::from_slice(&bytes).map_err(ApiError::bad_request)?;
+    let record =
+        output_delta_record::decode(&bytes, state.max_standing_runtime_state_payload_bytes)?;
     validate_standing_runtime_output_delta_record(&key, &record)?;
     if record
         .producer_commit
@@ -957,7 +960,7 @@ async fn read_authoritative_cursor_checkpoint_inner(
             let mut latest_checkpoint: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
             while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
                 let location = meta.location.to_string();
-                if location.ends_with(".checkpoint.json") {
+                if location.ends_with(".checkpoint.arrow") {
                     let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(location.clone())
                         .map_err(ApiError::bad_request)?;
                     latest_checkpoint = Some(match latest_checkpoint {
@@ -1678,8 +1681,11 @@ pub(super) fn standing_runtime_output_publication(
     checkpoint: &RuntimeCheckpoint,
     view_id: &str,
     checkpoint_key: &ObjectKey,
-    published_output: Value,
+    mut published_output: Value,
 ) -> Result<StandingRuntimeOutputPublication, ApiError> {
+    // ArrowState canonicalizes map entries. Hash and persist the same
+    // canonical Value so its decoded logical hash remains stable across IPC.
+    published_output.sort_all_objects();
     let output_row_count = standing_runtime_published_output_row_count(&published_output)?;
     let output_bytes = serde_json::to_vec(&published_output)
         .map_err(|source| ApiError::internal(source.to_string()))?;
@@ -1698,7 +1704,7 @@ pub(super) fn standing_runtime_output_publication(
         page_key: output_page_key.as_str().to_string(),
         page_content_hash: output_content_hash.clone(),
         row_count: output_row_count,
-        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
     };
     let page_record = StandingRuntimeOutputPageRecord {
         schema_version: 1,
@@ -1711,7 +1717,7 @@ pub(super) fn standing_runtime_output_publication(
         page_index: 0,
         page_content_hash: output_content_hash.clone(),
         row_count: output_row_count,
-        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
         source_kind: "standing_runtime_checkpoint_published_output".to_string(),
         published_output: published_output.clone(),
     };
@@ -1733,7 +1739,7 @@ pub(super) fn standing_runtime_output_publication(
         logical_epoch: checkpoint.logical_epoch,
         checkpoint_content_hash: checkpoint.state_root.content_hash.clone(),
         output_content_hash,
-        output_encoding: "velorix-delta-batch-json-v1".to_string(),
+        output_encoding: materialized_output_pages::GENERIC_ARROW_CODEC.to_string(),
         output_row_count,
         source_kind: "standing_runtime_checkpoint_published_output".to_string(),
         pages: vec![page_ref],
@@ -1974,7 +1980,7 @@ pub(super) fn standing_runtime_output_delta_records_for_checkpoint_with_binding(
             logical_epoch: checkpoint.logical_epoch,
             schema_fingerprint: output_delta.schema_fingerprint.clone(),
             delta_content_hash,
-            delta_encoding: "velorix-delta-batch-json-v1".to_string(),
+            delta_encoding: "velorix-arrow-ipc-zstd3-v1".to_string(),
             delta_row_count,
             source_kind: if producer_commit.is_some() {
                 "standing_runtime_epoch_output_commit".to_string()
@@ -2167,10 +2173,11 @@ pub(super) async fn persist_standing_runtime_output_delta(
     record: &StandingRuntimeOutputDeltaRecord,
 ) -> Result<(), ApiError> {
     let record = record.clone();
-    let bytes = tokio::task::spawn_blocking(move || serde_json::to_vec(&record))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)?;
+    let max_state_bytes = state.max_standing_runtime_state_payload_bytes;
+    let bytes =
+        tokio::task::spawn_blocking(move || output_delta_record::encode(&record, max_state_bytes))
+            .await
+            .map_err(ApiError::internal)??;
     let path = ObjectPath::from(output_delta_key.as_str());
     let result = state
         .store
@@ -2491,7 +2498,7 @@ pub(super) fn standing_runtime_checkpoint_pointer_from_record(
     record: &StandingRuntimeCheckpointRecord,
 ) -> StandingRuntimeCheckpointPointer {
     let manifest_hash = if record.manifest_hash.is_empty() {
-        serde_json::to_vec(record)
+        checkpoint_record::encode(record, checkpoint_record::MAX_ENCODED_RECORD_BYTES)
             .map(|bytes| stable_bytes_hash(&bytes))
             .unwrap_or_default()
     } else {
@@ -2639,7 +2646,7 @@ async fn read_latest_standing_runtime_checkpoint_inner(
     let mut latest_checkpoint: Option<(String, StandingRuntimeCheckpointKeyParts)> = None;
     while let Some(meta) = stream.try_next().await.map_err(ApiError::internal)? {
         let location = meta.location.to_string();
-        if location.ends_with(".checkpoint.json") {
+        if location.ends_with(".checkpoint.arrow") {
             let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(location.clone())
                 .map_err(ApiError::bad_request)?;
             latest_checkpoint = Some(match latest_checkpoint {
@@ -3490,8 +3497,8 @@ fn checkpoint_read_cache_key(
         output_id,
         object_path: raw.to_string(),
         content_hash,
-        codec: if raw.ends_with(".checkpoint.json") {
-            "checkpoint-json"
+        codec: if raw.ends_with(".checkpoint.arrow") {
+            "velorix-arrow-ipc-zstd3-v1"
         } else {
             "checkpoint-arrow-zstd-v2"
         }
@@ -3532,7 +3539,7 @@ fn checkpoint_cache_bytes_match(
                     .is_ok_and(|manifest| manifest.is_some())
             });
     }
-    if path.ends_with(".checkpoint.json") {
+    if path.ends_with(".checkpoint.arrow") {
         return standing_runtime_checkpoint_record_from_slice(bytes)
             .ok()
             .is_some_and(|record| record.checkpoint.state_root.content_hash == content_hash);
@@ -3600,25 +3607,23 @@ pub(super) async fn read_standing_runtime_output_delta_record(
                 "unsupported standing runtime checkpoint output delta ref for view `{view_id}`"
             ))
         })?;
-    let bytes = state
-        .store
-        .get(&ObjectPath::from(output_delta_key.to_string()))
-        .await
-        .map_err(ApiError::internal)?
-        .bytes()
-        .await
-        .map_err(ApiError::internal)?;
+    let bytes = read_object_bytes_bounded(
+        state,
+        &ObjectPath::from(output_delta_key.to_string()),
+        Some(state.max_standing_runtime_expansion_bytes as u64),
+    )
+    .await?;
     let output_delta_key = output_delta_key.to_string();
+    let max_state_bytes = state.max_standing_runtime_state_payload_bytes;
     tokio::task::spawn_blocking(move || {
         let (_, parts) = ObjectKey::parse_standing_runtime_output_delta(output_delta_key.clone())
             .map_err(ApiError::bad_request)?;
         let decode_timer = CursorPhaseTimer::new(
             &parts.view_id,
             parts.logical_epoch,
-            &format!("commit_json_decode_bytes_{}", bytes.len()),
+            &format!("commit_arrow_decode_bytes_{}", bytes.len()),
         );
-        let record: StandingRuntimeOutputDeltaRecord = serde_json::from_slice(&bytes)
-            .map_err(|source| ApiError::bad_request(source.to_string()))?;
+        let record = output_delta_record::decode(&bytes, max_state_bytes)?;
         drop(decode_timer);
         let (key, _) = ObjectKey::parse_standing_runtime_output_delta(output_delta_key.to_string())
             .map_err(ApiError::bad_request)?;
@@ -3655,7 +3660,7 @@ fn validate_standing_runtime_output_manifest_record_with_summary(
             record.tenant_id, record.program_id, record.view_id
         )));
     }
-    if record.output_encoding != "velorix-delta-batch-json-v1"
+    if record.output_encoding != materialized_output_pages::GENERIC_ARROW_CODEC
         || record.source_kind != "standing_runtime_checkpoint_published_output"
     {
         return Err(ApiError::bad_request(format!(
@@ -3731,7 +3736,7 @@ pub(super) fn validate_standing_runtime_output_delta_record(
             record.tenant_id, record.program_id, record.view_id
         )));
     }
-    if record.delta_encoding != "velorix-delta-batch-json-v1"
+    if record.delta_encoding != "velorix-arrow-ipc-zstd3-v1"
         || (is_legacy_delta && record.source_kind != "standing_runtime_epoch_output_delta")
         || (is_producer_commit && record.source_kind != "standing_runtime_epoch_output_commit")
         || record.schema_fingerprint.is_empty()
@@ -3903,7 +3908,7 @@ pub(super) fn validate_standing_runtime_output_page_ref(
     page: &StandingRuntimeOutputPageRef,
     view_id: &str,
 ) -> Result<(), ApiError> {
-    if page.output_encoding != "velorix-delta-batch-json-v1"
+    if page.output_encoding != materialized_output_pages::GENERIC_ARROW_CODEC
         && !materialized_output_pages::is_materialized_codec(&page.output_encoding)
     {
         return Err(ApiError::bad_request(format!(
@@ -3941,7 +3946,7 @@ fn validate_standing_runtime_output_page_record_with_summary(
             record.tenant_id, record.program_id, record.view_id
         )));
     }
-    if record.output_encoding != "velorix-delta-batch-json-v1"
+    if record.output_encoding != materialized_output_pages::GENERIC_ARROW_CODEC
         || record.source_kind != "standing_runtime_checkpoint_published_output"
     {
         return Err(ApiError::bad_request(format!(

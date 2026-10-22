@@ -56,7 +56,7 @@ gates.
 
 The manifest records the declared MSRV policy and requires package review
 records for the high-risk production dependency subjects that shape Velorix's
-database boundary: DataFusion, object storage, Kubernetes, SlateDB, Foyer, the
+database boundary: DataFusion, object storage, Kubernetes, Foyer, the
 metadata authority, and the internal materialized view runtime. The product
 metadata authority is the embedded Rhiza KV backend, reviewed on `2026-10-08`.
 Hiqlite is no longer a dependency: it left `Cargo.toml` and the lockfile, its
@@ -66,13 +66,6 @@ was removed with it. `deny.toml` also carries no advisory suppressions; the
 quick-xml 0.39 Hiqlite -> cryptr -> s3-simple line that required
 `RUSTSEC-2026-0194` and `RUSTSEC-2026-0195` exemptions is gone, so the authority
 path's only quick-xml line is 0.41.
-SlateDB uses exact crates.io 0.16.0 with default features disabled; its former
-Git-source allowance has been removed. The user accepted
-the official release's measured storage-cost increase. Default GC and durable
-commit acknowledgments remain enabled. The
-[comparison report](../development/slatedb-upstream-comparison-2026-09-27.md)
-preserves the original gate failure, scoped measured baseline recalibration,
-durability tests and bidirectional persisted-state compatibility evidence.
 Each package review names an owner, review date, local
 audit status, feature policy, and replacement plan. This is the required local
 audit workflow for the release gate.

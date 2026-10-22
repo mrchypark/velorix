@@ -1207,7 +1207,7 @@ struct InMemoryIngestPublication {
 }
 
 impl InMemoryMetaStore {
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "rhiza-backend"))]
     pub(crate) fn from_state_for_evaluation(state: InMemoryMetaState, now_unix_ms: u64) -> Self {
         let mut state = state;
         state.partition_authority_now_unix_ms = now_unix_ms;
@@ -1217,7 +1217,7 @@ impl InMemoryMetaStore {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "rhiza-backend"))]
     pub(crate) async fn snapshot_state(&self) -> InMemoryMetaState {
         self.inner.read().await.clone()
     }

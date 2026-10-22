@@ -293,8 +293,9 @@ pub(super) async fn consolidate_demand_publication_deltas(
         )
         .await?;
         charge(&mut remaining, &mut fetched_bytes, bytes.len())?;
-        let delta: StandingRuntimeOutputDeltaRecord =
-            serde_json::from_slice(&bytes).map_err(|error| invalid(&error.to_string()))?;
+        let delta =
+            output_delta_record::decode(&bytes, state.max_standing_runtime_state_payload_bytes)
+                .map_err(|error| invalid(&error.to_string()))?;
         drop(bytes);
         validate_standing_runtime_output_delta_record(&key, &delta)?;
         if delta.tenant_id != current.identity.tenant_id
@@ -454,15 +455,14 @@ mod tests {
             logical_epoch: 2,
             schema_fingerprint: "neutral-schema".into(),
             delta_content_hash,
-            delta_encoding: "velorix-delta-batch-json-v1".into(),
+            delta_encoding: "velorix-arrow-ipc-zstd3-v1".into(),
             delta_row_count: 1,
             source_kind: "standing_runtime_epoch_output_delta".into(),
             output_delta,
             producer_commit: None,
         };
-        let bytes = serde_json::to_vec(&record).unwrap();
-        let mut restored: StandingRuntimeOutputDeltaRecord =
-            serde_json::from_slice(&bytes).unwrap();
+        let bytes = output_delta_record::encode(&record, 1024 * 1024).unwrap();
+        let mut restored = output_delta_record::decode(&bytes, 1024 * 1024).unwrap();
         validate_standing_runtime_output_delta_record(&key, &restored).unwrap();
         restored.output_delta =
             serde_json::to_value(DeltaBatch::from_records([row(7, -1)])).unwrap();

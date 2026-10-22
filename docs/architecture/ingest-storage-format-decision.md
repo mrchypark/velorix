@@ -34,10 +34,10 @@ hot ingest write. Writing many small Parquet files directly on ingest would
 increase PUT/list cost, footer overhead, row-group inefficiency, and compaction
 debt.
 
-SlateDB remains the durable state substrate, not the primary ingest log.
-Putting ingest entries directly into SlateDB would mix ingest-log authority,
-state-store authority, and checkpoint-manifest progress semantics before the
-write-buffer and state-layout contracts are ready.
+Runtime checkpoint state is stored as versioned Arrow IPC objects in object
+storage. Rhiza provides metadata authority and does not replace those state
+objects. Keeping ingest batches, checkpoint state, and metadata in their own
+namespaces preserves their separate authority and progress contracts.
 
 ## Format Contract
 
@@ -140,8 +140,8 @@ The implementation should land as a single coherent breaking slice:
    batches.
 6. Keep Parquet out of hot ingest writes. Add Parquet only through a later
    compaction/export path over sealed or checkpointed ranges.
-7. Keep SlateDB out of the ingest log unless a future write-buffer/index
-   decision assigns it a narrow metadata role with checkpoint semantics.
+7. Keep ingest batches, checkpoint state objects, and metadata records in
+   separate namespaces with explicit authority and recovery contracts.
 
 ## Benchmark Gates
 
@@ -172,5 +172,4 @@ temporary baseline during development. It is not a compatibility requirement.
 - No durable JSON `DeltaBatch` ingest compatibility path.
 - No automatic migration of local bootstrap object-store data.
 - No per-ingest Parquet object as the default hot write path.
-- No SlateDB-backed primary ingest log in this decision.
 - No Foyer-based durability or admission semantics.

@@ -1,95 +1,44 @@
 # State Substrate Contract
 
 Status: Accepted
-Applies to: checkpoint manifest state references, SlateDB integration, and GC.
+Applies to: runtime checkpoint state, object references, recovery, and GC.
 
-Velorix manifests own stream progress and exactly-once publication. SlateDB owns
-the durable state substrate. Velorix must not take ownership of SlateDB internal
-object layout.
+Object storage holds Velorix runtime checkpoint state as immutable Arrow IPC
+objects. Rhiza stores metadata and its snapshot uses the shared Arrow snapshot
+format; Rhiza is not the runtime-state object store. Checkpoint manifests bind
+the state object references needed to restore the materialized runtime.
 
-## State Reference Types
+## State Objects
 
-`RawStateObjectRefV1` is bootstrap-only raw state payload:
+State payloads use the versioned Arrow formats described in
+[Checkpoint State Arrow V1](checkpoint-state-arrow-v1.md). Writers publish
+create-only objects under the Velorix `v1/state/` namespace. A manifest
+reference binds the object key, checkpoint identity, and state commitment so
+recovery can verify the bytes it reads.
 
-```text
-v1/state/{owner}/p={partition_id:010}/chk={checkpoint_version:020}/{object_id}.state
-```
+The object-store API is the authority for state bytes and visibility. Local
+files, process memory, and caches are disposable. Rhiza provides the metadata
+service and its own replicated KV snapshots; it does not own or interpret the
+runtime checkpoint state objects.
 
-It is Velorix-owned raw state and should be disabled in production except under
-an explicit bootstrap/migration flag.
+## Recovery and Retention
 
-`SlateDbCheckpointRefV1` is the production direction. Current manifests store
-it as optional `StateObjectRef.slatedb` metadata when `ref_type` is
-`slate_db_checkpoint`, keeping legacy/raw JSON compatible. It references a
-SlateDB-owned state key under a SlateDB database path, not a list of SlateDB
-internal object keys. The V1 metadata contains exactly:
-
-- `db_path`
-- `state_key`
-- `state_digest`
-- `state_bytes`
-- `created_by_checkpoint_version`
-
-The current implementation writes `state_digest` as a `sha256:`-prefixed digest
-of the state bytes and verifies digest and byte length on read.
-
-For publication-time validation, the SlateDB state store also writes a small
-Velorix-owned marker key under the SlateDB keyspace:
-
-```text
-__velorix_state_ref_v1/{sha256(state_key)}
-```
-
-The marker is written in the same SlateDB transaction as the state payload and
-contains the same V1 metadata as the manifest ref. Manifest publication checks
-the marker metadata and verifies that the payload key is still readable, but it
-does not re-hash the full state payload. Payload byte length and digest
-validation remain on the recovery/read boundary. The marker is a publication
-guard, not a retention handle.
-
-## GC and Recovery
-
-- Manifest `state_objects` must become a tagged reference type.
-- Recovery dispatches by state reference type.
-- Reading a SlateDB checkpoint ref through the raw store fails closed.
-- Reading a raw ref through the SlateDB store fails closed.
-- SlateDB reads require metadata presence and matching `db_path`, `state_key`,
-  checkpoint version, byte length, and digest.
-- SlateDB publication validation requires a matching marker and readable payload
-  key, and fails closed for missing or mismatched marker metadata.
-- Closing and reopening the SlateDB store can recover state written through the
-  returned checkpoint ref.
-- Velorix GC planning/execution can release Velorix-owned raw `v1/state/...`
-  objects, `v1/outputs/...` objects, and manifest-retired
-  `SlateDbCheckpointRefV1` state refs not referenced by retained manifests.
-- Velorix GC must never delete SlateDB internal objects by prefix walking.
-- SlateDB state release uses SlateDB public key APIs for the logical state key
-  and the Velorix marker key.
-- Mixed raw-to-SlateDB lineage must be explicit and tested.
+- Recovery starts from the authoritative checkpoint pointer and validates its
+  manifest before reading referenced Arrow state objects.
+- State decoding validates the supported Arrow format, size bounds, identity,
+  and commitment before restoring runtime state.
+- A missing, corrupt, or mismatched state object fails recovery closed.
+- GC retains every state object reachable from retained checkpoints and deletes
+  only manifest-unreferenced Velorix objects selected by the retention policy.
+- GC operates through the object-store API and does not walk unrelated key
+  prefixes.
+- Existing stores with earlier state encodings require a separately planned
+  rebuild or migration before the current readers can consume them.
 
 ## Verification
 
-- A manifest containing a `SlateDbCheckpointRefV1` can recover state through the
-  SlateDB store, including after local close/reopen.
-- Publication validation uses the small marker path plus payload-key existence,
-  and leaves full payload digest validation to read/recovery.
-- GC does not issue direct deletes for SlateDB internal prefixes; current tests
-  cover an internal-looking non-Velorix prefix remaining untouched by plan
-  execution.
-- GC releases manifest-retired `SlateDbCheckpointRefV1` refs through the
-  SlateDB store, keeps retained SlateDB refs readable, and records digest-bound
-  retention evidence for the released state key.
-- Production publication rejects raw state refs without a bootstrap flag.
-- Production publication rejects a SlateDB child checkpoint when any visible
-  parent or ancestor manifest in its lineage still carries raw/bootstrap state
-  refs.
-- CLI admin tooling no longer starts local engine recovery directly; raw
-  bootstrap/migration recovery remains confined to runtime recovery tests and
-  runtime-owned recovery paths.
-- `ref_type` is required outside migration mode.
-
-## Remaining Gaps
-
-- The current V1 handle is intentionally narrow: it proves recoverable state
-  bytes and manifest metadata integrity, not a full multi-handle SlateDB
-  checkpoint retention protocol.
+Arrow encoding, bounds, identity checks, fresh-process recovery, and Rhiza
+snapshot compatibility are covered by the storage and metadata test suites.
+Checkpoint lineage, object visibility, and retention evidence are described in
+[Checkpoint Recovery Index V1](checkpoint-recovery-index-v1.md) and
+[Storage Contract](storage-contract.md).

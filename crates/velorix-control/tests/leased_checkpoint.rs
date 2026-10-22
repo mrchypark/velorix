@@ -13,7 +13,6 @@ use velorix_storage::{
     },
     manifest::{
         CheckpointManifest, InputRange, OutputObjectRef, PartitionOwnerClaim, StateObjectRef,
-        StateRefType,
     },
     ownership::OwnershipEpochRecord,
     state::{
@@ -60,13 +59,7 @@ fn capabilities_with_weak_namespace(
 async fn checked_production_leased_publisher(
     store: Arc<dyn ObjectStore>,
 ) -> LeasedCheckpointPublisher {
-    LeasedCheckpointPublisher::with_slatedb_state_store_authoritative(
-        store,
-        "v1/slatedb/state",
-        &all_namespace_capabilities(),
-    )
-    .await
-    .unwrap()
+    LeasedCheckpointPublisher::new_authoritative(store, &all_namespace_capabilities()).unwrap()
 }
 
 fn assert_missing_namespace(err: LeasedCheckpointError, namespace: AuthoritativeNamespace) {
@@ -160,16 +153,8 @@ fn state_ref(state: &StateObjectWrite) -> StateObjectRef {
         owner: state.owner().to_string(),
         partition_id: state.partition_id(),
         checkpoint_version: state.checkpoint_version(),
-        ref_type: StateRefType::RawObject,
-        slatedb: None,
         owner_claim: state.owner_claim().cloned(),
     }
-}
-
-fn slatedb_state_ref(state: &StateObjectWrite) -> StateObjectRef {
-    let mut state_ref = state_ref(state);
-    state_ref.ref_type = StateRefType::SlateDbCheckpoint;
-    state_ref
 }
 
 fn output_ref(output: &OutputObjectWrite) -> OutputObjectRef {
@@ -648,12 +633,10 @@ async fn leased_checkpoint_production_constructor_rejects_missing_output_capabil
 ) {
     let (_temp_dir, store) = temp_store();
 
-    let err = LeasedCheckpointPublisher::with_slatedb_state_store_authoritative(
+    let err = LeasedCheckpointPublisher::new_authoritative(
         Arc::clone(&store),
-        "v1/slatedb/state",
         &capabilities_missing(AuthoritativeNamespace::Output),
     )
-    .await
     .unwrap_err();
 
     assert_missing_namespace(err, AuthoritativeNamespace::Output);
@@ -665,12 +648,10 @@ async fn leased_checkpoint_production_constructor_rejects_missing_output_capabil
 async fn leased_checkpoint_production_constructor_rejects_weak_output_capabilities_before_writes() {
     let (_temp_dir, store) = temp_store();
 
-    let err = LeasedCheckpointPublisher::with_slatedb_state_store_authoritative(
+    let err = LeasedCheckpointPublisher::new_authoritative(
         Arc::clone(&store),
-        "v1/slatedb/state",
         &capabilities_with_weak_namespace(AuthoritativeNamespace::Output),
     )
-    .await
     .unwrap_err();
 
     assert_weak_namespace(err, AuthoritativeNamespace::Output);
@@ -683,12 +664,10 @@ async fn leased_checkpoint_production_constructor_rejects_missing_ownership_capa
 ) {
     let (_temp_dir, store) = temp_store();
 
-    let err = LeasedCheckpointPublisher::with_slatedb_state_store_authoritative(
+    let err = LeasedCheckpointPublisher::new_authoritative(
         Arc::clone(&store),
-        "v1/slatedb/state",
         &capabilities_missing(AuthoritativeNamespace::Ownership),
     )
-    .await
     .unwrap_err();
 
     assert_missing_namespace(err, AuthoritativeNamespace::Ownership);
@@ -701,12 +680,10 @@ async fn leased_checkpoint_production_constructor_rejects_weak_ownership_capabil
 ) {
     let (_temp_dir, store) = temp_store();
 
-    let err = LeasedCheckpointPublisher::with_slatedb_state_store_authoritative(
+    let err = LeasedCheckpointPublisher::new_authoritative(
         Arc::clone(&store),
-        "v1/slatedb/state",
         &capabilities_with_weak_namespace(AuthoritativeNamespace::Ownership),
     )
-    .await
     .unwrap_err();
 
     assert_weak_namespace(err, AuthoritativeNamespace::Ownership);
@@ -726,7 +703,7 @@ async fn leased_checkpoint_production_rejects_missing_ownership_record_before_du
     let manifest = manifest(
         0,
         vec![input_range("orders", 0)],
-        vec![slatedb_state_ref(&state)],
+        vec![state_ref(&state)],
         vec![output_ref(&output)],
     );
 
@@ -790,7 +767,7 @@ async fn leased_checkpoint_production_rejects_stale_lower_epoch_grant_after_newe
     let manifest = manifest(
         0,
         vec![input_range("orders", 0)],
-        vec![slatedb_state_ref(&state)],
+        vec![state_ref(&state)],
         vec![output_ref(&output)],
     );
 
@@ -829,63 +806,6 @@ async fn leased_checkpoint_production_rejects_stale_lower_epoch_grant_after_newe
 }
 
 #[tokio::test]
-async fn leased_checkpoint_production_rejects_unchecked_slatedb_publisher_before_durable_writes() {
-    let (_temp_dir, store) = temp_store();
-    let publisher =
-        CheckpointPublisher::with_slatedb_state_store(Arc::clone(&store), "v1/slatedb/state")
-            .await
-            .unwrap();
-    let leased = LeasedCheckpointPublisher::new(publisher.clone());
-    let grant = grant("worker-a", 7, 2_000);
-    let claim = owner_claim("worker-a", 7);
-    publisher
-        .create_ownership_epoch_record(&ownership_record("orders", 0, "worker-a", 7))
-        .await
-        .unwrap();
-    publisher
-        .create_ownership_epoch_record(&ownership_record("settlements", 0, "worker-a", 7))
-        .await
-        .unwrap();
-    let state = state_write(0, 0, "state-0001", claim.clone(), b"state");
-    let output = output_write(0, 0, "out-0001", claim, b"output");
-    let manifest = manifest(
-        0,
-        vec![input_range("orders", 0)],
-        vec![slatedb_state_ref(&state)],
-        vec![output_ref(&output)],
-    );
-
-    let err = leased
-        .publish_production(
-            grant,
-            1_000,
-            vec![state.clone()],
-            vec![output.clone()],
-            manifest.clone(),
-        )
-        .await
-        .unwrap_err();
-
-    assert!(matches!(
-        err,
-        LeasedCheckpointError::MissingProductionAuthorityEvidence
-    ));
-    assert_eq!(publisher.latest_manifest().await.unwrap(), None);
-    assert!(publisher
-        .read_state_object(&manifest.state_objects[0])
-        .await
-        .is_err());
-    assert!(store
-        .head(&Path::from(output.object_key().as_str()))
-        .await
-        .is_err());
-    assert!(store
-        .head(&Path::from(manifest.object_key().as_str()))
-        .await
-        .is_err());
-}
-
-#[tokio::test]
 async fn leased_checkpoint_production_rejects_unchecked_raw_state_publisher_before_durable_writes()
 {
     let (_temp_dir, store) = temp_store();
@@ -906,7 +826,7 @@ async fn leased_checkpoint_production_rejects_unchecked_raw_state_publisher_befo
     let manifest = manifest(
         0,
         vec![input_range("orders", 0)],
-        vec![slatedb_state_ref(&state)],
+        vec![state_ref(&state)],
         vec![output_ref(&output)],
     );
 
@@ -941,7 +861,7 @@ async fn leased_checkpoint_production_rejects_unchecked_raw_state_publisher_befo
 }
 
 #[tokio::test]
-async fn leased_checkpoint_production_publishes_with_slatedb_refs_and_ownership_records() {
+async fn leased_checkpoint_production_publishes_raw_refs_and_ownership_records() {
     let (_temp_dir, store) = temp_store();
     let publisher = CheckpointPublisher::new(Arc::clone(&store));
     let leased = checked_production_leased_publisher(Arc::clone(&store)).await;
@@ -960,7 +880,7 @@ async fn leased_checkpoint_production_publishes_with_slatedb_refs_and_ownership_
     let manifest = manifest(
         0,
         vec![input_range("orders", 0)],
-        vec![slatedb_state_ref(&state)],
+        vec![state_ref(&state)],
         vec![output_ref(&output)],
     );
 
@@ -986,17 +906,9 @@ async fn leased_checkpoint_production_publishes_with_slatedb_refs_and_ownership_
     assert_eq!(latest.checkpoint_version, manifest.checkpoint_version);
     assert_eq!(latest.input_ranges, manifest.input_ranges);
     assert_eq!(latest.output_objects, manifest.output_objects);
-    assert_eq!(
-        latest.state_objects[0].ref_type,
-        StateRefType::SlateDbCheckpoint
-    );
-    let checked_reader = CheckpointPublisher::with_slatedb_state_store_authoritative(
-        Arc::clone(&store),
-        "v1/slatedb/state",
-        &all_namespace_capabilities(),
-    )
-    .await
-    .unwrap();
+    let checked_reader =
+        CheckpointPublisher::new_authoritative(Arc::clone(&store), &all_namespace_capabilities())
+            .unwrap();
     assert_eq!(
         checked_reader
             .read_state_object(&latest.state_objects[0])

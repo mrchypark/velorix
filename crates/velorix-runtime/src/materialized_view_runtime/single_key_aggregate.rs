@@ -478,7 +478,6 @@ impl SingleKeySumCountRuntime {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)] // exercised by colocated runtime fault-injection harnesses.
     fn arm_fail_next_output_encoding(&mut self) {
         self.fail_next_output_encoding = true;
     }

@@ -14,13 +14,11 @@ object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-slatedb = { workspace = true }
 thiserror = { workspace = true }
 velorix-core = { path = "../velorix-core" }
 
 [features]
 s3-compat-tests = ["object_store/aws"]
-benchmark-diagnostics = []
 
 [[test]]
 name = "s3_compat"
@@ -30,8 +28,3 @@ required-features = ["s3-compat-tests"]
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
-
-[[bench]]
-name = "slatedb_reopen_diagnostic"
-harness = false
-required-features = ["benchmark-diagnostics"]
