@@ -3933,7 +3933,7 @@ checks["checkpoint recovery repair and GC blocker remains evidence-bound"] = (
     and "cannot publish a mixed checkpoint" in checkpoint_recovery_index
     and "The GC root set is deliberately larger than the latest-N manifest policy" in storage_contract
     and "supported upgrade/rollback window" in storage_contract
-    and "PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 8" in control_readiness
+    and "PRODUCTION_READINESS_SCHEMA_VERSION: u16 = 9" in control_readiness
     and "S3CompatibleCheckpointFaultMatrix" in control_readiness
     and "s3_compatible_test_status missing s3_compatible_checkpoint_fault_matrix evidence"
     in control_readiness

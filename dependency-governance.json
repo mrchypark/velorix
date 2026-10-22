@@ -104,7 +104,7 @@
       "crate": "object_store",
       "owner": "runtime",
       "expires_on": "2027-01-08",
-      "reason": "Velorix authority paths select object_store 0.14.2, while DataFusion uses object_store 0.13 (0.13.2) via datafusion 55.1.0 and parquet 59.3.0. The scan boundary receives SQL text, so no object_store type crosses it.",
+      "reason": "Velorix authority paths select object_store 0.14.2, while DataFusion's object_store 0.13 (0.13.2) comes via datafusion 55.1.0 and parquet 59.3.0. The scan boundary receives SQL text, so no object_store type crosses it.",
       "replacement_plan": "Unify authority and scan object_store clients when DataFusion widens its object_store requirement to 0.14; then delete this exception and keep only the authority-path pin. Until then keep 0.14 on authority create/read/list/range behavior without weakening create-only semantics.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
