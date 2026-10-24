@@ -1254,13 +1254,25 @@ impl OrderedWindowRuntime {
             return Ok(());
         }
         for rows in output.records().chunks(VALIDATION_CHUNK_ROWS) {
-            let chunk = DeltaBatch::from_records(rows.to_vec());
             if self.plan.schema_version >= 2 {
-                // Ordered runtime output has one record per key. Keep restore's
-                // schema/type check bounded without applying the page byte budget.
-                if rows.iter().any(|row| row.weight != 1) {
-                    return Err(invalid_checkpoint());
-                }
+                // Bag-mode checkpoints store multiplicity in each canonical
+                // record's weight. Type validation needs one representative
+                // row per record; expanding multiplicities here would make
+                // restore validation proportional to logical bag size.
+                let records = rows
+                    .iter()
+                    .map(|row| {
+                        if row.weight <= 0 || (self.plan.schema_version != 3 && row.weight != 1) {
+                            return Err(invalid_checkpoint());
+                        }
+                        let mut representative = row.clone();
+                        representative.weight = 1;
+                        Ok(representative)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let chunk = DeltaBatch::from_records(records);
+                // Keep restore's schema/type check bounded without applying
+                // the page byte budget or expanding bag multiplicities.
                 super::output::materialized_bag_delta_page_batch(
                     &self.output_schema,
                     &chunk,
@@ -1273,6 +1285,7 @@ impl OrderedWindowRuntime {
                 )
                 .map_err(|_| invalid_checkpoint())?;
             } else {
+                let chunk = DeltaBatch::from_records(rows.to_vec());
                 materialized_generic_delta_to_record_batch(&self.key_first_schema()?, &chunk)
                     .map_err(|_| invalid_checkpoint())?;
             }
