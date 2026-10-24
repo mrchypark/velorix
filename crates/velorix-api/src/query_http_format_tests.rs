@@ -243,18 +243,29 @@ async fn direct_http_source_budgets_reject_before_page_reads_in_both_formats() {
             .create_for_production_table_scan("default", &policy_id, policy)
             .await
             .unwrap();
-        let key = object_store::path::Path::from("v1/views/purchases_by_user/active.json");
-        let bytes = state.store.get(&key).await.unwrap().bytes().await.unwrap();
-        let mut record: Value = serde_json::from_slice(&bytes).unwrap();
-        record["api"]["query_policy_id"] = json!(policy_id);
-        state
-            .store
-            .put(
-                &key,
-                bytes::Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
-            )
+        let meta_store = state.meta_store.as_ref().unwrap();
+        let snapshot = meta_store
+            .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+                scope: view_dependencies::active_view_registry_scope(&state),
+            })
             .await
             .unwrap();
+        let versioned = snapshot
+            .records
+            .into_iter()
+            .find(|entry| entry.record.view_id == "purchases_by_user")
+            .unwrap();
+        let mut record = versioned.record;
+        record.api.as_mut().unwrap().query_policy_id = Some(policy_id);
+        view_dependencies::compare_exchange_active_view_record(
+            &state,
+            "purchases_by_user",
+            versioned.generation,
+            record,
+            None,
+        )
+        .await
+        .unwrap();
         let counts = crate::tests::ObjectStoreAccessCounts::default();
         state.store = Arc::new(crate::tests::CountingObjectStore::new(
             state.store.clone(),

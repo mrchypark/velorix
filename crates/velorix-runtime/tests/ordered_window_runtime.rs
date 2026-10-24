@@ -453,6 +453,304 @@ fn ordered_resource_limits_reject_atomically_and_restore_with_lower_limits() {
 }
 
 #[test]
+fn delta_only_ordered_window_skips_full_snapshot_cap_but_page_reads_stay_bounded() {
+    use velorix_runtime::materialized_view_runtime::{
+        restore_standing_runtime_with_limits, RuntimeResourceLimits,
+    };
+    let sql = "select id, day, lag(metric) over (partition by group_id, day order by ts) as previous from events";
+    let mut catalog = catalog();
+    catalog.relation_schema.primary_key_column_ids = vec!["id".into(), "day".into()];
+    catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "day")
+        .unwrap()
+        .semantic_role = RelationSemanticRoleV1::PrimaryKey;
+    catalog.schema_fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&catalog.relation_schema).unwrap();
+    catalog.incremental_relation.schema_fingerprint = catalog.schema_fingerprint.clone();
+    let plan = validate_supported_ordered_window_sql(sql, &catalog).unwrap();
+    assert_eq!(plan.schema_version, 2);
+    let mut schema = output(&[
+        ("id", SqlDataType::Utf8, false),
+        ("day", SqlDataType::Int64, false),
+        ("previous", SqlDataType::Float64, true),
+    ]);
+    schema.primary_key = vec!["id".into(), "day".into()];
+    let input_schema = catalog_input_relation_schema(&catalog).unwrap();
+    let initial = create_standing_runtime_with_sql_and_catalogs(
+        &identity(sql),
+        std::slice::from_ref(&catalog),
+        sql,
+        &[input_schema],
+        &[schema],
+    )
+    .unwrap()
+    .checkpoint()
+    .unwrap();
+    let limits = RuntimeResourceLimits {
+        max_snapshot_bytes: 4 * 1024,
+        ..RuntimeResourceLimits::default()
+    };
+    let mut runtime = restore_standing_runtime_with_limits(initial, limits).unwrap();
+    let keys = (0..100)
+        .map(|index| format!("row-{index}"))
+        .collect::<Vec<_>>();
+    let rows = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| row(key, index as i64, Some(index as f64)))
+        .collect::<Vec<_>>();
+    let mut initial_input = input(&rows, 0);
+    initial_input.schema_fingerprint = catalog.schema_fingerprint.to_string();
+    let commit = runtime
+        .apply_changes_delta_only(
+            1,
+            EpochIdempotencyKey::new("delta-only-window").unwrap(),
+            vec![initial_input],
+        )
+        .unwrap();
+    assert!(commit.output_batches.is_empty());
+    assert_eq!(commit.output_deltas[0].delta.records().len(), 100);
+    let view = ScopedViewId {
+        tenant_id: "tenant-a".into(),
+        program_id: "ordered-program".into(),
+        view_id: "ordered".into(),
+    };
+    let unpaged = runtime.materialized_view_page(view.clone(), SnapshotPageRequest::default());
+    assert!(unpaged
+        .unwrap_err()
+        .to_string()
+        .contains("runtime_snapshot_bytes"));
+    let page = runtime
+        .materialized_view_page(
+            view.clone(),
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: Some(2),
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 2);
+    let continuation = page.next_page_token.clone().unwrap();
+    let next = runtime
+        .materialized_view_page(
+            view.clone(),
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: Some(continuation.clone()),
+                max_rows: Some(2),
+            },
+        )
+        .unwrap();
+    assert_eq!(next.batches[0].num_rows(), 2);
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut restored = restore_standing_runtime_with_limits(checkpoint, limits).unwrap();
+    let restored_next = restored
+        .materialized_view_page(
+            view.clone(),
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: Some(continuation),
+                max_rows: Some(2),
+            },
+        )
+        .unwrap();
+    assert_eq!(restored_next.batches, next.batches);
+
+    let mut seen = BTreeMap::new();
+    let mut token = None;
+    loop {
+        let page = restored
+            .materialized_view_page(
+                view.clone(),
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: token,
+                    max_rows: Some(7),
+                },
+            )
+            .unwrap();
+        let ids = page.batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for index in 0..ids.len() {
+            *seen.entry(ids.value(index).to_string()).or_insert(0usize) += 1;
+        }
+        token = page.next_page_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 100);
+    assert!(seen.values().all(|copies| *copies == 1));
+
+    let correction_rows = [
+        Row {
+            weight: -1,
+            ..row("row-50", 50, Some(50.0))
+        },
+        Row {
+            weight: 1,
+            ..row("row-50", 50, Some(150.0))
+        },
+    ];
+    let mut correction = input(&correction_rows, 100);
+    correction.schema_fingerprint = catalog.schema_fingerprint.to_string();
+    let correction_commit = restored
+        .apply_changes_delta_only(
+            2,
+            EpochIdempotencyKey::new("late-correction").unwrap(),
+            vec![correction],
+        )
+        .unwrap();
+    assert!(correction_commit.output_batches.is_empty());
+    let corrected_checkpoint = restored.checkpoint().unwrap();
+    let corrected =
+        restore_standing_runtime_with_limits(corrected_checkpoint.clone(), limits).unwrap();
+    assert!(corrected
+        .materialized_view_page(view.clone(), SnapshotPageRequest::default())
+        .unwrap_err()
+        .to_string()
+        .contains("runtime_snapshot_bytes"));
+
+    let mut corrected_values = BTreeMap::new();
+    let mut token = None;
+    loop {
+        let page = corrected
+            .materialized_view_page(
+                view.clone(),
+                SnapshotPageRequest {
+                    committed_epoch: Some(2),
+                    page_token: token,
+                    max_rows: Some(7),
+                },
+            )
+            .unwrap();
+        corrected_values.extend(float_values(&page.batches[0], "previous"));
+        token = page.next_page_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(corrected_values.len(), 100);
+    assert_eq!(corrected_values["row-50"], Some(49.0));
+    assert_eq!(corrected_values["row-51"], Some(150.0));
+    let paged_checksum = stable_bytes_hash(&serde_json::to_vec(&corrected_values).unwrap());
+    let default_limited = restore_standing_runtime(corrected_checkpoint).unwrap();
+    let full_values = float_values(&snapshot(default_limited.as_ref()), "previous");
+    assert_eq!(
+        paged_checksum,
+        stable_bytes_hash(&serde_json::to_vec(&full_values).unwrap())
+    );
+}
+
+#[test]
+fn single_utf8_primary_key_v1_pages_charge_only_requested_rows() {
+    use velorix_runtime::materialized_view_runtime::{
+        restore_standing_runtime_with_limits, RuntimeResourceLimits,
+    };
+    let sql =
+        "select id, lag(metric) over (partition by group_id order by ts) as previous from events";
+    let schema = output(&[
+        ("id", SqlDataType::Utf8, false),
+        ("previous", SqlDataType::Float64, true),
+    ]);
+    let plan = validate_supported_ordered_window_sql(sql, &catalog()).unwrap();
+    assert_eq!(plan.schema_version, 1);
+    let initial = runtime(sql, schema).checkpoint().unwrap();
+    let limits = RuntimeResourceLimits {
+        max_snapshot_bytes: 4 * 1024,
+        ..RuntimeResourceLimits::default()
+    };
+    let mut runtime = restore_standing_runtime_with_limits(initial, limits).unwrap();
+    let keys = (0..100)
+        .map(|index| format!("single-{index:03}"))
+        .collect::<Vec<_>>();
+    let rows = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| row(key, index as i64, Some(index as f64)))
+        .collect::<Vec<_>>();
+    let commit = runtime
+        .apply_changes_delta_only(
+            1,
+            EpochIdempotencyKey::new("single-key-v1").unwrap(),
+            vec![input(&rows, 0)],
+        )
+        .unwrap();
+    assert!(commit.output_batches.is_empty());
+    assert!(runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant-a".into(),
+                program_id: "ordered-program".into(),
+                view_id: "ordered".into(),
+            },
+            SnapshotPageRequest::default(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("runtime_snapshot_bytes"));
+
+    let view = ScopedViewId {
+        tenant_id: "tenant-a".into(),
+        program_id: "ordered-program".into(),
+        view_id: "ordered".into(),
+    };
+    let first = runtime
+        .materialized_view_page(
+            view.clone(),
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: Some(1),
+            },
+        )
+        .unwrap();
+    assert_eq!(first.batches[0].num_rows(), 1);
+    let continuation = first.next_page_token.clone().unwrap();
+    let checkpoint = runtime.checkpoint().unwrap();
+    let restored = restore_standing_runtime_with_limits(checkpoint, limits).unwrap();
+
+    let mut seen = BTreeMap::new();
+    let mut token = Some(continuation);
+    loop {
+        let page = restored
+            .materialized_view_page(
+                view.clone(),
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: token,
+                    max_rows: Some(7),
+                },
+            )
+            .unwrap();
+        let ids = page.batches[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for index in 0..ids.len() {
+            *seen.entry(ids.value(index).to_string()).or_insert(0usize) += 1;
+        }
+        token = page.next_page_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 99);
+    assert!(seen.values().all(|copies| *copies == 1));
+}
+
+#[test]
 fn composite_range_peers_nulls_late_suffix_retractions_and_restore() {
     let sql = "select id, group_id, day, ts, metric, sum(metric) over (partition by group_id, day order by ts) as cumulative from events";
     let schema = output(&[

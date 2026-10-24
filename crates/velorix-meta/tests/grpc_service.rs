@@ -27,26 +27,29 @@ use velorix_meta::{
         AcquireStandingRuntimeOwnerRequest as ProtoAcquireStandingRuntimeOwnerRequest,
         BeginViewBootstrapRequest as ProtoBeginViewBootstrapRequest,
         CaptureIngestSourceCutRequest as ProtoCaptureIngestSourceCutRequest,
-        PublishStandingRuntimeCheckpointRequest, ReadMetaStoreCapabilitiesRequest,
-        ReadRelationCatalogRequest, ReadStandingRuntimeCheckpointRequest,
-        ReadStandingRuntimeOwnerRequest, ReadViewBootstrapRequest as ProtoReadViewBootstrapRequest,
-        ReserveIngestRangeRequest, StandingRuntimeCheckpointPointer as ProtoCheckpointPointer,
+        PublishStandingRuntimeCheckpointRequest,
+        ReadDemandMetadataBatchRequest as ProtoReadDemandMetadataBatchRequest,
+        ReadMetaStoreCapabilitiesRequest, ReadRelationCatalogRequest,
+        ReadStandingRuntimeCheckpointRequest, ReadStandingRuntimeOwnerRequest,
+        ReadViewBootstrapRequest as ProtoReadViewBootstrapRequest, ReserveIngestRangeRequest,
+        StandingRuntimeCheckpointPointer as ProtoCheckpointPointer,
         StandingRuntimeOwnerToken as ProtoOwnerToken, StoreRelationCatalogRequest,
     },
     validate_bearer_token, AcquireRelationPartitionAuthorityOutcome,
     AcquireRelationPartitionAuthorityRequest, AcquireStandingRuntimeOwnerOutcome,
     BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
     CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
-    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
+    CommitIngestRangeOutcome, DemandRelationCatalogLookup, FixViewBootstrapActivationCutOutcome,
     FixViewBootstrapActivationCutRequest, GrpcMetaStore, InMemoryMetaStore, IngestRangeReservation,
     IngestSourceRelationIdentityV1, MetaGrpcService, MetaStore, OssMetaStore,
     PartitionAuthorityKey, PartitionCheckpointPointer, PromoteViewBootstrapOutcome,
     PromoteViewBootstrapRequest, PublishIngestReservationOutcome, PublishIngestReservationRequest,
     PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
     PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
-    RelationPartitionAuthorityKey, ReserveAuthoritativeIngestRangeRequest,
-    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    ReadDemandMetadataBatchRequest, RelationPartitionAuthorityKey,
+    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
 #[cfg(feature = "rhiza-backend")]
 use velorix_meta::{rhiza_kv::RhizaKvStore, rhiza_meta::RhizaKvMetaStore};
@@ -391,6 +394,31 @@ async fn grpc_service_stores_reads_catalog_and_reserves_ingest_range() {
         .await
         .unwrap()
         .into_inner();
+    let batch_response = service
+        .read_demand_metadata_batch(Request::new(ProtoReadDemandMetadataBatchRequest {
+            request_json: serde_json::to_vec(&ReadDemandMetadataBatchRequest {
+                source_cuts: None,
+                relation_catalogs: vec![DemandRelationCatalogLookup {
+                    relation_id: "orders".into(),
+                    relation_version: "v1".into(),
+                }],
+                standing_runtime_checkpoint: None,
+            })
+            .unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let batch: velorix_meta::ReadDemandMetadataBatchResponse =
+        serde_json::from_slice(&batch_response.response_json).unwrap();
+    assert_eq!(batch.relation_catalogs, vec![catalog.clone()]);
+    let arbitrary_key = service
+        .read_demand_metadata_batch(Request::new(ProtoReadDemandMetadataBatchRequest {
+            request_json: br#"{"object_key":"arbitrary"}"#.to_vec(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(arbitrary_key.code(), tonic::Code::InvalidArgument);
     let reserve_response = service
         .reserve_ingest_range(Request::new(ReserveIngestRangeRequest {
             stream_id: "orders".to_string(),
@@ -475,6 +503,16 @@ async fn grpc_service_rejects_every_rpc_without_valid_bearer_token() {
             .read_relation_catalog(wrong_bearer_request(ReadRelationCatalogRequest {
                 relation_id: "orders".to_string(),
                 relation_version: "v1".to_string(),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        service
+            .read_demand_metadata_batch(wrong_bearer_request(ProtoReadDemandMetadataBatchRequest {
+                request_json: b"{}".to_vec(),
             }))
             .await
             .unwrap_err()
@@ -709,11 +747,151 @@ async fn grpc_meta_store_allows_independent_rpcs_to_enter_concurrently() {
 }
 
 #[tokio::test]
-async fn grpc_meta_store_reserves_commits_and_captures_ingest_source_cut() {
+async fn grpc_meta_store_round_trips_active_registry_and_fenced_bootstrap() {
     let endpoint = spawn_meta_service().await;
     let store = GrpcMetaStore::connect(endpoint).await.unwrap();
     let catalog = common::orders_relation_catalog("v1");
     let reservation = ingest_range_reservation(&catalog);
+    let registry_scope = velorix_meta::ActiveViewRegistryScopeV1 {
+        authority_store_id: "grpc-authority".to_string(),
+        namespace: "grpc-registry".to_string(),
+    };
+    let runtime_record = velorix_storage::materialized_view_registry::ActiveMaterializedViewRecord {
+        schema_version: 3,
+        view_id: "orders-view".to_string(),
+        spec_hash: "sha256:orders-spec".to_string(),
+        execution_mode: Some(
+            velorix_storage::materialized_view_registry::MaterializedViewExecutionMode::StandingRuntime,
+        ),
+        api: None,
+        artifact: None,
+        runtime: Some(
+            velorix_storage::materialized_view_registry::MaterializedViewRuntimeBinding {
+                runtime_kind: "materialized_view_runtime".to_string(),
+                runtime_version: "v1".to_string(),
+                standing_program_identity: velorix_core::standing_program::StandingProgramIdentity {
+                    tenant_id: "default".to_string(),
+                    program_id: "orders-view".to_string(),
+                    view_ids: vec!["orders-view".to_string()],
+                    sql_hash: "sql-hash".to_string(),
+                    input_catalog_hash: "input-hash".to_string(),
+                    output_schema_hash: "output-hash".to_string(),
+                    planner_identity: "planner".to_string(),
+                    builtin_runtime_identities: vec![],
+                    runtime_capabilities: vec![],
+                    runtime_compatibility: "v1".to_string(),
+                    checkpoint_codec_identity: "v1".to_string(),
+                    native_code_policy: velorix_core::standing_program::NativeCodePolicy::DisabledNoExternalDependencies,
+                },
+                logical_plan: None,
+                published_relations: Vec::new(),
+                input_bindings: Vec::new(),
+            },
+        ),
+        lifecycle: Some(
+            velorix_storage::materialized_view_registry::MaterializedViewLifecycleStatus::
+                standing_runtime_deploying(None),
+        ),
+    };
+    assert_eq!(
+        store
+            .import_active_view_registry(velorix_meta::ImportActiveViewRegistryRequestV1 {
+                scope: registry_scope.clone(),
+                records: vec![runtime_record.clone()],
+            })
+            .await
+            .unwrap(),
+        velorix_meta::ImportActiveViewRegistryOutcomeV1::Imported
+    );
+    let initial_registry = store
+        .read_active_view_registry_snapshot(velorix_meta::ActiveViewRegistryReadRequestV1 {
+            scope: registry_scope.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(initial_registry.imported);
+    assert_eq!(initial_registry.records.len(), 1);
+    assert_eq!(initial_registry.records[0].record, runtime_record);
+    for other_scope in [
+        velorix_meta::ActiveViewRegistryScopeV1 {
+            authority_store_id: registry_scope.authority_store_id.clone(),
+            namespace: "other-namespace".to_string(),
+        },
+        velorix_meta::ActiveViewRegistryScopeV1 {
+            authority_store_id: "other-authority".to_string(),
+            namespace: registry_scope.namespace.clone(),
+        },
+    ] {
+        let isolated = store
+            .read_active_view_registry_snapshot(velorix_meta::ActiveViewRegistryReadRequestV1 {
+                scope: other_scope,
+            })
+            .await
+            .unwrap();
+        assert!(!isolated.imported);
+        assert!(isolated.records.is_empty());
+    }
+
+    let created_record =
+        velorix_storage::materialized_view_registry::ActiveMaterializedViewRecord {
+            schema_version: 3,
+            view_id: "created-view".to_string(),
+            spec_hash: "sha256:created-one".to_string(),
+            execution_mode: None,
+            api: None,
+            artifact: None,
+            runtime: None,
+            lifecycle: None,
+        };
+    assert!(matches!(
+        store
+            .create_active_view_record(velorix_meta::CreateActiveViewRecordRequestV1 {
+                scope: registry_scope.clone(),
+                record: created_record.clone(),
+            })
+            .await
+            .unwrap(),
+        velorix_meta::CreateActiveViewRecordOutcomeV1::Created(versioned)
+            if versioned.generation == 1
+    ));
+    let stale = store
+        .compare_exchange_active_view_record(
+            velorix_meta::CompareExchangeActiveViewRecordRequestV1 {
+                scope: registry_scope.clone(),
+                view_id: "created-view".to_string(),
+                expected_generation: 9,
+                record: velorix_storage::materialized_view_registry::ActiveMaterializedViewRecord {
+                    spec_hash: "sha256:stale".to_string(),
+                    ..created_record.clone()
+                },
+                owner: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stale,
+        velorix_meta::CompareExchangeActiveViewRecordOutcomeV1::Conflict
+    );
+    assert!(matches!(
+        store
+            .compare_exchange_active_view_record(
+                velorix_meta::CompareExchangeActiveViewRecordRequestV1 {
+                    scope: registry_scope.clone(),
+                    view_id: "created-view".to_string(),
+                    expected_generation: 1,
+                    record: velorix_storage::materialized_view_registry::ActiveMaterializedViewRecord {
+                        spec_hash: "sha256:created-two".to_string(),
+                        ..created_record
+                    },
+                    owner: None,
+                },
+            )
+            .await
+            .unwrap(),
+        velorix_meta::CompareExchangeActiveViewRecordOutcomeV1::Updated(versioned)
+            if versioned.generation == 2
+    ));
 
     assert_eq!(
         store
@@ -776,6 +954,39 @@ async fn grpc_meta_store_reserves_commits_and_captures_ingest_source_cut() {
         },
         other => panic!("unexpected owner outcome: {other:?}"),
     };
+    let mut active_runtime_record = runtime_record;
+    active_runtime_record.lifecycle = Some(
+        velorix_storage::materialized_view_registry::MaterializedViewLifecycleStatus::
+            standing_runtime(),
+    );
+    assert!(store
+        .compare_exchange_active_view_record(
+            velorix_meta::CompareExchangeActiveViewRecordRequestV1 {
+                scope: registry_scope.clone(),
+                view_id: "orders-view".to_string(),
+                expected_generation: 1,
+                record: active_runtime_record.clone(),
+                owner: None,
+            },
+        )
+        .await
+        .is_err());
+    assert!(matches!(
+        store
+            .compare_exchange_active_view_record(
+                velorix_meta::CompareExchangeActiveViewRecordRequestV1 {
+                    scope: registry_scope.clone(),
+                    view_id: "orders-view".to_string(),
+                    expected_generation: 1,
+                    record: active_runtime_record.clone(),
+                    owner: Some(owner.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        velorix_meta::CompareExchangeActiveViewRecordOutcomeV1::Updated(versioned)
+            if versioned.generation == 2
+    ));
     let mut pointer = checkpoint_pointer(1, "a");
     pointer.program_id = "orders-view".to_string();
     pointer.view_id = "orders-view".to_string();
@@ -843,19 +1054,37 @@ async fn grpc_meta_store_reserves_commits_and_captures_ingest_source_cut() {
     ));
     assert!(matches!(
         store
-            .promote_view_bootstrap(PromoteViewBootstrapRequest {
-                tenant_id: "default".to_string(),
-                program_id: "orders-view".to_string(),
-                view_id: "orders-view".to_string(),
-                bootstrap_generation: bootstrap.bootstrap_generation,
-                plan_hash: bootstrap.plan_hash,
-                checkpoint: pointer,
-                owner,
-            })
+            .promote_view_bootstrap_with_active_view_record(
+                velorix_meta::PromoteViewBootstrapWithActiveViewRecordRequestV1 {
+                    bootstrap: PromoteViewBootstrapRequest {
+                        tenant_id: "default".to_string(),
+                        program_id: "orders-view".to_string(),
+                        view_id: "orders-view".to_string(),
+                        bootstrap_generation: bootstrap.bootstrap_generation,
+                        plan_hash: bootstrap.plan_hash,
+                        checkpoint: pointer,
+                        owner,
+                    },
+                    scope: registry_scope.clone(),
+                    expected_generation: 2,
+                    record: active_runtime_record,
+                },
+            )
             .await
             .unwrap(),
         PromoteViewBootstrapOutcome::Promoted(_)
     ));
+    let final_registry = store
+        .read_active_view_registry_snapshot(velorix_meta::ActiveViewRegistryReadRequestV1 {
+            scope: registry_scope,
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_registry.records.len(), 2);
+    assert!(final_registry
+        .records
+        .iter()
+        .any(|record| { record.record.view_id == "orders-view" && record.generation == 3 }));
 }
 
 #[tokio::test]
@@ -1568,6 +1797,8 @@ async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
     let backend = InMemoryMetaStore::default();
     let endpoint = spawn_meta_service_for(backend).await;
     let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let catalog = common::orders_relation_catalog("v1");
+    store.store_relation_catalog(catalog.clone()).await.unwrap();
     let key = RelationPartitionAuthorityKey {
         namespace: "tenant-a".into(),
         relation_id: "orders".into(),
@@ -1644,6 +1875,34 @@ async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
         cuts[0].cut.partitions[0].publications[0].object_key,
         "objects/orders"
     );
+    let batch = store
+        .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+            source_cuts: Some(CaptureRelationIngestSourceCutsRequest {
+                namespace: "tenant-a".into(),
+                relations: vec![IngestSourceRelationIdentityV1 {
+                    relation_id: "orders".into(),
+                    relation_version: "v1".into(),
+                    relation_generation: 1,
+                    schema_fingerprint: "sha256:schema".into(),
+                }],
+            }),
+            relation_catalogs: vec![DemandRelationCatalogLookup {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+            }],
+            standing_runtime_checkpoint: Some(
+                velorix_meta::DemandStandingRuntimeCheckpointLookup {
+                    tenant_id: "tenant-a".into(),
+                    program_id: "program-a".into(),
+                    view_id: "view-a".into(),
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(batch.source_cuts, Some(cuts));
+    assert_eq!(batch.relation_catalogs, vec![catalog]);
+    assert!(batch.standing_runtime_checkpoint.is_none());
 }
 
 #[tokio::test]

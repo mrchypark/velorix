@@ -2,6 +2,8 @@
 //! full MetaStore: it exposes only linearizable single-key operations.
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -41,6 +43,8 @@ pub struct RhizaKvStore {
     /// [`RhizaKvStore::open_operator_managed`] started one. `None` means this
     /// store serves no operator endpoints.
     recovery_address: Option<String>,
+    #[cfg(test)]
+    get_calls: Arc<AtomicUsize>,
 }
 
 impl RhizaKvStore {
@@ -91,6 +95,8 @@ impl RhizaKvStore {
             Ok(Self {
                 db: Arc::new(db),
                 recovery_address: Some(address),
+                #[cfg(test)]
+                get_calls: Arc::new(AtomicUsize::new(0)),
             })
         })
         .await
@@ -108,7 +114,19 @@ impl RhizaKvStore {
         Self {
             db: Arc::new(db),
             recovery_address: None,
+            #[cfg(test)]
+            get_calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_calls(&self) -> usize {
+        self.get_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_get_calls(&self) {
+        self.get_calls.store(0, Ordering::SeqCst);
     }
 
     /// The bound address of the native recovery listener, if this store started
@@ -135,6 +153,8 @@ impl RhizaKvStore {
         &self,
         key: impl Into<String> + Send + 'static,
     ) -> Result<Option<Vec<u8>>, RhizaKvError> {
+        #[cfg(test)]
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
         let db = Arc::clone(&self.db);
         let key = key.into();
         tokio::task::spawn_blocking(move || {

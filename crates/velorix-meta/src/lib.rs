@@ -23,6 +23,7 @@ use velorix_storage::{
         DurableIngestAdmissionRecordV1, IngestAdmissionCoordinator,
         ReserveIngestRangeAdmissionOutcome,
     },
+    materialized_view_registry::ActiveMaterializedViewRecord,
     object_key::ObjectKey,
     relation_catalog_registry::{
         CreateRelationCatalogOutcome, RelationCatalogRegistry, RelationCatalogRegistryError,
@@ -447,6 +448,286 @@ pub struct PublishStandingRuntimeCheckpointRequest {
     pub expected_relation_source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
 }
 
+pub const MAX_DEMAND_METADATA_BATCH_LOOKUPS: usize = 64;
+/// Active registry RPC envelopes may carry the existing bounded snapshot, so
+/// tonic must be configured above its default 4 MiB message limit.
+pub const MAX_META_GRPC_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Authority boundary for the active-view registry.  This is deliberately the
+/// existing object-store authority plus namespace; it does not create a new
+/// tenant or authorization model.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveViewRegistryScopeV1 {
+    pub authority_store_id: String,
+    pub namespace: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveViewRecordVersionV1 {
+    pub generation: u64,
+    pub record: ActiveMaterializedViewRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveViewRegistryReadRequestV1 {
+    pub scope: ActiveViewRegistryScopeV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveViewRegistrySnapshotV1 {
+    pub snapshot_revision: u64,
+    /// False means this scope has never been imported/initialized. Callers
+    /// must not fall back to S3 once it is true, even when `records` is empty.
+    pub imported: bool,
+    pub records: Vec<ActiveViewRecordVersionV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateActiveViewRecordRequestV1 {
+    pub scope: ActiveViewRegistryScopeV1,
+    pub record: ActiveMaterializedViewRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateActiveViewRecordOutcomeV1 {
+    Created(ActiveViewRecordVersionV1),
+    Duplicate(ActiveViewRecordVersionV1),
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompareExchangeActiveViewRecordRequestV1 {
+    pub scope: ActiveViewRegistryScopeV1,
+    pub view_id: String,
+    pub expected_generation: u64,
+    pub record: ActiveMaterializedViewRecord,
+    /// Required when changing lifecycle on a standing-runtime record. Other
+    /// API-authorized metadata updates remain generation-CAS operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StandingRuntimeOwnerToken>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareExchangeActiveViewRecordOutcomeV1 {
+    Updated(ActiveViewRecordVersionV1),
+    Duplicate(ActiveViewRecordVersionV1),
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportActiveViewRegistryRequestV1 {
+    pub scope: ActiveViewRegistryScopeV1,
+    pub records: Vec<ActiveMaterializedViewRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportActiveViewRegistryOutcomeV1 {
+    Imported,
+    Duplicate,
+    Conflict,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromoteViewBootstrapWithActiveViewRecordRequestV1 {
+    pub bootstrap: PromoteViewBootstrapRequest,
+    pub scope: ActiveViewRegistryScopeV1,
+    pub expected_generation: u64,
+    pub record: ActiveMaterializedViewRecord,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveViewRegistryStateV1 {
+    initialized: bool,
+    snapshot_revision: u64,
+    #[serde(with = "crate::rhiza_snapshot::map_pairs")]
+    records: HashMap<String, ActiveViewRecordVersionV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandRelationCatalogLookup {
+    pub relation_id: String,
+    pub relation_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemandStandingRuntimeCheckpointLookup {
+    pub tenant_id: String,
+    pub program_id: String,
+    pub view_id: String,
+}
+
+/// A bounded, typed set of demand-start reads pinned to one metadata snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDemandMetadataBatchRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cuts: Option<CaptureRelationIngestSourceCutsRequest>,
+    #[serde(default)]
+    pub relation_catalogs: Vec<DemandRelationCatalogLookup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_runtime_checkpoint: Option<DemandStandingRuntimeCheckpointLookup>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDemandMetadataBatchResponse {
+    /// Returned in the order of `source_cuts.relations`.
+    pub source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
+    /// Returned in the order of `relation_catalogs`.
+    pub relation_catalogs: Vec<VelorixRelationCatalogV1>,
+    /// `None` means the requested pointer was absent, or no pointer was requested.
+    pub standing_runtime_checkpoint: Option<StandingRuntimeCheckpointPointer>,
+}
+
+impl ReadDemandMetadataBatchRequest {
+    pub fn validate(&self) -> Result<(), MetaStoreError> {
+        let source_cut_relations = self
+            .source_cuts
+            .as_ref()
+            .map_or(0, |source_cuts| source_cuts.relations.len());
+        let lookups = source_cut_relations
+            .saturating_add(self.relation_catalogs.len())
+            .saturating_add(self.standing_runtime_checkpoint.is_some() as usize);
+        if lookups == 0 {
+            return Err(MetaStoreError::EmptyField { field: "lookups" });
+        }
+        if lookups > MAX_DEMAND_METADATA_BATCH_LOOKUPS {
+            return Err(MetaStoreError::DemandMetadataBatchTooLarge {
+                actual: lookups,
+                max: MAX_DEMAND_METADATA_BATCH_LOOKUPS,
+            });
+        }
+        if let Some(source_cuts) = &self.source_cuts {
+            source_cuts.validate()?;
+        }
+        let mut catalogs = BTreeSet::new();
+        for lookup in &self.relation_catalogs {
+            require_non_empty("relation_id", &lookup.relation_id)?;
+            require_non_empty("relation_version", &lookup.relation_version)?;
+            if !catalogs.insert((&lookup.relation_id, &lookup.relation_version)) {
+                return Err(MetaStoreError::DuplicateDemandMetadataLookup {
+                    kind: "relation_catalog",
+                });
+            }
+        }
+        if let Some(checkpoint) = &self.standing_runtime_checkpoint {
+            require_non_empty("tenant_id", &checkpoint.tenant_id)?;
+            require_non_empty("program_id", &checkpoint.program_id)?;
+            require_non_empty("view_id", &checkpoint.view_id)?;
+        }
+        Ok(())
+    }
+}
+
+impl ReadDemandMetadataBatchResponse {
+    fn validate_for(&self, request: &ReadDemandMetadataBatchRequest) -> Result<(), MetaStoreError> {
+        if self.relation_catalogs.len() != request.relation_catalogs.len()
+            || self.source_cuts.is_some() != request.source_cuts.is_some()
+            || self
+                .source_cuts
+                .as_ref()
+                .zip(request.source_cuts.as_ref())
+                .is_some_and(|(actual, requested)| actual.len() != requested.relations.len())
+            || self
+                .source_cuts
+                .as_ref()
+                .zip(request.source_cuts.as_ref())
+                .is_some_and(|(actual, requested)| {
+                    actual
+                        .iter()
+                        .zip(&requested.relations)
+                        .any(|(cut, relation)| {
+                            &cut.relation != relation
+                                || cut.cut.namespace != requested.namespace
+                                || cut.cut.relation_id != relation.relation_id
+                        })
+                })
+            || (request.standing_runtime_checkpoint.is_none()
+                && self.standing_runtime_checkpoint.is_some())
+        {
+            return Err(MetaStoreError::Serialization(
+                "demand metadata batch response shape does not match request".into(),
+            ));
+        }
+        for (catalog, lookup) in self
+            .relation_catalogs
+            .iter()
+            .zip(&request.relation_catalogs)
+        {
+            if catalog.relation_schema.relation_id != lookup.relation_id
+                || catalog.relation_schema.relation_version != lookup.relation_version
+            {
+                return Err(MetaStoreError::Serialization(
+                    "demand metadata batch returned a mismatched relation catalog".into(),
+                ));
+            }
+        }
+        if let (Some(checkpoint), Some(lookup)) = (
+            &self.standing_runtime_checkpoint,
+            &request.standing_runtime_checkpoint,
+        ) {
+            if checkpoint.tenant_id != lookup.tenant_id
+                || checkpoint.program_id != lookup.program_id
+                || checkpoint.view_id != lookup.view_id
+            {
+                return Err(MetaStoreError::Serialization(
+                    "demand metadata batch returned a mismatched checkpoint pointer".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn read_demand_metadata_batch_from_state(
+    store: InMemoryMetaStore,
+    request: ReadDemandMetadataBatchRequest,
+) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
+    let source_cuts = match request.source_cuts {
+        Some(request) => Some(store.capture_relation_ingest_source_cuts(request).await?),
+        None => None,
+    };
+    let mut relation_catalogs = Vec::with_capacity(request.relation_catalogs.len());
+    for lookup in request.relation_catalogs {
+        relation_catalogs.push(
+            store
+                .read_relation_catalog(&lookup.relation_id, &lookup.relation_version)
+                .await?,
+        );
+    }
+    let standing_runtime_checkpoint = match request.standing_runtime_checkpoint {
+        Some(lookup) => {
+            store
+                .read_standing_runtime_checkpoint(
+                    &lookup.tenant_id,
+                    &lookup.program_id,
+                    &lookup.view_id,
+                )
+                .await?
+        }
+        None => None,
+    };
+    Ok(ReadDemandMetadataBatchResponse {
+        source_cuts,
+        relation_catalogs,
+        standing_runtime_checkpoint,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PublishStandingRuntimeCheckpointOutcome {
     Published,
@@ -491,6 +772,10 @@ pub enum MetaStoreError {
     UnsupportedRelationGeneration { generation: u64 },
     #[error("metadata timestamp overflow")]
     TimestampOverflow,
+    #[error("metadata snapshot exceeds the existing 8 MiB Rhiza KV limit")]
+    SnapshotTooLarge,
+    #[error("active-view registry exceeds the existing 8 MiB gRPC snapshot limit")]
+    ActiveViewRegistryTooLarge,
     #[error("partition authority epoch cannot advance beyond i64::MAX")]
     AuthorityEpochOverflow,
     #[error("metadata serialization error: {0}")]
@@ -512,6 +797,10 @@ pub enum MetaStoreError {
         relation_id: String,
         relation_version: String,
     },
+    #[error("duplicate demand metadata lookup of kind `{kind}`")]
+    DuplicateDemandMetadataLookup { kind: &'static str },
+    #[error("demand metadata batch has {actual} lookups; maximum is {max}")]
+    DemandMetadataBatchTooLarge { actual: usize, max: usize },
     #[error("overlapping source-cut ranges for {stream_id}/p={partition_id}")]
     OverlappingSourceCutRange {
         stream_id: String,
@@ -542,6 +831,12 @@ pub enum MetaStoreError {
     RhizaIndeterminate { request_id: String, detail: String },
     #[error("rhiza metadata CAS contention after {attempts} attempts")]
     RhizaContention { attempts: usize },
+    #[error("active view record identity does not match registry scope or requested view id")]
+    ActiveViewRecordIdentityMismatch,
+    #[error("active view registry import contains duplicate view id `{view_id}`")]
+    DuplicateActiveViewId { view_id: String },
+    #[error("active view registry contains duplicate normalized API path `{normalized_url_path}`")]
+    DuplicateActiveViewApiPath { normalized_url_path: String },
 }
 
 #[async_trait]
@@ -558,6 +853,76 @@ pub trait MetaStore: Send + Sync + 'static {
         relation_id: &str,
         relation_version: &str,
     ) -> Result<VelorixRelationCatalogV1, MetaStoreError>;
+
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: ActiveViewRegistryReadRequestV1,
+    ) -> Result<ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "active_view_registry",
+        ))
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: CreateActiveViewRecordRequestV1,
+    ) -> Result<CreateActiveViewRecordOutcomeV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_record(&request.scope, &request.record, None)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "active_view_registry",
+        ))
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: CompareExchangeActiveViewRecordRequestV1,
+    ) -> Result<CompareExchangeActiveViewRecordOutcomeV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_record(&request.scope, &request.record, Some(&request.view_id))?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "active_view_registry",
+        ))
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: ImportActiveViewRegistryRequestV1,
+    ) -> Result<ImportActiveViewRegistryOutcomeV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_records(&request.scope, &request.records)?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "active_view_registry",
+        ))
+    }
+
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: PromoteViewBootstrapWithActiveViewRecordRequestV1,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        request.bootstrap.validate()?;
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_record(
+            &request.scope,
+            &request.record,
+            Some(&request.bootstrap.view_id),
+        )?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "active_view_registry",
+        ))
+    }
+
+    /// Reads the fixed demand-start metadata set from one pinned state snapshot.
+    async fn read_demand_metadata_batch(
+        &self,
+        request: ReadDemandMetadataBatchRequest,
+    ) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "demand_metadata_read_batch",
+        ))
+    }
 
     async fn reserve_ingest_range(
         &self,
@@ -898,6 +1263,50 @@ where
             .await
     }
 
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: ActiveViewRegistryReadRequestV1,
+    ) -> Result<ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        (**self).read_active_view_registry_snapshot(request).await
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: CreateActiveViewRecordRequestV1,
+    ) -> Result<CreateActiveViewRecordOutcomeV1, MetaStoreError> {
+        (**self).create_active_view_record(request).await
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: CompareExchangeActiveViewRecordRequestV1,
+    ) -> Result<CompareExchangeActiveViewRecordOutcomeV1, MetaStoreError> {
+        (**self).compare_exchange_active_view_record(request).await
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: ImportActiveViewRegistryRequestV1,
+    ) -> Result<ImportActiveViewRegistryOutcomeV1, MetaStoreError> {
+        (**self).import_active_view_registry(request).await
+    }
+
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: PromoteViewBootstrapWithActiveViewRecordRequestV1,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        (**self)
+            .promote_view_bootstrap_with_active_view_record(request)
+            .await
+    }
+
+    async fn read_demand_metadata_batch(
+        &self,
+        request: ReadDemandMetadataBatchRequest,
+    ) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
+        (**self).read_demand_metadata_batch(request).await
+    }
+
     async fn fix_view_bootstrap_activation_cut(
         &self,
         request: FixViewBootstrapActivationCutRequest,
@@ -1172,6 +1581,8 @@ struct InMemoryMetaState {
     ingest_catalog_epoch: u64,
     #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     view_bootstraps: HashMap<(String, String, String), ViewBootstrapControlV1>,
+    #[serde(default, with = "crate::rhiza_snapshot::map_pairs")]
+    active_view_registries: HashMap<ActiveViewRegistryScopeV1, ActiveViewRegistryStateV1>,
     #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     view_dependency_graph_revisions: HashMap<String, u64>,
     #[serde(with = "crate::rhiza_snapshot::map_pairs")]
@@ -1217,6 +1628,17 @@ impl InMemoryMetaStore {
         }
     }
 
+    #[cfg(feature = "rhiza-backend")]
+    pub(crate) fn from_shared_state_for_evaluation(
+        inner: Arc<RwLock<InMemoryMetaState>>,
+        now_unix_ms: u64,
+    ) -> Self {
+        Self {
+            inner,
+            evaluation_now_unix_ms: Some(now_unix_ms),
+        }
+    }
+
     #[cfg(any(test, feature = "rhiza-backend"))]
     pub(crate) async fn snapshot_state(&self) -> InMemoryMetaState {
         self.inner.read().await.clone()
@@ -1224,6 +1646,13 @@ impl InMemoryMetaStore {
 
     fn evaluation_time_ms(&self) -> Result<u64, MetaStoreError> {
         self.evaluation_now_unix_ms.map_or_else(unix_time_ms, Ok)
+    }
+
+    async fn authority_read_time_ms(&self) -> u64 {
+        match self.evaluation_now_unix_ms {
+            Some(now_unix_ms) => now_unix_ms,
+            None => self.inner.read().await.partition_authority_now_unix_ms,
+        }
     }
 
     /// Controls the in-memory backend clock for deterministic authority tests.
@@ -1305,6 +1734,219 @@ impl MetaStore for InMemoryMetaStore {
                 relation_id: relation_id.to_string(),
                 relation_version: relation_version.to_string(),
             })
+    }
+
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: ActiveViewRegistryReadRequestV1,
+    ) -> Result<ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        let guard = self.inner.read().await;
+        let registry = guard.active_view_registries.get(&request.scope);
+        if let Some(registry) = registry {
+            for (view_id, version) in &registry.records {
+                validate_active_view_record(&request.scope, &version.record, Some(view_id))?;
+            }
+            validate_active_view_registry(registry)?;
+        }
+        let mut records: Vec<_> = registry
+            .into_iter()
+            .flat_map(|registry| registry.records.values().cloned())
+            .collect();
+        records.sort_by(|left, right| left.record.view_id.cmp(&right.record.view_id));
+        Ok(ActiveViewRegistrySnapshotV1 {
+            snapshot_revision: registry.map_or(0, |registry| registry.snapshot_revision),
+            imported: registry.is_some_and(|registry| registry.initialized),
+            records,
+        })
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: CreateActiveViewRecordRequestV1,
+    ) -> Result<CreateActiveViewRecordOutcomeV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_record(&request.scope, &request.record, None)?;
+        let mut guard = self.inner.write().await;
+        let mut candidate = guard
+            .active_view_registries
+            .get(&request.scope)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(existing) = candidate.records.get(&request.record.view_id) {
+            return Ok(if existing.record == request.record {
+                CreateActiveViewRecordOutcomeV1::Duplicate(existing.clone())
+            } else {
+                CreateActiveViewRecordOutcomeV1::Conflict
+            });
+        }
+        let generation = 1;
+        let version = ActiveViewRecordVersionV1 {
+            generation,
+            record: request.record,
+        };
+        candidate.snapshot_revision = candidate
+            .snapshot_revision
+            .checked_add(1)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        candidate.initialized = true;
+        candidate
+            .records
+            .insert(version.record.view_id.clone(), version.clone());
+        if let Err(error) = validate_active_view_registry(&candidate) {
+            if matches!(error, MetaStoreError::DuplicateActiveViewApiPath { .. }) {
+                return Ok(CreateActiveViewRecordOutcomeV1::Conflict);
+            }
+            return Err(error);
+        }
+        guard
+            .active_view_registries
+            .insert(request.scope, candidate);
+        Ok(CreateActiveViewRecordOutcomeV1::Created(version))
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: CompareExchangeActiveViewRecordRequestV1,
+    ) -> Result<CompareExchangeActiveViewRecordOutcomeV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_record(&request.scope, &request.record, Some(&request.view_id))?;
+        let mut guard = self.inner.write().await;
+        let Some(current) = guard.active_view_registries.get(&request.scope) else {
+            return Ok(CompareExchangeActiveViewRecordOutcomeV1::Conflict);
+        };
+        let Some(existing) = current.records.get(&request.view_id) else {
+            return Ok(CompareExchangeActiveViewRecordOutcomeV1::Conflict);
+        };
+        if existing.record == request.record {
+            return Ok(CompareExchangeActiveViewRecordOutcomeV1::Duplicate(
+                existing.clone(),
+            ));
+        }
+        if existing.generation != request.expected_generation {
+            return Ok(CompareExchangeActiveViewRecordOutcomeV1::Conflict);
+        }
+        if (existing.record.runtime.is_some()
+            || existing.record.execution_mode
+                == Some(
+                    velorix_storage::materialized_view_registry::MaterializedViewExecutionMode::StandingRuntime,
+                ))
+            && existing.record.lifecycle != request.record.lifecycle
+        {
+            let Some(owner) = request.owner.as_ref() else {
+                return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+            };
+            let Some(runtime) = existing.record.runtime.as_ref() else {
+                return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+            };
+            let identity = &runtime.standing_program_identity;
+            if owner.tenant_id != identity.tenant_id
+                || owner.program_id != identity.program_id
+                || owner.view_id != request.view_id
+                || !identity
+                    .view_ids
+                    .iter()
+                    .any(|view_id| view_id == &request.view_id)
+            {
+                return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+            }
+            let owner_key = (
+                identity.tenant_id.clone(),
+                identity.program_id.clone(),
+                request.view_id.clone(),
+            );
+            validate_current_standing_runtime_owner(
+                guard.standing_runtime_owners.get(&owner_key),
+                owner,
+                self.evaluation_time_ms()?,
+            )?;
+        }
+        let version = ActiveViewRecordVersionV1 {
+            generation: existing
+                .generation
+                .checked_add(1)
+                .ok_or(MetaStoreError::TimestampOverflow)?,
+            record: request.record,
+        };
+        let mut candidate = current.clone();
+        candidate.snapshot_revision = candidate
+            .snapshot_revision
+            .checked_add(1)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        candidate
+            .records
+            .insert(request.view_id.clone(), version.clone());
+        if let Err(error) = validate_active_view_registry(&candidate) {
+            if matches!(error, MetaStoreError::DuplicateActiveViewApiPath { .. }) {
+                return Ok(CompareExchangeActiveViewRecordOutcomeV1::Conflict);
+            }
+            return Err(error);
+        }
+        guard
+            .active_view_registries
+            .insert(request.scope, candidate);
+        Ok(CompareExchangeActiveViewRecordOutcomeV1::Updated(version))
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: ImportActiveViewRegistryRequestV1,
+    ) -> Result<ImportActiveViewRegistryOutcomeV1, MetaStoreError> {
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_records(&request.scope, &request.records)?;
+        let mut guard = self.inner.write().await;
+        if let Some(existing) = guard.active_view_registries.get(&request.scope) {
+            let same = existing.initialized
+                && existing.records.len() == request.records.len()
+                && request.records.iter().all(|record| {
+                    existing
+                        .records
+                        .get(&record.view_id)
+                        .is_some_and(|entry| entry.generation == 1 && entry.record == *record)
+                });
+            return Ok(if same {
+                ImportActiveViewRegistryOutcomeV1::Duplicate
+            } else {
+                ImportActiveViewRegistryOutcomeV1::Conflict
+            });
+        }
+        let records: HashMap<_, _> = request
+            .records
+            .into_iter()
+            .map(|record| {
+                let id = record.view_id.clone();
+                (
+                    id,
+                    ActiveViewRecordVersionV1 {
+                        generation: 1,
+                        record,
+                    },
+                )
+            })
+            .collect();
+        let candidate = ActiveViewRegistryStateV1 {
+            initialized: true,
+            snapshot_revision: 1,
+            records,
+        };
+        validate_active_view_registry(&candidate)?;
+        guard
+            .active_view_registries
+            .insert(request.scope, candidate);
+        Ok(ImportActiveViewRegistryOutcomeV1::Imported)
+    }
+
+    async fn read_demand_metadata_batch(
+        &self,
+        request: ReadDemandMetadataBatchRequest,
+    ) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
+        request.validate()?;
+        let state = self.inner.read().await.clone();
+        let store = Self {
+            inner: Arc::new(RwLock::new(state)),
+            evaluation_now_unix_ms: self.evaluation_now_unix_ms,
+        };
+        read_demand_metadata_batch_from_state(store, request).await
     }
 
     async fn reserve_ingest_range(
@@ -1825,6 +2467,110 @@ impl MetaStore for InMemoryMetaStore {
         Ok(PromoteViewBootstrapOutcome::Promoted(control))
     }
 
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: PromoteViewBootstrapWithActiveViewRecordRequestV1,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        request.bootstrap.validate()?;
+        validate_active_view_scope(&request.scope)?;
+        validate_active_view_record(
+            &request.scope,
+            &request.record,
+            Some(&request.bootstrap.view_id),
+        )?;
+        let bootstrap = request.bootstrap;
+        let key = (
+            bootstrap.tenant_id.clone(),
+            bootstrap.program_id.clone(),
+            bootstrap.view_id.clone(),
+        );
+        let mut guard = self.inner.write().await;
+        validate_current_standing_runtime_owner(
+            guard.standing_runtime_owners.get(&key),
+            &bootstrap.owner,
+            self.evaluation_time_ms()?,
+        )?;
+        let Some(mut control) = guard.view_bootstraps.get(&key).cloned() else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if control.bootstrap_generation != bootstrap.bootstrap_generation
+            || control.plan_hash != bootstrap.plan_hash
+            || bootstrap.owner.tenant_id != bootstrap.tenant_id
+            || bootstrap.owner.program_id != bootstrap.program_id
+            || bootstrap.owner.view_id != bootstrap.view_id
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        let registry = guard.active_view_registries.get(&request.scope);
+        let Some(active) = registry.and_then(|r| r.records.get(&bootstrap.view_id)) else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if active.generation != request.expected_generation {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        if control.lifecycle == ViewBootstrapLifecycleV1::Active {
+            return if control.active_checkpoint.as_ref() == Some(&bootstrap.checkpoint)
+                && active.record == request.record
+            {
+                Ok(PromoteViewBootstrapOutcome::Duplicate(control))
+            } else {
+                Ok(PromoteViewBootstrapOutcome::Conflict)
+            };
+        }
+        let Some(activation_cut) = control.activation_cut.as_ref() else {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        };
+        if guard.standing_runtime_checkpoints.get(&key) != Some(&bootstrap.checkpoint)
+            || bootstrap.checkpoint.bootstrap_generation != control.bootstrap_generation
+            || bootstrap.checkpoint.plan_hash != control.plan_hash
+            || !view_bootstrap::checkpoint_covers_source_cut(&bootstrap.checkpoint, activation_cut)
+            || (!control.view_inputs.is_empty()
+                && !bootstrap
+                    .checkpoint
+                    .published_input_bootstrap
+                    .as_ref()
+                    .is_some_and(|progress| {
+                        progress.matches_control(&control) && progress.is_complete()
+                    }))
+        {
+            return Ok(PromoteViewBootstrapOutcome::Conflict);
+        }
+        let mut candidate = guard
+            .active_view_registries
+            .get(&request.scope)
+            .expect("registry was validated while holding the write lock")
+            .clone();
+        let active = candidate
+            .records
+            .get_mut(&bootstrap.view_id)
+            .expect("active record was validated while holding the write lock");
+        let generation = active
+            .generation
+            .checked_add(1)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        candidate.snapshot_revision = candidate
+            .snapshot_revision
+            .checked_add(1)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        *active = ActiveViewRecordVersionV1 {
+            generation,
+            record: request.record,
+        };
+        if let Err(error) = validate_active_view_registry(&candidate) {
+            if matches!(error, MetaStoreError::DuplicateActiveViewApiPath { .. }) {
+                return Ok(PromoteViewBootstrapOutcome::Conflict);
+            }
+            return Err(error);
+        }
+        guard
+            .active_view_registries
+            .insert(request.scope, candidate);
+        control.lifecycle = ViewBootstrapLifecycleV1::Active;
+        control.active_checkpoint = Some(bootstrap.checkpoint);
+        guard.view_bootstraps.insert(key, control.clone());
+        Ok(PromoteViewBootstrapOutcome::Promoted(control))
+    }
+
     async fn renew_standing_runtime_owner(
         &self,
         owner: StandingRuntimeOwnerToken,
@@ -2122,11 +2868,12 @@ impl MetaStore for InMemoryMetaStore {
         key: &PartitionAuthorityKey,
     ) -> Result<Option<PartitionAuthorityToken>, MetaStoreError> {
         key.validate()?;
+        let now = self.authority_read_time_ms().await;
         let guard = self.inner.read().await;
         Ok(guard
             .partition_authorities
             .get(key)
-            .filter(|token| token.expires_at_unix_ms > guard.partition_authority_now_unix_ms)
+            .filter(|token| token.expires_at_unix_ms > now)
             .cloned())
     }
 
@@ -2197,11 +2944,12 @@ impl MetaStore for InMemoryMetaStore {
         key: &RelationPartitionAuthorityKey,
     ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
         key.validate()?;
+        let now = self.authority_read_time_ms().await;
         let guard = self.inner.read().await;
         Ok(guard
             .relation_partition_authorities
             .get(key)
-            .filter(|token| token.expires_at_unix_ms > guard.partition_authority_now_unix_ms)
+            .filter(|token| token.expires_at_unix_ms > now)
             .cloned())
     }
 
@@ -3304,6 +4052,84 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), MetaStoreEr
     }
 }
 
+fn validate_active_view_scope(scope: &ActiveViewRegistryScopeV1) -> Result<(), MetaStoreError> {
+    require_non_empty("authority_store_id", &scope.authority_store_id)?;
+    require_non_empty("namespace", &scope.namespace)
+}
+
+fn validate_active_view_record(
+    _scope: &ActiveViewRegistryScopeV1,
+    record: &ActiveMaterializedViewRecord,
+    expected_view_id: Option<&str>,
+) -> Result<(), MetaStoreError> {
+    require_non_empty("view_id", &record.view_id)?;
+    require_non_empty("spec_hash", &record.spec_hash)?;
+    if expected_view_id.is_some_and(|expected| expected != record.view_id) {
+        return Err(MetaStoreError::ActiveViewRecordIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_active_view_records(
+    scope: &ActiveViewRegistryScopeV1,
+    records: &[ActiveMaterializedViewRecord],
+) -> Result<(), MetaStoreError> {
+    let mut ids = BTreeSet::new();
+    for record in records {
+        validate_active_view_record(scope, record, None)?;
+        if !ids.insert(record.view_id.as_str()) {
+            return Err(MetaStoreError::DuplicateActiveViewId {
+                view_id: record.view_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_active_view_registry(
+    registry: &ActiveViewRegistryStateV1,
+) -> Result<(), MetaStoreError> {
+    let mut api_paths = BTreeSet::new();
+    for versioned in registry.records.values() {
+        let Some(path) = versioned
+            .record
+            .api
+            .as_ref()
+            .and_then(|api| api.url_path.as_deref())
+        else {
+            continue;
+        };
+        let normalized = path.trim_matches('/');
+        if !api_paths.insert(normalized) {
+            return Err(MetaStoreError::DuplicateActiveViewApiPath {
+                normalized_url_path: normalized.to_string(),
+            });
+        }
+    }
+    let snapshot = ActiveViewRegistrySnapshotV1 {
+        snapshot_revision: registry.snapshot_revision,
+        imported: registry.initialized,
+        records: registry.records.values().cloned().collect(),
+    };
+    let size = serde_json::to_vec(&snapshot)
+        .map_err(|error| MetaStoreError::Serialization(error.to_string()))?
+        .len();
+    if size > MAX_META_GRPC_MESSAGE_BYTES - 256 {
+        return Err(MetaStoreError::ActiveViewRegistryTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_active_view_rpc_payload_size(size: usize) -> Result<(), Status> {
+    if size > MAX_META_GRPC_MESSAGE_BYTES - 256 {
+        Err(Status::resource_exhausted(
+            "active view registry payload exceeds 8 MiB",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn validate_bearer_token(value: &str) -> Result<(), MetaStoreError> {
     require_non_empty("bearer_token", value)?;
     if value.trim() != value {
@@ -3719,8 +4545,9 @@ where
         request: Request<proto::CaptureIngestSourceCutRequest>,
     ) -> Result<Response<proto::CaptureIngestSourceCutResponse>, Status> {
         self.authorize(&request)?;
-        let request = serde_json::from_slice(&request.into_inner().request_json)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let request: CaptureIngestSourceCutRequest =
+            serde_json::from_slice(&request.into_inner().request_json)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let source_cut = self
             .store
             .capture_ingest_source_cut(request)
@@ -3928,6 +4755,136 @@ where
 
         Ok(Response::new(proto::ReadRelationCatalogResponse {
             catalog_json,
+        }))
+    }
+
+    async fn read_demand_metadata_batch(
+        &self,
+        request: Request<proto::ReadDemandMetadataBatchRequest>,
+    ) -> Result<Response<proto::ReadDemandMetadataBatchResponse>, Status> {
+        self.authorize(&request)?;
+        let request: ReadDemandMetadataBatchRequest =
+            serde_json::from_slice(&request.into_inner().request_json)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        request
+            .validate()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .store
+            .read_demand_metadata_batch(request)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::ReadDemandMetadataBatchResponse {
+            response_json: serde_json::to_vec(&response)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: Request<proto::ActiveViewRegistrySnapshotRequest>,
+    ) -> Result<Response<proto::ActiveViewRegistrySnapshotResponse>, Status> {
+        self.authorize(&request)?;
+        let request_json = request.into_inner().request_json;
+        validate_active_view_rpc_payload_size(request_json.len())?;
+        let request: ActiveViewRegistryReadRequestV1 = serde_json::from_slice(&request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .store
+            .read_active_view_registry_snapshot(request)
+            .await
+            .map_err(meta_status)?;
+        let response_json =
+            serde_json::to_vec(&response).map_err(|error| Status::internal(error.to_string()))?;
+        if response_json.len() > MAX_META_GRPC_MESSAGE_BYTES - 256 {
+            return Err(Status::resource_exhausted(
+                "active view registry snapshot exceeds 8 MiB",
+            ));
+        }
+        Ok(Response::new(proto::ActiveViewRegistrySnapshotResponse {
+            response_json,
+        }))
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: Request<proto::ActiveViewRecordMutationRequest>,
+    ) -> Result<Response<proto::ActiveViewRecordMutationResponse>, Status> {
+        self.authorize(&request)?;
+        let request_json = request.into_inner().request_json;
+        validate_active_view_rpc_payload_size(request_json.len())?;
+        let request: CreateActiveViewRecordRequestV1 = serde_json::from_slice(&request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .store
+            .create_active_view_record(request)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::ActiveViewRecordMutationResponse {
+            response_json: serde_json::to_vec(&response)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: Request<proto::ActiveViewRecordMutationRequest>,
+    ) -> Result<Response<proto::ActiveViewRecordMutationResponse>, Status> {
+        self.authorize(&request)?;
+        let request_json = request.into_inner().request_json;
+        validate_active_view_rpc_payload_size(request_json.len())?;
+        let request: CompareExchangeActiveViewRecordRequestV1 =
+            serde_json::from_slice(&request_json)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .store
+            .compare_exchange_active_view_record(request)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::ActiveViewRecordMutationResponse {
+            response_json: serde_json::to_vec(&response)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: Request<proto::ActiveViewRecordMutationRequest>,
+    ) -> Result<Response<proto::ActiveViewRecordMutationResponse>, Status> {
+        self.authorize(&request)?;
+        let request_json = request.into_inner().request_json;
+        validate_active_view_rpc_payload_size(request_json.len())?;
+        let request: ImportActiveViewRegistryRequestV1 = serde_json::from_slice(&request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .store
+            .import_active_view_registry(request)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::ActiveViewRecordMutationResponse {
+            response_json: serde_json::to_vec(&response)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        }))
+    }
+
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: Request<proto::ActiveViewRecordMutationRequest>,
+    ) -> Result<Response<proto::ActiveViewRecordMutationResponse>, Status> {
+        self.authorize(&request)?;
+        let request_json = request.into_inner().request_json;
+        validate_active_view_rpc_payload_size(request_json.len())?;
+        let request: PromoteViewBootstrapWithActiveViewRecordRequestV1 =
+            serde_json::from_slice(&request_json)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let response = self
+            .store
+            .promote_view_bootstrap_with_active_view_record(request)
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::ActiveViewRecordMutationResponse {
+            response_json: serde_json::to_vec(&response)
+                .map_err(|error| Status::internal(error.to_string()))?,
         }))
     }
 
@@ -4975,6 +5932,8 @@ fn standing_runtime_checkpoint_pointer_to_proto(
 
 fn meta_status(error: MetaStoreError) -> Status {
     match error {
+        MetaStoreError::SnapshotTooLarge => Status::resource_exhausted(error.to_string()),
+        MetaStoreError::ActiveViewRegistryTooLarge => Status::resource_exhausted(error.to_string()),
         MetaStoreError::RelationCatalogNotFound { .. } => Status::not_found(error.to_string()),
         MetaStoreError::RelationCatalogConflict { .. } => Status::already_exists(error.to_string()),
         MetaStoreError::RelationSchema(_)
@@ -4994,6 +5953,11 @@ fn meta_status(error: MetaStoreError) -> Status {
         | MetaStoreError::PartitionAuthorityTokenScopeMismatch
         | MetaStoreError::PartitionAuthorityInvalidToken
         | MetaStoreError::DuplicateSourceCutRelation { .. }
+        | MetaStoreError::DuplicateDemandMetadataLookup { .. }
+        | MetaStoreError::ActiveViewRecordIdentityMismatch
+        | MetaStoreError::DuplicateActiveViewId { .. }
+        | MetaStoreError::DuplicateActiveViewApiPath { .. }
+        | MetaStoreError::DemandMetadataBatchTooLarge { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::IncompleteRelationSourceCut { .. }
         | MetaStoreError::UnexpectedOutcome(_) => Status::invalid_argument(error.to_string()),
@@ -5008,6 +5972,8 @@ fn meta_status(error: MetaStoreError) -> Status {
 
 fn partition_authority_status(error: MetaStoreError) -> Status {
     match error {
+        MetaStoreError::SnapshotTooLarge => Status::resource_exhausted(error.to_string()),
+        MetaStoreError::ActiveViewRegistryTooLarge => Status::resource_exhausted(error.to_string()),
         MetaStoreError::EmptyField { .. }
         | MetaStoreError::InvalidDuration { .. }
         | MetaStoreError::IntegerOutOfRange { .. }
@@ -5031,6 +5997,11 @@ fn partition_authority_status(error: MetaStoreError) -> Status {
         | MetaStoreError::StandingRuntimeCheckpointScopeMismatch
         | MetaStoreError::StandingRuntimeOwnerMismatch
         | MetaStoreError::DuplicateSourceCutRelation { .. }
+        | MetaStoreError::DuplicateDemandMetadataLookup { .. }
+        | MetaStoreError::ActiveViewRecordIdentityMismatch
+        | MetaStoreError::DuplicateActiveViewId { .. }
+        | MetaStoreError::DuplicateActiveViewApiPath { .. }
+        | MetaStoreError::DemandMetadataBatchTooLarge { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
         | MetaStoreError::IncompleteRelationSourceCut { .. }
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
@@ -5129,7 +6100,9 @@ impl GrpcMetaStore {
             .connect()
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
-        let client = proto::velorix_meta_client::VelorixMetaClient::new(channel);
+        let client = proto::velorix_meta_client::VelorixMetaClient::new(channel)
+            .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES);
 
         Ok(Self {
             client,
@@ -5198,10 +6171,102 @@ impl MetaStore for GrpcMetaStore {
             .await
             .map_err(|error| MetaStoreError::Remote(error.to_string()))?;
         Ok(Some(Arc::new(Self {
-            client: proto::velorix_meta_client::VelorixMetaClient::new(channel),
+            client: proto::velorix_meta_client::VelorixMetaClient::new(channel)
+                .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
             endpoint: self.endpoint.clone(),
             bearer_token: self.bearer_token.clone(),
         })))
+    }
+
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: ActiveViewRegistryReadRequestV1,
+    ) -> Result<ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .read_active_view_registry_snapshot(
+                self.request(proto::ActiveViewRegistrySnapshotRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.response_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: CreateActiveViewRecordRequestV1,
+    ) -> Result<CreateActiveViewRecordOutcomeV1, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .create_active_view_record(
+                self.request(proto::ActiveViewRecordMutationRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.response_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: CompareExchangeActiveViewRecordRequestV1,
+    ) -> Result<CompareExchangeActiveViewRecordOutcomeV1, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .compare_exchange_active_view_record(
+                self.request(proto::ActiveViewRecordMutationRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.response_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: ImportActiveViewRegistryRequestV1,
+    ) -> Result<ImportActiveViewRegistryOutcomeV1, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .import_active_view_registry(
+                self.request(proto::ActiveViewRecordMutationRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.response_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: PromoteViewBootstrapWithActiveViewRecordRequestV1,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .promote_view_bootstrap_with_active_view_record(
+                self.request(proto::ActiveViewRecordMutationRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        serde_json::from_slice(&response.response_json)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))
     }
 
     // Relation-scoped authority forwarding is kept separate from the legacy
@@ -5492,6 +6557,28 @@ impl MetaStore for GrpcMetaStore {
 
         serde_json::from_slice(&response.catalog_json)
             .map_err(|error| MetaStoreError::Serialization(error.to_string()))
+    }
+
+    async fn read_demand_metadata_batch(
+        &self,
+        request: ReadDemandMetadataBatchRequest,
+    ) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
+        request.validate()?;
+        let request_json = serde_json::to_vec(&request)
+            .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        let response = self
+            .client()
+            .read_demand_metadata_batch(
+                self.request(proto::ReadDemandMetadataBatchRequest { request_json }),
+            )
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        let response: ReadDemandMetadataBatchResponse =
+            serde_json::from_slice(&response.response_json)
+                .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
+        response.validate_for(&request)?;
+        Ok(response)
     }
 
     async fn reserve_ingest_range(
@@ -6262,5 +7349,49 @@ mod relation_partition_authority_tests {
             .await
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod demand_metadata_batch_validation_tests {
+    use super::*;
+
+    fn request(source_cut_relation_count: usize) -> ReadDemandMetadataBatchRequest {
+        ReadDemandMetadataBatchRequest {
+            source_cuts: Some(CaptureRelationIngestSourceCutsRequest {
+                namespace: "tenant".into(),
+                relations: (0..source_cut_relation_count)
+                    .map(|index| IngestSourceRelationIdentityV1 {
+                        relation_id: format!("source-{index}"),
+                        relation_version: "v1".into(),
+                        relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                        schema_fingerprint: "schema".into(),
+                    })
+                    .collect(),
+            }),
+            relation_catalogs: (0..62)
+                .map(|index| DemandRelationCatalogLookup {
+                    relation_id: format!("catalog-{index}"),
+                    relation_version: "v1".into(),
+                })
+                .collect(),
+            standing_runtime_checkpoint: Some(DemandStandingRuntimeCheckpointLookup {
+                tenant_id: "tenant".into(),
+                program_id: "program".into(),
+                view_id: "view".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn demand_metadata_batch_limit_counts_each_source_relation() {
+        assert!(request(1).validate().is_ok());
+        assert!(matches!(
+            request(2).validate(),
+            Err(MetaStoreError::DemandMetadataBatchTooLarge {
+                actual: 65,
+                max: MAX_DEMAND_METADATA_BATCH_LOOKUPS,
+            })
+        ));
     }
 }

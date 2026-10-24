@@ -3340,6 +3340,22 @@ fn validate_filter_project_projection_expr(
     expr: &SupportedProjectionExpr,
 ) -> Result<(), StandingProgramRuntimeError> {
     match expr {
+        SupportedProjectionExpr::Typed { program, .. } => {
+            program.validate().map_err(|_| {
+                StandingProgramRuntimeError::InvalidProgramIdentity {
+                    field: "typed_projection",
+                }
+            })?;
+            for column_id in typed_expr_column_ids(program) {
+                let column = catalog_column_by_id(catalog, &column_id)?;
+                if column.column_id == catalog.relation_schema.weight_column_id {
+                    return Err(StandingProgramRuntimeError::InvalidProgramIdentity {
+                        field: "typed_projection",
+                    });
+                }
+            }
+            Ok(())
+        }
         SupportedProjectionExpr::Column { column_id }
         | SupportedProjectionExpr::CoalesceInt64 { column_id, .. } => {
             validate_filter_project_int64_projection_column(catalog, column_id)
@@ -5778,6 +5794,13 @@ fn validate_filter_project_predicate_column(
 
 fn collect_projection_expr_column_ids(expr: &SupportedProjectionExpr, columns: &mut Vec<String>) {
     match expr {
+        SupportedProjectionExpr::Typed { program, .. } => {
+            for column_id in typed_expr_column_ids(program) {
+                if !columns.contains(&column_id) {
+                    columns.push(column_id);
+                }
+            }
+        }
         SupportedProjectionExpr::Column { column_id } => {
             if !columns.iter().any(|existing| existing == column_id) {
                 columns.push(column_id.clone());
@@ -6197,6 +6220,10 @@ fn evaluate_projection_expr(
     catalog: &VelorixRelationCatalogV1,
 ) -> Result<i64, StandingProgramRuntimeError> {
     match expr {
+        SupportedProjectionExpr::Typed { program, .. } => {
+            let _ = (program, input, catalog);
+            Err(invalid_runtime_state())
+        }
         SupportedProjectionExpr::Column { column_id } => input
             .get(column_id.as_str())
             .and_then(Value::as_i64)

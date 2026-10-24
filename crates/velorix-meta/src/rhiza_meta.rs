@@ -39,6 +39,8 @@ use crate::{
 
 const MAX_CAS_ATTEMPTS: usize = 8;
 
+type CachedRootState = (RootToken, Arc<RwLock<crate::InMemoryMetaState>>);
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -48,7 +50,7 @@ pub struct RhizaKvMetaStore {
     snapshot: RhizaKvSnapshot,
     /// Process-local cache of the decoded snapshot, valid only while the KV
     /// root token still matches the cached token.
-    cache: Arc<RwLock<Option<(RootToken, crate::InMemoryMetaState)>>>,
+    cache: Arc<RwLock<Option<CachedRootState>>>,
     /// Serializes full snapshot loads so one root change decodes once.
     full_load_lock: Arc<Mutex<()>>,
     #[cfg(test)]
@@ -60,7 +62,7 @@ pub struct RhizaKvMetaStore {
 
 struct LoadedState {
     root: Option<RootToken>,
-    state: crate::InMemoryMetaState,
+    state: Arc<RwLock<crate::InMemoryMetaState>>,
     cache_hit: bool,
 }
 
@@ -110,7 +112,7 @@ impl RhizaKvMetaStore {
             *self.cache.write().await = None;
             return Ok(LoadedState {
                 root: None,
-                state: crate::InMemoryMetaState::default(),
+                state: Arc::new(RwLock::new(crate::InMemoryMetaState::default())),
                 cache_hit: false,
             });
         };
@@ -118,7 +120,7 @@ impl RhizaKvMetaStore {
             if *cached_root == root {
                 return Ok(LoadedState {
                     root: Some(root),
-                    state: state.clone(),
+                    state: Arc::clone(state),
                     cache_hit: true,
                 });
             }
@@ -128,33 +130,24 @@ impl RhizaKvMetaStore {
             if *cached_root == root {
                 return Ok(LoadedState {
                     root: Some(root),
-                    state: state.clone(),
+                    state: Arc::clone(state),
                     cache_hit: true,
                 });
             }
         }
         #[cfg(test)]
         self.full_loads.fetch_add(1, Ordering::SeqCst);
-        match self.snapshot.load().await.map_err(snapshot_error)? {
-            Some((loaded_root, bytes)) => {
-                let state = rhiza_snapshot::decode(&bytes)
-                    .map_err(|error| MetaStoreError::Serialization(error.to_string()))?;
-                *self.cache.write().await = Some((loaded_root.clone(), state.clone()));
-                Ok(LoadedState {
-                    root: Some(loaded_root),
-                    state,
-                    cache_hit: false,
-                })
-            }
-            None => {
-                *self.cache.write().await = None;
-                Ok(LoadedState {
-                    root: None,
-                    state: crate::InMemoryMetaState::default(),
-                    cache_hit: false,
-                })
-            }
-        }
+        let (loaded_root, bytes) = self.snapshot.load_at(root).await.map_err(snapshot_error)?;
+        let state = Arc::new(RwLock::new(
+            rhiza_snapshot::decode(&bytes)
+                .map_err(|error| MetaStoreError::Serialization(error.to_string()))?,
+        ));
+        *self.cache.write().await = Some((loaded_root.clone(), Arc::clone(&state)));
+        Ok(LoadedState {
+            root: Some(loaded_root),
+            state,
+            cache_hit: false,
+        })
     }
 
     async fn read_eval<R, F, Fut>(
@@ -172,7 +165,7 @@ impl RhizaKvMetaStore {
         let result = match loaded {
             Ok(loaded) => match unix_time_ms() {
                 Ok(now) => {
-                    evaluate(InMemoryMetaStore::from_state_for_evaluation(
+                    evaluate(InMemoryMetaStore::from_shared_state_for_evaluation(
                         loaded.state,
                         now,
                     ))
@@ -217,7 +210,10 @@ impl RhizaKvMetaStore {
                     break;
                 }
             };
-            let evaluator = InMemoryMetaStore::from_state_for_evaluation(loaded.state, now);
+            // Mutations always own a deep candidate copy. A failed root CAS
+            // must leave any same-root read evaluation pinned to its old state.
+            let candidate = loaded.state.read().await.clone();
+            let evaluator = InMemoryMetaStore::from_state_for_evaluation(candidate, now);
             let outcome = match evaluate(evaluator.clone()).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -252,7 +248,7 @@ impl RhizaKvMetaStore {
             };
             match exchanged {
                 CompareExchange::Applied(new_root) => {
-                    *self.cache.write().await = Some((new_root, state));
+                    *self.cache.write().await = Some((new_root, Arc::new(RwLock::new(state))));
                     result = Ok(outcome);
                     break;
                 }
@@ -313,6 +309,7 @@ fn rhiza_error(error: RhizaKvError) -> MetaStoreError {
 fn snapshot_error(error: SnapshotError) -> MetaStoreError {
     match error {
         SnapshotError::Kv(error) => rhiza_error(error),
+        SnapshotError::TooLarge => MetaStoreError::SnapshotTooLarge,
         other => MetaStoreError::Serialization(other.to_string()),
     }
 }
@@ -399,6 +396,79 @@ impl MetaStore for RhizaKvMetaStore {
             store
                 .read_relation_catalog(&relation_id, &relation_version)
                 .await
+        })
+        .await
+    }
+
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: crate::ActiveViewRegistryReadRequestV1,
+    ) -> Result<crate::ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        self.read_eval(
+            "read_active_view_registry_snapshot",
+            move |store| async move { store.read_active_view_registry_snapshot(request).await },
+        )
+        .await
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: crate::CreateActiveViewRecordRequestV1,
+    ) -> Result<crate::CreateActiveViewRecordOutcomeV1, MetaStoreError> {
+        self.mutate("create_active_view_record", move |store| {
+            let request = request.clone();
+            async move { store.create_active_view_record(request).await }
+        })
+        .await
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: crate::CompareExchangeActiveViewRecordRequestV1,
+    ) -> Result<crate::CompareExchangeActiveViewRecordOutcomeV1, MetaStoreError> {
+        self.mutate("compare_exchange_active_view_record", move |store| {
+            let request = request.clone();
+            async move { store.compare_exchange_active_view_record(request).await }
+        })
+        .await
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: crate::ImportActiveViewRegistryRequestV1,
+    ) -> Result<crate::ImportActiveViewRegistryOutcomeV1, MetaStoreError> {
+        self.mutate("import_active_view_registry", move |store| {
+            let request = request.clone();
+            async move { store.import_active_view_registry(request).await }
+        })
+        .await
+    }
+
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: crate::PromoteViewBootstrapWithActiveViewRecordRequestV1,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        self.mutate(
+            "promote_view_bootstrap_with_active_view_record",
+            move |store| {
+                let request = request.clone();
+                async move {
+                    store
+                        .promote_view_bootstrap_with_active_view_record(request)
+                        .await
+                }
+            },
+        )
+        .await
+    }
+
+    async fn read_demand_metadata_batch(
+        &self,
+        request: crate::ReadDemandMetadataBatchRequest,
+    ) -> Result<crate::ReadDemandMetadataBatchResponse, MetaStoreError> {
+        request.validate()?;
+        self.read_eval("read_demand_metadata_batch", move |store| async move {
+            super::read_demand_metadata_batch_from_state(store, request).await
         })
         .await
     }
@@ -906,10 +976,101 @@ mod tests {
             StoreRelationCatalogOutcome::Created
         );
         let after_write = store.full_loads();
+        let pinned = store.cache.read().await.as_ref().unwrap().1.clone();
         for _ in 0..3 {
             store.read_relation_catalog("orders", "v1").await.unwrap();
         }
+        let same_root = store.load_state().await.unwrap().state;
+        assert!(Arc::ptr_eq(&pinned, &same_root));
         assert_eq!(store.full_loads(), after_write);
+    }
+
+    #[tokio::test]
+    async fn shared_read_clock_override_does_not_change_standalone_authority_clock() {
+        let memory = InMemoryMetaStore::default();
+        memory.set_partition_authority_clock_for_test(100).await;
+        let key = crate::PartitionAuthorityKey {
+            namespace: "tenant".into(),
+            view_id: "view".into(),
+            stream_id: "stream".into(),
+            partition_id: 0,
+        };
+        assert!(matches!(
+            memory
+                .acquire_partition_authority(crate::AcquirePartitionAuthorityRequest {
+                    key: key.clone(),
+                    owner_id: "owner".into(),
+                    current_token: None,
+                    ttl_ms: 10,
+                })
+                .await
+                .unwrap(),
+            crate::AcquirePartitionAuthorityOutcome::Acquired(_)
+        ));
+
+        let shared =
+            InMemoryMetaStore::from_shared_state_for_evaluation(Arc::clone(&memory.inner), 110);
+        assert!(shared
+            .read_partition_authority(&key)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(memory
+            .read_partition_authority(&key)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn demand_metadata_batch_pins_one_fresh_root_for_all_typed_lookups() {
+        let (_directory, store) = store().await;
+        let relation_catalog = catalog("v1");
+        store
+            .store_relation_catalog(relation_catalog.clone())
+            .await
+            .unwrap();
+        let source_cut_request = crate::CaptureRelationIngestSourceCutsRequest {
+            namespace: "default".into(),
+            relations: vec![crate::IngestSourceRelationIdentityV1 {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+                relation_generation: crate::INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                schema_fingerprint: relation_catalog.schema_fingerprint.to_string(),
+            }],
+        };
+        let request = crate::ReadDemandMetadataBatchRequest {
+            source_cuts: Some(source_cut_request.clone()),
+            relation_catalogs: vec![crate::DemandRelationCatalogLookup {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+            }],
+            standing_runtime_checkpoint: Some(crate::DemandStandingRuntimeCheckpointLookup {
+                tenant_id: "tenant".into(),
+                program_id: "program".into(),
+                view_id: "view".into(),
+            }),
+        };
+
+        store.snapshot.reset_get_calls();
+        store
+            .capture_relation_ingest_source_cuts(source_cut_request)
+            .await
+            .unwrap();
+        store.read_relation_catalog("orders", "v1").await.unwrap();
+        assert!(store
+            .read_standing_runtime_checkpoint("tenant", "program", "view")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.snapshot.get_calls(), 3);
+
+        store.snapshot.reset_get_calls();
+        let result = store.read_demand_metadata_batch(request).await.unwrap();
+        assert_eq!(store.snapshot.get_calls(), 1);
+        assert_eq!(result.source_cuts.unwrap().len(), 1);
+        assert_eq!(result.relation_catalogs, vec![relation_catalog]);
+        assert!(result.standing_runtime_checkpoint.is_none());
     }
 
     #[tokio::test]
@@ -934,11 +1095,26 @@ mod tests {
         let before = first.full_loads();
 
         second.store_relation_catalog(catalog("v2")).await.unwrap();
-        assert_eq!(
-            first.read_relation_catalog("orders", "v2").await.unwrap(),
-            catalog("v2")
-        );
+        // A changed root causes one root read plus its immutable snapshot page.
+        first.snapshot.reset_get_calls();
+        let request = crate::ReadDemandMetadataBatchRequest {
+            source_cuts: None,
+            relation_catalogs: vec![crate::DemandRelationCatalogLookup {
+                relation_id: "orders".into(),
+                relation_version: "v2".into(),
+            }],
+            standing_runtime_checkpoint: None,
+        };
+        let result = first
+            .read_demand_metadata_batch(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.relation_catalogs, vec![catalog("v2")]);
+        assert_eq!(first.snapshot.get_calls(), 2);
         assert!(first.full_loads() > before);
+        first.snapshot.reset_get_calls();
+        first.read_demand_metadata_batch(request).await.unwrap();
+        assert_eq!(first.snapshot.get_calls(), 1);
     }
 
     #[tokio::test]
@@ -955,6 +1131,7 @@ mod tests {
         let (_directory, store) = store().await;
         store.store_relation_catalog(catalog("v1")).await.unwrap();
         store.read_relation_catalog("orders", "v1").await.unwrap();
+        let pinned = store.cache.read().await.as_ref().unwrap().1.clone();
         let before = store.full_loads();
         store.force_conflict_once();
         assert_eq!(
@@ -962,6 +1139,17 @@ mod tests {
             StoreRelationCatalogOutcome::Created
         );
         assert!(store.full_loads() > before, "conflict must reload");
+        let pinned_state = pinned.read().await;
+        assert_eq!(
+            pinned_state
+                .relation_catalogs
+                .get(&("orders".into(), "v1".into())),
+            Some(&catalog("v1"))
+        );
+        assert!(!pinned_state
+            .relation_catalogs
+            .contains_key(&("orders".into(), "v2".into())));
+        drop(pinned_state);
         assert_eq!(
             store.read_relation_catalog("orders", "v2").await.unwrap(),
             catalog("v2")

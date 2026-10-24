@@ -476,6 +476,17 @@ impl MaterializedViewRegistry {
         &self,
         view_id: &str,
     ) -> Result<ActiveMaterializedView, MaterializedViewRegistryError> {
+        let record = self.read_active_record(view_id).await?;
+        let spec = self.read(view_id, &record.spec_hash).await?;
+        self.active_view_from_spec(record, spec)
+    }
+
+    /// Reads and validates one mutable active pointer without fetching its
+    /// immutable spec, for callers resolving a bounded published-view closure.
+    pub async fn read_active_record(
+        &self,
+        view_id: &str,
+    ) -> Result<ActiveMaterializedViewRecord, MaterializedViewRegistryError> {
         let object_key = self.active_object_key(view_id)?;
         let bytes = self
             .store
@@ -485,24 +496,30 @@ impl MaterializedViewRegistry {
             .await?;
         let record = active_materialized_view_record_from_slice(&bytes)?;
         self.validate_active_record_identity(view_id, &record, &object_key)?;
-        let execution_mode = self.normalized_execution_mode(&record)?;
-        let lifecycle = self.normalized_lifecycle(&record, &execution_mode);
-        let spec = self.read(view_id, &record.spec_hash).await?;
-
-        Ok(ActiveMaterializedView {
-            spec_hash: record.spec_hash,
-            spec,
-            execution_mode,
-            api: record.api,
-            artifact: record.artifact,
-            runtime: record.runtime,
-            lifecycle,
-        })
+        self.normalized_execution_mode(&record)?;
+        Ok(record)
     }
 
     pub async fn list_active(
         &self,
     ) -> Result<Vec<ActiveMaterializedView>, MaterializedViewRegistryError> {
+        let records = self.list_active_records().await?;
+        let mut active = Vec::with_capacity(records.len());
+        for record in records {
+            let spec = self.read(&record.view_id, &record.spec_hash).await?;
+            active.push(self.active_view_from_spec(record, spec)?);
+        }
+
+        active.sort_by(|left, right| left.spec.view_id.cmp(&right.spec.view_id));
+        Ok(active)
+    }
+
+    /// Reads and validates every mutable active pointer without fetching its
+    /// immutable spec. Callers may resolve specs through a content-addressed
+    /// cache, but must call this for every operation so updates stay visible.
+    pub async fn list_active_records(
+        &self,
+    ) -> Result<Vec<ActiveMaterializedViewRecord>, MaterializedViewRegistryError> {
         let mut stream = self.store.list(Some(&Path::from("v1/views")));
         let mut active = Vec::new();
 
@@ -520,22 +537,65 @@ impl MaterializedViewRegistry {
                 .await?;
             let record = active_materialized_view_record_from_slice(&bytes)?;
             self.validate_active_record_identity(&record.view_id, &record, &object_key)?;
-            let execution_mode = self.normalized_execution_mode(&record)?;
-            let lifecycle = self.normalized_lifecycle(&record, &execution_mode);
-            let spec = self.read(&record.view_id, &record.spec_hash).await?;
-            active.push(ActiveMaterializedView {
-                spec_hash: record.spec_hash,
-                spec,
-                execution_mode,
-                api: record.api,
-                artifact: record.artifact,
-                runtime: record.runtime,
-                lifecycle,
-            });
+            self.normalized_execution_mode(&record)?;
+            active.push(record);
         }
 
-        active.sort_by(|left, right| left.spec.view_id.cmp(&right.spec.view_id));
+        active.sort_by(|left, right| left.view_id.cmp(&right.view_id));
         Ok(active)
+    }
+
+    /// Fetches the bytes selected by a freshly read active pointer. The bytes
+    /// are deliberately validated by `active_view_from_spec_bytes`, allowing
+    /// an API cache hit to pass through the same authority checks as a store hit.
+    pub async fn read_spec_bytes(
+        &self,
+        view_id: &str,
+        spec_hash: &str,
+    ) -> Result<Vec<u8>, MaterializedViewRegistryError> {
+        let object_key = self.object_key(view_id, spec_hash)?;
+        Ok(self
+            .store
+            .get(&Path::from(object_key.as_str()))
+            .await?
+            .bytes()
+            .await?
+            .to_vec())
+    }
+
+    /// Decodes and validates spec bytes against both the immutable object
+    /// identity and the active record that selected them.
+    pub fn active_view_from_spec_bytes(
+        &self,
+        record: ActiveMaterializedViewRecord,
+        bytes: &[u8],
+    ) -> Result<ActiveMaterializedView, MaterializedViewRegistryError> {
+        let spec: StandingViewSpec = serde_json::from_slice(bytes)?;
+        self.active_view_from_spec(record, spec)
+    }
+
+    fn active_view_from_spec(
+        &self,
+        record: ActiveMaterializedViewRecord,
+        spec: StandingViewSpec,
+    ) -> Result<ActiveMaterializedView, MaterializedViewRegistryError> {
+        let active_key = self.active_object_key(&record.view_id)?;
+        self.validate_active_record_identity(&record.view_id, &record, &active_key)?;
+        validate_materialized_standing_view_spec(&spec)?;
+        let spec_key = self.object_key(&record.view_id, &record.spec_hash)?;
+        self.validate_record_identity(&spec_key, &spec)?;
+        let execution_mode = self.normalized_execution_mode(&record)?;
+        let lifecycle = self.normalized_lifecycle(&record, &execution_mode);
+
+        Ok(ActiveMaterializedView {
+            spec_hash: record.spec_hash,
+            spec,
+            execution_mode,
+            api: record.api,
+            artifact: record.artifact,
+            runtime: record.runtime,
+            lifecycle,
+        })
     }
 
     pub async fn update_standing_runtime_lifecycle(

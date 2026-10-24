@@ -6,6 +6,40 @@ use velorix_runtime::runtime_contract::{
     QueryExecutionPermit,
 };
 
+struct QueryHandlerTimer(std::time::Instant);
+
+impl QueryHandlerTimer {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Drop for QueryHandlerTimer {
+    fn drop(&mut self) {
+        view_dependencies::demand_stage("query_handler_total", self.0.elapsed(), 0, 0, 0);
+    }
+}
+
+struct DemandStageTimer {
+    stage: &'static str,
+    started: std::time::Instant,
+}
+
+impl DemandStageTimer {
+    fn start(stage: &'static str) -> Self {
+        Self {
+            stage,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for DemandStageTimer {
+    fn drop(&mut self) {
+        view_dependencies::demand_stage(self.stage, self.started.elapsed(), 0, 0, 0);
+    }
+}
+
 #[cfg(test)]
 #[path = "query_admission_tests.rs"]
 mod admission_tests;
@@ -92,6 +126,7 @@ pub(super) async fn query_view_rows_get(
     Query(mut query): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _handler_timer = QueryHandlerTimer::start();
     let format = QueryResponseFormat::negotiate(&headers)?;
     let page_request = extract_snapshot_page_request(&mut query)?;
     let request_sql = query.remove("sql").filter(|value| !value.trim().is_empty());
@@ -99,11 +134,7 @@ pub(super) async fn query_view_rows_get(
         .into_iter()
         .map(|(name, value)| (name, Value::String(value)))
         .collect();
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let (active, registry_snapshot) = ActiveViewReadSnapshot::load_one(&state, &view_id).await?;
     validate_direct_view_query_parameter_sources(&active, &parameters)?;
     if ingest_epoch::is_demand_managed_view(&state, &active).await?
         && uses_demand_query(
@@ -124,6 +155,7 @@ pub(super) async fn query_view_rows_get(
             demand_materialization::DemandRequest::default(),
             format,
             None,
+            registry_snapshot,
         )
         .await;
     }
@@ -146,6 +178,7 @@ pub(super) async fn query_view_output_rows_get(
     Query(mut query): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _handler_timer = QueryHandlerTimer::start();
     let format = QueryResponseFormat::negotiate(&headers)?;
     let page_request = extract_snapshot_page_request(&mut query)?;
     let request_sql = query.remove("sql").filter(|value| !value.trim().is_empty());
@@ -153,11 +186,7 @@ pub(super) async fn query_view_output_rows_get(
         .into_iter()
         .map(|(name, value)| (name, Value::String(value)))
         .collect();
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let (active, registry_snapshot) = ActiveViewReadSnapshot::load_one(&state, &view_id).await?;
     if ingest_epoch::is_demand_managed_view(&state, &active).await?
         && uses_demand_query(
             page_request.committed_epoch,
@@ -177,6 +206,7 @@ pub(super) async fn query_view_output_rows_get(
             demand_materialization::DemandRequest::default(),
             format,
             Some(output_id),
+            registry_snapshot,
         )
         .await;
     }
@@ -232,9 +262,11 @@ pub(super) async fn query_view_api_get(
     Query(mut query): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let _handler_timer = QueryHandlerTimer::start();
     let format = QueryResponseFormat::negotiate(&headers)?;
     let page_request = extract_snapshot_page_request(&mut query)?;
-    let (active, mut parameters) = read_active_view_by_api_path(&state, &api_path).await?;
+    let (active, mut parameters, registry_snapshot) =
+        read_active_view_by_api_path(&state, &api_path).await?;
     let api = active.api.clone().unwrap_or_default();
     for (name, raw_value) in query {
         let value = request_query_value_for_api_field(&api, &name, raw_value.as_str())?;
@@ -274,6 +306,7 @@ pub(super) async fn query_view_api_get(
             demand_materialization::DemandRequest::default(),
             format,
             api.output_relation_id.clone(),
+            registry_snapshot,
         )
         .await;
     }
@@ -324,17 +357,14 @@ pub(super) async fn query_view_rows_post(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
+    let _handler_timer = QueryHandlerTimer::start();
     let explicit_materialization = body.get("materialization").is_some();
     let envelope: demand_materialization::DemandQueryRequest =
         serde_json::from_value(body).map_err(ApiError::bad_request)?;
     let request = envelope.query;
     validate_explicit_materialization(&state, &request, explicit_materialization)?;
     let format = QueryResponseFormat::negotiate(&headers)?;
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let (active, registry_snapshot) = ActiveViewReadSnapshot::load_one(&state, &view_id).await?;
     if request.sql.is_none() {
         validate_direct_view_query_parameter_sources(&active, &request.parameters)?;
     }
@@ -348,6 +378,7 @@ pub(super) async fn query_view_rows_post(
             envelope.materialization,
             format,
             None,
+            registry_snapshot,
         )
         .await;
     }
@@ -412,6 +443,7 @@ async fn query_physical_demand(
     mut demand: demand_materialization::DemandRequest,
     format: QueryResponseFormat,
     requested_output_id: Option<String>,
+    registry_snapshot: ActiveViewReadSnapshot,
 ) -> Result<Response, ApiError> {
     if active.lifecycle.admission_status != MaterializedViewAdmissionStatus::Admitted {
         return Err(ApiError::service_unavailable("view is not admitted"));
@@ -424,10 +456,15 @@ async fn query_physical_demand(
         .find(|schema| schema.relation_id == output)
         .ok_or_else(|| ApiError::bad_request("query output schema missing"))?;
     let api = active.api.clone().unwrap_or_default();
+    let query_policy_started = std::time::Instant::now();
     let query_policy =
         query_policy_for_view_api(&state, &active.api.clone().unwrap_or_default()).await?;
+    view_dependencies::demand_stage("query_policy", query_policy_started.elapsed(), 0, 0, 0);
+    let permit_started = std::time::Instant::now();
     let permit = acquire_query_permit(query_policy.policy, query_policy.limiter.as_ref())
         .map_err(ApiError::bad_request)?;
+    view_dependencies::demand_stage("query_permit", permit_started.elapsed(), 0, 0, 0);
+    let setup_started = std::time::Instant::now();
     let parameters = if request.sql.is_some() {
         request.parameters.clone()
     } else {
@@ -499,6 +536,8 @@ async fn query_physical_demand(
         None => selector,
     };
     let scoped_sql = normalize_view_query_sql(&scoped_sql, &output);
+    view_dependencies::demand_stage("query_setup", setup_started.elapsed(), 0, 0, 0);
+    let sql_validation_started = std::time::Instant::now();
     query_record_batches_table_with_bindings_and_policy_and_permit(
         &output,
         vec![RecordBatch::new_empty(
@@ -511,6 +550,7 @@ async fn query_physical_demand(
     )
     .await
     .map_err(ApiError::bad_request)?;
+    view_dependencies::demand_stage("sql_validation", sql_validation_started.elapsed(), 0, 0, 0);
     let continuation = request
         .page_token
         .as_deref()
@@ -518,16 +558,28 @@ async fn query_physical_demand(
     let first_record = if continuation {
         None
     } else {
-        let _turn = state.demand_scheduler.query_turn().await;
-        let outcome = demand_materialization::materialize_demand(
+        let scheduler_wait_started = std::time::Instant::now();
+        let turn = state.demand_scheduler.query_turn().await;
+        view_dependencies::demand_stage(
+            "scheduler_wait",
+            scheduler_wait_started.elapsed(),
+            0,
+            0,
+            0,
+        );
+        let scheduler_hold_timer = DemandStageTimer::start("scheduler_hold");
+        let outcome = demand_materialization::materialize_demand_with_snapshot(
             &state,
             &active,
             &demand,
             demand_materialization::DemandOrder::Forward,
             true,
+            Some(registry_snapshot.clone()),
         )
         .await?;
         if !outcome.complete {
+            drop(turn);
+            drop(scheduler_hold_timer);
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({"materialization": outcome})),
@@ -536,6 +588,7 @@ async fn query_physical_demand(
         }
         let identity = active_standing_runtime_identity(&active)
             .ok_or_else(|| ApiError::bad_request("demand runtime identity unavailable"))?;
+        let checkpoint_pin_started = std::time::Instant::now();
         let record = checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
             &state,
             identity,
@@ -543,13 +596,23 @@ async fn query_physical_demand(
         )
         .await?
         .ok_or_else(|| ApiError::conflict("completed demand checkpoint unavailable"))?;
+        view_dependencies::demand_stage(
+            "checkpoint_pin",
+            checkpoint_pin_started.elapsed(),
+            0,
+            0,
+            0,
+        );
         if outcome.checkpoint_epoch != Some(record.checkpoint.logical_epoch) {
             return Err(ApiError::conflict(
                 "demand checkpoint changed before query pinning",
             ));
         }
+        drop(turn);
+        drop(scheduler_hold_timer);
         Some(record)
     };
+    let prepare_started = std::time::Instant::now();
     let prepared = demand_pagination::prepare_page(
         &state,
         &active,
@@ -560,7 +623,9 @@ async fn query_physical_demand(
         query_policy.policy,
     )
     .await?;
+    view_dependencies::demand_stage("prepare_page", prepare_started.elapsed(), 0, 0, 0);
     let row_range = source_pageable.then(|| prepared.row_range());
+    let output_read_started = std::time::Instant::now();
     let (page, native_page) = demand_pagination::read_output_record(
         &state,
         &active,
@@ -571,7 +636,9 @@ async fn query_physical_demand(
         query_policy.policy,
     )
     .await?;
+    view_dependencies::demand_stage("output_read", output_read_started.elapsed(), 0, 0, 0);
     let has_more_native_pages = page.next_page_token.is_some();
+    let sql_execution_started = std::time::Instant::now();
     let batches = query_record_batches_table_with_bindings_and_policy_and_permit(
         &output,
         page.batches,
@@ -582,6 +649,7 @@ async fn query_physical_demand(
     )
     .await
     .map_err(ApiError::bad_request)?;
+    view_dependencies::demand_stage("sql_execution", sql_execution_started.elapsed(), 0, 0, 0);
     let result_schema = batches
         .first()
         .map(RecordBatch::schema)
@@ -606,12 +674,23 @@ async fn query_physical_demand(
         },
         permit,
     };
-    if source_pageable && native_page {
+    let finish_started = std::time::Instant::now();
+    let response = if source_pageable && native_page {
         demand_pagination::finish_native_page(prepared, response, has_more_native_pages)?
     } else {
         demand_pagination::finish_page(prepared, response)?
-    }
-    .into_http(format)
+    };
+    view_dependencies::demand_stage("finish_page", finish_started.elapsed(), 0, 0, 0);
+    let response_encode_started = std::time::Instant::now();
+    let response = response.into_http(format);
+    view_dependencies::demand_stage(
+        "response_encode",
+        response_encode_started.elapsed(),
+        0,
+        0,
+        0,
+    );
+    response
 }
 
 pub(super) async fn query_view_output_rows_post(
@@ -620,17 +699,14 @@ pub(super) async fn query_view_output_rows_post(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiError> {
+    let _handler_timer = QueryHandlerTimer::start();
     let explicit_materialization = body.get("materialization").is_some();
     let envelope: demand_materialization::DemandQueryRequest =
         serde_json::from_value(body).map_err(ApiError::bad_request)?;
     let request = envelope.query;
     validate_explicit_materialization(&state, &request, explicit_materialization)?;
     let format = QueryResponseFormat::negotiate(&headers)?;
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let (active, registry_snapshot) = ActiveViewReadSnapshot::load_one(&state, &view_id).await?;
     resolve_view_query_output_id(&active, Some(&output_id))?;
     if (explicit_materialization || ingest_epoch::is_demand_managed_view(&state, &active).await?)
         && uses_demand_query(request.epoch, request.page_token.as_deref())
@@ -642,6 +718,7 @@ pub(super) async fn query_view_output_rows_post(
             envelope.materialization,
             format,
             Some(output_id),
+            registry_snapshot,
         )
         .await;
     }
@@ -665,26 +742,16 @@ pub(super) async fn query_view_output_rows_post(
 pub(super) async fn read_active_view_by_api_path(
     state: &ApiState,
     api_path: &str,
-) -> Result<(ActiveMaterializedView, BTreeMap<String, Value>), ApiError> {
+) -> Result<
+    (
+        ActiveMaterializedView,
+        BTreeMap<String, Value>,
+        ActiveViewReadSnapshot,
+    ),
+    ApiError,
+> {
     let normalized = normalize_api_path(api_path);
-    let registry = state.view_registry()?;
-    let indexes = registry
-        .list_api_path_indexes()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    let matched = indexes
-        .into_iter()
-        .find_map(|index| {
-            match_api_path_pattern(&index.normalized_url_path, &normalized)
-                .map(|parameters| (index.view_id, parameters))
-        })
-        .ok_or_else(|| ApiError::bad_request(format!("view API path `/{normalized}` not found")))?;
-    let active = registry
-        .read_active(&matched.0)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-
-    Ok((active, matched.1))
+    ActiveViewReadSnapshot::load_api_path(state, &normalized).await
 }
 
 struct ViewQueryBatches {
@@ -1114,16 +1181,27 @@ pub(super) async fn activate_authoritative_view_bootstrap(
                 "authoritative standing runtime checkpoint is unavailable for `{view_id}`"
             ))
         })?;
+    let bootstrap = PromoteViewBootstrapRequest {
+        tenant_id: identity.tenant_id.clone(),
+        program_id: identity.program_id.clone(),
+        view_id: view_id.to_string(),
+        bootstrap_generation: fixed_control.bootstrap_generation,
+        plan_hash: fixed_control.plan_hash,
+        checkpoint,
+        owner,
+    };
+    let active = view_dependencies::read_active_view_record_version(state, view_id).await?;
+    let mut record = active.record;
+    record.lifecycle = Some(MaterializedViewLifecycleStatus::standing_runtime());
     match meta_store
-        .promote_view_bootstrap(PromoteViewBootstrapRequest {
-            tenant_id: identity.tenant_id.clone(),
-            program_id: identity.program_id.clone(),
-            view_id: view_id.to_string(),
-            bootstrap_generation: fixed_control.bootstrap_generation,
-            plan_hash: fixed_control.plan_hash,
-            checkpoint,
-            owner,
-        })
+        .promote_view_bootstrap_with_active_view_record(
+            PromoteViewBootstrapWithActiveViewRecordRequestV1 {
+                bootstrap,
+                scope: view_dependencies::active_view_registry_scope(state),
+                expected_generation: active.generation,
+                record,
+            },
+        )
         .await
         .map_err(meta_error_to_api)?
     {
@@ -1731,11 +1809,7 @@ pub(super) async fn run_view_backfill_step(
     range: Option<&BackfillRangeRequest>,
     scope: Option<&BackfillScopeRequest>,
 ) -> Result<BackfillViewResponse, ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(state, view_id).await?;
     let outcome = run_active_view_backfill_step(state, active, batch_limit, range, scope).await?;
     let progress = committed_backfill_progress(state, &outcome.active).await?;
     Ok(backfill_view_response(
@@ -1845,22 +1919,9 @@ pub(super) async fn run_active_view_backfill_step(
     replay.applied_batches += published_replay.applied_batches;
     if range.is_none() && scope.is_none() && replay.remaining_batches == 0 {
         activate_authoritative_view_bootstrap(state, identity, &active.spec.view_id).await?;
-        state
-            .view_registry()?
-            .update_standing_runtime_lifecycle(
-                &active.spec.view_id,
-                &active.spec_hash,
-                MaterializedViewLifecycleStatus::standing_runtime(),
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
     }
 
-    let refreshed = state
-        .view_registry()?
-        .read_active(&active.spec.view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let refreshed = view_dependencies::read_active_from_meta(state, &active.spec.view_id).await?;
     Ok(ActiveViewBackfillStepOutcome {
         active: refreshed,
         replay,

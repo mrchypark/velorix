@@ -4,6 +4,7 @@ pub(super) async fn create_view(
     State(state): State<ApiState>,
     Json(request): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
+    initialize_empty_active_view_registry_for_admission(&state).await?;
     let _admission_timer =
         checkpoint_publication::CursorPhaseTimer::new(&request.view_id, 0, "admission_total");
     let resolved_inputs = resolve_standing_inputs_for_view_request(&state, &request).await?;
@@ -52,11 +53,8 @@ pub(super) async fn create_view(
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
     let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
-    let existing = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?
+    let existing = view_dependencies::list_active_from_meta(&state)
+        .await?
         .into_iter()
         .find(|active| active.spec.view_id == spec.view_id && active.spec_hash == spec_hash);
     let input_bindings = if let Some(runtime) =
@@ -165,11 +163,7 @@ pub(super) async fn create_view(
         let identity = &runtime_binding.standing_program_identity;
         let operation_lock = state.standing_runtime_operation_lock(identity, &spec.view_id)?;
         let _operation_guard = operation_lock.lock().await;
-        let current = state
-            .view_registry()?
-            .read_active(&spec.view_id)
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
+        let current = view_dependencies::read_active_from_meta(&state, &spec.view_id).await?;
         if current.spec_hash != spec_hash
             || current.runtime != existing.runtime
             || current.api != existing.api
@@ -186,11 +180,15 @@ pub(super) async fn create_view(
                 .is_none()
         {
             lifecycle = deferred_lifecycle;
-            state
-                .view_registry()?
-                .update_standing_runtime_lifecycle(&spec.view_id, &spec_hash, lifecycle.clone())
-                .await
-                .map_err(materialized_view_registry_error_to_api)?;
+            // Admission is an authenticated administrative operation; this
+            // lifecycle reconciliation is not a runtime-worker transition.
+            view_dependencies::update_active_view_lifecycle_admin(
+                &state,
+                &spec.view_id,
+                &spec_hash,
+                lifecycle.clone(),
+            )
+            .await?;
             remove_standing_runtime(&state, identity, &spec.view_id)?;
         }
         RegisterMaterializedViewOutcome::Duplicate
@@ -221,11 +219,7 @@ pub(super) async fn create_view(
         .await?
     };
     if !demand_managed && has_published_inputs && view_query_availability(&lifecycle) {
-        let active = state
-            .view_registry()?
-            .read_active(&spec.view_id)
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
+        let active = view_dependencies::read_active_from_meta(&state, &spec.view_id).await?;
         bootstrap_legacy_view_if_empty(&state, &active).await?;
         drain_published_view_dependencies(&state).await?;
         activate_authoritative_view_bootstrap(
@@ -252,6 +246,64 @@ pub(super) async fn create_view(
             state.experimental_advanced_view_features,
         )?),
     ))
+}
+
+/// A fresh installation may establish the empty Meta registry on its first
+/// admission. Existing S3 active records require the explicit stopped-writer
+/// import endpoint; they are never auto-imported or used as a fallback.
+async fn initialize_empty_active_view_registry_for_admission(
+    state: &ApiState,
+) -> Result<(), ApiError> {
+    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("active-view Meta registry is not configured")
+    })?;
+    let scope = view_dependencies::active_view_registry_scope(state);
+    let snapshot = meta_store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: scope.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    if snapshot.imported {
+        return view_dependencies::validate_active_view_registry_snapshot(&snapshot);
+    }
+
+    let legacy_records = state
+        .view_registry()?
+        .list_active_records()
+        .await
+        .map_err(materialized_view_registry_error_to_api)?;
+    if !legacy_records.is_empty() {
+        return Err(ApiError::service_unavailable(
+            "active-view Meta registry is uninitialized and legacy S3 active records exist; stop writers and run POST /v1/admin/import-active-view-registry with confirm_writers_stopped=true",
+        ));
+    }
+
+    match meta_store
+        .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+            scope,
+            records: Vec::new(),
+        })
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        ImportActiveViewRegistryOutcomeV1::Imported
+        | ImportActiveViewRegistryOutcomeV1::Duplicate => {}
+        ImportActiveViewRegistryOutcomeV1::Conflict => {
+            // A concurrent importer may have initialized Meta after our
+            // empty-S3 check. Re-read and trust only its committed snapshot.
+            let latest = view_dependencies::read_active_view_registry_snapshot(state).await?;
+            view_dependencies::validate_active_view_registry_snapshot(&latest)?;
+            return Ok(());
+        }
+    }
+    let latest = meta_store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: view_dependencies::active_view_registry_scope(state),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    view_dependencies::validate_active_view_registry_snapshot(&latest)
 }
 
 pub(super) fn view_has_published_view_inputs(runtime: &MaterializedViewRuntimeBinding) -> bool {
@@ -540,11 +592,78 @@ pub(super) async fn register_materialized_view_execution(
     runtime: MaterializedViewRuntimeBinding,
     lifecycle: Option<MaterializedViewLifecycleStatus>,
 ) -> Result<RegisterMaterializedViewOutcome, ApiError> {
-    state
-        .view_registry()?
-        .register_with_api_metadata_runtime_execution(spec, api, runtime, lifecycle)
+    validate_materialized_standing_view_spec(spec).map_err(ApiError::bad_request)?;
+    // Never let a first create silently initialize Meta beside existing S3
+    // active pointers; those require the explicit all-record import operation.
+    view_dependencies::read_active_view_registry_snapshot(state).await?;
+    let spec_hash = view_spec_hash(spec).map_err(ApiError::bad_request)?;
+    let registry = state.view_registry()?;
+    let object_key = registry
+        .object_key(&spec.view_id, &spec_hash)
+        .map_err(materialized_view_registry_error_to_api)?;
+    let bytes = serde_json::to_vec(spec).map_err(ApiError::internal)?;
+    let stored_spec_bytes = match state
+        .store
+        .put_opts(
+            &ObjectPath::from(object_key.as_str()),
+            bytes.clone().into(),
+            PutMode::Create.into(),
+        )
         .await
-        .map_err(materialized_view_registry_error_to_api)
+    {
+        Ok(_) => bytes,
+        Err(object_store::Error::AlreadyExists { .. }) => registry
+            .read_spec_bytes(&spec.view_id, &spec_hash)
+            .await
+            .map_err(materialized_view_registry_error_to_api)?,
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let record = ActiveMaterializedViewRecord {
+        schema_version: 3,
+        view_id: spec.view_id.clone(),
+        spec_hash,
+        execution_mode: Some(MaterializedViewExecutionMode::StandingRuntime),
+        api,
+        artifact: None,
+        runtime: Some(runtime),
+        lifecycle: Some(
+            lifecycle.unwrap_or_else(MaterializedViewLifecycleStatus::standing_runtime),
+        ),
+    };
+    registry
+        .active_view_from_spec_bytes(record.clone(), &stored_spec_bytes)
+        .map_err(materialized_view_registry_error_to_api)?;
+    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+        ApiError::internal("active-view Meta registry is required; S3 fallback is disabled")
+    })?;
+    let outcome = meta_store
+        .create_active_view_record(CreateActiveViewRecordRequestV1 {
+            scope: view_dependencies::active_view_registry_scope(state),
+            record: record.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    match outcome {
+        CreateActiveViewRecordOutcomeV1::Created(versioned) => {
+            if versioned.record != record {
+                return Err(ApiError::internal(
+                    "Meta created an unexpected active-view record",
+                ));
+            }
+            Ok(RegisterMaterializedViewOutcome::Created)
+        }
+        CreateActiveViewRecordOutcomeV1::Duplicate(versioned) => {
+            if versioned.record != record {
+                return Err(ApiError::conflict(
+                    "active view is already registered with different metadata",
+                ));
+            }
+            Ok(RegisterMaterializedViewOutcome::Duplicate)
+        }
+        CreateActiveViewRecordOutcomeV1::Conflict => Err(ApiError::conflict(
+            "active-view record already exists with different metadata",
+        )),
+    }
 }
 
 pub(super) fn materialized_view_runtime_binding_for_spec(
@@ -865,19 +984,9 @@ async fn restore_standing_runtime_resident_locked_inner(
             .is_none()
         && standing_runtime_create_requires_backfill(state, &active.spec).await?
     {
-        state
-            .view_registry()?
-            .update_standing_runtime_lifecycle(
-                &active.spec.view_id,
-                &active.spec_hash,
-                lifecycle_for_create_view_execution(
-                    &MaterializedViewExecutionMode::StandingRuntime,
-                    true,
-                ),
-            )
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
-        return Ok(None);
+        return Err(ApiError::service_unavailable(
+            "view requires an explicit backfill before its runtime can be restored",
+        ));
     }
     let replay = ensure_standing_runtime_for_active_view(state, active).await?;
     let runtime = state

@@ -92,12 +92,7 @@ async fn authoritative_staged_families_backfill_and_restart_preserve_rows() {
             .map(|(id, version)| json!({"relation_id":id,"relation_version":version}))
             .collect::<Vec<_>>();
         post(&router, "/v1/views", json!({"view_id":view,"input_relation_refs":refs,"sql":sql,"response_formats":["json"]}), StatusCode::CREATED).await;
-        let active = state
-            .view_registry()
-            .unwrap()
-            .read_active(view)
-            .await
-            .unwrap();
+        let active = tests::read_test_active_view(&state, view).await.unwrap();
         assert!(
             read_latest_standing_runtime_checkpoint_header(
                 &state,
@@ -211,10 +206,7 @@ async fn authoritative_replay_skips_covered_payload_gets_but_rejects_uncovered_c
         assert_eq!(response.0, StatusCode::OK, "{response:?}");
         assert_eq!(response.1["materialization"]["complete"], true);
         if offset == 0 {
-            let active = state
-                .view_registry()
-                .unwrap()
-                .read_active("skip_total")
+            let active = tests::read_test_active_view(&state, "skip_total")
                 .await
                 .unwrap();
             let identity = active_standing_runtime_identity(&active).unwrap();
@@ -225,10 +217,7 @@ async fn authoritative_replay_skips_covered_payload_gets_but_rejects_uncovered_c
             first_plan = Some(standing_runtime_replay_plan_from_record_ref(&record));
         }
     }
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("skip_total")
+    let active = tests::read_test_active_view(&state, "skip_total")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();

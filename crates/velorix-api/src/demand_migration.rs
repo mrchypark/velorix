@@ -17,15 +17,26 @@ pub(super) async fn read_checkpoint(
         .meta_store
         .as_ref()
         .ok_or_else(|| insufficient("authoritative metadata required"))?;
-    let Some(pointer) = meta
+    let pointer = meta
         .read_standing_runtime_checkpoint(
             &identity.tenant_id,
             &identity.program_id,
             &active.spec.view_id,
         )
         .await
-        .map_err(meta_error_to_api)?
-    else {
+        .map_err(meta_error_to_api)?;
+    read_checkpoint_from_pointer(state, active, max_bytes, pointer).await
+}
+
+pub(super) async fn read_checkpoint_from_pointer(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    max_bytes: usize,
+    pointer: Option<StandingRuntimeCheckpointPointer>,
+) -> Result<(Option<StandingRuntimeCheckpointRecord>, usize), ApiError> {
+    let identity = active_standing_runtime_identity(active)
+        .ok_or_else(|| insufficient("runtime identity missing"))?;
+    let Some(pointer) = pointer else {
         return Ok((None, 0));
     };
     let path = ObjectPath::from(pointer.checkpoint_key.clone());

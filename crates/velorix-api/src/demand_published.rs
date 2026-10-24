@@ -110,8 +110,21 @@ fn required_budget(required: u64, supplied: usize) -> ApiError {
 struct ReadBudget {
     supplied: usize,
     used: usize,
+    checkpoint_cache_hits: usize,
+    checkpoint_cache_misses: usize,
+    checkpoint_canonical_validations: usize,
 }
 impl ReadBudget {
+    fn new(supplied: usize) -> Self {
+        Self {
+            supplied,
+            used: 0,
+            checkpoint_cache_hits: 0,
+            checkpoint_cache_misses: 0,
+            checkpoint_canonical_validations: 0,
+        }
+    }
+
     async fn read(&mut self, state: &ApiState, key: &str) -> Result<Vec<u8>, ApiError> {
         let path = ObjectPath::from(key);
         let size = match publication::cached_checkpoint_size(state, &path).await {
@@ -140,6 +153,71 @@ impl ReadBudget {
             .checked_add(bytes.len())
             .ok_or_else(|| invalid("published budget overflow"))?;
         Ok(bytes)
+    }
+
+    async fn read_checkpoint_record(
+        &mut self,
+        state: &ApiState,
+        key: &str,
+    ) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+        let path = ObjectPath::from(key);
+        let remaining = self.supplied.saturating_sub(self.used) as u64;
+        let mut cache_validations = 0;
+        let cached = publication::read_cached_checkpoint_record(
+            state,
+            &path,
+            remaining,
+            &mut cache_validations,
+        )
+        .await?;
+        self.checkpoint_canonical_validations += cache_validations;
+        let (record, size) = match cached {
+            publication::CachedCheckpointRecordRead::Hit { record, size } => {
+                self.checkpoint_cache_hits += 1;
+                (*record, size)
+            }
+            publication::CachedCheckpointRecordRead::OverBudget { size } => {
+                let required = (self.used as u64)
+                    .checked_add(size)
+                    .ok_or_else(|| invalid("published read size overflow"))?;
+                return Err(required_budget(required, self.supplied));
+            }
+            publication::CachedCheckpointRecordRead::Miss => {
+                if state.materialized_read_cache.is_some() {
+                    self.checkpoint_cache_misses += 1;
+                }
+                let size = state
+                    .store
+                    .head(&path)
+                    .await
+                    .map_err(ApiError::internal)?
+                    .size;
+                let required = (self.used as u64)
+                    .checked_add(size)
+                    .ok_or_else(|| invalid("published read size overflow"))?;
+                if required > self.supplied as u64 {
+                    return Err(required_budget(required, self.supplied));
+                }
+                let (record, read_size) =
+                    publication::read_uncached_checkpoint_record(state, &path, Some(size)).await?;
+                if read_size != size {
+                    return Err(invalid("published object size changed"));
+                }
+                self.checkpoint_canonical_validations += 1;
+                (record, read_size)
+            }
+        };
+        let required = (self.used as u64)
+            .checked_add(size)
+            .ok_or_else(|| invalid("published read size overflow"))?;
+        if required > self.supplied as u64 {
+            return Err(required_budget(required, self.supplied));
+        }
+        self.used = self
+            .used
+            .checked_add(usize::try_from(size).map_err(ApiError::internal)?)
+            .ok_or_else(|| invalid("published budget overflow"))?;
+        Ok(record)
     }
 }
 
@@ -212,12 +290,12 @@ async fn capture_proof(
         {
             return Err(invalid("published head scope mismatch"));
         }
-        let bytes = budget.read(state, &pointer.checkpoint_key).await?;
-        if stable_bytes_hash(&bytes) != pointer.manifest_hash {
+        let mut record = budget
+            .read_checkpoint_record(state, &pointer.checkpoint_key)
+            .await?;
+        if record.manifest_hash != pointer.manifest_hash {
             return Err(invalid("published header commitment mismatch"));
         }
-        let mut record =
-            standing_runtime_checkpoint_record_from_slice(&bytes).map_err(ApiError::bad_request)?;
         if record.checkpoint_key.is_empty() {
             record.checkpoint_key = pointer.checkpoint_key.clone();
         }
@@ -285,10 +363,8 @@ pub(super) async fn capture_demand_published_artifacts(
     previous_consumer: Option<&StandingRuntimeCheckpointRecord>,
     consumer_binding: &PublishedRelationBindingV1,
 ) -> Result<(Vec<DemandPublishedArtifact>, usize), ApiError> {
-    let mut budget = ReadBudget {
-        supplied: max_bytes,
-        used: 0,
-    };
+    let capture_started = std::time::Instant::now();
+    let mut budget = ReadBudget::new(max_bytes);
     let mut artifacts = Vec::new();
     let mut ordered = inputs.iter().collect::<Vec<_>>();
     ordered.sort_by(|a, b| a.edge.edge_id.cmp(&b.edge.edge_id));
@@ -418,6 +494,13 @@ pub(super) async fn capture_demand_published_artifacts(
             }
         }
     }
+    super::view_dependencies::demand_cache_stage(
+        "published_artifact_capture",
+        capture_started.elapsed(),
+        budget.checkpoint_cache_hits,
+        budget.checkpoint_cache_misses,
+        budget.checkpoint_canonical_validations,
+    );
     Ok((artifacts, budget.used))
 }
 
@@ -537,10 +620,7 @@ pub(super) async fn load_demand_published_artifact(
     artifact: &DemandPublishedArtifact,
     max_bytes: usize,
 ) -> Result<(RelationInputBatch, usize), ApiError> {
-    let mut budget = ReadBudget {
-        supplied: max_bytes,
-        used: 0,
-    };
+    let mut budget = ReadBudget::new(max_bytes);
     let header = &artifact.proof.lineage[artifact.header_index];
     if artifact.proof.head.logical_epoch < artifact.cursor.output_epoch
         || publication::producer_cursor_digest_from_header(header, &artifact.binding)?
@@ -692,12 +772,16 @@ mod tests {
         .await;
         let mut checkpoint = crate::tests::test_runtime_checkpoint(Vec::new());
         checkpoint.identity.tenant_id = "tenant-a.fragment-cache".into();
+        let owner = state
+            .acquire_standing_runtime_owner(&checkpoint.identity, "purchases_by_user")
+            .await
+            .unwrap();
         publication::persist_standing_runtime_checkpoint(
             &state,
             "purchases_by_user",
             &checkpoint,
             &[],
-            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), owner),
             None,
         )
         .await
@@ -712,10 +796,7 @@ mod tests {
         .unwrap();
         let path = ObjectPath::from(key.as_str());
         let size = state.store.head(&path).await.unwrap().size as usize;
-        let mut budget = ReadBudget {
-            supplied: size,
-            used: 0,
-        };
+        let mut budget = ReadBudget::new(size);
         let bytes = budget.read(&state, key.as_str()).await.unwrap();
         assert_eq!(budget.used, size, "uncached read charges serialized bytes");
 
@@ -730,10 +811,72 @@ mod tests {
             .unwrap(),
         );
         state = state.with_materialized_read_cache(cache.clone());
-        budget = ReadBudget {
-            supplied: 2 * size,
-            used: 0,
-        };
+
+        // The typed reader obtains the record from the same canonical decode
+        // that validates the cache hit, without an additional HEAD/GET/decode.
+        let mut typed_budget = ReadBudget::new(size);
+        let typed_record = typed_budget
+            .read_checkpoint_record(&state, key.as_str())
+            .await
+            .unwrap();
+        assert_eq!(typed_record.checkpoint.identity, checkpoint.identity);
+        assert_eq!(
+            typed_record.checkpoint.logical_epoch,
+            checkpoint.logical_epoch
+        );
+        assert_eq!(
+            typed_record.checkpoint.state_root.content_hash,
+            checkpoint.state_root.content_hash
+        );
+        assert!(typed_record.checkpoint.state_payload.is_none());
+        assert_eq!(typed_budget.used, size);
+        assert_eq!(typed_budget.checkpoint_cache_misses, 1);
+        assert_eq!(typed_budget.checkpoint_canonical_validations, 1);
+
+        let backing_store = state.store.clone();
+        state.store = Arc::new(InMemory::new());
+
+        let hit_accounts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_accounts = Arc::clone(&hit_accounts);
+        state.materialized_read_cache_hit_accountant = Some(Arc::new(move |_, _| {
+            recorded_accounts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+        let mut undersized_budget = ReadBudget::new(size - 1);
+        let error = undersized_budget
+            .read_checkpoint_record(&state, key.as_str())
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(undersized_budget.used, 0);
+        assert_eq!(undersized_budget.checkpoint_canonical_validations, 0);
+        assert_eq!(
+            hit_accounts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "over-budget cache records are rejected before hit accounting"
+        );
+
+        let mut cache_budget = ReadBudget::new(size);
+        let cached_record = cache_budget
+            .read_checkpoint_record(&state, key.as_str())
+            .await
+            .unwrap();
+        assert_eq!(cached_record.checkpoint, typed_record.checkpoint);
+        assert_eq!(cached_record.view_id, typed_record.view_id);
+        assert_eq!(cached_record.manifest_hash, typed_record.manifest_hash);
+        assert_eq!(cache_budget.used, size);
+        assert_eq!(cache_budget.checkpoint_cache_hits, 1);
+        assert_eq!(cache_budget.checkpoint_cache_misses, 0);
+        assert_eq!(cache_budget.checkpoint_canonical_validations, 1);
+        assert_eq!(
+            hit_accounts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an in-budget cache hit is accounted after canonical validation"
+        );
+
+        // Keep the backing store empty for the existing warm-budget and
+        // pointer-commitment assertions below.
+        budget = ReadBudget::new(2 * size);
         assert_eq!(budget.read(&state, key.as_str()).await.unwrap(), bytes);
         assert_eq!(
             publication::cached_checkpoint_size(&state, &path).await,
@@ -745,6 +888,7 @@ mod tests {
                 .is_err()
         );
 
+        state.store = backing_store;
         let mut record = standing_runtime_checkpoint_record_from_slice(&bytes).unwrap();
         publication::hydrate_standing_runtime_checkpoint_state_payload(&state, &mut record)
             .await

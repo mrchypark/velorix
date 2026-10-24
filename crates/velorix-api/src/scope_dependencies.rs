@@ -897,6 +897,7 @@ fn eval_int64_projection(
 ) -> Option<Option<i64>> {
     use SupportedProjectionBinaryOp as Op;
     match expression {
+        SupportedProjectionExpr::Typed { .. } => None,
         SupportedProjectionExpr::Column { column_id } => {
             let index = batch.schema().index_of(column_id).ok()?;
             int64_from_array(batch.column(index), row)

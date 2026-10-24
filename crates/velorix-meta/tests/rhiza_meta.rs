@@ -9,16 +9,62 @@ use velorix_meta::{
     AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    CaptureRelationIngestSourceCutsRequest, CommitIngestRangeOutcome, IngestRangeReservation,
-    IngestSourceRelationIdentityV1, MetaStore, PartitionAuthorityKey, PartitionCheckpointPointer,
-    PublishIngestReservationOutcome, PublishPartitionCheckpointPointerRequest,
-    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
-    PublishStandingRuntimeCheckpointRequest, RelationPartitionAuthorityKey,
-    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
-    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    ActiveViewRegistryReadRequestV1, ActiveViewRegistryScopeV1,
+    CaptureRelationIngestSourceCutsRequest, CommitIngestRangeOutcome,
+    ImportActiveViewRegistryRequestV1, IngestRangeReservation, IngestSourceRelationIdentityV1,
+    MetaStore, PartitionAuthorityKey, PartitionCheckpointPointer, PublishIngestReservationOutcome,
+    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
+    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
+    RelationPartitionAuthorityKey, ReserveIngestRangeOutcome,
+    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
+    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
+use velorix_storage::materialized_view_registry::ActiveMaterializedViewRecord;
 
 mod common;
+
+#[tokio::test]
+async fn active_view_registry_survives_rhiza_arrow_snapshot_restart() {
+    let directory = tempdir().unwrap();
+    let store = RhizaKvMetaStore::open(directory.path().display().to_string(), "active-registry")
+        .await
+        .unwrap();
+    let scope = ActiveViewRegistryScopeV1 {
+        authority_store_id: "store-a".into(),
+        namespace: "namespace-a".into(),
+    };
+    let record = ActiveMaterializedViewRecord {
+        schema_version: 3,
+        view_id: "view-a".into(),
+        spec_hash: "sha256:spec".into(),
+        execution_mode: None,
+        api: None,
+        artifact: None,
+        runtime: None,
+        lifecycle: None,
+    };
+    store
+        .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+            scope: scope.clone(),
+            records: vec![record.clone()],
+        })
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened =
+        RhizaKvMetaStore::open(directory.path().display().to_string(), "active-registry")
+            .await
+            .unwrap();
+    let snapshot = reopened
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 { scope })
+        .await
+        .unwrap();
+    assert!(snapshot.imported);
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].generation, 1);
+    assert_eq!(snapshot.records[0].record, record);
+}
 
 fn standing_runtime_checkpoint_pointer(
     epoch: u64,
@@ -125,6 +171,18 @@ async fn catalog_reserve_commit_and_reopen_are_durable() {
     drop(store);
 
     let reopened = RhizaKvMetaStore::open(path, "meta-a").await.unwrap();
+    let batch = reopened
+        .read_demand_metadata_batch(velorix_meta::ReadDemandMetadataBatchRequest {
+            source_cuts: None,
+            relation_catalogs: vec![velorix_meta::DemandRelationCatalogLookup {
+                relation_id: "orders".into(),
+                relation_version: "v1".into(),
+            }],
+            standing_runtime_checkpoint: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(batch.relation_catalogs, vec![catalog.clone()]);
     assert_eq!(
         reopened
             .read_relation_catalog("orders", "v1")

@@ -238,6 +238,8 @@ pub enum VelorixLogicalViewPlanNodeV1 {
         columns: Vec<LogicalPlanColumnRef>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         computed_columns: Vec<LogicalPlanComputedColumnV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        typed_predicate: Option<LogicalPlanTypedExprV1>,
     },
     Aggregate {
         node_id: String,
@@ -420,6 +422,20 @@ pub struct LogicalPlanComputedColumnV1 {
     pub output: LogicalPlanColumnRef,
     pub input_relation_id: String,
     pub expression: SupportedProjectionExpr,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogicalPlanTypedExprV1 {
+    pub program: TypedExprProgramV1,
+    pub bindings: Vec<LogicalPlanTypedExprBindingV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogicalPlanTypedExprBindingV1 {
+    pub internal_column_id: String,
+    pub input: LogicalPlanColumnRef,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -672,6 +688,19 @@ pub struct SupportedTypedJoinProjectPlanV1 {
     pub join_kind: SupportedJoinKind,
     pub key_pairs: Vec<SupportedJoinKeyPairV1>,
     pub projection: Vec<SupportedTypedJoinProjectionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<TypedExprProgramV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound_columns: Vec<SupportedTypedJoinBoundColumnV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportedTypedJoinBoundColumnV1 {
+    pub internal_id: String,
+    pub side: SupportedAggregateInputRelationSide,
+    pub column_id: String,
+    pub nullable: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -682,6 +711,8 @@ pub struct SupportedTypedJoinProjectionV1 {
     pub output_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coalesce_right_column_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<TypedExprProgramV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -865,6 +896,11 @@ pub struct SupportedProjectionColumn {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SupportedProjectionExpr {
+    Typed {
+        program: Box<TypedExprProgramV1>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bindings: Vec<LogicalPlanTypedExprBindingV1>,
+    },
     Column {
         column_id: String,
     },
@@ -3842,16 +3878,30 @@ fn required_columns_for_node(
         VelorixLogicalViewPlanNodeV1::Project {
             columns,
             computed_columns,
+            typed_predicate,
             ..
         } => {
             let mut required = columns.clone();
             for computed in computed_columns {
+                match &computed.expression {
+                    SupportedProjectionExpr::Typed { bindings, .. } if !bindings.is_empty() => {
+                        required.extend(bindings.iter().map(|binding| binding.input.clone()));
+                    }
+                    expression => required.extend(
+                        supported_projection_expr_column_ids(expression)
+                            .into_iter()
+                            .map(|column_id| {
+                                column_ref(computed.input_relation_id.as_str(), column_id.as_str())
+                            }),
+                    ),
+                }
+            }
+            if let Some(predicate) = typed_predicate {
                 required.extend(
-                    supported_projection_expr_column_ids(&computed.expression)
-                        .into_iter()
-                        .map(|column_id| {
-                            column_ref(computed.input_relation_id.as_str(), column_id.as_str())
-                        }),
+                    predicate
+                        .bindings
+                        .iter()
+                        .map(|binding| binding.input.clone()),
                 );
             }
             required
@@ -4514,6 +4564,7 @@ fn single_key_sum_count_logical_plan(
                 .map(|column_id| column_ref(&supported.input_relation_id, &column_id))
                 .collect(),
             computed_columns,
+            typed_predicate: None,
         });
         current_node = project_node;
     }
@@ -5063,6 +5114,7 @@ fn three_input_inner_join_count_logical_plan(
             input_relation_id: root_relation_id.clone(),
             expression: SupportedProjectionExpr::LiteralInt64 { value: 1 },
         }],
+        typed_predicate: None,
     });
     let aggregate_node = "aggregate_three_input_count".to_string();
     let group_keys = supported
@@ -5522,6 +5574,7 @@ fn latest_by_key_logical_plan(
                 column_ref(&supported.input_relation_id, &supported.value_column_id),
             ],
             computed_columns: Vec::new(),
+            typed_predicate: None,
         },
     ]);
     let mut output_input = project_node;
@@ -5855,6 +5908,7 @@ fn filter_project_logical_plan(
         input: current_node,
         columns,
         computed_columns: Vec::new(),
+        typed_predicate: None,
     });
     let mut output_input = project_node.clone();
     if let Some(top_k) = &supported.top_k {
@@ -5967,6 +6021,7 @@ fn semi_anti_join_project_logical_plan(
         input: join_node_id.clone(),
         columns,
         computed_columns: Vec::new(),
+        typed_predicate: None,
     });
     nodes.push(VelorixLogicalViewPlanNodeV1::Output {
         node_id: "output_materialized_view".to_string(),
@@ -14583,6 +14638,7 @@ fn validate_filter_project_int64_expr_column(
 
 fn first_supported_projection_expr_column_id(expr: &SupportedProjectionExpr) -> Option<String> {
     match expr {
+        SupportedProjectionExpr::Typed { program, .. } => first_typed_expr_column_id(&program.root),
         SupportedProjectionExpr::Column { column_id } => Some(column_id.clone()),
         SupportedProjectionExpr::LiteralInt64 { .. } => None,
         SupportedProjectionExpr::BinaryInt64 { left, right, .. } => {
@@ -14622,6 +14678,9 @@ fn collect_supported_projection_expr_column_ids(
     columns: &mut Vec<String>,
 ) {
     match expr {
+        SupportedProjectionExpr::Typed { program, .. } => {
+            collect_typed_expr_column_ids(&program.root, columns);
+        }
         SupportedProjectionExpr::Column { column_id } => {
             if !columns.iter().any(|existing| existing == column_id) {
                 columns.push(column_id.clone());
@@ -14661,6 +14720,32 @@ fn collect_supported_projection_expr_column_ids(
             }
             collect_supported_projection_expr_column_ids(then_expr, columns);
             collect_supported_projection_expr_column_ids(else_expr, columns);
+        }
+    }
+}
+
+fn first_typed_expr_column_id(node: &TypedExprNodeV1) -> Option<String> {
+    match &node.kind {
+        TypedExprKindV1::Column { column_id } => Some(column_id.clone()),
+        TypedExprKindV1::Literal { .. } => None,
+        TypedExprKindV1::Call { args, .. } | TypedExprKindV1::UdfCall { args, .. } => {
+            args.iter().find_map(first_typed_expr_column_id)
+        }
+    }
+}
+
+fn collect_typed_expr_column_ids(node: &TypedExprNodeV1, columns: &mut Vec<String>) {
+    match &node.kind {
+        TypedExprKindV1::Column { column_id } => {
+            if !columns.contains(column_id) {
+                columns.push(column_id.clone());
+            }
+        }
+        TypedExprKindV1::Literal { .. } => {}
+        TypedExprKindV1::Call { args, .. } | TypedExprKindV1::UdfCall { args, .. } => {
+            for arg in args {
+                collect_typed_expr_column_ids(arg, columns);
+            }
         }
     }
 }
@@ -16269,7 +16354,26 @@ fn supported_filter_project_typed_projection(
     catalog: &VelorixRelationCatalogV1,
     relation_alias: Option<&str>,
 ) -> Result<Option<TypedExprProgramV1>, ViewPlanError> {
-    let root = match typed_expr_node_from_expr(expr, catalog, relation_alias)? {
+    supported_filter_project_typed_projection_with_event_time_context(
+        expr,
+        catalog,
+        relation_alias,
+        true,
+    )
+}
+
+fn supported_filter_project_typed_projection_with_event_time_context(
+    expr: &Expr,
+    catalog: &VelorixRelationCatalogV1,
+    relation_alias: Option<&str>,
+    reinterpret_event_time: bool,
+) -> Result<Option<TypedExprProgramV1>, ViewPlanError> {
+    let root = match typed_expr_node_from_expr_in_context(
+        expr,
+        catalog,
+        relation_alias,
+        reinterpret_event_time,
+    )? {
         Some(node) => node,
         None => return Ok(None),
     };
@@ -16312,14 +16416,6 @@ fn typed_stage_call(
         nullable,
         kind: TypedExprKindV1::Call { function, args },
     })
-}
-
-fn typed_expr_node_from_expr(
-    expr: &Expr,
-    catalog: &VelorixRelationCatalogV1,
-    relation_alias: Option<&str>,
-) -> Result<Option<TypedExprNodeV1>, ViewPlanError> {
-    typed_expr_node_from_expr_in_context(expr, catalog, relation_alias, true)
 }
 
 fn typed_expr_node_from_expr_in_context(
@@ -18748,6 +18844,7 @@ fn scalar_aggregate_filter_logical_plan(
             input: filter_node_id,
             columns: project_columns,
             computed_columns,
+            typed_predicate: None,
         },
         VelorixLogicalViewPlanNodeV1::Output {
             node_id: "output_materialized_view".to_string(),
@@ -19058,14 +19155,13 @@ pub fn validate_supported_typed_join_project_sql(
         return unsupported("typed join projection requires SELECT");
     };
     validate_plain_select_clauses(select)?;
-    if select.selection.is_some()
-        || select.distinct.is_some()
+    if select.distinct.is_some()
         || !group_by_is_empty(&select.group_by)
         || select.having.is_some()
         || query.order_by.is_some()
     {
         return unsupported(
-            "typed join projection requires direct columns without filters, aggregate or ordering",
+            "typed join projection does not support DISTINCT, aggregation or ordering",
         );
     }
     let [from] = select.from.as_slice() else {
@@ -19102,6 +19198,8 @@ pub fn validate_supported_typed_join_project_sql(
         JoinOperator::FullOuter(constraint) => (SupportedJoinKind::Full, constraint),
         _ => return unsupported("typed join projection supports INNER, LEFT or FULL JOIN only"),
     };
+    let (expression_catalog, mut bound_columns) =
+        typed_join_expression_catalog(left, right, join_kind)?;
     let pairs = match constraint {
         JoinConstraint::Using(columns) => columns
             .iter()
@@ -19170,6 +19268,37 @@ pub fn validate_supported_typed_join_project_sql(
             .iter()
             .map(|pair| (&pair.left_column_id, &pair.right_column_id)),
     )?;
+    let predicate = select
+        .selection
+        .as_ref()
+        .map(|selection| {
+            let mut expression = selection.clone();
+            bind_typed_join_expression(
+                &mut expression,
+                left,
+                right,
+                &left_table.alias,
+                &right_table.alias,
+                &bound_columns,
+                constraint,
+            )?;
+            let Some(program) = supported_filter_project_typed_projection_with_event_time_context(
+                &expression,
+                &expression_catalog,
+                None,
+                false,
+            )?
+            else {
+                return unsupported(
+                    "typed join WHERE requires a supported typed boolean expression",
+                );
+            };
+            if program.root.result_type != RuntimeScalarTypeV1::Boolean {
+                return unsupported("typed join WHERE expression must be boolean");
+            }
+            Ok(program)
+        })
+        .transpose()?;
     let mut projection = Vec::new();
     let mut outputs = BTreeSet::new();
     for item in &select.projection {
@@ -19181,42 +19310,80 @@ pub fn validate_supported_typed_join_project_sql(
         if let Expr::Function(function) = expr {
             if function_name_eq(&function.name, "coalesce") && join_kind == SupportedJoinKind::Full
             {
-                let FunctionArguments::List(args) = &function.args else {
-                    return unsupported("FULL key COALESCE requires two direct columns");
+                let direct_key_pair = match &function.args {
+                    FunctionArguments::List(args) => match args.args.as_slice() {
+                        [FunctionArg::Unnamed(FunctionArgExpr::Expr(l)), FunctionArg::Unnamed(FunctionArgExpr::Expr(r))] => {
+                            match (
+                                expression_catalog_column(l, left, Some(&left_table.alias)),
+                                expression_catalog_column(r, right, Some(&right_table.alias)),
+                            ) {
+                                (Some(l), Some(r))
+                                    if key_pairs.iter().any(|pair| {
+                                        pair.left_column_id == l.column_id
+                                            && pair.right_column_id == r.column_id
+                                    }) =>
+                                {
+                                    Some((l, r))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    },
+                    _ => None,
                 };
-                let [FunctionArg::Unnamed(FunctionArgExpr::Expr(l)), FunctionArg::Unnamed(FunctionArgExpr::Expr(r))] =
-                    args.args.as_slice()
-                else {
-                    return unsupported("FULL key COALESCE requires two direct columns");
-                };
-                let Some(l) = expression_catalog_column(l, left, Some(&left_table.alias)) else {
-                    return unsupported("FULL key COALESCE first column must be left");
-                };
-                let Some(r) = expression_catalog_column(r, right, Some(&right_table.alias)) else {
-                    return unsupported("FULL key COALESCE second column must be right");
-                };
-                if !key_pairs.iter().any(|pair| {
-                    pair.left_column_id == l.column_id && pair.right_column_id == r.column_id
-                }) {
-                    return unsupported(
-                        "FULL key COALESCE must reference one admitted equality pair",
-                    );
+                if let Some((l, r)) = direct_key_pair {
+                    let Some(alias) = alias else {
+                        return unsupported("FULL key COALESCE requires output alias");
+                    };
+                    if !outputs.insert(alias.to_ascii_lowercase()) {
+                        return unsupported("typed join aliases must be unique");
+                    }
+                    projection.push(SupportedTypedJoinProjectionV1 {
+                        side: SupportedAggregateInputRelationSide::Left,
+                        column_id: l.column_id.clone(),
+                        output_name: alias.into(),
+                        coalesce_right_column_id: Some(r.column_id.clone()),
+                        expression: None,
+                    });
+                    continue;
                 }
-                let Some(alias) = alias else {
-                    return unsupported("FULL key COALESCE requires output alias");
-                };
-                if !outputs.insert(alias.to_ascii_lowercase()) {
-                    return unsupported("typed join aliases must be unique");
-                }
-                projection.push(SupportedTypedJoinProjectionV1 {
-                    side: SupportedAggregateInputRelationSide::Left,
-                    column_id: l.column_id.clone(),
-                    output_name: alias.into(),
-                    coalesce_right_column_id: Some(r.column_id.clone()),
-                });
-                continue;
             }
-            return unsupported("typed join functions require an explicit native projected stage");
+        }
+        if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            let Some(alias) = alias else {
+                return unsupported("computed typed join projections require an output alias");
+            };
+            if !outputs.insert(alias.to_ascii_lowercase()) {
+                return unsupported("typed join output names must be unique");
+            }
+            let mut expression = expr.clone();
+            bind_typed_join_expression(
+                &mut expression,
+                left,
+                right,
+                &left_table.alias,
+                &right_table.alias,
+                &bound_columns,
+                constraint,
+            )?;
+            let Some(program) = supported_filter_project_typed_projection_with_event_time_context(
+                &expression,
+                &expression_catalog,
+                None,
+                false,
+            )?
+            else {
+                return unsupported("typed join projection uses an unsupported expression");
+            };
+            projection.push(SupportedTypedJoinProjectionV1 {
+                side: SupportedAggregateInputRelationSide::Left,
+                column_id: String::new(),
+                output_name: alias.into(),
+                coalesce_right_column_id: None,
+                expression: Some(program),
+            });
+            continue;
         }
         let (side, column, catalog) =
             if let Some(column) = expression_catalog_column(expr, left, Some(&left_table.alias)) {
@@ -19244,18 +19411,228 @@ pub fn validate_supported_typed_join_project_sql(
             column_id: column.column_id.clone(),
             output_name,
             coalesce_right_column_id: None,
+            expression: None,
         });
     }
     if projection.is_empty() {
         return unsupported("typed join requires projections");
     }
+    let mut referenced_columns = Vec::new();
+    if let Some(program) = &predicate {
+        collect_typed_expr_column_ids(&program.root, &mut referenced_columns);
+    }
+    for program in projection
+        .iter()
+        .filter_map(|column| column.expression.as_ref())
+    {
+        collect_typed_expr_column_ids(&program.root, &mut referenced_columns);
+    }
+    bound_columns.retain(|column| referenced_columns.contains(&column.internal_id));
     Ok(SupportedTypedJoinProjectPlanV1 {
         left_relation_id: left.relation_schema.relation_id.clone(),
         right_relation_id: right.relation_schema.relation_id.clone(),
         join_kind,
         key_pairs,
         projection,
+        predicate,
+        bound_columns,
     })
+}
+
+fn typed_join_expression_catalog(
+    left: &VelorixRelationCatalogV1,
+    right: &VelorixRelationCatalogV1,
+    join_kind: SupportedJoinKind,
+) -> Result<
+    (
+        VelorixRelationCatalogV1,
+        Vec<SupportedTypedJoinBoundColumnV1>,
+    ),
+    ViewPlanError,
+> {
+    let mut catalog = left.clone();
+    let mut bindings = Vec::new();
+    catalog.relation_schema.columns.clear();
+    for (side, source, nullable_outer) in [
+        (
+            SupportedAggregateInputRelationSide::Left,
+            left,
+            join_kind == SupportedJoinKind::Full,
+        ),
+        (
+            SupportedAggregateInputRelationSide::Right,
+            right,
+            join_kind != SupportedJoinKind::Inner,
+        ),
+    ] {
+        for column in &source.relation_schema.columns {
+            if column.column_id == source.relation_schema.weight_column_id {
+                continue;
+            }
+            let internal_id = format!(
+                "__velorix_join_{}_{}",
+                if side == SupportedAggregateInputRelationSide::Left {
+                    "left"
+                } else {
+                    "right"
+                },
+                column.column_id
+            );
+            let mut bound = column.clone();
+            bound.column_id = internal_id.clone();
+            bound.name = internal_id.clone();
+            bound.nullable |= nullable_outer;
+            if source.relation_schema.event_time_column_id.as_deref()
+                == Some(column.column_id.as_str())
+            {
+                bound.physical_arrow_type =
+                    ArrowPhysicalTypeV1::TimestampNanosecond { timezone: None };
+            }
+            catalog.relation_schema.columns.push(bound);
+            bindings.push(SupportedTypedJoinBoundColumnV1 {
+                internal_id,
+                side,
+                column_id: column.column_id.clone(),
+                nullable: column.nullable || nullable_outer,
+            });
+        }
+    }
+    Ok((catalog, bindings))
+}
+
+fn bind_typed_join_expression(
+    expression: &mut Expr,
+    left: &VelorixRelationCatalogV1,
+    right: &VelorixRelationCatalogV1,
+    left_alias: &str,
+    right_alias: &str,
+    bindings: &[SupportedTypedJoinBoundColumnV1],
+    constraint: &JoinConstraint,
+) -> Result<(), ViewPlanError> {
+    use sqlparser::ast::{VisitMut, VisitorMut};
+    use std::ops::ControlFlow;
+    struct Binder<'a> {
+        left: &'a VelorixRelationCatalogV1,
+        right: &'a VelorixRelationCatalogV1,
+        left_alias: &'a str,
+        right_alias: &'a str,
+        bindings: &'a [SupportedTypedJoinBoundColumnV1],
+        using_columns: Vec<String>,
+        error: Option<String>,
+    }
+    fn candidate<'a>(
+        catalog: &'a VelorixRelationCatalogV1,
+        alias: &str,
+        qualifier: Option<&str>,
+        name: &str,
+        side: SupportedAggregateInputRelationSide,
+    ) -> Option<(SupportedAggregateInputRelationSide, &'a RelationColumnV1)> {
+        if qualifier.is_some_and(|q| {
+            !identifier_eq(q, alias)
+                && !identifier_eq(q, &catalog.relation_schema.relation_id)
+                && !identifier_eq(q, &catalog.relation_schema.relation_name)
+        }) {
+            return None;
+        }
+        catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|col| {
+                col.column_id != catalog.relation_schema.weight_column_id
+                    && column_identifier_eq(col, name)
+            })
+            .map(|column| (side, column))
+    }
+    impl VisitorMut for Binder<'_> {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            let (qualifier, name) = match expr {
+                Expr::Identifier(name) => (None, name.value.as_str()),
+                Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                    (Some(parts[0].value.as_str()), parts[1].value.as_str())
+                }
+                _ => return ControlFlow::Continue(()),
+            };
+            let left = candidate(
+                self.left,
+                self.left_alias,
+                qualifier,
+                name,
+                SupportedAggregateInputRelationSide::Left,
+            );
+            let right = candidate(
+                self.right,
+                self.right_alias,
+                qualifier,
+                name,
+                SupportedAggregateInputRelationSide::Right,
+            );
+            let chosen = match (qualifier, left, right) {
+                (Some(_), Some(l), None) => Some(l),
+                (Some(_), None, Some(r)) => Some(r),
+                (Some(_), _, _) => {
+                    self.error =
+                        Some("qualified typed join reference is unknown or ambiguous".into());
+                    return ControlFlow::Break(());
+                }
+                (None, Some(l), None) => Some(l),
+                (None, None, Some(r)) => Some(r),
+                (None, Some(l), Some(r)) if key_column_pair(&self.using_columns, l.1, r.1) => {
+                    Some(l)
+                }
+                (None, Some(_), Some(_)) => {
+                    self.error = Some("ambiguous typed join column must be qualified".into());
+                    return ControlFlow::Break(());
+                }
+                _ => return ControlFlow::Continue(()),
+            };
+            if let Some((side, column)) = chosen {
+                let Some(bound) = self
+                    .bindings
+                    .iter()
+                    .find(|b| b.side == side && b.column_id == column.column_id)
+                else {
+                    self.error = Some("typed join binding is missing".into());
+                    return ControlFlow::Break(());
+                };
+                *expr = Expr::Identifier(Ident::new(bound.internal_id.clone()));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let using_columns = match constraint {
+        JoinConstraint::Using(columns) => columns
+            .iter()
+            .filter_map(single_object_name_identifier)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut binder = Binder {
+        left,
+        right,
+        left_alias,
+        right_alias,
+        bindings,
+        using_columns,
+        error: None,
+    };
+    let _ = expression.visit(&mut binder);
+    if let Some(error) = binder.error {
+        return unsupported(error);
+    }
+    Ok(())
+}
+
+fn key_column_pair(
+    using_columns: &[String],
+    left: &RelationColumnV1,
+    right: &RelationColumnV1,
+) -> bool {
+    left.name.eq_ignore_ascii_case(&right.name)
+        && using_columns
+            .iter()
+            .any(|name| identifier_eq(name, &left.name))
 }
 
 pub fn lower_supported_typed_join_project_sql_to_logical_plan(
@@ -19282,6 +19659,13 @@ pub fn lower_supported_typed_join_project_sql_to_logical_plan(
         .projection
         .iter()
         .map(|projection| {
+            if let Some(program) = &projection.expression {
+                return Ok(ColumnSchema {
+                    name: projection.output_name.clone(),
+                    data_type: typed_result_data_type(program.root.result_type)?,
+                    nullable: program.root.nullable,
+                });
+            }
             let (catalog, schema) = if projection.side == SupportedAggregateInputRelationSide::Left
             {
                 (left, &left_schema)
@@ -19344,16 +19728,35 @@ pub fn lower_supported_typed_join_project_sql_to_logical_plan(
             right: step.right_input,
             left_key: step.left_key,
             right_key: step.right_key,
-            output_key: column_ref(
-                &output_schema.relation_id,
-                &supported.projection[0].output_name,
-            ),
+            // The full-join operator owns a coalesced equality key independent
+            // of user projection. This keeps payload-only projections valid.
+            output_key: column_ref("typed_join", "__velorix_coalesced_join_key"),
             composite_equality: step.composite_equality,
         }]
     } else {
         lower_join_chain_to_binary_dag("left_scan", &[step])?.0
     };
     let output = logical_relation_from_schema(output_schema);
+    let typed_bindings_for = |program: &TypedExprProgramV1| {
+        let mut referenced = Vec::new();
+        collect_typed_expr_column_ids(&program.root, &mut referenced);
+        supported
+            .bound_columns
+            .iter()
+            .filter(|binding| referenced.contains(&binding.internal_id))
+            .map(|binding| LogicalPlanTypedExprBindingV1 {
+                internal_column_id: binding.internal_id.clone(),
+                input: column_ref(
+                    if binding.side == SupportedAggregateInputRelationSide::Left {
+                        &supported.left_relation_id
+                    } else {
+                        &supported.right_relation_id
+                    },
+                    &binding.column_id,
+                ),
+            })
+            .collect::<Vec<_>>()
+    };
     let mut nodes = vec![
         VelorixLogicalViewPlanNodeV1::RelationScan {
             node_id: "left_scan".into(),
@@ -19371,6 +19774,7 @@ pub fn lower_supported_typed_join_project_sql_to_logical_plan(
         columns: supported
             .projection
             .iter()
+            .filter(|projection| projection.expression.is_none())
             .map(|projection| {
                 column_ref(
                     if projection.side == SupportedAggregateInputRelationSide::Left {
@@ -19382,7 +19786,27 @@ pub fn lower_supported_typed_join_project_sql_to_logical_plan(
                 )
             })
             .collect(),
-        computed_columns: Vec::new(),
+        computed_columns: supported
+            .projection
+            .iter()
+            .filter_map(|projection| {
+                projection
+                    .expression
+                    .as_ref()
+                    .map(|program| LogicalPlanComputedColumnV1 {
+                        output: column_ref(&output_schema.relation_id, &projection.output_name),
+                        input_relation_id: "typed_join".into(),
+                        expression: SupportedProjectionExpr::Typed {
+                            program: Box::new(program.clone()),
+                            bindings: typed_bindings_for(program),
+                        },
+                    })
+            })
+            .collect(),
+        typed_predicate: supported.predicate.clone().map(|program| {
+            let bindings = typed_bindings_for(&program);
+            LogicalPlanTypedExprV1 { program, bindings }
+        }),
     });
     nodes.push(VelorixLogicalViewPlanNodeV1::Output {
         node_id: "output_materialized_view".into(),
@@ -19409,6 +19833,23 @@ pub fn lower_supported_typed_join_project_sql_to_logical_plan(
         execution: VelorixLogicalViewExecutionV1::TypedJoinProject {
             plan: Box::new(supported),
         },
+    })
+}
+
+fn typed_result_data_type(ty: RuntimeScalarTypeV1) -> Result<SqlDataType, ViewPlanError> {
+    Ok(match ty {
+        RuntimeScalarTypeV1::Boolean => SqlDataType::Bool,
+        RuntimeScalarTypeV1::Int64 => SqlDataType::Int64,
+        RuntimeScalarTypeV1::Float64 => SqlDataType::Float64,
+        RuntimeScalarTypeV1::Decimal128 { precision, scale } => SqlDataType::Decimal {
+            precision,
+            scale: u8::try_from(scale).map_err(|_| ViewPlanError::UnsupportedShape {
+                reason: "invalid typed join decimal scale".into(),
+            })?,
+        },
+        RuntimeScalarTypeV1::Utf8 => SqlDataType::Utf8,
+        RuntimeScalarTypeV1::Date32 => SqlDataType::Date,
+        RuntimeScalarTypeV1::TimestampNanosecond => SqlDataType::Timestamp { timezone: None },
     })
 }
 
@@ -21119,6 +21560,7 @@ pub fn lower_supported_recursive_cte_sql_to_logical_plan(
                     .map(|column_id| column_ref(&supported.input_relation_id, column_id.as_str()))
                     .collect(),
                 computed_columns: Vec::new(),
+                typed_predicate: None,
             },
             VelorixLogicalViewPlanNodeV1::Output {
                 node_id: "output_materialized_view".to_string(),

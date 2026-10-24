@@ -52,6 +52,492 @@ pub(super) struct ValidatedProducerCommitV1 {
     pub(super) output_delta: DeltaBatch,
 }
 
+/// Validated active-view registry state pinned for one root API operation.
+/// Construct a new snapshot for every request; never retain it in ApiState.
+#[derive(Clone, Debug)]
+pub(super) struct ActiveViewReadSnapshot {
+    active_views: Vec<ActiveMaterializedView>,
+    records: BTreeMap<String, ActiveViewRecordVersionV1>,
+    revision: u64,
+}
+
+impl ActiveViewReadSnapshot {
+    pub(super) async fn load(state: &ApiState) -> Result<Self, ApiError> {
+        let started = std::time::Instant::now();
+        let snapshot = read_active_view_registry_snapshot(state).await?;
+        let revision = snapshot.snapshot_revision;
+        let records = snapshot
+            .records
+            .into_iter()
+            .map(|versioned| (versioned.record.view_id.clone(), versioned))
+            .collect::<BTreeMap<_, _>>();
+        let registry = state.view_registry()?;
+        let mut active_views = Vec::with_capacity(records.len());
+        let mut spec_cache_hits = 0;
+        let mut spec_cache_misses = 0;
+        for versioned in records.values() {
+            let (active, cache_hit) = load_active_view_record_with_cache_status(
+                state,
+                &registry,
+                versioned.record.clone(),
+            )
+            .await?;
+            spec_cache_hits += usize::from(cache_hit);
+            spec_cache_misses += usize::from(!cache_hit);
+            active_views.push(active);
+        }
+        demand_stage(
+            "active_view_registry_snapshot",
+            started.elapsed(),
+            0,
+            spec_cache_hits,
+            spec_cache_misses,
+        );
+        Ok(Self {
+            active_views,
+            records,
+            revision,
+        })
+    }
+
+    /// Resolve a public API path against the fresh Meta snapshot before
+    /// hydrating immutable view specs. Most path queries need exactly one
+    /// spec, so they should not fetch/decode every view in the authority.
+    pub(super) async fn load_api_path(
+        state: &ApiState,
+        normalized_path: &str,
+    ) -> Result<(ActiveMaterializedView, BTreeMap<String, Value>, Self), ApiError> {
+        let started = std::time::Instant::now();
+        let snapshot = read_active_view_registry_snapshot(state).await?;
+        let revision = snapshot.snapshot_revision;
+        let records = snapshot
+            .records
+            .into_iter()
+            .map(|versioned| (versioned.record.view_id.clone(), versioned))
+            .collect::<BTreeMap<_, _>>();
+        let mut matched = None;
+        for versioned in records.values() {
+            let Some(path) = versioned
+                .record
+                .api
+                .as_ref()
+                .and_then(|api| api.url_path.as_deref())
+            else {
+                continue;
+            };
+            let Some(parameters) =
+                match_api_path_pattern(&normalize_api_path(path), normalized_path)
+            else {
+                continue;
+            };
+            if matched.is_some() {
+                return Err(ApiError::conflict(format!(
+                    "multiple active views match API path `/{normalized_path}`"
+                )));
+            }
+            matched = Some((versioned, parameters));
+        }
+        let (versioned, parameters) = matched.ok_or_else(|| {
+            ApiError::bad_request(format!("view API path `/{normalized_path}` not found"))
+        })?;
+        let registry = state.view_registry()?;
+        let (active, cache_hit) =
+            load_active_view_record_with_cache_status(state, &registry, versioned.record.clone())
+                .await?;
+        demand_stage(
+            "active_view_api_path",
+            started.elapsed(),
+            0,
+            usize::from(cache_hit),
+            usize::from(!cache_hit),
+        );
+        let read_snapshot = Self {
+            active_views: vec![active.clone()],
+            records,
+            revision,
+        };
+        Ok((active, parameters, read_snapshot))
+    }
+
+    pub(super) async fn load_one(
+        state: &ApiState,
+        view_id: &str,
+    ) -> Result<(ActiveMaterializedView, Self), ApiError> {
+        let started = std::time::Instant::now();
+        let snapshot = read_active_view_registry_snapshot(state).await?;
+        let revision = snapshot.snapshot_revision;
+        let records = snapshot
+            .records
+            .into_iter()
+            .map(|versioned| (versioned.record.view_id.clone(), versioned))
+            .collect::<BTreeMap<_, _>>();
+        let versioned = records
+            .get(view_id)
+            .ok_or_else(|| ApiError::bad_request(format!("active view `{view_id}` not found")))?;
+        let registry = state.view_registry()?;
+        let (active, cache_hit) =
+            load_active_view_record_with_cache_status(state, &registry, versioned.record.clone())
+                .await?;
+        demand_stage(
+            "active_view_read",
+            started.elapsed(),
+            0,
+            usize::from(cache_hit),
+            usize::from(!cache_hit),
+        );
+        let read_snapshot = Self {
+            active_views: vec![active.clone()],
+            records,
+            revision,
+        };
+        Ok((active, read_snapshot))
+    }
+
+    /// Resolve a producer closure from one fresh, authority-scoped metadata
+    /// snapshot. Mutable active records are never fetched from S3 on this path.
+    pub(super) async fn load_demand_closure(
+        state: &ApiState,
+        root_view_id: &str,
+    ) -> Result<Self, ApiError> {
+        let started = std::time::Instant::now();
+        let snapshot = read_active_view_registry_snapshot(state).await?;
+        Self::resolve_demand_closure(state, snapshot, root_view_id, started.elapsed()).await
+    }
+
+    pub(super) async fn resolve_demand_closure(
+        state: &ApiState,
+        snapshot: ActiveViewRegistrySnapshotV1,
+        root_view_id: &str,
+        snapshot_elapsed: std::time::Duration,
+    ) -> Result<Self, ApiError> {
+        let started = std::time::Instant::now();
+        let revision = snapshot.snapshot_revision;
+        let mut records = snapshot
+            .records
+            .into_iter()
+            .map(|versioned| (versioned.record.view_id.clone(), versioned))
+            .collect::<BTreeMap<_, _>>();
+        let mut pending = vec![root_view_id.to_string()];
+        let mut selected = BTreeSet::new();
+        while let Some(view_id) = pending.pop() {
+            if !selected.insert(view_id.clone()) {
+                continue;
+            }
+            let versioned = records.get(&view_id).ok_or_else(|| {
+                ApiError::conflict(format!(
+                    "active-view registry snapshot is missing dependency `{view_id}`"
+                ))
+            })?;
+            if let Some(runtime) = &versioned.record.runtime {
+                for binding in &runtime.input_bindings {
+                    if let StandingInputBindingV1::PublishedView {
+                        published_relation, ..
+                    } = binding
+                    {
+                        pending.push(published_relation.producer_view_id.clone());
+                    }
+                }
+            }
+        }
+        records.retain(|view_id, _| selected.contains(view_id));
+        let registry = state.view_registry()?;
+        let mut active_views = Vec::with_capacity(records.len());
+        let mut spec_cache_hits = 0;
+        let mut spec_cache_misses = 0;
+        for versioned in records.values() {
+            let (active, cache_hit) = load_active_view_record_with_cache_status(
+                state,
+                &registry,
+                versioned.record.clone(),
+            )
+            .await?;
+            spec_cache_hits += usize::from(cache_hit);
+            spec_cache_misses += usize::from(!cache_hit);
+            active_views.push(active);
+        }
+        active_views.sort_by(|left, right| left.spec.view_id.cmp(&right.spec.view_id));
+        demand_stage(
+            "demand_closure",
+            snapshot_elapsed + started.elapsed(),
+            0,
+            spec_cache_hits,
+            spec_cache_misses,
+        );
+        Ok(Self {
+            active_views,
+            records,
+            revision,
+        })
+    }
+
+    pub(super) fn views(&self) -> &[ActiveMaterializedView] {
+        &self.active_views
+    }
+
+    pub(super) fn registry_snapshot(&self) -> ActiveViewRegistrySnapshotV1 {
+        ActiveViewRegistrySnapshotV1 {
+            snapshot_revision: self.revision,
+            imported: true,
+            records: self.records.values().cloned().collect(),
+        }
+    }
+}
+
+/// Leave the Meta gRPC JSON-envelope margin in place: a registry accepted by
+/// API validation must also fit the bounded Meta read response.
+pub(super) const MAX_ACTIVE_VIEW_REGISTRY_SNAPSHOT_BYTES: usize =
+    velorix_control::meta_admin::MAX_META_GRPC_MESSAGE_BYTES - 256;
+
+pub(super) fn active_view_registry_scope(state: &ApiState) -> ActiveViewRegistryScopeV1 {
+    ActiveViewRegistryScopeV1 {
+        authority_store_id: state.ingest_writer.authority().store_id.clone(),
+        namespace: state.materialized_read_cache_namespace().to_string(),
+    }
+}
+
+pub(super) async fn read_active_view_registry_snapshot(
+    state: &ApiState,
+) -> Result<ActiveViewRegistrySnapshotV1, ApiError> {
+    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+        ApiError::internal("active-view Meta registry is required; S3 fallback is disabled")
+    })?;
+    let snapshot = meta_store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: active_view_registry_scope(state),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    validate_active_view_registry_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+pub(super) fn validate_active_view_registry_snapshot(
+    snapshot: &ActiveViewRegistrySnapshotV1,
+) -> Result<(), ApiError> {
+    if !snapshot.imported {
+        return Err(ApiError::conflict(
+            "active-view Meta registry has not been imported; explicit migration is required",
+        ));
+    }
+    let encoded = serde_json::to_vec(snapshot).map_err(ApiError::internal)?;
+    if encoded.len() > MAX_ACTIVE_VIEW_REGISTRY_SNAPSHOT_BYTES {
+        return Err(ApiError::internal(format!(
+            "active-view Meta registry snapshot exceeds {} bytes",
+            MAX_ACTIVE_VIEW_REGISTRY_SNAPSHOT_BYTES
+        )));
+    }
+    let mut ids = BTreeSet::new();
+    if snapshot.records.iter().any(|versioned| {
+        versioned.generation == 0 || !ids.insert(versioned.record.view_id.as_str())
+    }) {
+        return Err(ApiError::internal(
+            "active-view Meta registry snapshot contains an invalid or duplicate record",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) async fn load_active_view_record_with_cache_status(
+    state: &ApiState,
+    registry: &MaterializedViewRegistry,
+    record: velorix_control::storage_admin::ActiveMaterializedViewRecord,
+) -> Result<(ActiveMaterializedView, bool), ApiError> {
+    let (bytes, cache_hit) = if let Some(cache) = &state.materialized_read_cache {
+        let key = active_view_spec_cache_key(state, registry, &record.view_id, &record.spec_hash)?;
+        let view_id = record.view_id.clone();
+        let spec_hash = record.spec_hash.clone();
+        let fetched = std::sync::atomic::AtomicBool::new(false);
+        let validate = |bytes: &[u8]| {
+            registry
+                .active_view_from_spec_bytes(record.clone(), bytes)
+                .map(|_| ())
+        };
+        let (bytes, cache_hit) = cache
+            .read_through(
+                key,
+                || async {
+                    fetched.store(true, std::sync::atomic::Ordering::Relaxed);
+                    registry.read_spec_bytes(&view_id, &spec_hash).await
+                },
+                validate,
+            )
+            .await
+            .map_err(materialized_view_registry_error_to_api)
+            .map(|bytes| (bytes, !fetched.load(std::sync::atomic::Ordering::Relaxed)))?;
+        (bytes, cache_hit)
+    } else {
+        let bytes = registry
+            .read_spec_bytes(&record.view_id, &record.spec_hash)
+            .await
+            .map_err(materialized_view_registry_error_to_api)?;
+        (bytes, false)
+    };
+    let active = registry
+        .active_view_from_spec_bytes(record, &bytes)
+        .map_err(materialized_view_registry_error_to_api)?;
+    Ok((active, cache_hit))
+}
+
+#[cfg(test)]
+pub(super) async fn read_active_cached(
+    state: &ApiState,
+    view_id: &str,
+) -> Result<ActiveMaterializedView, ApiError> {
+    ActiveViewReadSnapshot::load_one(state, view_id)
+        .await
+        .map(|(active, _)| active)
+}
+
+pub(super) async fn read_active_from_meta(
+    state: &ApiState,
+    view_id: &str,
+) -> Result<ActiveMaterializedView, ApiError> {
+    ActiveViewReadSnapshot::load_one(state, view_id)
+        .await
+        .map(|(active, _)| active)
+}
+
+pub(super) async fn list_active_from_meta(
+    state: &ApiState,
+) -> Result<Vec<ActiveMaterializedView>, ApiError> {
+    Ok(ActiveViewReadSnapshot::load(state).await?.active_views)
+}
+
+pub(super) async fn compare_exchange_active_view_record(
+    state: &ApiState,
+    view_id: &str,
+    expected_generation: u64,
+    record: velorix_control::storage_admin::ActiveMaterializedViewRecord,
+    owner: Option<velorix_control::meta_admin::StandingRuntimeOwnerToken>,
+) -> Result<(), ApiError> {
+    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+        ApiError::internal("active-view Meta registry is required; S3 fallback is disabled")
+    })?;
+    if record.view_id != view_id {
+        return Err(ApiError::bad_request(
+            "active-view compare-and-set record identity mismatch",
+        ));
+    }
+    match meta_store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: active_view_registry_scope(state),
+            view_id: view_id.to_string(),
+            expected_generation,
+            record,
+            owner,
+        })
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        CompareExchangeActiveViewRecordOutcomeV1::Updated(_)
+        | CompareExchangeActiveViewRecordOutcomeV1::Duplicate(_) => Ok(()),
+        CompareExchangeActiveViewRecordOutcomeV1::Conflict => Err(ApiError::conflict(
+            "active-view record changed concurrently; retry the operation",
+        )),
+    }
+}
+
+pub(super) async fn update_active_view_lifecycle_admin(
+    state: &ApiState,
+    view_id: &str,
+    expected_spec_hash: &str,
+    lifecycle: MaterializedViewLifecycleStatus,
+) -> Result<(), ApiError> {
+    let snapshot = read_active_view_registry_snapshot(state).await?;
+    let versioned = snapshot
+        .records
+        .iter()
+        .find(|versioned| versioned.record.view_id == view_id)
+        .ok_or_else(|| ApiError::conflict("active view disappeared from Meta registry"))?;
+    if versioned.record.spec_hash != expected_spec_hash {
+        return Err(ApiError::conflict(
+            "active view changed before lifecycle update; retry the operation",
+        ));
+    }
+    let mut record = versioned.record.clone();
+    record.lifecycle = Some(lifecycle);
+    let owner = if let Some(runtime) = versioned.record.runtime.as_ref() {
+        Some(
+            state
+                .acquire_standing_runtime_owner(&runtime.standing_program_identity, view_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::service_unavailable(
+                        "standing-runtime lifecycle update requires a metadata owner fence",
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    compare_exchange_active_view_record(state, view_id, versioned.generation, record, owner).await
+}
+
+pub(super) async fn read_active_view_record_version(
+    state: &ApiState,
+    view_id: &str,
+) -> Result<ActiveViewRecordVersionV1, ApiError> {
+    read_active_view_registry_snapshot(state)
+        .await?
+        .records
+        .into_iter()
+        .find(|versioned| versioned.record.view_id == view_id)
+        .ok_or_else(|| ApiError::conflict("active view disappeared from Meta registry"))
+}
+
+pub(super) fn demand_stage(
+    stage: &'static str,
+    elapsed: std::time::Duration,
+    active_pointer_reads: usize,
+    spec_cache_hits: usize,
+    spec_cache_misses: usize,
+) {
+    if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "demand_query_stage stage={stage} elapsed_us={} active_pointer_reads={active_pointer_reads} spec_cache_hits={spec_cache_hits} spec_cache_misses={spec_cache_misses}",
+            elapsed.as_micros()
+        );
+    }
+}
+
+pub(super) fn demand_cache_stage(
+    stage: &'static str,
+    elapsed: std::time::Duration,
+    cache_hits: usize,
+    cache_misses: usize,
+    canonical_validations: usize,
+) {
+    if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "demand_query_stage stage={stage} elapsed_us={} checkpoint_cache_hits={cache_hits} checkpoint_cache_misses={cache_misses} checkpoint_canonical_validations={canonical_validations}",
+            elapsed.as_micros()
+        );
+    }
+}
+
+fn active_view_spec_cache_key(
+    state: &ApiState,
+    registry: &MaterializedViewRegistry,
+    view_id: &str,
+    spec_hash: &str,
+) -> Result<materialized_read_cache::MaterializedReadCacheKey, ApiError> {
+    let object_key = registry
+        .object_key(view_id, spec_hash)
+        .map_err(materialized_view_registry_error_to_api)?;
+    Ok(materialized_read_cache::MaterializedReadCacheKey {
+        store_id: state.materialized_read_cache_store_id().to_string(),
+        namespace: state.materialized_read_cache_namespace().to_string(),
+        tenant_id: String::new(),
+        program_id: String::new(),
+        output_id: view_id.to_string(),
+        object_path: object_key.to_string(),
+        content_hash: spec_hash.to_string(),
+        codec: "velorix-standing-view-spec-json-v1".to_string(),
+        checkpoint_epoch: 0,
+        root_hash: String::new(),
+    })
+}
+
 async fn try_read_source_catalog(
     state: &ApiState,
     relation_id: &str,
@@ -142,11 +628,7 @@ pub(super) async fn resolve_standing_inputs_for_view_request(
         }
     }
 
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active_views = list_active_from_meta(state).await?;
     let mut resolved = Vec::with_capacity(refs.len());
     for (relation_id, relation_version) in refs {
         let source = try_read_source_catalog(state, &relation_id, &relation_version).await?;
@@ -474,11 +956,13 @@ pub(super) fn validate_view_dependency_graph_with_candidate(
 pub(super) async fn view_dependency_edges_from_active_views(
     state: &ApiState,
 ) -> Result<Vec<ViewDependencyEdgeV1>, ApiError> {
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let snapshot = ActiveViewReadSnapshot::load(state).await?;
+    view_dependency_edges_from_snapshot(snapshot.views())
+}
+
+pub(super) fn view_dependency_edges_from_snapshot(
+    active_views: &[ActiveMaterializedView],
+) -> Result<Vec<ViewDependencyEdgeV1>, ApiError> {
     let mut edges = Vec::new();
     for active in active_views {
         let Some(runtime) = active.runtime.as_ref() else {
@@ -611,11 +1095,7 @@ pub(super) async fn published_input_history_roots(
     state: &ApiState,
     inputs: &[ResolvedAdmissionInputV1],
 ) -> Result<Vec<RelationSchema>, ApiError> {
-    let active = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = list_active_from_meta(state).await?;
     let mut pending = Vec::new();
     let mut roots = BTreeMap::new();
     for input in inputs {
@@ -798,11 +1278,8 @@ pub(super) async fn resolve_consumer_bootstrap_inputs_locked(
             *bootstrap_cursor = Some(capture.captured_cursor.clone());
         }
         if bootstrap_cursor.is_none() {
-            let producer = state
-                .view_registry()?
-                .read_active(&published_relation.producer_view_id)
-                .await
-                .map_err(materialized_view_registry_error_to_api)?;
+            let producer =
+                read_active_from_meta(state, &published_relation.producer_view_id).await?;
             *bootstrap_cursor = capture_optional_producer_bootstrap_cursor(
                 state,
                 producer_tenant_id,
@@ -1871,13 +2348,17 @@ pub(super) struct DependencyDrainSummary {
 pub(super) async fn drain_published_view_dependencies(
     state: &ApiState,
 ) -> Result<DependencyDrainSummary, ApiError> {
+    let snapshot = ActiveViewReadSnapshot::load(state).await?;
+    drain_published_view_dependencies_from_snapshot(state, &snapshot).await
+}
+
+pub(super) async fn drain_published_view_dependencies_from_snapshot(
+    state: &ApiState,
+    snapshot: &ActiveViewReadSnapshot,
+) -> Result<DependencyDrainSummary, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    let edges = view_dependency_edges_from_active_views(state).await?;
+    let active_views = snapshot.views();
+    let edges = view_dependency_edges_from_snapshot(active_views)?;
     let mut summary = DependencyDrainSummary::default();
     if edges.is_empty() {
         return Ok(summary);

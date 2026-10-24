@@ -211,12 +211,7 @@ async fn append(router: &Router, offset: u64, score: i64) {
 }
 
 async fn finish(state: &ApiState, view: &str) -> u64 {
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active(view)
-        .await
-        .unwrap();
+    let active = tests::read_test_active_view(state, view).await.unwrap();
     let request = demand_materialization::DemandRequest {
         scope: Some(demand_materialization::DemandScope {
             predicate: "score >= 7".into(),
@@ -277,12 +272,7 @@ async fn run_case(derived: bool) {
     } else {
         "migration_source"
     };
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active(target)
-        .await
-        .unwrap();
+    let active = tests::read_test_active_view(&state, target).await.unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
     let old = read_latest_standing_runtime_checkpoint(&state, identity, target)
         .await
@@ -428,10 +418,7 @@ async fn derived_pause_resume_preserves_cursors_without_physical_source_cut() {
     finish(&state, "control_source").await;
     declare(&router, "control_copy", "control_source", "v1").await;
     finish(&state, "control_copy").await;
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("control_copy")
+    let active = tests::read_test_active_view(&state, "control_copy")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
