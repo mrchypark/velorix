@@ -114,6 +114,34 @@ struct PageRows {
     schema: Option<RelationSchema>,
 }
 
+#[derive(Clone)]
+struct CachedPageBinding {
+    family: Option<String>,
+    schema_fingerprint: String,
+    checkpoint_content_hash: String,
+    schema: Option<RelationSchema>,
+    page_stats: Option<Vec<ColumnStats>>,
+}
+
+type DecodedQueryPage = (
+    StandingRuntimeOutputPageRecord,
+    Option<RecordBatch>,
+    usize,
+    std::time::Duration,
+    CachedPageBinding,
+    DeltaBatch,
+);
+
+struct CachedPageBindingInput<'a> {
+    manifest: &'a StandingRuntimeOutputManifestRecord,
+    index: &'a PageIndex,
+    reference: &'a StandingRuntimeOutputPageRef,
+    page: &'a StandingRuntimeOutputPageRecord,
+    binding: &'a CachedPageBinding,
+    rows: &'a DeltaBatch,
+    typed: Option<&'a RecordBatch>,
+}
+
 #[track_caller]
 fn invalid() -> ApiError {
     ApiError::bad_request(format!(
@@ -519,12 +547,21 @@ fn decode_ipc(bytes: &[u8]) -> Result<(StandingRuntimeOutputPageRecord, RecordBa
     decode_ipc_bounded(bytes, MAX_INDEX_BYTES)
 }
 
+#[cfg(test)]
 fn decode_ipc_bounded(
     bytes: &[u8],
     max_expanded_bytes: usize,
 ) -> Result<(StandingRuntimeOutputPageRecord, RecordBatch), ApiError> {
+    let (record, batch, _) = decode_ipc_bounded_with_expansion(bytes, max_expanded_bytes)?;
+    Ok((record, batch))
+}
+
+fn decode_ipc_bounded_with_expansion(
+    bytes: &[u8],
+    max_expanded_bytes: usize,
+) -> Result<(StandingRuntimeOutputPageRecord, RecordBatch, usize), ApiError> {
     use arrow::array::{Array, BinaryArray};
-    let compressed = validate_ipc_frames(bytes, max_expanded_bytes)?;
+    let (compressed, frame_expanded_bytes) = validate_ipc_frames(bytes, max_expanded_bytes)?;
     let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
         .map_err(ApiError::bad_request)?;
     // The IPC header identifies the codec family; read it before the record
@@ -596,6 +633,7 @@ fn decode_ipc_bounded(
         .as_any()
         .downcast_ref::<BinaryArray>()
         .ok_or_else(invalid)?;
+    let mut state_expanded_bytes = 0;
     if batch.num_rows() == 0 {
         payload.rows = DeltaBatch::default();
     } else {
@@ -607,6 +645,7 @@ fn decode_ipc_bounded(
             max_expanded_bytes,
         )
         .map_err(ApiError::bad_request)?;
+        state_expanded_bytes = state.as_bytes().len();
         payload.rows =
             velorix_core::arrow_state::from_state(&state).map_err(ApiError::bad_request)?;
     }
@@ -625,10 +664,14 @@ fn decode_ipc_bounded(
     record.page_content_hash = stable_bytes_hash(bytes);
     let typed = RecordBatch::try_new(output_schema, batch.columns()[..n].to_vec())
         .map_err(ApiError::bad_request)?;
-    Ok((record, typed))
+    Ok((
+        record,
+        typed,
+        frame_expanded_bytes.max(state_expanded_bytes),
+    ))
 }
 
-fn validate_ipc_frames(mut bytes: &[u8], limit: usize) -> Result<bool, ApiError> {
+fn validate_ipc_frames(mut bytes: &[u8], limit: usize) -> Result<(bool, usize), ApiError> {
     if bytes.len() > limit.saturating_mul(2).saturating_add(16 * 1024) {
         return Err(invalid());
     }
@@ -644,7 +687,7 @@ fn validate_ipc_frames(mut bytes: &[u8], limit: usize) -> Result<bool, ApiError>
         bytes = &bytes[8..];
         if length == 0 {
             return if bytes.is_empty() && messages == 2 {
-                Ok(compressed)
+                Ok((compressed, expanded))
             } else {
                 Err(invalid())
             };
@@ -723,9 +766,18 @@ fn decode_page_bounded(
     codec: &str,
     max_expanded_bytes: usize,
 ) -> Result<StandingRuntimeOutputPageRecord, ApiError> {
+    decode_page_bounded_with_expansion(bytes, codec, max_expanded_bytes).map(|(record, _)| record)
+}
+
+fn decode_page_bounded_with_expansion(
+    bytes: &[u8],
+    codec: &str,
+    max_expanded_bytes: usize,
+) -> Result<(StandingRuntimeOutputPageRecord, usize), ApiError> {
     if codec == GENERIC_ARROW_CODEC {
         let state = velorix_core::arrow_state::ArrowState::from_ipc(bytes, max_expanded_bytes)
             .map_err(ApiError::bad_request)?;
+        let expanded_bytes = state.as_bytes().len();
         let envelope = state
             .field::<StandingRuntimeOutputPageRecord>("page")
             .map_err(ApiError::bad_request)?
@@ -740,10 +792,11 @@ fn decode_page_bounded(
         if canonical.as_bytes() != bytes {
             return Err(invalid());
         }
-        return Ok(envelope);
+        return Ok((envelope, expanded_bytes));
     }
     if codec_spec(codec).is_some() {
-        decode_ipc_bounded(bytes, max_expanded_bytes).map(|(record, _)| record)
+        decode_ipc_bounded_with_expansion(bytes, max_expanded_bytes)
+            .map(|(record, _, expanded)| (record, expanded))
     } else {
         Err(invalid())
     }
@@ -753,18 +806,23 @@ fn decode_query_page(
     bytes: &[u8],
     manifest: &StandingRuntimeOutputManifestRecord,
     reference: &StandingRuntimeOutputPageRef,
+    index: &PageIndex,
     max_expanded_bytes: usize,
-) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>), ApiError> {
-    let (record, batch) = if reference.output_encoding == GENERIC_ARROW_CODEC {
-        (
-            decode_page_bounded(bytes, &reference.output_encoding, max_expanded_bytes)?,
-            None,
-        )
+) -> Result<DecodedQueryPage, ApiError> {
+    let (record, batch, expanded_source_bytes) = if reference.output_encoding == GENERIC_ARROW_CODEC
+    {
+        let (record, expanded) = decode_page_bounded_with_expansion(
+            bytes,
+            &reference.output_encoding,
+            max_expanded_bytes,
+        )?;
+        (record, None, expanded)
     } else if codec_spec(&reference.output_encoding).is_some() {
-        let (r, b) = decode_ipc_bounded(bytes, max_expanded_bytes)?;
-        (r, Some(b))
+        let (record, batch, expanded) =
+            decode_ipc_bounded_with_expansion(bytes, max_expanded_bytes)?;
+        (record, Some(batch), expanded)
     } else {
-        (decode_page(bytes, &reference.output_encoding)?, None)
+        (decode_page(bytes, &reference.output_encoding)?, None, 0)
     };
     let (key, parts) = ObjectKey::parse_standing_runtime_output_page(&reference.page_key)
         .map_err(ApiError::bad_request)?;
@@ -784,40 +842,220 @@ fn decode_query_page(
     {
         return Err(invalid());
     }
-    validate_page_binding_metadata(manifest, &record)?;
-    Ok((record, batch))
+    let binding_started = std::time::Instant::now();
+    let (rows, binding) = validate_page_binding_metadata_with_index(manifest, index, &record)?;
+    if canonical_count(&rows)? != reference.row_count {
+        return Err(invalid());
+    }
+    let binding_elapsed = binding_started.elapsed();
+    Ok((
+        record,
+        batch,
+        expanded_source_bytes,
+        binding_elapsed,
+        binding,
+        rows,
+    ))
 }
 
 async fn read_query_page(
     state: &ApiState,
     manifest: &StandingRuntimeOutputManifestRecord,
     reference: &StandingRuntimeOutputPageRef,
+    index: &PageIndex,
     max_encoded_bytes: Option<u64>,
     max_expanded_bytes: usize,
-) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>, u64), ApiError> {
+) -> Result<DecodedOutputPageRead, ApiError> {
     let max_expanded_bytes = max_expanded_bytes.min(state.max_standing_runtime_expansion_bytes);
-    read_query_page_with_decoder(state, manifest, reference, max_encoded_bytes, |bytes| {
-        decode_query_page(bytes, manifest, reference, max_expanded_bytes)
-    })
+    read_decoded_query_page_with_decoder(
+        state,
+        manifest,
+        reference,
+        index,
+        max_encoded_bytes,
+        max_expanded_bytes,
+        |bytes| decode_query_page(bytes, manifest, reference, index, max_expanded_bytes),
+    )
     .await
 }
 
-async fn read_query_page_with_decoder(
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: u64,
+}
+
+pub(crate) struct DecodedOutputPage {
+    record: StandingRuntimeOutputPageRecord,
+    binding: CachedPageBinding,
+    rows: DeltaBatch,
+    typed: Option<RecordBatch>,
+    encoded_bytes: u64,
+    expanded_source_bytes: usize,
+    expanded_json_bytes: u64,
+}
+
+struct DecodedOutputPageRead {
+    page: Arc<DecodedOutputPage>,
+    cache_hit: bool,
+    cache_weight_bytes: usize,
+    cache_capacity_bytes: usize,
+    cache_enabled: bool,
+    decode_elapsed: std::time::Duration,
+    binding_validation_elapsed: std::time::Duration,
+    read_elapsed: std::time::Duration,
+}
+
+impl DecodedOutputPage {
+    pub(crate) fn cache_weight_bytes(&self) -> usize {
+        let arrow_bytes = self
+            .typed
+            .as_ref()
+            .map_or(0, RecordBatch::get_array_memory_size);
+        let row_bytes = usize::try_from(self.expanded_json_bytes).unwrap_or(usize::MAX);
+        std::mem::size_of::<Self>()
+            .saturating_add(arrow_bytes)
+            // Both the logical rows and the record's JSON payload retain the
+            // source values, with allocator/container overhead.
+            .saturating_add(row_bytes.saturating_mul(4))
+            .saturating_add(
+                self.rows
+                    .records()
+                    .len()
+                    .saturating_mul(std::mem::size_of::<velorix_core::delta::DeltaRecord>()),
+            )
+    }
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("JSON byte count overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn expanded_page_json_bytes(rows: &DeltaBatch) -> Result<u64, ApiError> {
+    rows.records().iter().try_fold(0u64, |total, row| {
+        let mut counter = JsonByteCounter::default();
+        serde_json::to_writer(&mut counter, row).map_err(ApiError::internal)?;
+        let weighted = counter
+            .bytes
+            .checked_mul(u64::try_from(row.weight).map_err(ApiError::bad_request)?)
+            .ok_or_else(invalid)?;
+        total.checked_add(weighted).ok_or_else(invalid)
+    })
+}
+
+fn filtered_page_memory_required(
+    expanded_json_bytes: u64,
+    encoded_page_bytes: u64,
+    retained_bytes: u64,
+) -> Result<u64, ApiError> {
+    expanded_json_bytes
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(encoded_page_bytes.saturating_mul(16)))
+        .and_then(|n| n.checked_add(retained_bytes))
+        .ok_or_else(invalid)
+}
+
+fn validate_filtered_page_memory_budget(
+    required: u64,
+    policy: QueryPolicy,
+) -> Result<(), ApiError> {
+    if policy.memory_limit_bytes.is_some_and(|max| required > max) {
+        return Err(ApiError::bad_request(
+            "native filtered BAG expansion exceeds query memory budget",
+        ));
+    }
+    Ok(())
+}
+
+fn query_page_cache_key(
     state: &ApiState,
     manifest: &StandingRuntimeOutputManifestRecord,
     reference: &StandingRuntimeOutputPageRef,
+) -> super::materialized_read_cache::MaterializedReadCacheKey {
+    super::materialized_read_cache::MaterializedReadCacheKey {
+        store_id: state.materialized_read_cache_store_id().into(),
+        namespace: state.materialized_read_cache_namespace().into(),
+        tenant_id: manifest.tenant_id.clone(),
+        program_id: manifest.program_id.clone(),
+        output_id: manifest.view_id.clone(),
+        object_path: reference.page_key.clone(),
+        content_hash: reference.page_content_hash.clone(),
+        codec: reference.output_encoding.clone(),
+        root_hash: manifest.output_content_hash.clone(),
+        checkpoint_epoch: manifest.logical_epoch,
+    }
+}
+
+async fn read_decoded_query_page_with_decoder(
+    state: &ApiState,
+    manifest: &StandingRuntimeOutputManifestRecord,
+    reference: &StandingRuntimeOutputPageRef,
+    index: &PageIndex,
     max_bytes: Option<u64>,
-    decode: impl Fn(&[u8]) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>), ApiError>,
-) -> Result<(StandingRuntimeOutputPageRecord, Option<RecordBatch>, u64), ApiError> {
+    max_expanded_bytes: usize,
+    decode: impl Fn(
+        &[u8],
+    ) -> Result<
+        (
+            StandingRuntimeOutputPageRecord,
+            Option<RecordBatch>,
+            usize,
+            std::time::Duration,
+            CachedPageBinding,
+            DeltaBatch,
+        ),
+        ApiError,
+    >,
+) -> Result<DecodedOutputPageRead, ApiError> {
+    let read_started = std::time::Instant::now();
+    let schema_fingerprint = index.schema.schema_fingerprint.as_str();
+    let key = query_page_cache_key(state, manifest, reference);
+    if let Some(page) = state
+        .materialized_read_cache
+        .as_ref()
+        .and_then(|cache| cache.decoded_output_page(&key, schema_fingerprint))
+    {
+        validate_cached_decoded_page(&page, max_bytes, max_expanded_bytes)?;
+        let binding_started = std::time::Instant::now();
+        validate_cached_page_binding(manifest, index, reference, &page)?;
+        let binding_validation_elapsed = binding_started.elapsed();
+        let cache = state.materialized_read_cache.as_ref().ok_or_else(invalid)?;
+        return Ok(DecodedOutputPageRead {
+            cache_weight_bytes: cache.decoded_output_page_weight_bytes(
+                &key,
+                schema_fingerprint,
+                &page,
+            ),
+            cache_capacity_bytes: cache.decoded_output_page_capacity_bytes(),
+            cache_enabled: true,
+            page,
+            cache_hit: true,
+            decode_elapsed: std::time::Duration::ZERO,
+            binding_validation_elapsed,
+            read_elapsed: read_started.elapsed(),
+        });
+    }
     // Per-read handoff only: cached bytes still undergo all proof/hash/stat checks.
     let decoded = std::sync::Mutex::new(None);
+    let decode_elapsed = std::sync::Mutex::new(std::time::Duration::ZERO);
     let validate = |bytes: &[u8]| {
         if max_bytes.is_some_and(|max| bytes.len() as u64 > max) {
             return Err(ApiError::bad_request(
                 "native cached page exceeds query byte budget",
             ));
         }
+        let decode_started = std::time::Instant::now();
         let page = decode(bytes)?;
+        *decode_elapsed.lock().map_err(|_| invalid())? = decode_started.elapsed();
         *decoded.lock().map_err(|_| invalid())? = Some(page);
         Ok(())
     };
@@ -825,29 +1063,83 @@ async fn read_query_page_with_decoder(
     let fetch =
         || super::checkpoint_publication::read_object_bytes_bounded(state, &path, max_bytes);
     let bytes = if let Some(cache) = &state.materialized_read_cache {
-        let key = super::materialized_read_cache::MaterializedReadCacheKey {
-            store_id: state.materialized_read_cache_store_id().into(),
-            namespace: state.materialized_read_cache_namespace().into(),
-            tenant_id: manifest.tenant_id.clone(),
-            program_id: manifest.program_id.clone(),
-            output_id: manifest.view_id.clone(),
-            object_path: reference.page_key.clone(),
-            content_hash: reference.page_content_hash.clone(),
-            codec: reference.output_encoding.clone(),
-            root_hash: manifest.output_content_hash.clone(),
-            checkpoint_epoch: manifest.logical_epoch,
-        };
-        cache.read_through(key, fetch, validate).await?
+        cache.read_through(key.clone(), fetch, validate).await?
     } else {
         let bytes = fetch().await?;
         validate(&bytes)?;
         bytes
     };
-    let (record, batch) = decoded
+    let (record, batch, expanded_source_bytes, decode_binding_elapsed, binding, rows) = decoded
         .into_inner()
         .map_err(|_| invalid())?
         .ok_or_else(invalid)?;
-    Ok((record, batch, bytes.len() as u64))
+    let binding_started = std::time::Instant::now();
+    validate_cached_page_binding_parts(
+        CachedPageBindingInput {
+            manifest,
+            index,
+            reference,
+            page: &record,
+            binding: &binding,
+            rows: &rows,
+            typed: batch.as_ref(),
+        },
+        true,
+    )?;
+    let binding_validation_elapsed =
+        decode_binding_elapsed.saturating_add(binding_started.elapsed());
+    let expanded_json_bytes = expanded_page_json_bytes(&rows)?;
+    let page = Arc::new(DecodedOutputPage {
+        record,
+        binding,
+        rows,
+        typed: batch,
+        encoded_bytes: bytes.len() as u64,
+        expanded_source_bytes,
+        expanded_json_bytes,
+    });
+    validate_cached_decoded_page(&page, max_bytes, max_expanded_bytes)?;
+    if let Some(cache) = &state.materialized_read_cache {
+        cache.cache_decoded_output_page(&key, schema_fingerprint, Arc::clone(&page));
+    }
+    let (cache_enabled, cache_capacity_bytes, cache_weight_bytes) = state
+        .materialized_read_cache
+        .as_ref()
+        .map(|cache| {
+            (
+                true,
+                cache.decoded_output_page_capacity_bytes(),
+                cache.decoded_output_page_weight_bytes(&key, schema_fingerprint, &page),
+            )
+        })
+        .unwrap_or((false, 0, 0));
+    let decode_elapsed = *decode_elapsed.lock().map_err(|_| invalid())?;
+    Ok(DecodedOutputPageRead {
+        page,
+        cache_hit: false,
+        cache_weight_bytes,
+        cache_capacity_bytes,
+        cache_enabled,
+        decode_elapsed: decode_elapsed.saturating_sub(decode_binding_elapsed),
+        binding_validation_elapsed,
+        read_elapsed: read_started.elapsed(),
+    })
+}
+
+fn validate_cached_decoded_page(
+    page: &DecodedOutputPage,
+    max_encoded_bytes: Option<u64>,
+    max_expanded_bytes: usize,
+) -> Result<(), ApiError> {
+    if max_encoded_bytes.is_some_and(|max| page.encoded_bytes > max) {
+        return Err(ApiError::bad_request(
+            "native cached page exceeds query byte budget",
+        ));
+    }
+    if page.expanded_source_bytes > max_expanded_bytes {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 async fn read_query_metadata(
@@ -1406,6 +1698,14 @@ fn validate_page_binding_metadata(
 ) -> Result<DeltaBatch, ApiError> {
     let index: PageIndex =
         serde_json::from_value(manifest.published_output.clone()).map_err(ApiError::bad_request)?;
+    validate_page_binding_metadata_with_index(manifest, &index, page).map(|(rows, _)| rows)
+}
+
+fn validate_page_binding_metadata_with_index(
+    manifest: &StandingRuntimeOutputManifestRecord,
+    index: &PageIndex,
+    page: &StandingRuntimeOutputPageRecord,
+) -> Result<(DeltaBatch, CachedPageBinding), ApiError> {
     let payload: PageRows =
         serde_json::from_value(page.published_output.clone()).map_err(ApiError::bad_request)?;
     // Only the Arrow codecs carry a decoded page root and the inlined schema;
@@ -1425,14 +1725,101 @@ fn validate_page_binding_metadata(
     {
         return Err(invalid());
     }
-    if let Some(pages) = &index.page_stats {
-        if pages.get(page.page_index as usize)
-            != Some(&page_statistics(&index.schema, &payload.rows)?)
-        {
+    let page_stats = if let Some(pages) = &index.page_stats {
+        let page_stats = page_statistics(&index.schema, &payload.rows)?;
+        if pages.get(page.page_index as usize) != Some(&page_stats) {
             return Err(invalid());
         }
+        Some(page_stats)
+    } else {
+        None
+    };
+    Ok((
+        payload.rows,
+        CachedPageBinding {
+            family: payload.family,
+            schema_fingerprint: payload.schema_fingerprint,
+            checkpoint_content_hash: payload.checkpoint_content_hash,
+            schema: payload.schema,
+            page_stats,
+        },
+    ))
+}
+
+fn validate_cached_page_binding(
+    manifest: &StandingRuntimeOutputManifestRecord,
+    index: &PageIndex,
+    reference: &StandingRuntimeOutputPageRef,
+    page: &DecodedOutputPage,
+) -> Result<(), ApiError> {
+    validate_cached_page_binding_parts(
+        CachedPageBindingInput {
+            manifest,
+            index,
+            reference,
+            page: &page.record,
+            binding: &page.binding,
+            rows: &page.rows,
+            typed: page.typed.as_ref(),
+        },
+        false,
+    )
+}
+
+fn validate_cached_page_binding_parts(
+    input: CachedPageBindingInput<'_>,
+    validate_canonical_rows: bool,
+) -> Result<(), ApiError> {
+    let CachedPageBindingInput {
+        manifest,
+        index,
+        reference,
+        page,
+        binding,
+        rows,
+        typed,
+    } = input;
+    let arrow = codec_spec(&reference.output_encoding).is_some();
+    if page.page_index != reference.page_index
+        || page.page_content_hash != reference.page_content_hash
+        || page.row_count != reference.row_count
+        || page.output_encoding != reference.output_encoding
+        || page.tenant_id != manifest.tenant_id
+        || page.program_id != manifest.program_id
+        || page.view_id != manifest.view_id
+        || page.logical_epoch != manifest.logical_epoch
+        || (page.output_content_hash != manifest.output_content_hash
+            && !(arrow && page.output_content_hash.is_empty()))
+        || binding.family != index.family
+        || binding.schema_fingerprint != index.schema.schema_fingerprint
+        || binding.checkpoint_content_hash != manifest.checkpoint_content_hash
+        || (arrow && binding.schema.as_ref() != Some(&index.schema))
+        || (!arrow && binding.schema.is_some())
+        || binding.page_stats.as_ref()
+            != index
+                .page_stats
+                .as_ref()
+                .and_then(|stats| stats.get(reference.page_index as usize))
+        || canonical_count(rows)? != reference.row_count
+    {
+        return Err(invalid());
     }
-    Ok(payload.rows)
+    if validate_canonical_rows && typed.is_none() {
+        if codec_spec(&reference.output_encoding).is_some_and(|spec| spec.bag) {
+            velorix_runtime::materialized_view_runtime::materialized_bag_canonical_batch(
+                &index.schema,
+                rows,
+            )
+            .map_err(ApiError::bad_request)?;
+        } else {
+            velorix_runtime::materialized_view_runtime::materialized_canonical_output_batch(
+                &index.schema,
+                rows,
+            )
+            .map_err(ApiError::bad_request)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn validate_checkpoint_binding(
@@ -2053,43 +2440,29 @@ async fn query_bound_selected_policy_at_pointer(
                 .map(|n| n.saturating_sub(retained_bytes) / 16)
                 .and_then(|n| usize::try_from(n).ok())
                 .unwrap_or(state.max_standing_runtime_expansion_bytes);
-            let (page, typed, byte_count) = read_query_page(
+            let page_read = read_query_page(
                 state,
                 &manifest,
                 page_ref,
+                &index,
                 scan_remaining,
                 expanded_remaining,
             )
             .await?;
+            let page = page_read.page;
+            let byte_count = page.encoded_bytes;
+            let rows = &page.rows;
+            let typed = page.typed.as_ref();
             {
                 scan_bytes = scan_bytes.checked_add(byte_count).ok_or_else(invalid)?;
-                let payload: PageRows = serde_json::from_value(page.published_output.clone())
-                    .map_err(ApiError::bad_request)?;
-                let expanded = payload.rows.records().iter().try_fold(0u64, |n, row| {
-                    let bytes = serde_json::to_vec(row).map_err(ApiError::internal)?.len() as u64;
-                    n.checked_add(
-                        bytes
-                            .checked_mul(u64::try_from(row.weight).map_err(ApiError::bad_request)?)
-                            .ok_or_else(invalid)?,
-                    )
-                    .ok_or_else(invalid)
-                })?;
-                let required = expanded
-                    .checked_mul(16)
-                    .and_then(|n| n.checked_add(byte_count.saturating_mul(16)))
-                    .and_then(|n| n.checked_add(retained_bytes))
-                    .ok_or_else(invalid)?;
-                if policy.memory_limit_bytes.is_some_and(|max| required > max) {
-                    return Err(ApiError::bad_request(
-                        "native filtered BAG expansion exceeds query memory budget",
-                    ));
-                }
+                let required = filtered_page_memory_required(
+                    page.expanded_json_bytes,
+                    byte_count,
+                    retained_bytes,
+                )?;
+                validate_filtered_page_memory_budget(required, policy)?;
             }
-            let rows = if typed.is_some() {
-                validate_page_binding_metadata(&manifest, &page)?
-            } else {
-                validate_page_binding(&manifest, &page)?
-            };
+            let selection_started = std::time::Instant::now();
             let mut position = start;
             let mut selected = Vec::new();
             let mut indices = Vec::new();
@@ -2124,6 +2497,22 @@ async fn query_bound_selected_policy_at_pointer(
                 canonical_batch(schema, &DeltaBatch::from_records(selected))
                     .map_err(ApiError::bad_request)?
             };
+            if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "demand_query_stage stage=decoded_output_page elapsed_us={} decoded_cache_enabled={} decoded_cache_hits={} decoded_cache_misses={} decoded_cache_weight_bytes={} decoded_cache_capacity_bytes={} decoded_cache_oversize={} source_decode_us={} binding_validation_us={} typed_arrow={} output_selection_us={}",
+                    page_read.read_elapsed.as_micros(),
+                    if page_read.cache_enabled { 1 } else { 0 },
+                    if page_read.cache_hit { 1 } else { 0 },
+                    if page_read.cache_enabled && !page_read.cache_hit { 1 } else { 0 },
+                    page_read.cache_weight_bytes,
+                    page_read.cache_capacity_bytes,
+                    if page_read.cache_enabled && page_read.cache_weight_bytes > page_read.cache_capacity_bytes { 1 } else { 0 },
+                    page_read.decode_elapsed.as_micros(),
+                    page_read.binding_validation_elapsed.as_micros(),
+                    if typed.is_some() { 1 } else { 0 },
+                    selection_started.elapsed().as_micros(),
+                );
+            }
             retained_bytes = retained_bytes
                 .checked_add(batch.get_array_memory_size() as u64)
                 .ok_or_else(invalid)?;
@@ -2318,6 +2707,39 @@ pub(crate) mod tests {
             DeltaValue::from_json(json!({"power":value})),
             weight,
         )
+    }
+
+    #[test]
+    fn expanded_page_cost_preserves_weighted_json_bytes_and_rechecks_policy() {
+        let rows = DeltaBatch::from_records([
+            DeltaRecord::new(
+                DeltaKey::from_json(json!("nullable")),
+                DeltaValue::from_json(json!({"value": Value::Null, "nested": [1, null]})),
+                3,
+            ),
+            row(json!("x"), 2),
+        ]);
+        let expected = rows
+            .records()
+            .iter()
+            .map(|row| {
+                (serde_json::to_vec(row).unwrap().len() as u64) * u64::try_from(row.weight).unwrap()
+            })
+            .sum::<u64>();
+        let cached_source_cost = expanded_page_json_bytes(&rows).unwrap();
+        assert_eq!(cached_source_cost, expected);
+
+        let required = filtered_page_memory_required(cached_source_cost, 17, 5).unwrap();
+        let tight_policy = QueryPolicy {
+            memory_limit_bytes: Some(required - 1),
+            ..QueryPolicy::default()
+        };
+        assert!(validate_filtered_page_memory_budget(required, tight_policy).is_err());
+        let sufficient_policy = QueryPolicy {
+            memory_limit_bytes: Some(required),
+            ..QueryPolicy::default()
+        };
+        assert!(validate_filtered_page_memory_budget(required, sufficient_policy).is_ok());
     }
 
     #[test]
@@ -2738,15 +3160,15 @@ pub(crate) mod tests {
             .unwrap()],
             ..Default::default()
         };
-        MaterializedViewRegistry::new(state.store.clone())
-            .register_with_api_metadata_runtime_execution(
-                &spec,
-                Some(api),
-                runtime,
-                Some(MaterializedViewLifecycleStatus::standing_runtime()),
-            )
-            .await
-            .unwrap();
+        crate::view_admission::register_materialized_view_execution(
+            &state,
+            &spec,
+            Some(api),
+            runtime,
+            Some(MaterializedViewLifecycleStatus::standing_runtime()),
+        )
+        .await
+        .unwrap();
         state
             .meta_store
             .as_ref()
@@ -2773,8 +3195,7 @@ pub(crate) mod tests {
         activate_authoritative_view_bootstrap(&state, &checkpoint.identity, &spec.view_id)
             .await
             .unwrap();
-        let active = MaterializedViewRegistry::new(state.store.clone())
-            .read_active(&spec.view_id)
+        let active = crate::tests::read_test_active_view(&state, &spec.view_id)
             .await
             .unwrap();
         (state, active)
@@ -3210,9 +3631,11 @@ pub(crate) mod tests {
         )];
         let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let meta = Arc::new(InMemoryMetaStore::default());
-        let state = crate::tests::test_api_state_with_store(store, "native-pages-test", false)
-            .await
-            .with_meta_store(meta.clone());
+        let state = crate::tests::with_initialized_active_view_meta_store(
+            crate::tests::test_api_state_with_store(store, "native-pages-test", false).await,
+            meta.clone(),
+        )
+        .await;
         let state_record = StandingRuntimeStatePayloadRecord {
             schema_version: 1,
             record_kind: "standing_runtime_state_payload_v1".into(),
@@ -3528,14 +3951,24 @@ pub(crate) mod tests {
         let calls = AtomicUsize::new(0);
         let manifest = &publication.manifest_record;
         let reference = &manifest.pages[0];
+        let index = serde_json::from_value::<PageIndex>(manifest.published_output.clone()).unwrap();
+        let schema_fingerprint = index.schema.schema_fingerprint.clone();
         let max_expanded_bytes = state.max_standing_runtime_expansion_bytes;
         let decode = |bytes: &[u8]| {
             calls.fetch_add(1, Ordering::Relaxed);
-            decode_query_page(bytes, manifest, reference, max_expanded_bytes)
+            decode_query_page(bytes, manifest, reference, &index, max_expanded_bytes)
         };
-        read_query_page_with_decoder(&state, manifest, reference, None, decode)
-            .await
-            .unwrap();
+        read_decoded_query_page_with_decoder(
+            &state,
+            manifest,
+            reference,
+            &index,
+            None,
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .unwrap();
         assert_eq!(calls.swap(0, Ordering::Relaxed), 1, "uncached read");
         let directory = tempfile::tempdir().unwrap();
         let cache = Arc::new(
@@ -3548,21 +3981,92 @@ pub(crate) mod tests {
             .unwrap(),
         );
         state = state.with_materialized_read_cache(cache.clone());
-        for label in ["cold cache", "warm cache"] {
-            let (record, batch, _) =
-                read_query_page_with_decoder(&state, manifest, reference, None, decode)
-                    .await
-                    .unwrap();
-            assert_eq!(calls.swap(0, Ordering::Relaxed), 1, "{label}");
-            assert_eq!(record.row_count, 7);
-            assert_eq!(batch.unwrap().num_rows(), 1);
-        }
+        let cold = read_decoded_query_page_with_decoder(
+            &state,
+            manifest,
+            reference,
+            &index,
+            None,
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 1, "cold decoded cache");
+        assert_eq!(cold.page.record.row_count, 7);
+        assert_eq!(cold.page.typed.as_ref().unwrap().num_rows(), 1);
+        assert!(cold.cache_enabled);
         assert!(
-            read_query_page_with_decoder(&state, manifest, reference, Some(1), decode)
-                .await
-                .is_err()
+            cold.cache_weight_bytes <= cold.cache_capacity_bytes || cold.cache_capacity_bytes == 0
         );
-        assert_eq!(calls.load(Ordering::Relaxed), 0, "byte guard before decode");
+        let warm = read_decoded_query_page_with_decoder(
+            &state,
+            manifest,
+            reference,
+            &index,
+            None,
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 0, "warm decoded cache");
+        assert!(warm.cache_hit);
+        assert_eq!(warm.page.rows, cold.page.rows);
+        let mut changed_manifest_binding = (*manifest).clone();
+        changed_manifest_binding
+            .checkpoint_content_hash
+            .push_str("-changed");
+        assert!(read_decoded_query_page_with_decoder(
+            &state,
+            &changed_manifest_binding,
+            reference,
+            &index,
+            None,
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "current manifest binding");
+        let mut stale_reference = reference.clone();
+        stale_reference.page_content_hash.push_str("-stale");
+        let stale_key = query_page_cache_key(&state, manifest, &stale_reference);
+        assert!(cache
+            .decoded_output_page(&stale_key, &schema_fingerprint)
+            .is_none());
+        assert!(read_decoded_query_page_with_decoder(
+            &state,
+            manifest,
+            reference,
+            &index,
+            Some(1),
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "byte guard on decoded hit"
+        );
+        assert!(read_decoded_query_page_with_decoder(
+            &state, manifest, reference, &index, None, 0, decode,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "expansion guard on decoded hit"
+        );
+        assert!(cache
+            .decoded_output_page(
+                &query_page_cache_key(&state, manifest, reference),
+                "stale-schema"
+            )
+            .is_none());
         cache.close().await.unwrap();
     }
 
@@ -3579,6 +4083,7 @@ pub(crate) mod tests {
         let manifest = &publication.manifest_record;
         let reference = &manifest.pages[0];
         let encoded = encode_page(&publication.page_records[0].1).unwrap();
+        let index = serde_json::from_value::<PageIndex>(manifest.published_output.clone()).unwrap();
         let encoded_cap = u64::try_from(encoded.len()).unwrap();
         assert!(decode_ipc_bounded(&encoded, encoded.len()).is_err());
 
@@ -3586,6 +4091,7 @@ pub(crate) mod tests {
             &state,
             manifest,
             reference,
+            &index,
             Some(encoded_cap),
             state.max_standing_runtime_expansion_bytes,
         )
@@ -3596,6 +4102,7 @@ pub(crate) mod tests {
             &state,
             manifest,
             reference,
+            &index,
             Some(encoded_cap),
             encoded.len(),
         )
@@ -3724,7 +4231,9 @@ pub(crate) mod tests {
             checkpoint_epoch: checkpoint.logical_epoch,
         };
         cache
-            .insert(cache_key, b"corrupt".to_vec(), |_| Ok::<(), ApiError>(()))
+            .insert(cache_key.clone(), b"corrupt".to_vec(), |_| {
+                Ok::<(), ApiError>(())
+            })
             .unwrap();
         counts.clear();
         query_bound_selected(
@@ -3742,9 +4251,52 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             counts.get_paths().len(),
-            1,
-            "bad cached page evicted and refetched, immutable metadata and second page stay warm"
+            0,
+            "an already validated decoded page remains usable despite raw-cache corruption"
         );
+
+        // With no decoded page to trust, the corrupt raw-cache entry must be
+        // rejected by the production decoder and fetched again from storage.
+        let isolated_directory = tempfile::tempdir().unwrap();
+        let isolated_cache = Arc::new(
+            MaterializedReadCache::open(MaterializedReadCacheConfig {
+                directory: isolated_directory.path().into(),
+                memory_bytes: 256 * 1024,
+                disk_bytes: 8 * 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        isolated_cache
+            .insert(cache_key, b"corrupt".to_vec(), |_| Ok::<(), ApiError>(()))
+            .unwrap();
+        let isolated_state = state
+            .clone()
+            .with_materialized_read_cache(isolated_cache.clone());
+        counts.clear();
+        query_bound_selected(
+            &isolated_state,
+            &schema.relation_id,
+            &checkpoint.identity,
+            &schema.relation_id,
+            "generic_set_ops_v1",
+            &schema,
+            SnapshotPageRequest::default(),
+            Some((&predicate, QueryPolicy::default())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            counts
+                .get_paths()
+                .iter()
+                .filter(|path| path.as_str() == reference.page_key.as_str())
+                .count(),
+            1,
+            "untrusted raw cache bytes are rejected and the page is refetched"
+        );
+        isolated_cache.close().await.unwrap();
         cache.close().await.unwrap();
     }
 

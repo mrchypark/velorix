@@ -24,6 +24,92 @@ pub struct TwoInputJoinRuntime {
     applied_epochs: BTreeMap<String, LogicalEpoch>,
 }
 
+#[cfg(test)]
+mod checkpoint_row_cost_tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct RetainedRows {
+        logical_epoch: LogicalEpoch,
+        left_state: DeltaBatch,
+        right_state: DeltaBatch,
+        output: DeltaBatch,
+    }
+
+    fn record(key: &str, value: &str, weight: i64) -> DeltaRecord {
+        DeltaRecord::new(
+            DeltaKey::from_json(serde_json::json!({"key": key})),
+            DeltaValue::from_json(serde_json::json!({"value": value})),
+            weight,
+        )
+    }
+
+    fn measured_rows(checkpoint: &RetainedRows) -> usize {
+        checkpoint_rows_cost(checkpoint.left_state.records()).unwrap()
+            + checkpoint_rows_cost(checkpoint.right_state.records()).unwrap()
+            + checkpoint_rows_cost(checkpoint.output.records()).unwrap()
+    }
+
+    #[test]
+    fn row_cost_sum_matches_full_measure_after_signed_updates_and_restore() {
+        let mut checkpoint = RetainedRows {
+            logical_epoch: 1,
+            left_state: DeltaBatch::from_records([record("left-a", "x", 2)]),
+            right_state: DeltaBatch::from_records([record("right-a", "y", 1)]),
+            output: DeltaBatch::from_records([record("out-a", "z", 2)]),
+        };
+        let measure = |checkpoint: &RetainedRows| {
+            velorix_core::arrow_state::ArrowState::measure_serializable(checkpoint, usize::MAX)
+                .unwrap()
+        };
+        let metadata = RetainedRows {
+            logical_epoch: checkpoint.logical_epoch,
+            left_state: DeltaBatch::default(),
+            right_state: DeltaBatch::default(),
+            output: DeltaBatch::default(),
+        };
+        assert_eq!(
+            measure(&checkpoint),
+            measure(&metadata) + measured_rows(&checkpoint)
+        );
+
+        // Model a signed retraction of one retained row and insertion of a wider row.
+        let current_cost = measured_rows(&checkpoint);
+        let old_left_cost = checkpoint_rows_cost(checkpoint.left_state.records()).unwrap();
+        let old_output_cost = checkpoint_rows_cost(checkpoint.output.records()).unwrap();
+        checkpoint.logical_epoch = 2;
+        checkpoint.left_state =
+            DeltaBatch::from_records([record("left-b-with-more-bytes", "x", 1)]);
+        checkpoint.output = DeltaBatch::from_records([record("out-b-with-more-bytes", "z", 1)]);
+        let running_cost = adjust_checkpoint_row_cost(
+            current_cost,
+            old_left_cost + old_output_cost,
+            checkpoint_rows_cost(checkpoint.left_state.records()).unwrap()
+                + checkpoint_rows_cost(checkpoint.output.records()).unwrap(),
+        )
+        .unwrap();
+        let metadata = RetainedRows {
+            logical_epoch: checkpoint.logical_epoch,
+            left_state: DeltaBatch::default(),
+            right_state: DeltaBatch::default(),
+            output: DeltaBatch::default(),
+        };
+        assert_eq!(
+            measure(&checkpoint),
+            measure(&metadata) + measured_rows(&checkpoint)
+        );
+        assert_eq!(running_cost, measured_rows(&checkpoint));
+
+        let restored = RetainedRows {
+            logical_epoch: checkpoint.logical_epoch,
+            left_state: checkpoint.left_state.clone(),
+            right_state: checkpoint.right_state.clone(),
+            output: checkpoint.output.clone(),
+        };
+        assert_eq!(measured_rows(&restored), running_cost);
+    }
+}
+
 /// Adds the outer-join portion to the inner delta retained by the prepared
 /// join.  The sparse token lets this inspect only keys touched by the epoch;
 /// no side snapshot or reconstructed join is required.
@@ -84,6 +170,30 @@ fn join_records_weight(records: &[DeltaRecord]) -> Result<i64, StandingProgramRu
             .checked_add(row.weight)
             .ok_or_else(invalid_runtime_state)
     })
+}
+
+fn checkpoint_row_cost(row: &DeltaRecord) -> Result<usize, StandingProgramRuntimeError> {
+    velorix_core::arrow_state::ArrowState::measure_serializable(row, usize::MAX)
+        .map_err(|_| invalid_runtime_state())
+}
+
+fn checkpoint_rows_cost(rows: &[DeltaRecord]) -> Result<usize, StandingProgramRuntimeError> {
+    rows.iter().try_fold(0_usize, |total, row| {
+        total
+            .checked_add(checkpoint_row_cost(row)?)
+            .ok_or_else(invalid_runtime_state)
+    })
+}
+
+fn adjust_checkpoint_row_cost(
+    current: usize,
+    removed: usize,
+    added: usize,
+) -> Result<usize, StandingProgramRuntimeError> {
+    current
+        .checked_sub(removed)
+        .and_then(|cost| cost.checked_add(added))
+        .ok_or_else(invalid_runtime_state)
 }
 
 fn append_unmatched_records(
@@ -940,6 +1050,47 @@ impl StandingProgramRuntime for TwoInputJoinRuntime {
 const TYPED_JOIN_PROJECT_RUNTIME_KIND: &str = "typed_join_project_v1";
 const TYPED_JOIN_PROJECT_KEY_CODEC: &str = "velorix-typed-full-row-bag-key-v2";
 
+fn typed_join_scalar(
+    value: Option<&Value>,
+    column: &RelationColumnV1,
+    event_time: bool,
+) -> super::RuntimeScalarValue {
+    use super::RuntimeScalarValue as Scalar;
+    use velorix_core::view_plan::RuntimeScalarTypeV1 as Type;
+    let ty = if event_time {
+        Type::TimestampNanosecond
+    } else {
+        match &column.physical_arrow_type {
+            ArrowPhysicalTypeV1::Boolean => Type::Boolean,
+            ArrowPhysicalTypeV1::Int64 => Type::Int64,
+            ArrowPhysicalTypeV1::Float64 => Type::Float64,
+            ArrowPhysicalTypeV1::Utf8 => Type::Utf8,
+            ArrowPhysicalTypeV1::Date32 => Type::Date32,
+            ArrowPhysicalTypeV1::TimestampNanosecond { .. } => Type::TimestampNanosecond,
+            _ => Type::Int64,
+        }
+    };
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Scalar::Null(ty);
+    };
+    match ty {
+        Type::Boolean => value.as_bool().map(Scalar::Boolean),
+        Type::Int64 => value.as_i64().map(Scalar::Int64),
+        Type::Float64 => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Scalar::Float64),
+        Type::Utf8 => value.as_str().map(|value| Scalar::Utf8(value.to_owned())),
+        Type::Date32 => value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .map(Scalar::Date32),
+        Type::TimestampNanosecond => value.as_i64().map(Scalar::TimestampNanosecond),
+        Type::Decimal128 { .. } => None,
+    }
+    .unwrap_or(Scalar::Null(ty))
+}
+
 // NULL-containing tuples inhabit disjoint side namespaces. They retain their
 // multiplicity for outer output and retraction but never join across sides.
 fn typed_join_equality_key(values: Vec<Value>, side: SupportedAggregateInputRelationSide) -> Value {
@@ -957,6 +1108,7 @@ pub(super) fn checkpoint_has_typed_join_project_payload(checkpoint: &RuntimeChec
 /// Typed bag projection over the same sparse internal equijoin used by aggregate joins.
 pub struct TypedJoinProjectRuntime {
     limits: RuntimeResourceLimits,
+    checkpoint_row_cost: usize,
     identity: StandingProgramIdentity,
     catalogs: Vec<VelorixRelationCatalogV1>,
     input_schemas: Vec<RelationSchema>,
@@ -1065,6 +1217,7 @@ impl TypedJoinProjectRuntime {
         }
         let runtime = Self {
             limits: RuntimeResourceLimits::default(),
+            checkpoint_row_cost: 0,
             identity,
             catalogs,
             input_schemas,
@@ -1116,6 +1269,43 @@ impl TypedJoinProjectRuntime {
                 return Err(invalid_runtime_state());
             }
         }
+        let mut referenced = BTreeSet::new();
+        for program in self.plan.predicate.iter().chain(
+            self.plan
+                .projection
+                .iter()
+                .filter_map(|projection| projection.expression.as_ref()),
+        ) {
+            referenced.extend(super::typed_expr_column_ids(program));
+        }
+        let mut bound = BTreeSet::new();
+        for binding in &self.plan.bound_columns {
+            let catalog = self.catalog(binding.side)?;
+            let column = catalog_column(catalog, &binding.column_id)?;
+            let side = if binding.side == SupportedAggregateInputRelationSide::Left {
+                "left"
+            } else {
+                "right"
+            };
+            let nullable = column.nullable
+                || self.plan.join_kind == SupportedJoinKind::Full
+                || (binding.side == SupportedAggregateInputRelationSide::Right
+                    && self.plan.join_kind == SupportedJoinKind::Left);
+            if binding.internal_id != format!("__velorix_join_{side}_{}", binding.column_id)
+                || binding.nullable != nullable
+                || !referenced.contains(&binding.internal_id)
+                || !bound.insert(binding.internal_id.as_str())
+            {
+                return Err(invalid_runtime_state());
+            }
+        }
+        let bound_ids = bound
+            .iter()
+            .map(|id| (*id).to_owned())
+            .collect::<BTreeSet<_>>();
+        if referenced != bound_ids {
+            return Err(invalid_runtime_state());
+        }
         if self.plan.projection.is_empty()
             || !self.output_schema.primary_key.is_empty()
             || self.output_schema.columns.len() != self.plan.projection.len()
@@ -1124,6 +1314,16 @@ impl TypedJoinProjectRuntime {
         }
         let mut names = BTreeSet::new();
         for (projection, output) in self.plan.projection.iter().zip(&self.output_schema.columns) {
+            if let Some(program) = &projection.expression {
+                if output.name != projection.output_name
+                    || output.data_type != super::typed_result_sql_data_type(program)?
+                    || output.nullable != program.root.nullable
+                    || !names.insert(&output.name)
+                {
+                    return Err(invalid_runtime_state());
+                }
+                continue;
+            }
             let catalog = self.catalog(projection.side)?;
             let column = catalog_column(catalog, &projection.column_id)?;
             let nullable = if let Some(right_id) = &projection.coalesce_right_column_id {
@@ -1275,8 +1475,55 @@ impl TypedJoinProjectRuntime {
                     .as_json()
                     .as_object()
                     .ok_or_else(invalid_runtime_state)?;
+                let get_column = |internal_id: &str| {
+                    let binding = self
+                        .plan
+                        .bound_columns
+                        .iter()
+                        .find(|binding| binding.internal_id == internal_id)?;
+                    let catalog = self.catalog(binding.side).ok()?;
+                    let column = catalog_column(catalog, &binding.column_id).ok()?;
+                    let side_key = if binding.side == SupportedAggregateInputRelationSide::Left {
+                        JOIN_LEFT_VALUE_FIELD
+                    } else {
+                        JOIN_RIGHT_VALUE_FIELD
+                    };
+                    let payload = joined.get(side_key)?;
+                    let value = if payload.is_null() {
+                        None
+                    } else {
+                        payload.get(&binding.column_id)
+                    };
+                    Some(typed_join_scalar(
+                        value,
+                        column,
+                        catalog.relation_schema.event_time_column_id.as_deref()
+                            == Some(column.column_id.as_str()),
+                    ))
+                };
+                if let Some(predicate) = &self.plan.predicate {
+                    match super::evaluate_typed_expr(predicate, &get_column)
+                        .map_err(|_| invalid_runtime_state())?
+                    {
+                        super::RuntimeScalarValue::Boolean(true) => {}
+                        super::RuntimeScalarValue::Boolean(false)
+                        | super::RuntimeScalarValue::Null(
+                            velorix_core::view_plan::RuntimeScalarTypeV1::Boolean,
+                        ) => return Ok(None),
+                        _ => return Err(invalid_runtime_state()),
+                    }
+                }
                 let mut values = Map::new();
                 for projection in &self.plan.projection {
+                    if let Some(program) = &projection.expression {
+                        let value = super::evaluate_typed_expr(program, &get_column)
+                            .map_err(|_| invalid_runtime_state())?;
+                        values.insert(
+                            projection.output_name.clone(),
+                            super::typed_scalar_value_to_json(value)?,
+                        );
+                        continue;
+                    }
                     let side = match projection.side {
                         SupportedAggregateInputRelationSide::Left => JOIN_LEFT_VALUE_FIELD,
                         SupportedAggregateInputRelationSide::Right => JOIN_RIGHT_VALUE_FIELD,
@@ -1307,13 +1554,16 @@ impl TypedJoinProjectRuntime {
                     }
                     values.insert(projection.output_name.clone(), value);
                 }
-                Ok(DeltaRecord::new(
+                Ok(Some(DeltaRecord::new(
                     DeltaKey::from_json(Value::Object(values)),
                     DeltaValue::from_json(Value::Null),
                     row.weight,
-                ))
+                )))
             })
-            .collect::<Result<Vec<_>, StandingProgramRuntimeError>>()?;
+            .collect::<Result<Vec<_>, StandingProgramRuntimeError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         DeltaBatch::from_records(records)
             .net_rows()
             .map(DeltaBatch::from_records)
@@ -1453,34 +1703,43 @@ impl TypedJoinProjectRuntime {
         } else {
             Vec::new()
         };
-        let mut checkpoint = self.checkpoint_data();
-        checkpoint.left_state = DeltaBatch::from_records(
-            checkpoint
-                .left_state
-                .combine(&left)
-                .net_rows()
-                .map_err(|_| invalid_runtime_state())?,
-        );
-        checkpoint.right_state = DeltaBatch::from_records(
-            checkpoint
-                .right_state
-                .combine(&right)
-                .net_rows()
-                .map_err(|_| invalid_runtime_state())?,
-        );
-        checkpoint.output = DeltaBatch::from_records(
-            self.output
-                .iter()
-                .filter(|(key, _)| !updates.contains_key(*key))
-                .map(|(_, row)| row.clone())
-                .chain(updates.values().filter_map(Clone::clone)),
-        );
-        checkpoint.logical_epoch = logical_epoch;
-        checkpoint.input_frontiers = frontiers.clone();
-        checkpoint.input_event_time_frontiers = event_frontiers.clone();
-        checkpoint.applied_epochs.insert(key.clone(), logical_epoch);
-        retain_recent_applied_epochs(&mut checkpoint.applied_epochs);
-        self.limits.validate_checkpoint_value(&checkpoint)?;
+        let mut next_row_cost = self.checkpoint_row_cost;
+        for join_side in [JoinInputSide::Left, JoinInputSide::Right] {
+            for touched in prepared.touched_keys(join_side) {
+                let before = self
+                    .join
+                    .prepared_side_records(&prepared, join_side, &touched, false)
+                    .map_err(|_| invalid_runtime_state())?;
+                let after = self
+                    .join
+                    .prepared_side_records(&prepared, join_side, &touched, true)
+                    .map_err(|_| invalid_runtime_state())?;
+                next_row_cost = adjust_checkpoint_row_cost(
+                    next_row_cost,
+                    checkpoint_rows_cost(&before)?,
+                    checkpoint_rows_cost(&after)?,
+                )?;
+            }
+        }
+        for (encoded, next) in &updates {
+            let previous_cost = self
+                .output
+                .get(encoded)
+                .map_or(Ok(0), checkpoint_row_cost)?;
+            let next_cost = next.as_ref().map_or(Ok(0), checkpoint_row_cost)?;
+            next_row_cost = adjust_checkpoint_row_cost(next_row_cost, previous_cost, next_cost)?;
+        }
+        let mut applied_epochs = self.applied_epochs.clone();
+        applied_epochs.insert(key.clone(), logical_epoch);
+        retain_recent_applied_epochs(&mut applied_epochs);
+        let metadata =
+            self.checkpoint_metadata(logical_epoch, &frontiers, &event_frontiers, applied_epochs);
+        let metadata_cost = self.limits.measure_checkpoint_value(&metadata)?;
+        self.limits.validate_checkpoint_size(
+            metadata_cost
+                .checked_add(next_row_cost)
+                .ok_or_else(invalid_runtime_state)?,
+        )?;
         self.join
             .commit_prepared_epoch(prepared)
             .map_err(|_| invalid_runtime_state())?;
@@ -1496,6 +1755,7 @@ impl TypedJoinProjectRuntime {
         self.logical_epoch = logical_epoch;
         self.applied_epochs.insert(key, logical_epoch);
         retain_recent_applied_epochs(&mut self.applied_epochs);
+        self.checkpoint_row_cost = next_row_cost;
         Ok(EpochCommit {
             logical_epoch,
             idempotency_key,
@@ -1516,7 +1776,13 @@ impl TypedJoinProjectRuntime {
         DeltaBatch::from_records(self.output.values().cloned())
     }
 
-    fn checkpoint_data(&self) -> TypedJoinProjectCheckpoint {
+    fn checkpoint_metadata(
+        &self,
+        logical_epoch: LogicalEpoch,
+        input_frontiers: &[RelationFrontier],
+        input_event_time_frontiers: &[InputEventTimeFrontier],
+        applied_epochs: BTreeMap<String, LogicalEpoch>,
+    ) -> TypedJoinProjectCheckpoint {
         TypedJoinProjectCheckpoint {
             schema_version: 1,
             runtime_kind: TYPED_JOIN_PROJECT_RUNTIME_KIND.into(),
@@ -1527,14 +1793,27 @@ impl TypedJoinProjectRuntime {
             view_sql: self.view_sql.clone(),
             plan: self.plan.clone(),
             logical_plan: self.logical_plan.clone(),
-            left_state: self.join.left_state(),
-            right_state: self.join.right_state(),
-            output: DeltaBatch::from_records(self.output.values().cloned()),
-            logical_epoch: self.logical_epoch,
-            input_frontiers: self.input_frontiers.clone(),
-            input_event_time_frontiers: self.input_event_time_frontiers.clone(),
-            applied_epochs: self.applied_epochs.clone(),
+            left_state: DeltaBatch::default(),
+            right_state: DeltaBatch::default(),
+            output: DeltaBatch::default(),
+            logical_epoch,
+            input_frontiers: input_frontiers.to_vec(),
+            input_event_time_frontiers: input_event_time_frontiers.to_vec(),
+            applied_epochs,
         }
+    }
+
+    fn checkpoint_data(&self) -> TypedJoinProjectCheckpoint {
+        let mut checkpoint = self.checkpoint_metadata(
+            self.logical_epoch,
+            &self.input_frontiers,
+            &self.input_event_time_frontiers,
+            self.applied_epochs.clone(),
+        );
+        checkpoint.left_state = self.join.left_state();
+        checkpoint.right_state = self.join.right_state();
+        checkpoint.output = DeltaBatch::from_records(self.output.values().cloned());
+        checkpoint
     }
 }
 
@@ -1767,6 +2046,15 @@ impl TypedJoinProjectRuntime {
         {
             return Err(invalid_checkpoint());
         }
+        let left_cost =
+            checkpoint_rows_cost(payload.left_state.records()).map_err(|_| invalid_checkpoint())?;
+        let right_cost = checkpoint_rows_cost(payload.right_state.records())
+            .map_err(|_| invalid_checkpoint())?;
+        let output_cost = checkpoint_rows_cost(&rows).map_err(|_| invalid_checkpoint())?;
+        let restored_row_cost = left_cost
+            .checked_add(right_cost)
+            .and_then(|cost| cost.checked_add(output_cost))
+            .ok_or_else(invalid_checkpoint)?;
         let units = rows
             .iter()
             .map(|row| {
@@ -1800,6 +2088,25 @@ impl TypedJoinProjectRuntime {
         runtime.logical_epoch = payload.logical_epoch;
         runtime.input_frontiers = payload.input_frontiers;
         runtime.input_event_time_frontiers = payload.input_event_time_frontiers;
+        runtime.checkpoint_row_cost = restored_row_cost;
+        let metadata = runtime.checkpoint_metadata(
+            runtime.logical_epoch,
+            &runtime.input_frontiers,
+            &runtime.input_event_time_frontiers,
+            runtime.applied_epochs.clone(),
+        );
+        let metadata_cost = runtime
+            .limits
+            .measure_checkpoint_value(&metadata)
+            .map_err(|_| invalid_checkpoint())?;
+        runtime
+            .limits
+            .validate_checkpoint_size(
+                metadata_cost
+                    .checked_add(restored_row_cost)
+                    .ok_or_else(invalid_checkpoint)?,
+            )
+            .map_err(|_| invalid_checkpoint())?;
         Ok(runtime)
     }
 }

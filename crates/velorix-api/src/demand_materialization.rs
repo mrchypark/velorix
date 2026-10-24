@@ -312,9 +312,10 @@ pub(super) struct DemandOutcome {
 
 /// Resolve only the requested view's transitive dependencies. Repeated edges
 /// share producer work, but retain distinct edge identities at application.
-pub(super) async fn demand_dependency_order(
-    state: &ApiState,
+async fn demand_dependency_order_from_snapshot(
+    _state: &ApiState,
     target: &ActiveMaterializedView,
+    snapshot: &ActiveViewReadSnapshot,
 ) -> Result<Vec<ActiveMaterializedView>, ApiError> {
     let mut pending = vec![(target.clone(), false)];
     let mut visiting = BTreeSet::new();
@@ -345,11 +346,17 @@ pub(super) async fn demand_dependency_order(
                 published_relation, ..
             } = input
             {
-                let producer = state
-                    .view_registry()?
-                    .read_active(&published_relation.producer_view_id)
-                    .await
-                    .map_err(materialized_view_registry_error_to_api)?;
+                let producer = snapshot
+                    .views()
+                    .iter()
+                    .find(|active| active.spec.view_id == published_relation.producer_view_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "demand producer view `{}` is absent from the active registry snapshot",
+                            published_relation.producer_view_id
+                        ))
+                    })?;
                 if published_relation_binding_for_active_view(&producer)?.as_ref()
                     != Some(published_relation)
                 {
@@ -368,6 +375,29 @@ pub(super) async fn demand_dependency_order(
     Ok(ordered)
 }
 
+pub(super) fn demand_root_from_snapshot(
+    target: &ActiveMaterializedView,
+    snapshot: &ActiveViewReadSnapshot,
+) -> Result<ActiveMaterializedView, ApiError> {
+    let current = snapshot
+        .views()
+        .iter()
+        .find(|active| active.spec.view_id == target.spec.view_id)
+        .ok_or_else(|| {
+            ApiError::conflict(format!(
+                "demand target `{}` is absent from the active registry snapshot; retry the request",
+                target.spec.view_id
+            ))
+        })?;
+    if current != target {
+        return Err(ApiError::conflict(format!(
+            "demand target `{}` changed after it was read; retry the request",
+            target.spec.view_id
+        )));
+    }
+    Ok(current.clone())
+}
+
 /// Share one work budget across the requested dependency closure. Ancestors
 /// are conservatively materialized in full; the target may use a narrow proof.
 pub(super) async fn materialize_demand(
@@ -377,8 +407,32 @@ pub(super) async fn materialize_demand(
     order: DemandOrder,
     query_priority: bool,
 ) -> Result<DemandOutcome, ApiError> {
+    materialize_demand_with_snapshot(state, target, request, order, query_priority, None).await
+}
+
+pub(super) async fn materialize_demand_with_snapshot(
+    state: &ApiState,
+    target: &ActiveMaterializedView,
+    request: &DemandRequest,
+    order: DemandOrder,
+    query_priority: bool,
+    pinned_snapshot: Option<ActiveViewReadSnapshot>,
+) -> Result<DemandOutcome, ApiError> {
     request.budget.validate()?;
-    let closure = demand_dependency_order(state, target).await?;
+    let snapshot = match pinned_snapshot {
+        Some(snapshot) => {
+            ActiveViewReadSnapshot::resolve_demand_closure(
+                state,
+                snapshot.registry_snapshot(),
+                &target.spec.view_id,
+                std::time::Duration::ZERO,
+            )
+            .await?
+        }
+        None => ActiveViewReadSnapshot::load_demand_closure(state, &target.spec.view_id).await?,
+    };
+    let root = demand_root_from_snapshot(target, &snapshot)?;
+    let closure = demand_dependency_order_from_snapshot(state, &root, &snapshot).await?;
     let started = std::time::Instant::now();
     let mut used_rows = 0u64;
     let mut used_bytes = 0usize;
@@ -523,7 +577,8 @@ pub(super) async fn materialize_source_demand(
     query_priority: bool,
 ) -> Result<DemandOutcome, ApiError> {
     use super::demand_source::{
-        capture_demand_source_artifacts, demand_source_artifact_key, load_demand_source_artifact,
+        demand_source_artifact_key, demand_source_artifacts_from_cuts,
+        demand_source_relation_identities, load_demand_source_artifact,
     };
     request.budget.validate()?;
     if active.runtime.as_ref().is_some_and(|runtime| {
@@ -540,12 +595,63 @@ pub(super) async fn materialize_source_demand(
         .ok_or_else(|| ApiError::bad_request("demand requires a standing runtime"))?;
     let operation = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let mut operation_guard = operation.lock_owned().await;
-    let (cuts, artifacts) = capture_demand_source_artifacts(state, active).await?;
+    let config = state.relation_ingest_config.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("authoritative ingest configuration unavailable")
+    })?;
+    let meta = state
+        .meta_store
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("authoritative metadata unavailable"))?;
+    let source_relations = demand_source_relation_identities(active);
+    let scope_certificate_started = std::time::Instant::now();
+    let batch = meta
+        .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+            source_cuts: (!source_relations.is_empty()).then(|| {
+                CaptureRelationIngestSourceCutsRequest {
+                    namespace: config.namespace.clone(),
+                    relations: source_relations.clone(),
+                }
+            }),
+            relation_catalogs: active
+                .spec
+                .input_relations
+                .iter()
+                .map(|input| DemandRelationCatalogLookup {
+                    relation_id: input.relation_id.clone(),
+                    relation_version: input.relation_version.clone(),
+                })
+                .collect(),
+            standing_runtime_checkpoint: Some(DemandStandingRuntimeCheckpointLookup {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: active.spec.view_id.clone(),
+            }),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    let cuts = match (source_relations.is_empty(), batch.source_cuts) {
+        (true, None) => Vec::new(),
+        (false, Some(cuts)) => cuts,
+        _ => {
+            return Err(ApiError::bad_request(
+                "metadata batch source-cut shape mismatch",
+            ))
+        }
+    };
+    let relation_catalogs = batch.relation_catalogs;
+    let checkpoint_pointer = batch.standing_runtime_checkpoint;
+    let (cuts, artifacts) =
+        demand_source_artifacts_from_cuts(&config.namespace, &source_relations, cuts)?;
     let cut_hash = stable_bytes_hash(&serde_json::to_vec(&cuts).map_err(ApiError::internal)?);
     let scope_sql = request.scope.as_ref().map(|scope| scope.predicate.as_str());
     let requested_scope = scope_hash(scope_sql)?;
-    let (mut previous, migration_bytes) =
-        migration::read_checkpoint(state, active, request.budget.max_bytes).await?;
+    let (mut previous, migration_bytes) = migration::read_checkpoint_from_pointer(
+        state,
+        active,
+        request.budget.max_bytes,
+        checkpoint_pointer,
+    )
+    .await?;
     migration::validate_source_prefixes(active, previous.as_ref(), &artifacts)?;
     let plan_hash = active
         .runtime
@@ -581,9 +687,14 @@ pub(super) async fn materialize_source_demand(
                 "source dependency proof requires one input",
             ));
         };
-        let catalog =
-            read_relation_catalog(state, &input.relation_id, &input.relation_version).await?;
-        dependencies.bind_source_catalog(&catalog)?;
+        let catalog = relation_catalogs
+            .iter()
+            .find(|catalog| {
+                catalog.relation_schema.relation_id == input.relation_id
+                    && catalog.relation_schema.relation_version == input.relation_version
+            })
+            .ok_or_else(|| ApiError::bad_request("metadata batch omitted relation catalog"))?;
+        dependencies.bind_source_catalog(catalog)?;
     }
     let output_schema = active
         .spec
@@ -677,6 +788,13 @@ pub(super) async fn materialize_source_demand(
                     .get(&scan_scope)
                     .is_some_and(ProcessedSpans::is_complete)
     }) {
+        view_dependencies::demand_stage(
+            "scope_certificate",
+            scope_certificate_started.elapsed(),
+            0,
+            0,
+            0,
+        );
         return Ok(DemandOutcome {
             work_units: 0,
             checkpoint_epoch: previous
@@ -690,6 +808,13 @@ pub(super) async fn materialize_source_demand(
             dependency_mode: mode,
         });
     }
+    view_dependencies::demand_stage(
+        "scope_certificate",
+        scope_certificate_started.elapsed(),
+        0,
+        0,
+        0,
+    );
     if causal_event_time && progress.event_time_replay_id.is_none() {
         progress.event_time_replay_id = Some(format!(
             "demand:{}:{}",
@@ -719,6 +844,7 @@ pub(super) async fn materialize_source_demand(
     let mut read_bytes = migration_bytes;
     let mut units = 0usize;
     let mut validated_source_publications = Vec::new();
+    let mut selected_inputs = Vec::new();
     for (key, artifact) in &keyed {
         if (!query_priority && state.demand_scheduler.foreground.load(Ordering::Acquire) != 0)
             || units >= request.budget.batch_limit
@@ -795,14 +921,19 @@ pub(super) async fn materialize_source_demand(
             .map_or(0, |frontier| frontier.committed_offset_exclusive);
         selected.start_offset_inclusive = frontier;
         selected.end_offset_exclusive = frontier;
-        let selected_inputs = if causal_event_time {
+        let artifact_inputs = if causal_event_time {
             progress.artifacts[key].selected_source_runs(&input, interval, &may_match)?
         } else {
             vec![selected]
         };
+        selected_inputs.extend(artifact_inputs);
         progress.artifacts.insert((*key).clone(), staged);
         // Full producer coverage is installed only by the final frontier step.
         progress.full_complete = false;
+        processed_rows += count as u64;
+        units += 1;
+    }
+    if units > 0 {
         operation_guard = commit_demand_unit_locked(
             state,
             active,
@@ -823,8 +954,6 @@ pub(super) async fn materialize_source_demand(
             &active.spec.view_id,
         )
         .await?;
-        processed_rows += count as u64;
-        units += 1;
     }
     let remaining_rows = keyed.iter().try_fold(0u64, |sum, (key, _)| {
         let entry = &progress.artifacts[key];

@@ -89,6 +89,89 @@ fn bag_publication_validates_checkpoint_and_checkpoint_budget_is_atomic() {
     .is_err());
 }
 
+#[test]
+fn checkpoint_budget_exact_boundary_survives_signed_updates_and_restore() {
+    use velorix_runtime::materialized_view_runtime::{
+        restore_standing_runtime_with_limits, RuntimeResourceLimits,
+    };
+    let (runtime, catalogs) = runtime("INNER");
+    let empty = runtime.checkpoint().unwrap();
+    let inputs = vec![
+        input(
+            &catalogs[0],
+            false,
+            0,
+            &[
+                ("same", 10, Some(2.0), None, 2),
+                ("same", 10, Some(3.0), None, 1),
+            ],
+        ),
+        input(&catalogs[1], true, 0, &[("same", 10, Some(4.0), None, 1)]),
+    ];
+    let accepts = |max_checkpoint_bytes| {
+        let limits = RuntimeResourceLimits {
+            max_checkpoint_bytes,
+            ..RuntimeResourceLimits::default()
+        };
+        let Ok(mut candidate) = restore_standing_runtime_with_limits(empty.clone(), limits) else {
+            return false;
+        };
+        candidate.apply_changes(1, key(1), inputs.clone()).is_ok()
+    };
+    let mut low = empty.state_payload.as_ref().unwrap().payload.len();
+    let mut high = RuntimeResourceLimits::default().max_checkpoint_bytes;
+    assert!(accepts(high));
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if accepts(middle) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    assert!(accepts(low));
+    assert!(low > 0 && !accepts(low - 1));
+
+    let exact_limits = RuntimeResourceLimits {
+        max_checkpoint_bytes: low,
+        ..RuntimeResourceLimits::default()
+    };
+    let mut bounded = restore_standing_runtime_with_limits(empty.clone(), exact_limits).unwrap();
+    assert!(bounded.apply_changes(1, key(1), inputs.clone()).is_ok());
+    let committed = bounded.checkpoint().unwrap();
+    let restore_limits = RuntimeResourceLimits {
+        max_checkpoint_bytes: low + 1024,
+        ..RuntimeResourceLimits::default()
+    };
+    let mut restored =
+        restore_standing_runtime_with_limits(committed.clone(), restore_limits).unwrap();
+    let retract = input(&catalogs[0], false, 2, &[("same", 10, Some(2.0), None, -2)]);
+    restored.apply_changes(2, key(2), vec![retract]).unwrap();
+    let after_retract = restored.checkpoint().unwrap();
+    assert_eq!(
+        restore_standing_runtime_with_limits(after_retract.clone(), restore_limits)
+            .unwrap()
+            .checkpoint()
+            .unwrap(),
+        after_retract
+    );
+
+    let mut rejected = restore_standing_runtime_with_limits(
+        empty.clone(),
+        RuntimeResourceLimits {
+            max_checkpoint_bytes: low - 1,
+            ..RuntimeResourceLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(rejected
+        .apply_changes(1, key(1), inputs)
+        .unwrap_err()
+        .to_string()
+        .contains("runtime_checkpoint_bytes"));
+    assert_eq!(rejected.checkpoint().unwrap(), empty);
+}
+
 fn catalog(id: &str, right: bool) -> VelorixRelationCatalogV1 {
     let names = if right {
         ["key_r", "bucket_r", "metric", "aux", "delta"]
@@ -297,6 +380,17 @@ fn runtime_with_nullable_keys(
             column.nullable = true;
         }
     }
+    runtime_for_sql(sql, output, catalogs)
+}
+
+fn runtime_for_sql(
+    sql: String,
+    output: RelationSchema,
+    catalogs: Vec<VelorixRelationCatalogV1>,
+) -> (
+    Box<dyn StandingProgramRuntime + Send>,
+    Vec<VelorixRelationCatalogV1>,
+) {
     let logical =
         lower_supported_typed_join_project_sql_to_logical_plan(&sql, &catalogs, &output).unwrap();
     let identity = StandingProgramIdentity {
@@ -635,6 +729,307 @@ fn checkpoint_rejects_corrupted_hash_codec_schema_and_torn_bag() {
 }
 
 #[test]
+fn computed_join_projection_filter_retractions_and_restart_use_join_deltas() {
+    use velorix_core::view_plan::VelorixLogicalViewPlanNodeV1;
+    let catalogs = vec![catalog("samples", false), catalog("measurement", true)];
+    let sql = "SELECT s.item, s.metric + e.metric AS combined FROM samples s LEFT JOIN measurement e ON s.item = e.key_r AND s.bucket = e.bucket_r WHERE e.metric IS NULL OR e.metric > 0.0".to_string();
+    let mut output = output_schema();
+    output.columns = vec![
+        ColumnSchema {
+            name: "item".into(),
+            data_type: SqlDataType::Utf8,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: "combined".into(),
+            data_type: SqlDataType::Float64,
+            nullable: true,
+        },
+    ];
+    let logical =
+        lower_supported_typed_join_project_sql_to_logical_plan(&sql, &catalogs, &output).unwrap();
+    assert!(logical.nodes.iter().any(|node| matches!(
+        node,
+        VelorixLogicalViewPlanNodeV1::Project {
+            typed_predicate: Some(_),
+            ..
+        }
+    )));
+    let (computed_columns, predicate) = logical
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            VelorixLogicalViewPlanNodeV1::Project {
+                computed_columns,
+                typed_predicate: Some(predicate),
+                ..
+            } => Some((computed_columns, predicate)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(predicate.bindings.iter().all(|binding| {
+        ["samples", "measurement"].contains(&binding.input.relation_id.as_str())
+            && binding.internal_column_id.starts_with("__velorix_join_")
+            && binding.input.column_id == "metric"
+    }));
+    assert_eq!(predicate.bindings.len(), 1);
+    let typed_computed = computed_columns
+        .iter()
+        .find_map(|computed| match &computed.expression {
+            velorix_core::view_plan::SupportedProjectionExpr::Typed { bindings, .. } => {
+                Some(bindings)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(typed_computed.iter().all(|binding| {
+        ["samples", "measurement"].contains(&binding.input.relation_id.as_str())
+            && binding.internal_column_id.starts_with("__velorix_join_")
+            && binding.input.column_id == "metric"
+    }));
+    assert_eq!(typed_computed.len(), 2);
+    let (mut runtime, _) = runtime_for_sql(sql, output, catalogs.clone());
+    let first = runtime
+        .apply_changes(
+            1,
+            key(1),
+            vec![
+                input(
+                    &catalogs[0],
+                    false,
+                    0,
+                    &[("item-a", 300, Some(2.0), None, 2)],
+                ),
+                input(
+                    &catalogs[1],
+                    true,
+                    0,
+                    &[("item-a", 300, Some(3.0), None, 1)],
+                ),
+            ],
+        )
+        .unwrap();
+    assert_eq!(first.output_deltas[0].delta.records()[0].weight, 2);
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    runtime = restored;
+    let replacement = runtime
+        .apply_changes(
+            2,
+            key(2),
+            vec![input(
+                &catalogs[1],
+                true,
+                1,
+                &[("item-a", 300, Some(3.0), None, -1)],
+            )],
+        )
+        .unwrap();
+    let changes = replacement.output_deltas[0].delta.records();
+    assert_eq!(changes.len(), 2);
+    assert!(changes
+        .iter()
+        .any(|row| row.weight == -2 && row.key.as_json()["combined"] == json!(5.0)));
+    assert!(changes
+        .iter()
+        .any(|row| row.weight == 2 && row.key.as_json()["combined"].is_null()));
+}
+
+#[test]
+fn typed_join_rejects_ambiguous_columns_and_where_unknown_on_both_join_shapes() {
+    let catalogs = vec![catalog("samples", false), catalog("measurement", true)];
+    let ambiguous = "SELECT metric FROM samples s JOIN measurement e ON s.item = e.key_r";
+    assert!(validate_supported_typed_join_project_sql(ambiguous, &catalogs).is_err());
+    for sql in [
+        "SELECT metric + 1.0 AS computed FROM samples s JOIN measurement e ON s.item = e.key_r",
+        "SELECT s.item FROM samples s JOIN measurement e ON s.item = e.key_r WHERE metric > 0.0",
+    ] {
+        assert!(validate_supported_typed_join_project_sql(sql, &catalogs).is_err());
+    }
+
+    // USING disambiguates its own key only. A same-named non-key remains
+    // ambiguous in expressions even when the join has a USING clause.
+    let mut using_catalogs = catalogs.clone();
+    let right_key = using_catalogs[1]
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == "key_r")
+        .unwrap();
+    right_key.name = "item".into();
+    let fingerprint =
+        SchemaFingerprintV1::for_relation_schema(&using_catalogs[1].relation_schema).unwrap();
+    using_catalogs[1].schema_fingerprint = fingerprint.clone();
+    using_catalogs[1].incremental_relation.schema_fingerprint = fingerprint;
+    assert!(validate_supported_typed_join_project_sql(
+        "SELECT metric + 1.0 AS computed FROM samples s JOIN measurement e USING (item)",
+        &using_catalogs,
+    )
+    .is_err());
+
+    let sql = "SELECT s.item, e.metric AS measurement FROM samples s LEFT JOIN measurement e ON s.item = e.key_r AND s.bucket = e.bucket_r WHERE e.metric > 0.0".to_string();
+    let mut output = output_schema();
+    output.columns = vec![
+        ColumnSchema {
+            name: "item".into(),
+            data_type: SqlDataType::Utf8,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: "measurement".into(),
+            data_type: SqlDataType::Float64,
+            nullable: true,
+        },
+    ];
+    let (mut runtime, _) = runtime_for_sql(sql, output, catalogs.clone());
+    let result = runtime
+        .apply_changes(
+            1,
+            key(1),
+            vec![
+                input(
+                    &catalogs[0],
+                    false,
+                    0,
+                    &[
+                        ("unmatched", 10, Some(1.0), None, 1),
+                        ("matched-null", 20, Some(2.0), None, 1),
+                    ],
+                ),
+                input(
+                    &catalogs[1],
+                    true,
+                    0,
+                    &[("matched-null", 20, None, None, 1)],
+                ),
+            ],
+        )
+        .unwrap();
+    assert!(result.output_deltas[0].delta.records().is_empty());
+    let materialized = runtime
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant".into(),
+                program_id: "join".into(),
+                view_id: "item_fact".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(1),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    let batch = &materialized.batches[0];
+    assert_eq!(batch.schema().fields().len(), 2);
+    assert_eq!(batch.schema().field(0).name(), "item");
+    assert_eq!(batch.schema().field(1).name(), "measurement");
+    assert_eq!(batch.num_rows(), 0);
+}
+
+#[test]
+fn full_join_output_key_tracks_coalesced_key_after_computed_projection() {
+    use velorix_core::view_plan::VelorixLogicalViewPlanNodeV1;
+    let catalogs = vec![catalog("samples", false), catalog("measurement", true)];
+    let sql = "SELECT s.metric + e.metric AS combined, COALESCE(s.item, e.key_r) AS join_key FROM samples s FULL OUTER JOIN measurement e ON s.item = e.key_r";
+    let mut output = output_schema();
+    output.columns = vec![
+        ColumnSchema {
+            name: "combined".into(),
+            data_type: SqlDataType::Float64,
+            nullable: true,
+        },
+        ColumnSchema {
+            name: "join_key".into(),
+            data_type: SqlDataType::Utf8,
+            nullable: false,
+        },
+    ];
+    let plan =
+        lower_supported_typed_join_project_sql_to_logical_plan(sql, &catalogs, &output).unwrap();
+    let join = plan
+        .nodes
+        .iter()
+        .find_map(|node| match node {
+            VelorixLogicalViewPlanNodeV1::FullEquiJoin { output_key, .. } => Some(output_key),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(join.relation_id, "typed_join");
+    assert_eq!(join.column_id, "__velorix_coalesced_join_key");
+    let (mut runtime, _) = runtime_for_sql(sql.to_string(), output, catalogs.clone());
+    runtime
+        .apply_changes_delta_only(
+            1,
+            key(1),
+            vec![input(
+                &catalogs[1],
+                true,
+                0,
+                &[("right-only", 1, Some(3.0), None, 2)],
+            )],
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant".into(),
+                    program_id: "join".into(),
+                    view_id: "item_fact".into()
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(1),
+                    page_token: None,
+                    max_rows: None
+                },
+            )
+            .unwrap()
+            .batches[0]
+            .num_rows(),
+        2
+    );
+    let transition = runtime
+        .apply_changes_delta_only(
+            2,
+            key(2),
+            vec![input(
+                &catalogs[0],
+                false,
+                0,
+                &[("right-only", 1, Some(4.0), None, 1)],
+            )],
+        )
+        .unwrap();
+    let rows = transition.output_deltas[0].delta.records();
+    assert!(rows
+        .iter()
+        .any(|row| row.weight == -2 && row.key.as_json()["join_key"] == json!("right-only")));
+    assert!(rows
+        .iter()
+        .any(|row| row.weight == 2 && row.key.as_json()["combined"] == json!(7.0)));
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_eq!(
+        restored
+            .materialized_view_page(
+                ScopedViewId {
+                    tenant_id: "tenant".into(),
+                    program_id: "join".into(),
+                    view_id: "item_fact".into()
+                },
+                SnapshotPageRequest {
+                    committed_epoch: Some(2),
+                    page_token: None,
+                    max_rows: None
+                },
+            )
+            .unwrap()
+            .batches[0]
+            .num_rows(),
+        2
+    );
+}
+
+#[test]
 fn join_admission_accepts_nullable_keys_and_rejects_unimplemented_sql_shapes() {
     let catalogs = vec![catalog("samples", false), catalog("measurement", true)];
     for sql in [
@@ -802,49 +1197,116 @@ fn nullable_composite_equality_keys_are_unmatched_bags_across_restore() {
 }
 
 #[test]
-fn full_join_direct_nullable_first_projection_needs_no_coalesce() {
-    let (mut runtime, catalogs) = runtime_with_nullable_keys("FULL DIRECT", true);
-    runtime
-        .apply_changes(
+fn full_join_payload_only_projection_preserves_values_and_multiplicity() {
+    let catalogs = vec![catalog("samples", false), catalog("measurement", true)];
+    let sql = "SELECT s.metric AS left_metric, e.metric AS right_metric FROM samples s FULL OUTER JOIN measurement e ON s.item = e.key_r".to_string();
+    let mut output = output_schema();
+    output.columns = vec![
+        ColumnSchema {
+            name: "left_metric".into(),
+            data_type: SqlDataType::Float64,
+            nullable: true,
+        },
+        ColumnSchema {
+            name: "right_metric".into(),
+            data_type: SqlDataType::Float64,
+            nullable: true,
+        },
+    ];
+    let (mut runtime, _) = runtime_for_sql(sql, output, catalogs.clone());
+    let initial = runtime
+        .apply_changes_delta_only(
             1,
             key(1),
-            vec![
-                nullable_key_input(
-                    &catalogs[0],
-                    false,
-                    0,
-                    &[(Some("left"), Some(1), Some(2.0), 1)],
-                ),
-                nullable_key_input(
-                    &catalogs[1],
-                    true,
-                    0,
-                    &[(Some("right"), Some(1), Some(3.0), 2)],
-                ),
-            ],
-        )
-        .unwrap();
-    let (rows, _) = page(runtime.as_ref(), None, None);
-    assert_eq!(rows.len(), 3);
-    assert_eq!(
-        rows.iter()
-            .filter(|row| row[0].is_null() && row[1].is_null() && row[4] == json!(3.0))
-            .count(),
-        2
-    );
-    let mut restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
-    assert_eq!(page(restored.as_ref(), None, None).0, rows);
-    restored
-        .apply_changes(
-            2,
-            key(2),
-            vec![nullable_key_input(
+            vec![input(
                 &catalogs[1],
                 true,
-                1,
-                &[(Some("right"), Some(1), Some(3.0), -1)],
+                0,
+                &[("k", 1, Some(3.0), None, 2)],
             )],
         )
         .unwrap();
-    assert_eq!(page(restored.as_ref(), None, None).0.len(), 2);
+    assert!(initial.output_deltas[0].delta.records().iter().any(|row| {
+        row.weight == 2
+            && row.key.as_json()["left_metric"].is_null()
+            && row.key.as_json()["right_metric"] == json!(3.0)
+    }));
+    let transition = runtime
+        .apply_changes_delta_only(
+            2,
+            key(2),
+            vec![input(
+                &catalogs[0],
+                false,
+                0,
+                &[("k", 1, Some(5.0), None, 1)],
+            )],
+        )
+        .unwrap();
+    let changes = transition.output_deltas[0].delta.records();
+    assert!(changes.iter().any(|row| row.weight == -2
+        && row.key.as_json()["left_metric"].is_null()
+        && row.key.as_json()["right_metric"] == json!(3.0)));
+    assert!(changes.iter().any(|row| row.weight == 2
+        && row.key.as_json()["left_metric"] == json!(5.0)
+        && row.key.as_json()["right_metric"] == json!(3.0)));
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    let page = restored
+        .materialized_view_page(
+            ScopedViewId {
+                tenant_id: "tenant".into(),
+                program_id: "join".into(),
+                view_id: "item_fact".into(),
+            },
+            SnapshotPageRequest {
+                committed_epoch: Some(2),
+                page_token: None,
+                max_rows: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(page.batches[0].num_rows(), 2);
+}
+
+#[test]
+fn full_join_typed_coalesce_defaults_nullable_payloads() {
+    let catalogs = vec![catalog("samples", false), catalog("measurement", true)];
+    let sql = "SELECT COALESCE(s.metric, 0.0) AS left_metric, COALESCE(e.metric, 0.0) AS right_metric FROM samples s FULL OUTER JOIN measurement e ON s.item = e.key_r".to_string();
+    let mut output = output_schema();
+    output.columns = vec![
+        ColumnSchema {
+            name: "left_metric".into(),
+            data_type: SqlDataType::Float64,
+            nullable: false,
+        },
+        ColumnSchema {
+            name: "right_metric".into(),
+            data_type: SqlDataType::Float64,
+            nullable: false,
+        },
+    ];
+    let (mut runtime, _) = runtime_for_sql(sql, output, catalogs.clone());
+
+    let changes = runtime
+        .apply_changes_delta_only(
+            1,
+            key(1),
+            vec![
+                input(&catalogs[0], false, 0, &[("left", 1, None, None, 1)]),
+                input(&catalogs[1], true, 0, &[("right", 1, Some(4.5), None, 1)]),
+            ],
+        )
+        .unwrap();
+    let rows = changes.output_deltas[0].delta.records();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| {
+        row.key.as_json()["left_metric"] == json!(0.0)
+            && row.key.as_json()["right_metric"] == json!(0.0)
+    }));
+    assert!(rows.iter().any(|row| {
+        row.key.as_json()["left_metric"] == json!(0.0)
+            && row.key.as_json()["right_metric"] == json!(4.5)
+    }));
+    let restored = restore_standing_runtime(runtime.checkpoint().unwrap()).unwrap();
+    assert_eq!(restored.logical_epoch(), 1);
 }

@@ -6,6 +6,12 @@ service VelorixMeta {
   rpc ReadMetaStoreCapabilities(ReadMetaStoreCapabilitiesRequest) returns (ReadMetaStoreCapabilitiesResponse);
   rpc StoreRelationCatalog(StoreRelationCatalogRequest) returns (StoreRelationCatalogResponse);
   rpc ReadRelationCatalog(ReadRelationCatalogRequest) returns (ReadRelationCatalogResponse);
+  rpc ReadDemandMetadataBatch(ReadDemandMetadataBatchRequest) returns (ReadDemandMetadataBatchResponse);
+  rpc ReadActiveViewRegistrySnapshot(ActiveViewRegistrySnapshotRequest) returns (ActiveViewRegistrySnapshotResponse);
+  rpc CreateActiveViewRecord(ActiveViewRecordMutationRequest) returns (ActiveViewRecordMutationResponse);
+  rpc CompareExchangeActiveViewRecord(ActiveViewRecordMutationRequest) returns (ActiveViewRecordMutationResponse);
+  rpc ImportActiveViewRegistry(ActiveViewRecordMutationRequest) returns (ActiveViewRecordMutationResponse);
+  rpc PromoteViewBootstrapWithActiveViewRecord(ActiveViewRecordMutationRequest) returns (ActiveViewRecordMutationResponse);
   rpc ReserveIngestRange(ReserveIngestRangeRequest) returns (ReserveIngestRangeResponse);
   rpc ReserveAuthoritativeIngestRange(ReserveAuthoritativeIngestRangeRequest) returns (ReserveIngestRangeResponse);
   rpc CommitIngestRange(ReserveIngestRangeRequest) returns (CommitIngestRangeResponse);
@@ -211,6 +217,19 @@ message ReadRelationCatalogRequest {
 message ReadRelationCatalogResponse {
   bytes catalog_json = 1;
 }
+
+message ReadDemandMetadataBatchRequest {
+  bytes request_json = 1;
+}
+
+message ReadDemandMetadataBatchResponse {
+  bytes response_json = 1;
+}
+
+message ActiveViewRegistrySnapshotRequest { bytes request_json = 1; }
+message ActiveViewRegistrySnapshotResponse { bytes response_json = 1; }
+message ActiveViewRecordMutationRequest { bytes request_json = 1; }
+message ActiveViewRecordMutationResponse { bytes response_json = 1; }
 
 message ReserveIngestRangeRequest {
   string stream_id = 1;

@@ -54,6 +54,38 @@ authoritative: Legacy view admission also requires bootstrap metadata. It is
 also separate from `VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES`, which gates SQL
 families rather than selecting ingest/materialization mode.
 
+### Active-view metadata authority and upgrade
+
+Meta is authoritative for mutable active-view records and their generations
+within each object-store authority and namespace. Each operation reads a fresh
+pinned registry snapshot; updates use generation CAS, and runtime-owned
+activation also checks the owner fence. Immutable view
+specifications and runtime checkpoints remain in object storage; Foyer may cache
+immutable specifications, but it is not an authority for active records.
+
+A new namespace may initialize an empty Meta registry automatically only when
+its legacy object-store active-view registry is empty. If legacy active records
+exist, stop every API, operator, and other writer for that namespace before
+cutover, and ensure their requests are drained. Start one API instance with the
+normal Meta endpoint and admin authentication configured, then import the
+existing active records through its protected admin route:
+
+```sh
+curl --fail-with-body -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  "$API_URL/v1/admin/import-active-view-registry" \
+  -d '{"confirm_writers_stopped":true}'
+```
+
+The import validates the existing records and their immutable specifications,
+then commits the registry metadata atomically. It does not replay input,
+redeclare views, or rewrite checkpoints. After cutover, Meta remains the sole
+authority: there is no object-store active-record fallback or dual write. Keep
+the existing specification and checkpoint objects in place. Registry reads and
+RPC payloads are bounded by the 8 MiB Meta message limit; oversized snapshots
+or imports fail closed and require reducing registry size before cutover.
+
 Legacy backfill keeps its existing `batch_limit` step path and returns HTTP 200
 with progress; that status alone does not establish completion. Demand `scope`,
 `budget`, pause/resume, and reverse order require authoritative mode and are
@@ -510,6 +542,34 @@ do not promise arbitrary join predicates, all join kinds, or aggregate
 expressions of every type. See the positive aggregate and join cases in
 [core plan tests](../../crates/velorix-core/tests/view_plan.rs). Mixing a direct
 source and a published view in the same declaration is rejected.
+
+The native typed join projection path also supports direct projections and
+deterministic typed expressions over both inputs, followed by a typed boolean
+`WHERE` predicate. It supports bounded INNER, LEFT, and FULL equijoins and
+preserves signed join deltas and multiplicity through restart. A FULL JOIN
+derives its internal coalesced equality key independently of the user
+projection, so payload-only projections are supported. This path does not
+require the advanced SQL flag. The flag
+`VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true` is for analytic-window SQL;
+it is off by default.
+
+For example, with `key Utf8` and `metric Float64` in both registered relations:
+
+```sql
+SELECT l.key, l.metric + r.metric AS combined
+FROM left_values l
+LEFT JOIN right_values r ON l.key = r.key
+WHERE r.metric IS NULL OR r.metric > 0.0
+```
+
+To expose the coalesced equality key as a payload column, project it explicitly:
+
+```sql
+SELECT l.metric + r.metric AS combined,
+       COALESCE(l.key, r.key) AS key
+FROM left_values l
+FULL OUTER JOIN right_values r ON l.key = r.key
+```
 
 ### 4. Compute ordered outputs
 

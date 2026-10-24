@@ -112,7 +112,7 @@ pub struct PromoteViewBootstrapRequest {
     pub owner: StandingRuntimeOwnerToken,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub enum PromoteViewBootstrapOutcome {
     Promoted(ViewBootstrapControlV1),
     Duplicate(ViewBootstrapControlV1),

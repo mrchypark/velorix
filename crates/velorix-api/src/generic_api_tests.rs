@@ -28,15 +28,16 @@ async fn global_aggregates_publish_empty_and_append_results() {
         assert_eq!(actual, status, "{path}: {value}");
         value
     }
-    let state = tests::test_api_state_with_store(
-        Arc::new(object_store::memory::InMemory::new()),
-        "global-empty-owner",
-        false,
+    let state = tests::with_initialized_active_view_meta_store(
+        tests::test_api_state_with_store(
+            Arc::new(object_store::memory::InMemory::new()),
+            "global-empty-owner",
+            false,
+        )
+        .await,
+        Arc::new(velorix_control::meta_admin::InMemoryMetaStore::default()),
     )
-    .await
-    .with_meta_store(Arc::new(
-        velorix_control::meta_admin::InMemoryMetaStore::default(),
-    ));
+    .await;
     let router = app(state);
     let catalog = VelorixRelationCatalogV1::from_relation_schema(
         VelorixRelationSchemaV1 {
@@ -240,15 +241,16 @@ async fn typed_join_chain_preserves_nonunique_values_and_null_key_semantics() {
         assert_eq!(actual_status, status, "{path}: {value}");
         value
     }
-    let state = tests::test_api_state_with_store(
-        Arc::new(object_store::memory::InMemory::new()),
-        "join-bag-chain",
-        false,
+    let state = tests::with_initialized_active_view_meta_store(
+        tests::test_api_state_with_store(
+            Arc::new(object_store::memory::InMemory::new()),
+            "join-bag-chain",
+            false,
+        )
+        .await,
+        Arc::new(velorix_control::meta_admin::InMemoryMetaStore::default()),
     )
-    .await
-    .with_meta_store(Arc::new(
-        velorix_control::meta_admin::InMemoryMetaStore::default(),
-    ));
+    .await;
     let router = app(state);
     for relation in ["grove_left", "grove_right"] {
         let catalog = VelorixRelationCatalogV1::from_relation_schema(
@@ -435,11 +437,11 @@ async fn typed_map_chain_preserves_live_bags_and_aggregate_updates() {
         values
     }
     let store = Arc::new(object_store::memory::InMemory::new());
-    let state = tests::test_api_state_with_store(store, "bag-chain-a", false)
-        .await
-        .with_meta_store(Arc::new(
-            velorix_control::meta_admin::InMemoryMetaStore::default(),
-        ));
+    let state = tests::with_initialized_active_view_meta_store(
+        tests::test_api_state_with_store(store, "bag-chain-a", false).await,
+        Arc::new(velorix_control::meta_admin::InMemoryMetaStore::default()),
+    )
+    .await;
     let router = app(state.clone());
     let catalog = VelorixRelationCatalogV1::from_relation_schema(
         VelorixRelationSchemaV1 {
@@ -523,10 +525,7 @@ async fn typed_map_chain_preserves_live_bags_and_aggregate_updates() {
     )
     .await;
     assert_eq!(records(&router).await, [11, 11, 19]);
-    let producer = state
-        .view_registry()
-        .unwrap()
-        .read_active("orchard_middle")
+    let producer = tests::read_test_active_view(&state, "orchard_middle")
         .await
         .unwrap();
     let binding = published_relation_binding_for_active_view(&producer)

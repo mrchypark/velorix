@@ -169,9 +169,11 @@ fn data_page_reads(counts: &ObjectStoreAccessCounts) -> usize {
 
 #[tokio::test]
 async fn materialized_public_runtime_normalizes_filter_projection_group_and_two_schema_join() {
-    let state = test_api_state()
-        .await
-        .with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    let state = tests::with_initialized_active_view_meta_store(
+        test_api_state().await,
+        Arc::new(InMemoryMetaStore::default()),
+    )
+    .await;
     let router = app(state);
     register(
         &router,
@@ -242,10 +244,9 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
         Arc::new(InMemory::new()),
         counts.clone(),
     ));
-    let state = test_api_state_with_store(store, "materialized-page-owner", false)
-        .await
-        .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024)
-        .with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    let (state, _meta_store) =
+        test_api_state_with_uninitialized_active_registry(store, "materialized-page-owner").await;
+    let state = state.with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024);
     let router = app(state.clone());
     register(
         &router,
@@ -282,49 +283,45 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
         assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     }
     activate(&router, "row_output").await;
-    let mut without_meta = state;
-    without_meta.meta_store = None;
-    let router_without_meta = app(without_meta);
-    for router in [&router, &router_without_meta] {
-        for sql in [
-            "SELECT count(*) AS count FROM row_output",
-            "WITH selected AS (SELECT * FROM row_output) SELECT count(*) AS count FROM selected",
-        ] {
-            counts.clear();
-            assert_eq!(
-                request_rows(router, "row_output", sql).await,
-                vec![json!({"count":10017})]
-            );
-            assert_eq!(data_page_reads(&counts), 20);
-            assert!(!counts
-                .get_paths()
-                .iter()
-                .any(|path| path.starts_with("v1/standing-runtime-state-payloads/")));
-        }
-        for (predicate, count, max_pages) in [
-            ("key_col='k10016'", 1, 2),
-            ("key_col='k10016' AND abs(amount)>0", 1, 2),
-            ("key_col='k10016' OR amount IS NULL", 2, 3),
-            ("key_col='missing' AND amount>0", 0, 0),
-            ("amount IS NULL", 1, 1),
-            ("key_col='missing' OR abs(amount)>0", 10016, 20),
-        ] {
-            counts.clear();
-            let sql = format!("SELECT count(*) AS count FROM row_output WHERE {predicate}");
-            assert_eq!(
-                request_rows(router, "row_output", &sql).await,
-                vec![json!({"count":count})]
-            );
-            assert!(
-                data_page_reads(&counts) <= max_pages,
-                "{predicate}: {:?}",
-                counts.get_paths()
-            );
-            assert!(!counts
-                .get_paths()
-                .iter()
-                .any(|path| path.starts_with("v1/standing-runtime-state-payloads/")));
-        }
+    let router = &router;
+    for sql in [
+        "SELECT count(*) AS count FROM row_output",
+        "WITH selected AS (SELECT * FROM row_output) SELECT count(*) AS count FROM selected",
+    ] {
+        counts.clear();
+        assert_eq!(
+            request_rows(router, "row_output", sql).await,
+            vec![json!({"count":10017})]
+        );
+        assert_eq!(data_page_reads(&counts), 20);
+        assert!(!counts
+            .get_paths()
+            .iter()
+            .any(|path| path.starts_with("v1/standing-runtime-state-payloads/")));
+    }
+    for (predicate, count, max_pages) in [
+        ("key_col='k10016'", 1, 2),
+        ("key_col='k10016' AND abs(amount)>0", 1, 2),
+        ("key_col='k10016' OR amount IS NULL", 2, 3),
+        ("key_col='missing' AND amount>0", 0, 0),
+        ("amount IS NULL", 1, 1),
+        ("key_col='missing' OR abs(amount)>0", 10016, 20),
+    ] {
+        counts.clear();
+        let sql = format!("SELECT count(*) AS count FROM row_output WHERE {predicate}");
+        assert_eq!(
+            request_rows(router, "row_output", &sql).await,
+            vec![json!({"count":count})]
+        );
+        assert!(
+            data_page_reads(&counts) <= max_pages,
+            "{predicate}: {:?}",
+            counts.get_paths()
+        );
+        assert!(!counts
+            .get_paths()
+            .iter()
+            .any(|path| path.starts_with("v1/standing-runtime-state-payloads/")));
     }
 }
 
@@ -538,9 +535,11 @@ fn materialized_predicate_ast_rejects_nested_reads_and_preserves_unknown_coercio
 
 #[tokio::test]
 async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_signed_update() {
-    let state = test_api_state()
-        .await
-        .with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    let state = tests::with_initialized_active_view_meta_store(
+        test_api_state().await,
+        Arc::new(InMemoryMetaStore::default()),
+    )
+    .await;
     let router = app(state);
     register(
         &router,
@@ -720,14 +719,16 @@ async fn publication_state(store: Arc<dyn ObjectStore>, meta: Arc<InMemoryMetaSt
     )
     .await
     .unwrap();
-    ApiState::from_validated_authority_with_ingest_admission_startup(
+    let state = ApiState::from_validated_authority_with_ingest_admission_startup(
         authority,
         "synthetic-owner",
         false,
     )
     .await
     .unwrap()
-    .with_meta_store(meta)
+    .with_view_bootstrap_meta_store(meta.clone())
+    .with_meta_store(meta.clone());
+    tests::with_initialized_active_view_meta_store(state, meta).await
 }
 
 fn publication_schema(checkpoint: &RuntimeCheckpoint) -> RelationSchema {
@@ -1288,10 +1289,7 @@ async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
             assert!(error.contains("spec.input_relations.synthetic_input.k"));
             assert!(error.contains("timezone-bearing timestamps are not supported yet"));
             assert!(error.contains("timezone=UTC"));
-            assert!(state
-                .view_registry()
-                .unwrap()
-                .list_active()
+            assert!(tests::list_test_active_views(&state)
                 .await
                 .unwrap()
                 .is_empty());

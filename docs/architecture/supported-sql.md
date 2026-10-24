@@ -53,6 +53,11 @@ API can reach the validator and runtime, but an API
 admission-to-materialization-to-restart test has not yet supplied end-to-end
 evidence for that family.
 
+`VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true` enables analytic-window SQL;
+with the default `false` setting, analytic-window families remain gated. The
+typed two-input join projection family below uses the default admission path
+and does not require this flag.
+
 | SQL family | Status | Exact bounded scope / evidence |
 | --- | --- | --- |
 | Filters and projections | Default public | One registered relation, key-preserving direct projection plus bounded `WHERE` predicates. `filter_project_*` plan tests and REST tests in `crates/velorix-api/src/tests.rs`. |
@@ -66,6 +71,7 @@ evidence for that family.
 | Latest / arg extrema | Default public | One `arg_min(value, ordering)` or `arg_max(value, ordering)`, grouped by the input primary key. `latest_by_key_*` plan tests. |
 | Top-K | Default public | `ORDER BY` plus literal positive `LIMIT`/`FETCH`, optional literal non-negative `OFFSET`; public limit is 1,000. |
 | Inner join | Default public | Two registered inputs with validated equality/key restrictions and admitted aggregate/project shapes. `rest_two_relation_join_view_materialized_output_survives_api_restart`. |
+| Typed two-input join projections and post-join filters | Default public path; API E2E/restart verification pending | One INNER, LEFT, or FULL equijoin; direct and typed computed projections may reference either input, and a typed boolean `WHERE` filters joined rows. FULL JOIN derives its internal coalesced equality key independently of projected payload columns. Runtime coverage: `computed_join_projection_filter_retractions_and_restart_use_join_deltas`, `full_join_output_key_tracks_coalesced_key_after_computed_projection`, and `full_join_payload_only_projection_preserves_values_and_multiplicity`. |
 | Outer joins | Default public | Narrow left/right grouped forms and a narrow full join with the required coalesced key; raw/general outer joins are rejected. `rest_left_join_left_group_key_view_materializes_unmatched_left_rows` and `rest_right_join_swaps_operands_and_materializes_unmatched_right_rows`. |
 | Self join | Default public | Two aliases of one relation, one non-primary scalar equality, global `COUNT(*)` only. `rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract`. |
 | Semi / anti join | Default public | Direct correlated `EXISTS`/`NOT EXISTS` equality over two single, non-null scalar primary keys; not general subquery support. `correlated_exists_*` and `rest_exists_and_not_exists_views_survive_restart_and_match_transitions`. |

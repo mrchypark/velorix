@@ -2869,26 +2869,23 @@ pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer(
         )));
     }
     const MAX_CHECKPOINT_RECORD_BYTES: usize = 16 * 1024 * 1024;
-    let bytes = read_object_bytes_bounded(
+    let (mut record, encoded_size) = read_checkpoint_record_bounded(
         state,
         &ObjectPath::from(pointer.checkpoint_key.clone()),
-        Some(MAX_CHECKPOINT_RECORD_BYTES as u64),
+        MAX_CHECKPOINT_RECORD_BYTES as u64,
     )
     .await?;
-    if bytes.len() > MAX_CHECKPOINT_RECORD_BYTES {
+    if encoded_size > MAX_CHECKPOINT_RECORD_BYTES as u64 {
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint exceeds the record-size budget for `{tenant_id}/{program_id}/{view_id}`"
         )));
     }
-    let actual_manifest_hash = stable_bytes_hash(&bytes);
-    if actual_manifest_hash != pointer.manifest_hash {
+    if record.manifest_hash != pointer.manifest_hash {
         return Err(ApiError::bad_request(format!(
             "standing runtime checkpoint manifest hash mismatch for `{}/{}/{}`",
             pointer.tenant_id, pointer.program_id, pointer.view_id
         )));
     }
-    let mut record = standing_runtime_checkpoint_record_from_slice(&bytes)
-        .map_err(|source| ApiError::bad_request(source.to_string()))?;
     if record.checkpoint_key.is_empty() {
         record.checkpoint_key = pointer.checkpoint_key.clone();
     }
@@ -3461,6 +3458,142 @@ pub(super) async fn read_object_bytes_bounded(
         }
     }
     read_object_bytes_bounded_uncached(state, path, max_bytes).await
+}
+
+/// Return a checkpoint record decoded by the cache validator itself. Callers
+/// that need the typed record should not validate the cached Arrow envelope,
+/// then decode and canonically re-encode the same bytes a second time.
+pub(super) enum CachedCheckpointRecordRead {
+    Miss,
+    Hit {
+        record: Box<StandingRuntimeCheckpointRecord>,
+        size: u64,
+    },
+    OverBudget {
+        size: u64,
+    },
+}
+
+pub(super) async fn read_cached_checkpoint_record(
+    state: &ApiState,
+    path: &ObjectPath,
+    max_bytes: u64,
+    canonical_validations: &mut usize,
+) -> Result<CachedCheckpointRecordRead, ApiError> {
+    let Some(cache) = &state.materialized_read_cache else {
+        return Ok(CachedCheckpointRecordRead::Miss);
+    };
+    if !path.as_ref().ends_with(".checkpoint.arrow") {
+        return Ok(CachedCheckpointRecordRead::Miss);
+    }
+    let key = checkpoint_read_cache_key(state, path)?;
+    let object_path = path.to_string();
+    let content_hash = key.content_hash.clone();
+    let decoded = std::sync::Mutex::new(None);
+    let validation_count = std::sync::atomic::AtomicUsize::new(0);
+    let validate = |bytes: &[u8]| {
+        if bytes.len() as u64 > max_bytes {
+            // Budget rejection is not corruption. Keep this immutable entry,
+            // but do not decode it or authorize/account it for this request.
+            return Ok::<(), ()>(());
+        }
+        validation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let record =
+            decode_checkpoint_cache_record(&object_path, &content_hash, bytes).map_err(|_| ())?;
+        *decoded.lock().map_err(|_| ())? = Some(record);
+        Ok::<(), ()>(())
+    };
+    let cached = cache.get(&key, validate).await;
+    *canonical_validations = validation_count.load(std::sync::atomic::Ordering::Relaxed);
+    let Some(bytes) = cached else {
+        return Ok(CachedCheckpointRecordRead::Miss);
+    };
+    let size = bytes.len() as u64;
+    if size > max_bytes {
+        return Ok(CachedCheckpointRecordRead::OverBudget { size });
+    }
+    if let Some(account) = &state.materialized_read_cache_hit_accountant {
+        account(&object_path, size)?;
+    }
+    let record = decoded
+        .into_inner()
+        .map_err(|_| ApiError::internal("checkpoint cache validation lock poisoned"))?
+        .ok_or_else(|| ApiError::internal("checkpoint cache validator returned no record"))?;
+    Ok(CachedCheckpointRecordRead::Hit {
+        record: Box::new(record),
+        size,
+    })
+}
+
+pub(super) async fn read_checkpoint_record_bounded(
+    state: &ApiState,
+    path: &ObjectPath,
+    max_bytes: u64,
+) -> Result<(StandingRuntimeCheckpointRecord, u64), ApiError> {
+    let mut canonical_validations = 0;
+    match read_cached_checkpoint_record(state, path, max_bytes, &mut canonical_validations).await? {
+        CachedCheckpointRecordRead::Hit { record, size } => return Ok((*record, size)),
+        CachedCheckpointRecordRead::OverBudget { .. } => {
+            return Err(ApiError::bad_request(
+                "native read exceeds query scan or memory byte budget",
+            ));
+        }
+        CachedCheckpointRecordRead::Miss => {}
+    }
+    read_uncached_checkpoint_record(state, path, Some(max_bytes)).await
+}
+
+/// Read and decode an uncached checkpoint once, then insert only the exact
+/// bytes whose full canonical envelope and path commitment were just checked.
+pub(super) async fn read_uncached_checkpoint_record(
+    state: &ApiState,
+    path: &ObjectPath,
+    max_bytes: Option<u64>,
+) -> Result<(StandingRuntimeCheckpointRecord, u64), ApiError> {
+    if !path.as_ref().ends_with(".checkpoint.arrow") {
+        return Err(ApiError::bad_request(
+            "checkpoint record path has an unsupported object suffix",
+        ));
+    }
+    let key = checkpoint_read_cache_key(state, path)?;
+    let bytes = read_object_bytes_bounded_uncached(state, path, max_bytes).await?;
+    let object_path = path.to_string();
+    let record = decode_checkpoint_cache_record(&object_path, &key.content_hash, &bytes)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if let Some(cache) = &state.materialized_read_cache {
+        cache
+            .insert(key, bytes.clone(), |candidate| {
+                if candidate == bytes.as_slice() {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            })
+            .map_err(|_| ApiError::internal("validated checkpoint cache insert failed"))?;
+    }
+    Ok((record, bytes.len() as u64))
+}
+
+fn decode_checkpoint_cache_record(
+    path: &str,
+    content_hash: &str,
+    bytes: &[u8],
+) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+    let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(path.to_string())
+        .map_err(ApiError::bad_request)?;
+    let record = standing_runtime_checkpoint_record_from_slice(bytes)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if record.checkpoint.identity.tenant_id != parts.tenant_id
+        || record.checkpoint.identity.program_id != parts.program_id
+        || record.view_id != parts.view_id
+        || record.checkpoint.logical_epoch != parts.logical_epoch
+        || record.checkpoint.state_root.content_hash != content_hash
+    {
+        return Err(ApiError::bad_request(
+            "checkpoint cache record does not match its immutable object key",
+        ));
+    }
+    Ok(record)
 }
 
 fn checkpoint_read_cache_key(

@@ -142,10 +142,7 @@ async fn demand_reuses_verified_publication_bytes_for_checkpoint_coverage() {
     let source_size = store.head(&source_key).await.unwrap().size;
     assert_eq!(source_reads[0].1, source_size, "source bytes delivered");
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("single_source_publication")
+    let active = tests::read_test_active_view(&state, "single_source_publication")
         .await
         .unwrap();
     let (_, artifacts) = demand_source::capture_demand_source_artifacts(&state, &active)
@@ -179,6 +176,83 @@ async fn demand_reuses_verified_publication_bytes_for_checkpoint_coverage() {
     let mut corrupted = raw.to_vec();
     corrupted[0] ^= 0xff;
     assert!(recovery::validate_demand_source_payload(artifact, corrupted.into()).is_err());
+}
+
+#[tokio::test]
+async fn demand_caches_verified_immutable_source_and_batches_fenced_progress() {
+    let (state, _router, _store, _meta, counts) = fixture().await;
+    for offset in 0..4 {
+        ingest(
+            &app(state.clone()),
+            offset,
+            json!([{"user_id":"a","score":offset,"delta":1}]),
+        )
+        .await;
+    }
+    declare(
+        &app(state.clone()),
+        "batched_demand",
+        &[("scores", "2026-05-24.v1")],
+        "SELECT user_id, score FROM scores",
+    )
+    .await;
+
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(
+        materialized_read_cache::MaterializedReadCache::open(
+            materialized_read_cache::MaterializedReadCacheConfig {
+                directory: cache_dir.path().join("cache"),
+                memory_bytes: 64 * 1024,
+                disk_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let state = state.with_materialized_read_cache(cache.clone());
+    let router = app(state.clone());
+    counts.clear();
+    let mut body = demand_body(None, 4);
+    body["materialization"]["budget"]["batch_limit"] = json!(4);
+    let response = post(&router, "/v1/views/batched_demand/query", body).await;
+    assert_eq!(response.0, StatusCode::OK, "{response:?}");
+    let mut rows = response.1["rows"].as_array().unwrap().clone();
+    rows.sort_by_key(Value::to_string);
+    assert_eq!(
+        rows,
+        (0..4)
+            .map(|score| json!({"user_id":"a","score":score}))
+            .collect::<Vec<_>>()
+    );
+    let source_gets = counts
+        .get_paths()
+        .iter()
+        .filter(|path| path.starts_with("v1/ingest-staging/"))
+        .count();
+    assert_eq!(source_gets, 4, "one GET per distinct immutable publication");
+    let active = tests::read_test_active_view(&state, "batched_demand")
+        .await
+        .unwrap();
+    let (_, artifacts) = demand_source::capture_demand_source_artifacts(&state, &active)
+        .await
+        .unwrap();
+    counts.clear();
+    for _ in 0..2 {
+        demand_source::load_demand_source_artifact(&state, artifacts.first().unwrap(), 1024 * 1024)
+            .await
+            .unwrap();
+    }
+    assert!(
+        counts
+            .get_paths()
+            .iter()
+            .all(|path| !path.starts_with("v1/ingest-staging/")),
+        "verified immutable source cache still fetched S3 objects: {:?}",
+        counts.get_paths()
+    );
+    let record = checkpoint(&state, "batched_demand").await.unwrap();
+    assert!(record.checkpoint.logical_epoch <= 2, "{record:?}");
+    cache.close().await.unwrap();
 }
 
 async fn demand(router: &Router, view: &str, scope: Option<&str>, rows: usize) -> Vec<Value> {
@@ -369,20 +443,14 @@ async fn published_page_byte_budget_commits_fitting_prefix_then_resumes() {
     )
     .await;
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("paged_bytes_consumer")
+    let active = tests::read_test_active_view(&state, "paged_bytes_consumer")
         .await
         .unwrap();
     let (previous, migration_bytes) =
         demand_materialization::migration_read_bytes_for_test(&state, &active, 16 * 1024 * 1024)
             .await
             .unwrap();
-    let producer_active = state
-        .view_registry()
-        .unwrap()
-        .read_active("paged_bytes_producer")
+    let producer_active = tests::read_test_active_view(&state, "paged_bytes_producer")
         .await
         .unwrap();
     let (_, dependency_migration_bytes) = demand_materialization::migration_read_bytes_for_test(
@@ -606,12 +674,7 @@ async fn demand_continuation_keeps_the_certified_scope() {
 }
 
 async fn checkpoint(state: &ApiState, view: &str) -> Option<StandingRuntimeCheckpointRecord> {
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active(view)
-        .await
-        .unwrap();
+    let active = tests::read_test_active_view(state, view).await.unwrap();
     read_latest_standing_runtime_checkpoint(
         state,
         active_standing_runtime_identity(&active).unwrap(),
@@ -1239,10 +1302,7 @@ async fn cancelled_demand_before_pointer_cas_retries_exactly_once() {
     tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
         .await
         .unwrap();
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("cancelled_total")
+    let active = tests::read_test_active_view(&state, "cancelled_total")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
@@ -1384,10 +1444,7 @@ async fn cancelled_demand_during_blocking_apply_retains_lock_and_retries_once() 
         "SELECT user_id, SUM(score) AS total FROM scores GROUP BY user_id",
     )
     .await;
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("cancelled_apply")
+    let active = tests::read_test_active_view(&state, "cancelled_apply")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap().clone();
@@ -1493,10 +1550,7 @@ async fn late_bounded_producer_publishes_delta_from_last_complete_output() {
         demand(&router, "totals_copy", None, 64).await,
         vec![json!({"user_id":"a","total":3})]
     );
-    let consumer = state
-        .view_registry()
-        .unwrap()
-        .read_active("totals_copy")
+    let consumer = tests::read_test_active_view(&state, "totals_copy")
         .await
         .unwrap();
     let baseline = checkpoint(&state, "totals_copy").await.unwrap();

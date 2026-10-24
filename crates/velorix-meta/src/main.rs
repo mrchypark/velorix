@@ -27,6 +27,7 @@ use velorix_meta::{
     InMemoryMetaStore, MetaGrpcService, MetaStore, MetaStoreError, OssMetaStore,
     PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
     StandingRuntimeCheckpointPointer, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
+    MAX_META_GRPC_MESSAGE_BYTES,
 };
 use velorix_storage::object_key::ObjectKey;
 
@@ -116,12 +117,20 @@ async fn serve() -> anyhow::Result<()> {
                     .identity(Identity::from_pem(cert, key))
                     .client_ca_root(Certificate::from_pem(client_ca)),
             )?
-            .add_service(VelorixMetaServer::new(service))
+            .add_service(
+                VelorixMetaServer::new(service)
+                    .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
+            )
             .serve(config.bind)
             .await?;
     } else {
         Server::builder()
-            .add_service(VelorixMetaServer::new(service))
+            .add_service(
+                VelorixMetaServer::new(service)
+                    .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
+                    .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
+            )
             .serve(config.bind)
             .await?;
     }

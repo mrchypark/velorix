@@ -71,11 +71,16 @@ impl RuntimeResourceLimits {
         &self,
         value: &T,
     ) -> Result<(), StandingProgramRuntimeError> {
+        self.measure_checkpoint_value(value).map(|_| ())
+    }
+    pub(super) fn measure_checkpoint_value<T: Serialize>(
+        &self,
+        value: &T,
+    ) -> Result<usize, StandingProgramRuntimeError> {
         velorix_core::arrow_state::ArrowState::measure_serializable(
             value,
             self.max_checkpoint_bytes,
         )
-        .map(|_| ())
         .map_err(|error| {
             if error.to_string().contains("runtime_checkpoint_bytes") {
                 limit_error("runtime_checkpoint_bytes")
@@ -83,6 +88,15 @@ impl RuntimeResourceLimits {
                 invalid_checkpoint()
             }
         })
+    }
+    pub(super) fn validate_checkpoint_size(
+        &self,
+        measured_size: usize,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        if measured_size > self.max_checkpoint_bytes {
+            return Err(limit_error("runtime_checkpoint_bytes"));
+        }
+        Ok(())
     }
     pub(super) fn charge_expansion(
         &self,

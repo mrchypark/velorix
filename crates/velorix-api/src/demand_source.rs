@@ -156,6 +156,30 @@ pub(super) async fn capture_demand_source_artifacts(
     ),
     ApiError,
 > {
+    let relations = demand_source_relation_identities(active);
+    if relations.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let config = state.relation_ingest_config.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("authoritative ingest configuration unavailable")
+    })?;
+    let meta = state
+        .meta_store
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("authoritative metadata unavailable"))?;
+    let cuts = meta
+        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
+            namespace: config.namespace.clone(),
+            relations: relations.clone(),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    demand_source_artifacts_from_cuts(config.namespace.as_str(), &relations, cuts)
+}
+
+pub(super) fn demand_source_relation_identities(
+    active: &ActiveMaterializedView,
+) -> Vec<IngestSourceRelationIdentityV1> {
     let relations = active
         .spec
         .input_relations
@@ -176,32 +200,32 @@ pub(super) async fn capture_demand_source_artifacts(
             schema_fingerprint: input.schema_fingerprint.clone(),
         })
         .collect::<Vec<_>>();
+    relations
+}
+
+pub(super) fn demand_source_artifacts_from_cuts(
+    namespace: &str,
+    relations: &[IngestSourceRelationIdentityV1],
+    cuts: Vec<RelationIngestSourceIdentityCutV1>,
+) -> Result<
+    (
+        Vec<RelationIngestSourceIdentityCutV1>,
+        Vec<DemandSourceArtifact>,
+    ),
+    ApiError,
+> {
     if relations.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let config = state.relation_ingest_config.as_ref().ok_or_else(|| {
-        ApiError::service_unavailable("authoritative ingest configuration unavailable")
-    })?;
-    let meta = state
-        .meta_store
-        .as_ref()
-        .ok_or_else(|| ApiError::service_unavailable("authoritative metadata unavailable"))?;
-    let cuts = meta
-        .capture_relation_ingest_source_cuts(CaptureRelationIngestSourceCutsRequest {
-            namespace: config.namespace.clone(),
-            relations: relations.clone(),
-        })
-        .await
-        .map_err(meta_error_to_api)?;
     if cuts.len() != relations.len() {
         return Err(ApiError::bad_request("source cut count mismatch"));
     }
     let mut seen = BTreeSet::new();
     let mut artifacts = Vec::new();
-    for cut in &cuts {
-        if !relations.contains(&cut.relation)
+    for (cut, requested_relation) in cuts.iter().zip(relations) {
+        if &cut.relation != requested_relation
             || !seen.insert(cut.relation.relation_id.clone())
-            || cut.cut.namespace != config.namespace
+            || cut.cut.namespace != namespace
             || cut.cut.relation_id != cut.relation.relation_id
             || cut.cut.schema_version != RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1
         {
@@ -261,43 +285,94 @@ pub(super) async fn load_demand_source_artifact(
     validate_artifact(artifact)?;
     let limit = max_bytes.min(MAX_ARTIFACT_BYTES);
     let path = ObjectPath::from(artifact.publication.object_key.clone());
-    // shortcut: source envelopes need publication/schema proof, not checkpoint hashes; revisit with a proof-bound source cache.
-    let head = state.store.head(&path).await.map_err(ApiError::internal)?;
-    if head.size > limit as u64 {
-        return Err(budget_error(head.size, max_bytes, "serialized_read", true));
-    }
-    let object = state.store.get(&path).await.map_err(ApiError::internal)?;
-    if object.meta.size != head.size {
-        return Err(ApiError::bad_request(
-            "source object size changed after HEAD",
-        ));
-    }
-    let mut stream = object.into_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(ApiError::internal)?;
-        let next = bytes
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| ApiError::bad_request("source read overflow"))?;
-        if next > limit || next as u64 > head.size {
+    let cache_key = state.materialized_read_cache.as_ref().and_then(|_| {
+        let config = state.relation_ingest_config.as_ref()?;
+        Some(materialized_read_cache::MaterializedReadCacheKey {
+            store_id: state.materialized_read_cache_store_id().to_owned(),
+            namespace: config.namespace.clone(),
+            tenant_id: artifact.relation.relation_id.clone(),
+            program_id: artifact.relation.relation_version.clone(),
+            output_id: format!("{}:{}", artifact.stream_id, artifact.partition_id),
+            object_path: path.to_string(),
+            content_hash: artifact.publication.object_digest.clone(),
+            codec: "velorix-ingest-envelope-v1".into(),
+            checkpoint_epoch: 0,
+            root_hash: demand_source_artifact_key(artifact).ok()?,
+        })
+    });
+    let cache = state.materialized_read_cache.as_ref();
+    let cached = match (cache, cache_key.as_ref()) {
+        (Some(cache), Some(key)) => {
+            cache
+                .get(key, |bytes| {
+                    (stable_bytes_hash(bytes) == artifact.publication.object_digest)
+                        .then_some(())
+                        .ok_or(())
+                })
+                .await
+        }
+        _ => None,
+    };
+    let (bytes, fetched) = if let Some(bytes) = cached {
+        let size = bytes.len();
+        if size > limit {
             return Err(budget_error(
-                next as u64,
+                size as u64,
                 max_bytes,
                 "serialized_read",
                 true,
             ));
         }
-        bytes.extend_from_slice(&chunk);
-    }
-    if bytes.len() as u64 != head.size {
-        return Err(ApiError::bad_request("source object length mismatch"));
-    }
-    let fetched = bytes.len();
+        (bytes, size)
+    } else {
+        let head = state.store.head(&path).await.map_err(ApiError::internal)?;
+        if head.size > limit as u64 {
+            return Err(budget_error(head.size, max_bytes, "serialized_read", true));
+        }
+        let object = state.store.get(&path).await.map_err(ApiError::internal)?;
+        if object.meta.size != head.size {
+            return Err(ApiError::bad_request(
+                "source object size changed after HEAD",
+            ));
+        }
+        let mut stream = object.into_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(ApiError::internal)?;
+            let next = bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| ApiError::bad_request("source read overflow"))?;
+            if next > limit || next as u64 > head.size {
+                return Err(budget_error(
+                    next as u64,
+                    max_bytes,
+                    "serialized_read",
+                    true,
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() as u64 != head.size {
+            return Err(ApiError::bad_request("source object length mismatch"));
+        }
+        let size = bytes.len();
+        (bytes, size)
+    };
+    let cache_bytes = bytes.clone();
     let (envelope, proof) = recovery::validate_demand_source_payload(artifact, bytes.into())?;
     let h = envelope.header();
     let batches = envelope.record_batches().map_err(ApiError::bad_request)?;
     validate_decoded_source_budget(&batches, fetched, max_bytes)?;
+    if let (Some(cache), Some(key)) = (cache, cache_key) {
+        // The envelope and digest were fully validated above; the immutable key
+        // binds every cached body to this captured publication identity.
+        cache.insert(key, cache_bytes, |bytes| {
+            (stable_bytes_hash(bytes) == artifact.publication.object_digest)
+                .then_some(())
+                .ok_or_else(|| ApiError::bad_request("cached source digest mismatch"))
+        })?;
+    }
     Ok((
         RelationInputBatch {
             encoding: RelationInputEncodingV1::SourceRelationV1,

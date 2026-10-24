@@ -47,15 +47,21 @@ use velorix_control::{
     ingest_writer_runtime::DeployedIngestWriterRuntime,
     meta_admin::{
         validate_bearer_token, AcquireStandingRuntimeOwnerOutcome,
-        AcquireStandingRuntimeOwnerRequest, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
-        BeginViewDependencyEdgeV1, CaptureIngestSourceCutRequest,
-        CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
-        CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
-        FixViewBootstrapActivationCutRequest, GrpcClientTlsConfig, GrpcMetaStore,
-        IngestRangeReservation, IngestSourceRelationIdentityV1, MetaStore, MetaStoreError,
-        PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
+        AcquireStandingRuntimeOwnerRequest, ActiveViewRecordVersionV1,
+        ActiveViewRegistryReadRequestV1, ActiveViewRegistryScopeV1, ActiveViewRegistrySnapshotV1,
+        BeginViewBootstrapOutcome, BeginViewBootstrapRequest, BeginViewDependencyEdgeV1,
+        CaptureIngestSourceCutRequest, CaptureRelationIngestSourceCutRequest,
+        CaptureRelationIngestSourceCutsRequest, CommitIngestRangeOutcome,
+        CompareExchangeActiveViewRecordOutcomeV1, CompareExchangeActiveViewRecordRequestV1,
+        CreateActiveViewRecordOutcomeV1, CreateActiveViewRecordRequestV1,
+        DemandRelationCatalogLookup, DemandStandingRuntimeCheckpointLookup,
+        FixViewBootstrapActivationCutOutcome, FixViewBootstrapActivationCutRequest,
+        GrpcClientTlsConfig, GrpcMetaStore, ImportActiveViewRegistryOutcomeV1,
+        ImportActiveViewRegistryRequestV1, IngestRangeReservation, IngestSourceRelationIdentityV1,
+        MetaStore, MetaStoreError, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+        PromoteViewBootstrapWithActiveViewRecordRequestV1, PublishIngestReservationOutcome,
         PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-        RelationIngestCapability, RelationIngestPublicationRefV1,
+        ReadDemandMetadataBatchRequest, RelationIngestCapability, RelationIngestPublicationRefV1,
         RelationIngestSourceIdentityCutV1, RelationPartitionAuthorityKey,
         ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer,
         StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
@@ -78,17 +84,17 @@ use velorix_control::{
         RelationIngestPublisher, RelationIngestPublisherConfig, RelationIngestPublisherError,
     },
     storage_admin::{
-        ActiveMaterializedView, AppendValidatedEnvelopeOutcome, AuthoritativeNamespace,
-        AuthoritativeObjectStoreCapabilitiesV1, CreateRelationCatalogOutcome, IngestBatch,
-        IngestBatchDescriptor, IngestEnvelope, IngestEnvelopeEncodeRequest, IngestEnvelopeHeader,
-        IngestLog, InvalidExecutionModeReason, MaterializedViewAdmissionStatus,
-        MaterializedViewApiMetadata, MaterializedViewDeploymentStatus,
-        MaterializedViewExecutionMode, MaterializedViewLifecycleStatus, MaterializedViewRegistry,
-        MaterializedViewRegistryError, MaterializedViewRequestFieldSpec,
-        MaterializedViewResponseColumnSpec, MaterializedViewResponseSchema,
-        MaterializedViewRuntimeBinding, ObjectKey, ObjectStoreCapabilityProfile,
-        RegisterMaterializedViewOutcome, RelationCatalogRegistry, ReplayCheckpoint,
-        StandingRuntimeCheckpointKeyParts,
+        ActiveMaterializedView, ActiveMaterializedViewRecord, AppendValidatedEnvelopeOutcome,
+        AuthoritativeNamespace, AuthoritativeObjectStoreCapabilitiesV1,
+        CreateRelationCatalogOutcome, IngestBatch, IngestBatchDescriptor, IngestEnvelope,
+        IngestEnvelopeEncodeRequest, IngestEnvelopeHeader, IngestLog, InvalidExecutionModeReason,
+        MaterializedViewAdmissionStatus, MaterializedViewApiMetadata,
+        MaterializedViewDeploymentStatus, MaterializedViewExecutionMode,
+        MaterializedViewLifecycleStatus, MaterializedViewRegistry, MaterializedViewRegistryError,
+        MaterializedViewRequestFieldSpec, MaterializedViewResponseColumnSpec,
+        MaterializedViewResponseSchema, MaterializedViewRuntimeBinding, ObjectKey,
+        ObjectStoreCapabilityProfile, RegisterMaterializedViewOutcome, RelationCatalogRegistry,
+        ReplayCheckpoint, StandingRuntimeCheckpointKeyParts,
     },
 };
 use velorix_core::{
@@ -770,6 +776,33 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
         {
             let mut columns = Vec::with_capacity(plan.projection.len());
             for projection in &plan.projection {
+                if let Some(program) = &projection.expression {
+                    use velorix_core::view_plan::RuntimeScalarTypeV1;
+                    let data_type = match program.root.result_type {
+                        RuntimeScalarTypeV1::Boolean => SqlDataType::Bool,
+                        RuntimeScalarTypeV1::Int64 => SqlDataType::Int64,
+                        RuntimeScalarTypeV1::Float64 => SqlDataType::Float64,
+                        RuntimeScalarTypeV1::Utf8 => SqlDataType::Utf8,
+                        RuntimeScalarTypeV1::Date32 => SqlDataType::Date,
+                        RuntimeScalarTypeV1::TimestampNanosecond => {
+                            SqlDataType::Timestamp { timezone: None }
+                        }
+                        RuntimeScalarTypeV1::Decimal128 { precision, scale } => {
+                            SqlDataType::Decimal {
+                                precision,
+                                scale: u8::try_from(scale).map_err(|_| {
+                                    ApiError::bad_request("typed decimal scale must be nonnegative")
+                                })?,
+                            }
+                        }
+                    };
+                    columns.push(ColumnSchema {
+                        name: projection.output_name.clone(),
+                        data_type,
+                        nullable: program.root.nullable,
+                    });
+                    continue;
+                }
                 let relation_id = if projection.side == SupportedAggregateInputRelationSide::Left {
                     &plan.left_relation_id
                 } else {
@@ -884,9 +917,9 @@ impl StandingProgramRuntimeFactory for MaterializedViewRuntimeFactory {
                 return filter_project_output_schema(view_id, outer_catalog, &plan.projection)
                     .map(|schema| Some(vec![schema]));
             }
-            if catalogs.len() == 2 {
-                return Ok(None);
-            }
+        }
+        if catalogs.len() == 2 {
+            return Ok(None);
         }
         let Some(catalog) = catalogs.first() else {
             return Ok(None);
@@ -1657,11 +1690,20 @@ impl ApiState {
         allow_legacy_rebuild: bool,
     ) -> Result<usize, ApiError> {
         self.validate_standing_runtime_fencing_or_evict().await?;
-        let active_views = self
-            .view_registry()?
-            .list_active()
-            .await
-            .map_err(materialized_view_registry_error_to_api)?;
+        if let Some(meta_store) = &self.meta_store {
+            let registry = meta_store
+                .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+                    scope: view_dependencies::active_view_registry_scope(self),
+                })
+                .await
+                .map_err(meta_error_to_api)?;
+            if !registry.imported {
+                // The service must be available for the explicit, stopped-writer
+                // import operation; do not discover or adopt S3 pointers here.
+                return Ok(0);
+            }
+        }
+        let active_views = view_dependencies::list_active_from_meta(self).await?;
         let mut restored = 0;
 
         for active in active_views {
@@ -1694,17 +1736,6 @@ impl ApiState {
                     .is_none()
                 && standing_runtime_create_requires_backfill(self, &active.spec).await?
             {
-                self.view_registry()?
-                    .update_standing_runtime_lifecycle(
-                        &active.spec.view_id,
-                        &active.spec_hash,
-                        lifecycle_for_create_view_execution(
-                            &MaterializedViewExecutionMode::StandingRuntime,
-                            true,
-                        ),
-                    )
-                    .await
-                    .map_err(materialized_view_registry_error_to_api)?;
                 continue;
             }
             // Protect the newly inserted runtime until its replay completes.
@@ -1831,6 +1862,10 @@ pub fn app(state: ApiState) -> Router {
         .route(
             "/v1/standing-runtime/ingest-epoch-failures/repair",
             post(repair_ingest_epoch_runtime_failure),
+        )
+        .route(
+            "/v1/admin/import-active-view-registry",
+            post(import_active_view_registry),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2864,11 +2899,7 @@ async fn get_standing_runtime_owners(
 async fn acquire_standing_runtime_owners(
     State(state): State<ApiState>,
 ) -> Result<Json<StandingRuntimeOwnerAcquireResponse>, ApiError> {
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active_views = view_dependencies::list_active_from_meta(&state).await?;
     let mut outcomes = Vec::new();
 
     for active in active_views {
@@ -2934,11 +2965,7 @@ async fn acquire_standing_runtime_owners(
 async fn standing_runtime_owner_report(
     state: &ApiState,
 ) -> Result<StandingRuntimeOwnerReportResponse, ApiError> {
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active_views = view_dependencies::list_active_from_meta(state).await?;
     let mut owners = Vec::new();
 
     for active in active_views {
@@ -2995,12 +3022,96 @@ async fn standing_runtime_owner_report(
     })
 }
 
-async fn list_views(State(state): State<ApiState>) -> Result<Json<ViewCatalogResponse>, ApiError> {
-    let views = state
-        .view_registry()?
-        .list_active()
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportActiveViewRegistryRequest {
+    confirm_writers_stopped: bool,
+}
+
+async fn import_active_view_registry(
+    State(state): State<ApiState>,
+    Json(request): Json<ImportActiveViewRegistryRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    if !request.confirm_writers_stopped {
+        return Err(ApiError::bad_request(
+            "active-view import requires confirm_writers_stopped=true",
+        ));
+    }
+    let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("active-view Meta registry is not configured")
+    })?;
+    let registry = state.view_registry()?;
+    let records = registry
+        .list_active_records()
         .await
-        .map_err(materialized_view_registry_error_to_api)?
+        .map_err(materialized_view_registry_error_to_api)?;
+    let mut total_spec_cache_hits = 0usize;
+    for record in &records {
+        let (_, cache_hit) = view_dependencies::load_active_view_record_with_cache_status(
+            &state,
+            &registry,
+            record.clone(),
+        )
+        .await?;
+        total_spec_cache_hits += usize::from(cache_hit);
+    }
+    let active_views = records.len();
+    let bytes = serde_json::to_vec(&ActiveViewRegistrySnapshotV1 {
+        snapshot_revision: 0,
+        imported: true,
+        records: records
+            .iter()
+            .cloned()
+            .map(|record| ActiveViewRecordVersionV1 {
+                generation: 1,
+                record,
+            })
+            .collect(),
+    })
+    .map_err(ApiError::internal)?
+    .len();
+    if bytes > view_dependencies::MAX_ACTIVE_VIEW_REGISTRY_SNAPSHOT_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "active-view import is {bytes} bytes; maximum is {}",
+            view_dependencies::MAX_ACTIVE_VIEW_REGISTRY_SNAPSHOT_BYTES
+        )));
+    }
+    let import_request = ImportActiveViewRegistryRequestV1 {
+        scope: view_dependencies::active_view_registry_scope(&state),
+        records,
+    };
+    let import_request_bytes = serde_json::to_vec(&import_request).map_err(ApiError::internal)?;
+    if import_request_bytes.len() > velorix_control::meta_admin::MAX_META_GRPC_MESSAGE_BYTES - 256 {
+        return Err(ApiError::bad_request(format!(
+            "active-view import request is {} bytes; maximum is {}",
+            import_request_bytes.len(),
+            velorix_control::meta_admin::MAX_META_GRPC_MESSAGE_BYTES - 256
+        )));
+    }
+    match meta_store
+        .import_active_view_registry(import_request)
+        .await
+        .map_err(meta_error_to_api)?
+    {
+        ImportActiveViewRegistryOutcomeV1::Imported => Ok((
+            StatusCode::CREATED,
+            Json(
+                json!({"outcome":"imported","active_views":active_views,"spec_cache_hits":total_spec_cache_hits,"snapshot_bytes":bytes}),
+            ),
+        )),
+        ImportActiveViewRegistryOutcomeV1::Duplicate => Ok((
+            StatusCode::OK,
+            Json(json!({"outcome":"duplicate","active_views":active_views})),
+        )),
+        ImportActiveViewRegistryOutcomeV1::Conflict => Err(ApiError::conflict(
+            "active-view registry changed during import; stop writers and retry",
+        )),
+    }
+}
+
+async fn list_views(State(state): State<ApiState>) -> Result<Json<ViewCatalogResponse>, ApiError> {
+    let views = view_dependencies::list_active_from_meta(&state)
+        .await?
         .iter()
         .map(|view| active_view_response(view, None))
         .collect::<Result<Vec<_>, _>>()?;
@@ -3012,11 +3123,7 @@ async fn get_view(
     State(state): State<ApiState>,
     AxumPath(view_id): AxumPath<String>,
 ) -> Result<Json<ViewResponse>, ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(&state, &view_id).await?;
 
     Ok(Json(active_view_response(&active, None)?))
 }
@@ -3025,11 +3132,7 @@ async fn get_view_backfill_status(
     State(state): State<ApiState>,
     AxumPath(view_id): AxumPath<String>,
 ) -> Result<Json<BackfillViewResponse>, ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(&state, &view_id).await?;
     let progress = committed_backfill_progress(&state, &active).await?;
     Ok(Json(backfill_view_response(
         &active,
@@ -3047,11 +3150,7 @@ async fn run_view_backfill(
     AxumPath(view_id): AxumPath<String>,
     Json(request): Json<BackfillViewRequest>,
 ) -> Result<Response, ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(&view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(&state, &view_id).await?;
     if !ingest_epoch::is_demand_managed_view(&state, &active).await? {
         if request.scope.is_some()
             || request.budget.is_some()
@@ -3180,11 +3279,7 @@ async fn compact_view_output_once(
     view_id: &str,
     mode: &str,
 ) -> Result<CompactViewResponse, ApiError> {
-    let active = state
-        .view_registry()?
-        .read_active(view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(state, view_id).await?;
     ensure_view_execution_allowed(&active)?;
     let identity = active_standing_runtime_identity(&active).ok_or_else(|| {
         ApiError::conflict(format!(
@@ -6454,6 +6549,26 @@ fn projection_expression_output_type(
     expression: &SupportedProjectionExpr,
 ) -> Result<(SqlDataType, bool), ApiError> {
     match expression {
+        SupportedProjectionExpr::Typed { program, .. } => {
+            use velorix_core::view_plan::RuntimeScalarTypeV1;
+            let ty = match program.root.result_type {
+                RuntimeScalarTypeV1::Boolean => SqlDataType::Bool,
+                RuntimeScalarTypeV1::Int64 => SqlDataType::Int64,
+                RuntimeScalarTypeV1::Float64 => SqlDataType::Float64,
+                RuntimeScalarTypeV1::Utf8 => SqlDataType::Utf8,
+                RuntimeScalarTypeV1::Date32 => SqlDataType::Date,
+                RuntimeScalarTypeV1::TimestampNanosecond => {
+                    SqlDataType::Timestamp { timezone: None }
+                }
+                RuntimeScalarTypeV1::Decimal128 { precision, scale } => SqlDataType::Decimal {
+                    precision,
+                    scale: u8::try_from(scale).map_err(|_| {
+                        ApiError::bad_request("typed decimal scale must be nonnegative")
+                    })?,
+                },
+            };
+            Ok((ty, program.root.nullable))
+        }
         SupportedProjectionExpr::Column { column_id } => {
             let column = catalog
                 .relation_schema
@@ -8372,14 +8487,22 @@ fn meta_error_to_api(error: MetaStoreError) -> ApiError {
         | MetaStoreError::PartitionCheckpointScopeMismatch
         | MetaStoreError::PartitionAuthorityTokenScopeMismatch
         | MetaStoreError::DuplicateSourceCutRelation { .. }
+        | MetaStoreError::DuplicateDemandMetadataLookup { .. }
+        | MetaStoreError::DemandMetadataBatchTooLarge { .. }
         | MetaStoreError::OverlappingSourceCutRange { .. }
+        | MetaStoreError::ActiveViewRecordIdentityMismatch
+        | MetaStoreError::DuplicateActiveViewId { .. }
         | MetaStoreError::UnsupportedRelationGeneration { .. }
         | MetaStoreError::UnexpectedOutcome(_) => ApiError::bad_request(error),
+        MetaStoreError::SnapshotTooLarge | MetaStoreError::ActiveViewRegistryTooLarge => {
+            ApiError::payload_too_large(error)
+        }
         MetaStoreError::RelationCatalogConflict { .. }
         | MetaStoreError::NonMonotonicCheckpointEpoch { .. }
         | MetaStoreError::AuthorityEpochOverflow
         | MetaStoreError::StandingRuntimeOwnerMismatch
-        | MetaStoreError::PartitionAuthorityInvalidToken => ApiError::conflict(error),
+        | MetaStoreError::PartitionAuthorityInvalidToken
+        | MetaStoreError::DuplicateActiveViewApiPath { .. } => ApiError::conflict(error),
         MetaStoreError::UnsupportedCapability(_)
         | MetaStoreError::IncompleteRelationSourceCut { .. } => {
             ApiError::service_unavailable(error)

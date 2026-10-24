@@ -9,6 +9,7 @@
 //! because the frame is bounded).
 
 use super::*;
+use velorix_core::delta::encode_kv_ordered;
 
 pub struct AnalyticWindowFrameRuntime {
     identity: StandingProgramIdentity,
@@ -678,6 +679,7 @@ type OrderedPartition = BTreeMap<String, OrderedWindowRow>;
 #[derive(Clone)]
 pub struct OrderedWindowRuntime {
     limits: RuntimeResourceLimits,
+    suppress_apply_snapshot: bool,
     identity: StandingProgramIdentity,
     catalog: VelorixRelationCatalogV1,
     input_schema: RelationSchema,
@@ -793,6 +795,7 @@ impl OrderedWindowRuntime {
             logical_plan,
             partitions: BTreeMap::new(),
             limits: RuntimeResourceLimits::default(),
+            suppress_apply_snapshot: false,
             key_partitions: BTreeMap::new(),
             partition_outputs: BTreeMap::new(),
             published_output: DeltaBatch::default(),
@@ -1186,6 +1189,109 @@ impl OrderedWindowRuntime {
             output,
         )?)
     }
+
+    fn snapshot_budget_page(
+        &self,
+        page: &SnapshotPageRequest,
+    ) -> Result<SnapshotPageRequest, StandingProgramRuntimeError> {
+        let Some(token) = page.page_token.as_deref() else {
+            return Ok(page.clone());
+        };
+        let offset = if self.plan.schema_version >= 2 {
+            let (epoch, offset): (u64, usize) =
+                serde_json::from_str(token).map_err(|_| invalid_runtime_state())?;
+            if epoch != self.logical_epoch {
+                return Err(invalid_runtime_state());
+            }
+            offset
+        } else if let Some(token) = token.strip_prefix("velorix-bag:") {
+            let (schema, epoch, offset): (String, u64, usize) =
+                serde_json::from_str(token).map_err(|_| invalid_runtime_state())?;
+            if schema != self.output_schema.schema_fingerprint || epoch != self.logical_epoch {
+                return Err(invalid_runtime_state());
+            }
+            offset
+        } else {
+            // Schema-v1 pages use the last emitted key as their continuation token.
+            // Translate it to the offset form consumed by validate_page, using the
+            // same key ordering as materialized_generic_delta_page_batch.
+            let key: Value = serde_json::from_str(token).map_err(|_| invalid_runtime_state())?;
+            let encoded = encode_kv_ordered(&key, &Value::Null);
+            self.published_output
+                .net_rows()
+                .map_err(|_| invalid_runtime_state())?
+                .partition_point(|row| {
+                    encode_kv_ordered(row.key.as_json(), &Value::Null) <= encoded
+                })
+        };
+        let page_token = serde_json::to_string(&(self.logical_epoch, offset))
+            .map_err(|_| invalid_runtime_state())?;
+        Ok(SnapshotPageRequest {
+            committed_epoch: page.committed_epoch,
+            page_token: Some(page_token),
+            max_rows: page.max_rows,
+        })
+    }
+
+    fn validate_output_types_in_chunks(
+        &self,
+        output: &DeltaBatch,
+    ) -> Result<(), StandingProgramRuntimeError> {
+        const VALIDATION_CHUNK_ROWS: usize = 256;
+        if output.records().is_empty() {
+            if self.plan.schema_version >= 2 {
+                super::output::materialized_bag_delta_page_batch(
+                    &self.output_schema,
+                    output,
+                    self.logical_epoch,
+                    SnapshotPageRequest::default(),
+                )
+                .map_err(|_| invalid_checkpoint())?;
+            } else {
+                materialized_generic_delta_to_record_batch(&self.key_first_schema()?, output)
+                    .map_err(|_| invalid_checkpoint())?;
+            }
+            return Ok(());
+        }
+        for rows in output.records().chunks(VALIDATION_CHUNK_ROWS) {
+            if self.plan.schema_version >= 2 {
+                // Bag-mode checkpoints store multiplicity in each canonical
+                // record's weight. Type validation needs one representative
+                // row per record; expanding multiplicities here would make
+                // restore validation proportional to logical bag size.
+                let records = rows
+                    .iter()
+                    .map(|row| {
+                        if row.weight <= 0 || (self.plan.schema_version != 3 && row.weight != 1) {
+                            return Err(invalid_checkpoint());
+                        }
+                        let mut representative = row.clone();
+                        representative.weight = 1;
+                        Ok(representative)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let chunk = DeltaBatch::from_records(records);
+                // Keep restore's schema/type check bounded without applying
+                // the page byte budget or expanding bag multiplicities.
+                super::output::materialized_bag_delta_page_batch(
+                    &self.output_schema,
+                    &chunk,
+                    self.logical_epoch,
+                    SnapshotPageRequest {
+                        page_token: None,
+                        max_rows: Some(rows.len()),
+                        committed_epoch: None,
+                    },
+                )
+                .map_err(|_| invalid_checkpoint())?;
+            } else {
+                let chunk = DeltaBatch::from_records(rows.to_vec());
+                materialized_generic_delta_to_record_batch(&self.key_first_schema()?, &chunk)
+                    .map_err(|_| invalid_checkpoint())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl StandingProgramRuntime for OrderedWindowRuntime {
@@ -1208,6 +1314,7 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
         idempotency_key: EpochIdempotencyKey,
         input_changes: Vec<RelationInputBatch>,
     ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        let include_snapshot = !self.suppress_apply_snapshot;
         let idempotency = idempotency_key.as_str().to_string();
         if let Some(applied) = self.applied_epochs.get(&idempotency) {
             if *applied != logical_epoch {
@@ -1223,11 +1330,15 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
                 input_frontiers: self.input_frontiers.clone(),
                 input_event_time_frontiers: self.input_event_time_frontiers.clone(),
                 output_deltas: Vec::new(),
-                output_batches: vec![ViewOutputBatch {
-                    view_id: self.identity.view_ids[0].clone(),
-                    schema_fingerprint: self.output_schema.schema_fingerprint.clone(),
-                    batches: vec![self.output_batch(&self.published_output)?],
-                }],
+                output_batches: if include_snapshot {
+                    vec![ViewOutputBatch {
+                        view_id: self.identity.view_ids[0].clone(),
+                        schema_fingerprint: self.output_schema.schema_fingerprint.clone(),
+                        batches: vec![self.output_batch(&self.published_output)?],
+                    }]
+                } else {
+                    Vec::new()
+                },
             });
         }
         if logical_epoch <= self.logical_epoch {
@@ -1342,7 +1453,9 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
                 .net_rows()
                 .map_err(|_| invalid_runtime_state())?,
         );
-        let output_batch = self.output_batch(&next_output)?;
+        let output_batch = include_snapshot
+            .then(|| self.output_batch(&next_output))
+            .transpose()?;
         let mut output_keys = BTreeSet::new();
         for row in next_output.records() {
             if self.plan.schema_version != 3
@@ -1390,12 +1503,29 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
                 schema_fingerprint: self.output_schema.schema_fingerprint.clone(),
                 delta,
             }],
-            output_batches: vec![ViewOutputBatch {
-                view_id: self.identity.view_ids[0].clone(),
-                schema_fingerprint: self.output_schema.schema_fingerprint.clone(),
-                batches: vec![output_batch],
-            }],
+            output_batches: output_batch
+                .map(|batch| {
+                    vec![ViewOutputBatch {
+                        view_id: self.identity.view_ids[0].clone(),
+                        schema_fingerprint: self.output_schema.schema_fingerprint.clone(),
+                        batches: vec![batch],
+                    }]
+                })
+                .unwrap_or_default(),
         })
+    }
+
+    fn apply_changes_delta_only(
+        &mut self,
+        logical_epoch: LogicalEpoch,
+        idempotency_key: EpochIdempotencyKey,
+        input_changes: Vec<RelationInputBatch>,
+    ) -> Result<EpochCommit, StandingProgramRuntimeError> {
+        let previous = self.suppress_apply_snapshot;
+        self.suppress_apply_snapshot = true;
+        let result = self.apply_changes(logical_epoch, idempotency_key, input_changes);
+        self.suppress_apply_snapshot = previous;
+        result
     }
 
     fn materialized_view_page(
@@ -1412,8 +1542,11 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
             });
         }
         let (batch, next_page_token) = if self.plan.schema_version >= 2 {
-            self.limits
-                .validate_page(&self.published_output, self.logical_epoch, &page)?;
+            self.limits.validate_page(
+                &self.published_output,
+                self.logical_epoch,
+                &self.snapshot_budget_page(&page)?,
+            )?;
             super::output::materialized_bag_delta_page_batch(
                 &self.output_schema,
                 &self.published_output,
@@ -1424,7 +1557,7 @@ impl StandingProgramRuntime for OrderedWindowRuntime {
             self.limits.validate_page(
                 &self.published_output,
                 self.logical_epoch,
-                &SnapshotPageRequest::default(),
+                &self.snapshot_budget_page(&page)?,
             )?;
             materialized_generic_delta_page_batch(
                 &self.key_first_schema()?,
@@ -1591,7 +1724,7 @@ impl OrderedWindowRuntime {
         {
             return Err(invalid_checkpoint());
         }
-        runtime.output_batch(&expected)?;
+        runtime.validate_output_types_in_chunks(&expected)?;
         let mut keys = BTreeSet::new();
         for row in expected.records() {
             if runtime.plan.schema_version != 3 && !keys.insert(canonical_json(row.key.as_json())) {

@@ -87,6 +87,14 @@ impl RhizaKvSnapshot {
     pub fn new(kv: super::rhiza_kv::RhizaKvStore) -> Self {
         Self { kv }
     }
+    #[cfg(test)]
+    pub(crate) fn get_calls(&self) -> usize {
+        self.kv.get_calls()
+    }
+    #[cfg(test)]
+    pub(crate) fn reset_get_calls(&self) {
+        self.kv.reset_get_calls();
+    }
     /// The current root token, read with exactly one KV get.
     pub async fn root(&self) -> Result<Option<RootToken>, SnapshotError> {
         Ok(self.kv.get(ROOT_KEY).await?.map(RootToken))
@@ -94,7 +102,14 @@ impl RhizaKvSnapshot {
     pub async fn load(&self) -> Result<Option<(RootToken, Vec<u8>)>, SnapshotError> {
         let root = self.kv.get(ROOT_KEY).await?;
         let Some(root) = root else { return Ok(None) };
-        let manifest = parse_manifest(&root)?;
+        self.load_at(RootToken(root)).await.map(Some)
+    }
+    /// Load pages for a root already read linearly by the caller.
+    pub(crate) async fn load_at(
+        &self,
+        root: RootToken,
+    ) -> Result<(RootToken, Vec<u8>), SnapshotError> {
+        let manifest = parse_manifest(&root.0)?;
         if manifest.schema_version != 1 || manifest.len > MAX_SNAPSHOT_BYTES {
             return Err(SnapshotError::Invalid("manifest bounds/version".into()));
         }
@@ -127,7 +142,7 @@ impl RhizaKvSnapshot {
                 "snapshot length or digest mismatch".into(),
             ));
         }
-        Ok(Some((RootToken(root), bytes)))
+        Ok((root, bytes))
     }
     pub async fn compare_exchange(
         &self,
@@ -158,19 +173,21 @@ impl RhizaKvSnapshot {
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>();
-                self.kv
+                let inserted = self
+                    .kv
                     .put_if_absent(
                         page_request_id,
                         format!("velorix/snapshot/page/{hash}"),
                         chunk.to_vec(),
                     )
                     .await?;
-                if self
-                    .kv
-                    .get(format!("velorix/snapshot/page/{hash}"))
-                    .await?
-                    .as_deref()
-                    != Some(chunk)
+                if !inserted
+                    && self
+                        .kv
+                        .get(format!("velorix/snapshot/page/{hash}"))
+                        .await?
+                        .as_deref()
+                        != Some(chunk)
                 {
                     return Err(SnapshotError::Invalid("immutable page mismatch".into()));
                 }
@@ -284,9 +301,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let snapshot = RhizaKvSnapshot::new(kv);
+        let snapshot = RhizaKvSnapshot::new(kv.clone());
         assert_eq!(snapshot.root().await.unwrap(), None);
         let bytes = b"snapshot".to_vec();
+        kv.reset_get_calls();
         let CompareExchange::Applied(root) = snapshot
             .compare_exchange(None, bytes.clone(), "root-test")
             .await
@@ -294,7 +312,45 @@ mod tests {
         else {
             panic!("first publish must apply");
         };
+        assert_eq!(
+            kv.get_calls(),
+            0,
+            "a successful page insert needs no readback"
+        );
         assert_eq!(snapshot.root().await.unwrap(), Some(root.clone()));
         assert_eq!(snapshot.load().await.unwrap(), Some((root, bytes)));
+    }
+
+    #[tokio::test]
+    async fn existing_unpublished_page_is_verified_before_root_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        let kv = crate::rhiza_kv::RhizaKvStore::open_config(
+            rhizadb::Config::new(directory.path())
+                .node_id("snapshot-orphan")
+                .local(),
+        )
+        .await
+        .unwrap();
+        let snapshot = RhizaKvSnapshot::new(kv.clone());
+        let bytes = b"orphan page".to_vec();
+        let hash = digest(&bytes);
+        assert!(kv
+            .put_if_absent(
+                "orphan-page",
+                format!("velorix/snapshot/page/{hash}"),
+                bytes.clone(),
+            )
+            .await
+            .unwrap());
+
+        kv.reset_get_calls();
+        assert!(matches!(
+            snapshot
+                .compare_exchange(None, bytes, "publish-orphan")
+                .await
+                .unwrap(),
+            CompareExchange::Applied(_)
+        ));
+        assert_eq!(kv.get_calls(), 1, "an existing page must be verified");
     }
 }

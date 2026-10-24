@@ -1,6 +1,7 @@
 use super::*;
 use axum::http::Method;
 use tower::ServiceExt;
+use velorix_control::meta_admin::InMemoryMetaStore;
 use velorix_core::relation::*;
 
 async fn post(router: &Router, path: &str, body: Value, expected: StatusCode) -> Value {
@@ -76,12 +77,7 @@ async fn checkpoint(
     state: &ApiState,
     view: &str,
 ) -> (ActiveMaterializedView, StandingRuntimeCheckpointRecord) {
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active(view)
-        .await
-        .unwrap();
+    let active = tests::read_test_active_view(state, view).await.unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
     let record = read_latest_standing_runtime_checkpoint(state, identity, view)
         .await
@@ -118,16 +114,239 @@ fn rows(join: bool, left: i64, right: &[i64]) -> Vec<Value> {
     }
 }
 
+#[tokio::test]
+async fn active_view_read_snapshot_reuses_validated_records_and_refreshes_per_operation() {
+    let counts = crate::tests::ObjectStoreAccessCounts::default();
+    let store: Arc<dyn ObjectStore> = Arc::new(crate::tests::CountingObjectStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        counts.clone(),
+    ));
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(
+        materialized_read_cache::MaterializedReadCache::open(
+            materialized_read_cache::MaterializedReadCacheConfig {
+                directory: cache_dir.path().to_owned(),
+                memory_bytes: 1024 * 1024,
+                disk_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let state = crate::tests::test_api_state_with_store(store, "snapshot-owner", false).await;
+    let meta_store = Arc::new(InMemoryMetaStore::default());
+    let state = state.with_meta_store(meta_store.clone());
+    meta_store
+        .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+            scope: view_dependencies::active_view_registry_scope(&state),
+            records: vec![],
+        })
+        .await
+        .unwrap();
+    let router = app(state.clone());
+    post(
+        &router,
+        "/v1/relations",
+        json!({"catalog":catalog("snapshot_source")}),
+        StatusCode::CREATED,
+    )
+    .await;
+    post(
+        &router,
+        "/v1/views",
+        json!({
+            "view_id":"snapshot_view",
+            "input_relation_id":"snapshot_source",
+            "input_relation_version":"v1",
+            "sql":"SELECT item, reading FROM snapshot_source WHERE reading IS NOT NULL",
+            "response_formats":["json"]
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    post(
+        &router,
+        "/v1/relations",
+        json!({"catalog":catalog("unrelated_source")}),
+        StatusCode::CREATED,
+    )
+    .await;
+    post(
+        &router,
+        "/v1/views",
+        json!({
+            "view_id":"unrelated_view",
+            "input_relation_id":"unrelated_source",
+            "input_relation_version":"v1",
+            "sql":"SELECT item, reading FROM unrelated_source WHERE reading IS NOT NULL",
+            "response_formats":["json"]
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let state = state.with_materialized_read_cache(cache.clone());
+
+    counts.clear();
+    let first = ActiveViewReadSnapshot::load(&state).await.unwrap();
+    for _ in 0..3 {
+        view_dependency_edges_from_snapshot(first.views()).unwrap();
+    }
+    assert!(counts.list_prefixes().is_empty());
+    let paths = counts.get_paths();
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with("active.json"))
+            .count(),
+        0,
+        "mutable active pointers are served by one Meta snapshot"
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.contains("spec-sha256"))
+            .count(),
+        2
+    );
+
+    let active = first.views().first().unwrap();
+    view_dependencies::update_active_view_lifecycle_admin(
+        &state,
+        "snapshot_view",
+        &active.spec_hash,
+        MaterializedViewLifecycleStatus::standing_runtime_deploying(None),
+    )
+    .await
+    .unwrap();
+    counts.clear();
+    let second = ActiveViewReadSnapshot::load(&state).await.unwrap();
+    assert_eq!(
+        second.views()[0].lifecycle.deployment_status,
+        MaterializedViewDeploymentStatus::Deploying
+    );
+    assert!(counts.list_prefixes().is_empty());
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.ends_with("active.json"))
+            .count(),
+        0,
+        "next operation sees the external Meta update without an S3 pointer read"
+    );
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.contains("spec-sha256"))
+            .count(),
+        0,
+        "a second operation must reuse only the immutable spec bytes"
+    );
+    let error = demand_materialization::demand_root_from_snapshot(active, &second).unwrap_err();
+    assert!(error.message.contains("changed after it was read"));
+
+    let registry = state.view_registry().unwrap();
+    let record = second.records.get("snapshot_view").unwrap().record.clone();
+    let key =
+        active_view_spec_cache_key(&state, &registry, &record.view_id, &record.spec_hash).unwrap();
+    let mut other_authority = key.clone();
+    other_authority.store_id.push_str("-other");
+    let mut other_namespace = key.clone();
+    other_namespace.namespace.push_str("-other");
+    assert!(cache
+        .get(&other_authority, |_| Ok::<(), ()>(()))
+        .await
+        .is_none());
+    assert!(cache
+        .get(&other_namespace, |_| Ok::<(), ()>(()))
+        .await
+        .is_none());
+    // A corrupt cache entry is discarded and refetched from the authoritative
+    // immutable object; it can never be returned as a spec.
+    cache
+        .insert(key, b"corrupt cached spec".to_vec(), |_| Ok::<(), ()>(()))
+        .unwrap();
+    counts.clear();
+    let recovered = ActiveViewReadSnapshot::load(&state).await.unwrap();
+    assert_eq!(recovered.views()[0].spec.view_id, "snapshot_view");
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.contains("spec-sha256"))
+            .count(),
+        1,
+        "corrupt cached bytes must miss and reload the verified spec"
+    );
+
+    counts.clear();
+    let closure = ActiveViewReadSnapshot::load_demand_closure(&state, "snapshot_view")
+        .await
+        .unwrap();
+    assert_eq!(closure.views().len(), 1);
+    assert_eq!(closure.views()[0].spec.view_id, "snapshot_view");
+    assert!(counts.list_prefixes().is_empty());
+    assert!(counts
+        .get_paths()
+        .iter()
+        .all(|path| !path.ends_with("active.json")));
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.contains("spec-sha256"))
+            .count(),
+        0
+    );
+
+    // Query entry points take a new Meta snapshot while resolving unchanged
+    // immutable specs through the validated Foyer cache.
+    counts.clear();
+    let queried = view_dependencies::read_active_cached(&state, "snapshot_view")
+        .await
+        .unwrap();
+    assert_eq!(
+        queried.lifecycle.deployment_status,
+        MaterializedViewDeploymentStatus::Deploying
+    );
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.ends_with("active.json"))
+            .count(),
+        0,
+        "every request refreshes mutable records from Meta, not S3"
+    );
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.contains("spec-sha256"))
+            .count(),
+        0,
+        "an unchanged immutable spec should reuse the validated cache"
+    );
+    cache.close().await.unwrap();
+}
+
 async fn two_producer_dag(join: bool) {
+    // Keep ordinary DAG recovery work comfortably inside the owner lease even
+    // when this integration test runs beside the full API suite. Expiry and
+    // takeover remain covered below after the router and old state are dropped.
+    const OWNER_TTL_MS: u64 = 5_000;
     let failing_store = Arc::new(crate::tests::ArmedPrefixFailingObjectStore::new(Arc::new(
         object_store::memory::InMemory::new(),
     )));
     let store: Arc<dyn ObjectStore> = failing_store.clone();
     let meta = Arc::new(velorix_control::meta_admin::InMemoryMetaStore::default());
-    let state = crate::tests::test_api_state_with_store(store.clone(), "dag-owner-a", false)
-        .await
-        .with_meta_store(meta.clone())
-        .with_standing_runtime_owner_ttl_ms(1_000);
+    let state = crate::tests::with_initialized_active_view_meta_store(
+        crate::tests::test_api_state_with_store(store.clone(), "dag-owner-a", false).await,
+        meta.clone(),
+    )
+    .await
+    .with_standing_runtime_owner_ttl_ms(OWNER_TTL_MS);
     let router = app(state.clone());
     for (source, producer) in [
         ("left_source", "left_stage"),
@@ -369,13 +588,35 @@ async fn two_producer_dag(join: bool) {
     )
     .await;
     assert_eq!(lag["details"]["code"], "MATERIALIZATION_LAG");
+    let combined_identity = active_standing_runtime_identity(&active).unwrap().clone();
     drop(router);
     drop(state);
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    let restarted = crate::tests::test_api_state_with_store(store, "dag-owner-b", true)
-        .await
-        .with_meta_store(meta)
-        .with_standing_runtime_owner_ttl_ms(1_000);
+    let expiry_wait = std::time::Duration::from_millis(OWNER_TTL_MS + OWNER_TTL_MS / 3 + 1_000);
+    tokio::time::timeout(expiry_wait, async {
+        loop {
+            if meta
+                .read_standing_runtime_owner(
+                    &combined_identity.tenant_id,
+                    &combined_identity.program_id,
+                    "combined",
+                )
+                .await
+                .expect("read previous owner while waiting for expiry")
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("previous owner must expire after its renewal worker stops");
+    let restarted = crate::tests::with_initialized_active_view_meta_store(
+        crate::tests::test_api_state_with_store(store, "dag-owner-b", true).await,
+        meta,
+    )
+    .await
+    .with_standing_runtime_owner_ttl_ms(OWNER_TTL_MS);
     assert_eq!(
         restarted
             .restore_standing_program_runtimes_from_active_views()

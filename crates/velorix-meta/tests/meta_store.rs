@@ -1,35 +1,470 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 use velorix_core::relation::SchemaFingerprintV1;
 use velorix_core::standing_program::{
-    RuntimeCheckpointInputCoverageV1, RuntimeCheckpointPartitionCoverageV1,
-    RuntimeCheckpointRelationCoverageV1, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
+    BuiltinRuntimeIdentity, NativeCodePolicy, RuntimeCheckpointInputCoverageV1,
+    RuntimeCheckpointPartitionCoverageV1, RuntimeCheckpointRelationCoverageV1,
+    StandingProgramIdentity, RUNTIME_CHECKPOINT_INPUT_COVERAGE_SCHEMA_VERSION_V1,
 };
 use velorix_meta::{
     AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
-    BeginViewBootstrapOutcome, BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
+    ActiveViewRegistryReadRequestV1, ActiveViewRegistryScopeV1, BeginViewBootstrapOutcome,
+    BeginViewBootstrapRequest, CaptureIngestSourceCutRequest,
     CaptureRelationIngestSourceCutRequest, CaptureRelationIngestSourceCutsRequest,
-    CommitIngestRangeOutcome, FixViewBootstrapActivationCutOutcome,
-    FixViewBootstrapActivationCutRequest, InMemoryMetaStore, IngestRangeReservation,
+    CommitIngestRangeOutcome, CompareExchangeActiveViewRecordOutcomeV1,
+    CompareExchangeActiveViewRecordRequestV1, CreateActiveViewRecordOutcomeV1,
+    CreateActiveViewRecordRequestV1, FixViewBootstrapActivationCutOutcome,
+    FixViewBootstrapActivationCutRequest, ImportActiveViewRegistryOutcomeV1,
+    ImportActiveViewRegistryRequestV1, InMemoryMetaStore, IngestRangeReservation,
     IngestSourceCutV1, IngestSourceRelationIdentityV1, MetaStore, MetaStoreCapabilities,
-    OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken, PartitionCheckpointPointer,
-    PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest, PublishIngestReservationOutcome,
-    PublishIngestReservationRequest, PublishPartitionCheckpointPointerOutcome,
-    PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
-    PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-    RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
-    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
-    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
-    StandingRuntimeOwnerToken, StoreRelationCatalogOutcome, ViewBootstrapLifecycleV1,
+    MetaStoreError, OssMetaStore, PartitionAuthorityKey, PartitionAuthorityToken,
+    PartitionCheckpointPointer, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
+    PublishIngestReservationOutcome, PublishIngestReservationRequest,
+    PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
+    PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
+    PublishStandingRuntimeCheckpointRequest, RelationPartitionAuthorityKey,
+    RelationPartitionAuthorityToken, ReserveAuthoritativeIngestRangeRequest,
+    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
+    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
+    ViewBootstrapLifecycleV1, MAX_META_GRPC_MESSAGE_BYTES,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK,
     STANDING_RUNTIME_BACKEND_TIME_SOURCE_UNAVAILABLE,
 };
+use velorix_storage::materialized_view_registry::{
+    ActiveMaterializedViewRecord, MaterializedViewApiMetadata, MaterializedViewExecutionMode,
+    MaterializedViewLifecycleStatus, MaterializedViewRuntimeBinding,
+};
 
 mod common;
+
+fn active_record(view_id: &str, spec_hash: &str) -> ActiveMaterializedViewRecord {
+    ActiveMaterializedViewRecord {
+        schema_version: 3,
+        view_id: view_id.to_string(),
+        spec_hash: spec_hash.to_string(),
+        execution_mode: None,
+        api: None,
+        artifact: None,
+        runtime: None,
+        lifecycle: None,
+    }
+}
+
+fn active_record_with_api_path(
+    view_id: &str,
+    spec_hash: &str,
+    url_path: &str,
+) -> ActiveMaterializedViewRecord {
+    let mut record = active_record(view_id, spec_hash);
+    record.api = Some(MaterializedViewApiMetadata {
+        url_path: Some(url_path.to_string()),
+        ..MaterializedViewApiMetadata::default()
+    });
+    record
+}
+
+fn active_scope(namespace: &str) -> ActiveViewRegistryScopeV1 {
+    ActiveViewRegistryScopeV1 {
+        authority_store_id: "store-a".to_string(),
+        namespace: namespace.to_string(),
+    }
+}
+
+fn active_runtime_record(view_id: &str) -> ActiveMaterializedViewRecord {
+    ActiveMaterializedViewRecord {
+        schema_version: 3,
+        view_id: view_id.to_string(),
+        spec_hash: "sha256:runtime-spec".to_string(),
+        execution_mode: Some(MaterializedViewExecutionMode::StandingRuntime),
+        api: None,
+        artifact: None,
+        runtime: Some(MaterializedViewRuntimeBinding {
+            runtime_kind: "materialized_view_runtime".to_string(),
+            runtime_version: "v1".to_string(),
+            standing_program_identity: StandingProgramIdentity {
+                tenant_id: "default".to_string(),
+                program_id: view_id.to_string(),
+                view_ids: vec![view_id.to_string()],
+                sql_hash: "sql".to_string(),
+                input_catalog_hash: "input".to_string(),
+                output_schema_hash: "output".to_string(),
+                planner_identity: "planner".to_string(),
+                builtin_runtime_identities: vec![BuiltinRuntimeIdentity {
+                    name: "materialized_view_runtime".to_string(),
+                    version: "v1".to_string(),
+                }],
+                runtime_capabilities: vec![],
+                runtime_compatibility: "v1".to_string(),
+                checkpoint_codec_identity: "v1".to_string(),
+                native_code_policy: NativeCodePolicy::DisabledNoExternalDependencies,
+            },
+            logical_plan: None,
+            published_relations: vec![],
+            input_bindings: vec![],
+        }),
+        lifecycle: Some(MaterializedViewLifecycleStatus::standing_runtime_deploying(
+            None,
+        )),
+    }
+}
+
+#[tokio::test]
+async fn active_view_registry_snapshot_is_scoped_and_cas_refreshes_next_read() {
+    let store = InMemoryMetaStore::default();
+    let scope = active_scope("tenant-space");
+    let first = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!first.imported);
+    assert!(first.records.is_empty());
+
+    let created = store
+        .create_active_view_record(CreateActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            record: active_record("view-a", "sha256:one"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(created, CreateActiveViewRecordOutcomeV1::Created(v) if v.generation == 1));
+
+    let stale = store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            view_id: "view-a".to_string(),
+            expected_generation: 9,
+            record: active_record("view-a", "sha256:two"),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale, CompareExchangeActiveViewRecordOutcomeV1::Conflict);
+
+    let updated = store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            view_id: "view-a".to_string(),
+            expected_generation: 1,
+            record: active_record("view-a", "sha256:two"),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(updated, CompareExchangeActiveViewRecordOutcomeV1::Updated(v) if v.generation == 2)
+    );
+
+    let next = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(next.imported);
+    assert_eq!(next.records.len(), 1);
+    assert_eq!(next.records[0].generation, 2);
+    assert_eq!(next.records[0].record.spec_hash, "sha256:two");
+    let other_scope = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: active_scope("other-space"),
+        })
+        .await
+        .unwrap();
+    assert!(!other_scope.imported);
+    assert!(other_scope.records.is_empty());
+}
+
+#[tokio::test]
+async fn active_view_api_path_uniqueness_is_atomic_for_create_cas_and_import() {
+    let store = Arc::new(InMemoryMetaStore::default());
+    let scope = active_scope("api-paths");
+    let create = |view_id: &'static str, path: &'static str| {
+        let store = Arc::clone(&store);
+        let scope = scope.clone();
+        async move {
+            store
+                .create_active_view_record(CreateActiveViewRecordRequestV1 {
+                    scope,
+                    record: active_record_with_api_path(view_id, "sha256:spec", path),
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let (first, second) = tokio::join!(
+        create("view-a", "/reports/current/"),
+        create("view-b", "reports/current"),
+    );
+    assert!(matches!(
+        (&first, &second),
+        (
+            CreateActiveViewRecordOutcomeV1::Created(_),
+            CreateActiveViewRecordOutcomeV1::Conflict
+        ) | (
+            CreateActiveViewRecordOutcomeV1::Conflict,
+            CreateActiveViewRecordOutcomeV1::Created(_)
+        )
+    ));
+
+    let winner = match (&first, &second) {
+        (CreateActiveViewRecordOutcomeV1::Created(versioned), _) => {
+            versioned.record.view_id.clone()
+        }
+        (_, CreateActiveViewRecordOutcomeV1::Created(versioned)) => {
+            versioned.record.view_id.clone()
+        }
+        _ => unreachable!("one concurrent path claim must be created"),
+    };
+    let self_path = store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            view_id: winner.clone(),
+            expected_generation: 1,
+            record: active_record_with_api_path(&winner, "sha256:self-update", "/reports/current"),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        self_path,
+        CompareExchangeActiveViewRecordOutcomeV1::Updated(versioned)
+            if versioned.generation == 2
+    ));
+    let other_view = if winner == "view-a" {
+        "view-b"
+    } else {
+        "view-a"
+    };
+    let other_path = store
+        .create_active_view_record(CreateActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            record: active_record_with_api_path(other_view, "sha256:other", "/reports/next"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        other_path,
+        CreateActiveViewRecordOutcomeV1::Created(_)
+    ));
+
+    let moved = store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            view_id: other_view.to_string(),
+            expected_generation: 1,
+            record: active_record_with_api_path(other_view, "sha256:other", "/reports/current"),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved, CompareExchangeActiveViewRecordOutcomeV1::Conflict);
+    let after_move = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap();
+    let unchanged = after_move
+        .records
+        .iter()
+        .find(|versioned| versioned.record.view_id == other_view)
+        .unwrap();
+    assert_eq!(unchanged.generation, 1);
+    assert_eq!(
+        unchanged.record.api.as_ref().unwrap().url_path.as_deref(),
+        Some("/reports/next")
+    );
+
+    let import_store = InMemoryMetaStore::default();
+    let import_scope = active_scope("duplicate-import-path");
+    let import = import_store
+        .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+            scope: import_scope.clone(),
+            records: vec![
+                active_record_with_api_path("view-a", "sha256:a", "/same/path"),
+                active_record_with_api_path("view-b", "sha256:b", "same/path/"),
+            ],
+        })
+        .await;
+    assert!(matches!(
+        import,
+        Err(MetaStoreError::DuplicateActiveViewApiPath { normalized_url_path })
+            if normalized_url_path == "same/path"
+    ));
+    let after_import = import_store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: import_scope,
+        })
+        .await
+        .unwrap();
+    assert!(!after_import.imported);
+    assert!(after_import.records.is_empty());
+}
+
+#[tokio::test]
+async fn active_view_registry_import_is_atomic_idempotent_and_conflict_checked() {
+    let store = InMemoryMetaStore::default();
+    let scope = active_scope("tenant-space");
+    let invalid = store
+        .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+            scope: scope.clone(),
+            records: vec![
+                active_record("view-a", "sha256:one"),
+                active_record("view-a", "sha256:duplicate"),
+            ],
+        })
+        .await;
+    assert!(invalid.is_err());
+    let before = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 {
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!before.imported);
+    assert!(before.records.is_empty());
+
+    let records = vec![
+        active_record("view-a", "sha256:one"),
+        active_record("view-b", "sha256:two"),
+    ];
+    assert_eq!(
+        store
+            .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+                scope: scope.clone(),
+                records: records.clone(),
+            })
+            .await
+            .unwrap(),
+        ImportActiveViewRegistryOutcomeV1::Imported
+    );
+    assert_eq!(
+        store
+            .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+                scope: scope.clone(),
+                records: records.clone(),
+            })
+            .await
+            .unwrap(),
+        ImportActiveViewRegistryOutcomeV1::Duplicate
+    );
+    assert_eq!(
+        store
+            .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+                scope: scope.clone(),
+                records: vec![active_record("view-a", "sha256:changed")],
+            })
+            .await
+            .unwrap(),
+        ImportActiveViewRegistryOutcomeV1::Conflict
+    );
+    let after = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 { scope })
+        .await
+        .unwrap();
+    assert!(after.imported);
+    assert_eq!(after.records.len(), 2);
+    assert_eq!(after.records[0].generation, 1);
+}
+
+#[tokio::test]
+async fn oversized_active_registry_import_leaves_scope_uninitialized() {
+    let store = InMemoryMetaStore::default();
+    let scope = active_scope("oversized-space");
+    let oversized_record =
+        active_record("oversized-view", &"x".repeat(MAX_META_GRPC_MESSAGE_BYTES));
+
+    let result = store
+        .import_active_view_registry(ImportActiveViewRegistryRequestV1 {
+            scope: scope.clone(),
+            records: vec![oversized_record],
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "unreadable snapshots must not be committed"
+    );
+
+    let snapshot = store
+        .read_active_view_registry_snapshot(ActiveViewRegistryReadRequestV1 { scope })
+        .await
+        .unwrap();
+    assert!(!snapshot.imported);
+    assert!(snapshot.records.is_empty());
+}
+
+#[tokio::test]
+async fn active_runtime_lifecycle_cas_requires_current_owner_fence() {
+    let store = InMemoryMetaStore::default();
+    let scope = active_scope("tenant-space");
+    let record = active_runtime_record("view-a");
+    store
+        .create_active_view_record(CreateActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            record: record.clone(),
+        })
+        .await
+        .unwrap();
+    let owner = match store
+        .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "default".to_string(),
+            program_id: "view-a".to_string(),
+            view_id: "view-a".to_string(),
+            owner_id: "owner-expiring".to_string(),
+            ttl_ms: 1,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim)
+        | AcquireStandingRuntimeOwnerOutcome::Renewed(claim) => StandingRuntimeOwnerToken {
+            tenant_id: claim.tenant_id,
+            program_id: claim.program_id,
+            view_id: claim.view_id,
+            owner_id: claim.owner_id,
+            owner_epoch: claim.owner_epoch,
+        },
+        AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
+            panic!("unexpected owner conflict: {claim:?}")
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut changed = record;
+    changed.lifecycle = Some(MaterializedViewLifecycleStatus::standing_runtime());
+    let stale = store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            view_id: "view-a".to_string(),
+            expected_generation: 1,
+            record: changed.clone(),
+            owner: Some(owner),
+        })
+        .await;
+    assert!(matches!(
+        stale,
+        Err(velorix_meta::MetaStoreError::StandingRuntimeOwnerMismatch)
+    ));
+    let fresh_owner = acquire_owner_for_scope(&store, "view-a", "view-a", "owner-current").await;
+    let fresh = store
+        .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+            scope: scope.clone(),
+            view_id: "view-a".to_string(),
+            expected_generation: 1,
+            record: changed,
+            owner: Some(fresh_owner),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(fresh, CompareExchangeActiveViewRecordOutcomeV1::Updated(v) if v.generation == 2)
+    );
+}
 
 #[tokio::test]
 async fn meta_store_capabilities_mark_in_memory_and_oss_as_not_production_multi_writer_safe() {

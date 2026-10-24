@@ -384,8 +384,9 @@ pub(super) async fn ingest_epoch(
                 .await,
         );
     }
+    let view_snapshot = ActiveViewReadSnapshot::load(&state).await?;
     let (locked_view_ids, _correction_guards) =
-        preflight_correction_ingest(&state, &prepared_batches).await?;
+        preflight_correction_ingest(&state, &prepared_batches, &view_snapshot).await?;
     let epoch_manifest = persist_ingest_epoch_manifest(&state, &prepared_batches).await?;
     timer.mark("epoch_manifest");
 
@@ -398,16 +399,11 @@ pub(super) async fn ingest_epoch(
         let mut publication_outcomes = Vec::with_capacity(prepared_batches.len());
         for prepared in &prepared_batches {
             let mut known_retry = false;
-            for active in state
-                .view_registry()?
-                .list_active()
-                .await
-                .map_err(materialized_view_registry_error_to_api)?
-            {
+            for active in view_snapshot.views() {
                 if !locked_view_ids.contains(&active.spec.view_id) {
                     continue;
                 }
-                if let Some(identity) = active_standing_runtime_identity(&active) {
+                if let Some(identity) = active_standing_runtime_identity(active) {
                     known_retry |= read_ingest_epoch_view_convergence(
                         &state,
                         &epoch_manifest,
@@ -440,8 +436,13 @@ pub(super) async fn ingest_epoch(
             publication_outcomes.push(publication.outcome);
         }
         timer.mark("authoritative_publish");
-        ensure_no_ingest_epoch_view_runtime_failures(&state, &epoch_manifest, &prepared_batches)
-            .await?;
+        ensure_no_ingest_epoch_view_runtime_failures_with_snapshot(
+            &state,
+            &epoch_manifest,
+            &prepared_batches,
+            &view_snapshot,
+        )
+        .await?;
         let mut ensured_ingest_relations = BTreeSet::new();
         let mut runtime_pins = Vec::new();
         for prepared in &prepared_batches {
@@ -450,8 +451,14 @@ pub(super) async fn ingest_epoch(
                 prepared.request.relation_version.as_str(),
             );
             if ensured_ingest_relations.insert(key) {
-                runtime_pins
-                    .extend(ensure_standing_runtimes_for_ingest(&state, &prepared.request).await?);
+                runtime_pins.extend(
+                    ensure_standing_runtimes_for_ingest_with_snapshot(
+                        &state,
+                        &prepared.request,
+                        &view_snapshot,
+                    )
+                    .await?,
+                );
             }
         }
         timer.mark("ensure_runtime");
@@ -462,7 +469,12 @@ pub(super) async fn ingest_epoch(
                 prepared.request.relation_version.as_str(),
             );
             if preacquired_ingest_relations.insert(key) {
-                preacquire_standing_runtime_owners_for_ingest(&state, &prepared.request).await?;
+                preacquire_standing_runtime_owners_for_ingest_with_snapshot(
+                    &state,
+                    &prepared.request,
+                    &view_snapshot,
+                )
+                .await?;
             }
         }
         timer.mark("preacquire_owner");
@@ -473,15 +485,11 @@ pub(super) async fn ingest_epoch(
             ack_mode,
             &mut timer,
             &locked_view_ids,
+            &view_snapshot,
         )
         .await?;
-        drain_published_view_dependencies(&state).await?;
-        for active in state
-            .view_registry()?
-            .list_active()
-            .await
-            .map_err(materialized_view_registry_error_to_api)?
-        {
+        drain_published_view_dependencies_from_snapshot(&state, &view_snapshot).await?;
+        for active in view_snapshot.views() {
             // Ingest reconciles active graphs only. Historical baselines,
             // including durable partial published-input checkpoints, are
             // activated by explicit backfill after coverage is complete.
@@ -489,7 +497,7 @@ pub(super) async fn ingest_epoch(
             if !view_query_availability(&active.lifecycle) {
                 continue;
             }
-            if let Some(identity) = active_standing_runtime_identity(&active) {
+            if let Some(identity) = active_standing_runtime_identity(active) {
                 activate_authoritative_view_bootstrap(&state, identity, &active.spec.view_id)
                     .await?;
             }
@@ -553,8 +561,13 @@ pub(super) async fn ingest_epoch(
         ));
     }
 
-    ensure_no_ingest_epoch_view_runtime_failures(&state, &epoch_manifest, &prepared_batches)
-        .await?;
+    ensure_no_ingest_epoch_view_runtime_failures_with_snapshot(
+        &state,
+        &epoch_manifest,
+        &prepared_batches,
+        &view_snapshot,
+    )
+    .await?;
     let mut ensured_ingest_relations = BTreeSet::new();
     let mut runtime_pins = Vec::new();
     for prepared in &prepared_batches {
@@ -563,8 +576,14 @@ pub(super) async fn ingest_epoch(
             prepared.request.relation_version.as_str(),
         );
         if ensured_ingest_relations.insert(key) {
-            runtime_pins
-                .extend(ensure_standing_runtimes_for_ingest(&state, &prepared.request).await?);
+            runtime_pins.extend(
+                ensure_standing_runtimes_for_ingest_with_snapshot(
+                    &state,
+                    &prepared.request,
+                    &view_snapshot,
+                )
+                .await?,
+            );
         }
     }
     timer.mark("ensure_runtime");
@@ -575,7 +594,12 @@ pub(super) async fn ingest_epoch(
             prepared.request.relation_version.as_str(),
         );
         if preacquired_ingest_relations.insert(key) {
-            preacquire_standing_runtime_owners_for_ingest(&state, &prepared.request).await?;
+            preacquire_standing_runtime_owners_for_ingest_with_snapshot(
+                &state,
+                &prepared.request,
+                &view_snapshot,
+            )
+            .await?;
         }
     }
     timer.mark("preacquire_owner");
@@ -609,8 +633,59 @@ pub(super) async fn ingest_epoch(
         ack_mode,
         &mut timer,
         &locked_view_ids,
+        &view_snapshot,
     )
     .await?;
+
+    // Meta-backed active views need the same dependency drain and fenced
+    // bootstrap promotion as the authoritative-ingest branch. The legacy
+    // append path still materializes the committed epoch, but previously
+    // returned before reconciling its authoritative bootstrap control.
+    if state.meta_store.is_some() {
+        drain_published_view_dependencies_from_snapshot(&state, &view_snapshot).await?;
+        for active in view_snapshot.views() {
+            if !view_query_availability(&active.lifecycle) {
+                continue;
+            }
+            if !prepared_batches
+                .iter()
+                .any(|prepared| view_uses_prepared_ingest_batch(active, prepared))
+            {
+                continue;
+            }
+            let Some(identity) = active_standing_runtime_identity(active) else {
+                continue;
+            };
+            let meta_store = state.meta_store.as_ref().ok_or_else(|| {
+                ApiError::internal("Meta store disappeared during bootstrap reconciliation")
+            })?;
+            let control = meta_store
+                .read_view_bootstrap(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    &active.spec.view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?;
+            if control.as_ref().is_some_and(|control| {
+                control.lifecycle == ViewBootstrapLifecycleV1::Active
+                    && control.active_checkpoint.is_some()
+            }) {
+                // The committed active checkpoint is already the readiness
+                // proof. Do not rescan legacy ingest manifests or repeat the
+                // owner-fenced promotion on every subsequent ingest.
+                continue;
+            }
+            if committed_backfill_progress(&state, active)
+                .await?
+                .remaining_batches
+                != 0
+            {
+                continue;
+            }
+            activate_authoritative_view_bootstrap(&state, identity, &active.spec.view_id).await?;
+        }
+    }
 
     let (status, outcome) = if appended > 0 {
         (StatusCode::CREATED, "appended")
@@ -792,6 +867,7 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
     ack_mode: IngestAckMode,
     timer: &mut IngestTimer,
     locked_view_ids: &BTreeSet<String>,
+    view_snapshot: &ActiveViewReadSnapshot,
 ) -> Result<IngestMaterializationResponse, ApiError> {
     match ack_mode {
         IngestAckMode::Materialized => {
@@ -801,13 +877,14 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
                 &prepared_batches,
                 Some(timer),
                 locked_view_ids,
+                view_snapshot,
             )
             .await?;
             timer.mark("materialize");
             // Producer checkpoints are durable now; pull every pending
             // producer commit into dependent consumer views before the
             // materialized acknowledgement returns.
-            drain_published_view_dependencies(state).await?;
+            drain_published_view_dependencies_from_snapshot(state, view_snapshot).await?;
             timer.mark("materialize_view_dependencies");
             Ok(materialization_response("completed", summary))
         }
@@ -849,11 +926,7 @@ pub(super) async fn repair_ingest_epoch_runtime_failure(
     if repair_reason.is_empty() {
         return Err(ApiError::bad_request("repair_reason must not be empty"));
     }
-    let active = state
-        .view_registry()?
-        .read_active(&request.view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(&state, &request.view_id).await?;
     let identity = active_standing_runtime_identity(&active).ok_or_else(|| {
         ApiError::bad_request(format!(
             "view `{}` is not backed by a standing runtime identity",
@@ -1822,12 +1895,9 @@ pub(super) async fn is_demand_managed_view(
 async fn preflight_correction_ingest(
     state: &ApiState,
     prepared_batches: &[PreparedIngestBatch],
+    view_snapshot: &ActiveViewReadSnapshot,
 ) -> Result<(BTreeSet<String>, Vec<tokio::sync::OwnedMutexGuard<()>>), ApiError> {
-    let mut active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let mut active_views = view_snapshot.views().to_vec();
     active_views.retain(|active| {
         (standing_runtime_can_accept_incremental_ingest(active) || view_has_backfill_required_lag(active))
             && prepared_batches.iter().any(|prepared| view_uses_prepared_ingest_batch(active, prepared))
@@ -1849,8 +1919,20 @@ async fn preflight_correction_ingest(
     }
     let mut runtime_pins = Vec::new();
     for prepared in prepared_batches {
-        runtime_pins.extend(ensure_standing_runtimes_for_ingest(state, &prepared.request).await?);
-        preacquire_standing_runtime_owners_for_ingest(state, &prepared.request).await?;
+        runtime_pins.extend(
+            ensure_standing_runtimes_for_ingest_with_snapshot(
+                state,
+                &prepared.request,
+                view_snapshot,
+            )
+            .await?,
+        );
+        preacquire_standing_runtime_owners_for_ingest_with_snapshot(
+            state,
+            &prepared.request,
+            view_snapshot,
+        )
+        .await?;
     }
     active_views.sort_by(|left, right| {
         let left =
@@ -1909,17 +1991,23 @@ async fn preflight_correction_ingest(
     Ok((locked_view_ids, guards))
 }
 
+#[cfg(test)]
 pub(super) async fn ensure_standing_runtimes_for_ingest(
     state: &ApiState,
     request: &IngestRowsRequest,
 ) -> Result<Vec<SharedStandingRuntime>, ApiError> {
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let snapshot = ActiveViewReadSnapshot::load(state).await?;
+    ensure_standing_runtimes_for_ingest_with_snapshot(state, request, &snapshot).await
+}
+
+async fn ensure_standing_runtimes_for_ingest_with_snapshot(
+    state: &ApiState,
+    request: &IngestRowsRequest,
+    snapshot: &ActiveViewReadSnapshot,
+) -> Result<Vec<SharedStandingRuntime>, ApiError> {
+    let active_views = snapshot.views();
     let mut runtime_pins = Vec::new();
-    for active in &active_views {
+    for active in active_views {
         if !standing_runtime_can_accept_incremental_ingest(active)
             || is_demand_managed_view(state, active).await?
         {
@@ -1962,25 +2050,21 @@ pub(super) async fn ensure_standing_runtimes_for_ingest(
     Ok(runtime_pins)
 }
 
-pub(super) async fn preacquire_standing_runtime_owners_for_ingest(
+async fn preacquire_standing_runtime_owners_for_ingest_with_snapshot(
     state: &ApiState,
     request: &IngestRowsRequest,
+    snapshot: &ActiveViewReadSnapshot,
 ) -> Result<(), ApiError> {
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    for active in active_views {
-        if !standing_runtime_can_accept_incremental_ingest(&active)
-            || is_demand_managed_view(state, &active).await?
+    for active in snapshot.views() {
+        if !standing_runtime_can_accept_incremental_ingest(active)
+            || is_demand_managed_view(state, active).await?
         {
             continue;
         }
-        let Some(identity) = active_standing_runtime_identity(&active) else {
+        let Some(identity) = active_standing_runtime_identity(active) else {
             continue;
         };
-        if !view_uses_ingest_relation(&active, request) {
+        if !view_uses_ingest_relation(active, request) {
             continue;
         }
         state
@@ -1991,28 +2075,24 @@ pub(super) async fn preacquire_standing_runtime_owners_for_ingest(
     Ok(())
 }
 
-pub(super) async fn ensure_no_ingest_epoch_view_runtime_failures(
+async fn ensure_no_ingest_epoch_view_runtime_failures_with_snapshot(
     state: &ApiState,
     epoch_manifest: &PersistedIngestEpochManifest,
     prepared_batches: &[PreparedIngestBatch],
+    snapshot: &ActiveViewReadSnapshot,
 ) -> Result<(), ApiError> {
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
-    for active in active_views {
-        if !standing_runtime_can_accept_incremental_ingest(&active)
-            || is_demand_managed_view(state, &active).await?
+    for active in snapshot.views() {
+        if !standing_runtime_can_accept_incremental_ingest(active)
+            || is_demand_managed_view(state, active).await?
         {
             continue;
         }
-        let Some(identity) = active_standing_runtime_identity(&active) else {
+        let Some(identity) = active_standing_runtime_identity(active) else {
             continue;
         };
         if !prepared_batches
             .iter()
-            .any(|prepared| view_uses_prepared_ingest_batch(&active, prepared))
+            .any(|prepared| view_uses_prepared_ingest_batch(active, prepared))
         {
             continue;
         }
@@ -2046,43 +2126,61 @@ pub(super) async fn apply_standing_runtime_ingest_epoch(
     prepared_batches: &[PreparedIngestBatch],
     timer: Option<&mut IngestTimer>,
     locked_view_ids: &BTreeSet<String>,
+    view_snapshot: &ActiveViewReadSnapshot,
 ) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
-    apply_standing_runtime_prepared_ingests(
+    apply_standing_runtime_prepared_ingests_with_snapshot(
         state,
         Some(epoch_manifest),
         prepared_batches,
         timer,
         locked_view_ids,
+        view_snapshot,
     )
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn apply_standing_runtime_prepared_ingests(
+    state: &ApiState,
+    epoch_manifest: Option<&PersistedIngestEpochManifest>,
+    prepared_batches: &[PreparedIngestBatch],
+    timer: Option<&mut IngestTimer>,
+    locked_view_ids: &BTreeSet<String>,
+) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
+    let snapshot = ActiveViewReadSnapshot::load(state).await?;
+    apply_standing_runtime_prepared_ingests_with_snapshot(
+        state,
+        epoch_manifest,
+        prepared_batches,
+        timer,
+        locked_view_ids,
+        &snapshot,
+    )
+    .await
+}
+
+async fn apply_standing_runtime_prepared_ingests_with_snapshot(
     state: &ApiState,
     epoch_manifest: Option<&PersistedIngestEpochManifest>,
     prepared_batches: &[PreparedIngestBatch],
     mut timer: Option<&mut IngestTimer>,
     locked_view_ids: &BTreeSet<String>,
+    snapshot: &ActiveViewReadSnapshot,
 ) -> Result<PreparedStandingRuntimeApplySummary, ApiError> {
     state.validate_standing_runtime_fencing_or_evict().await?;
-    let active_views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
     let mut summary = PreparedStandingRuntimeApplySummary::default();
-    for active in active_views {
-        if !standing_runtime_can_accept_incremental_ingest(&active)
-            || is_demand_managed_view(state, &active).await?
+    for active in snapshot.views() {
+        if !standing_runtime_can_accept_incremental_ingest(active)
+            || is_demand_managed_view(state, active).await?
         {
             continue;
         }
-        let Some(identity) = active_standing_runtime_identity(&active) else {
+        let Some(identity) = active_standing_runtime_identity(active) else {
             continue;
         };
         let matching_prepared_batches = prepared_batches
             .iter()
-            .filter(|prepared| view_uses_prepared_ingest_batch(&active, prepared))
+            .filter(|prepared| view_uses_prepared_ingest_batch(active, prepared))
             .collect::<Vec<_>>();
         if matching_prepared_batches.is_empty() {
             continue;
@@ -2131,19 +2229,19 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
         };
         // A query may have established sparse demand state while ingestion
         // waited for this lock. Recheck before any eager replay or mutation.
-        if is_demand_managed_view(state, &active).await? {
+        if is_demand_managed_view(state, active).await? {
             continue;
         }
         // Deferred materialization can outlive the request's runtime pins.
         // Reload and catch up under the operation lock before checking coverage.
         let Some((runtime, replay)) =
-            restore_standing_runtime_resident_locked(state, &active).await?
+            restore_standing_runtime_resident_locked(state, active).await?
         else {
             continue;
         };
         if let Some(replay) = replay {
             if let Err(error) =
-                replay_committed_ingest_into_standing_runtime_locked(state, &active, &replay).await
+                replay_committed_ingest_into_standing_runtime_locked(state, active, &replay).await
             {
                 remove_standing_runtime(state, identity, &active.spec.view_id)?;
                 return Err(error);
@@ -2248,7 +2346,7 @@ pub(super) async fn apply_standing_runtime_prepared_ingests(
                 owner,
             )
             .with_event_time_state(apply_result.staged_event_time_state.clone())
-            .with_published_relation(published_relation_binding_for_active_view(&active)?),
+            .with_published_relation(published_relation_binding_for_active_view(active)?),
             timer.as_deref_mut(),
         )
         .await

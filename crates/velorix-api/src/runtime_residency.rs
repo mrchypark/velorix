@@ -220,10 +220,7 @@ mod tests {
         state: &ApiState,
         view: &str,
     ) -> (ActiveMaterializedView, SharedStandingRuntime) {
-        let active = state
-            .view_registry()
-            .unwrap()
-            .read_active(view)
+        let active = crate::tests::read_test_active_view(state, view)
             .await
             .unwrap();
         let identity = active_standing_runtime_identity(&active).unwrap();

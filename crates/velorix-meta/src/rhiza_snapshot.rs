@@ -141,10 +141,35 @@ fn decode_bounded(
             envelope.schema_version,
         ));
     }
-    let state = serde_json::from_value(envelope.state)
+    let had_active_view_registries = envelope
+        .state
+        .as_object()
+        .is_some_and(|state| state.contains_key("active_view_registries"));
+    let state: InMemoryMetaState = serde_json::from_value(envelope.state)
         .map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
-    let canonical = encode(&state)?;
-    if canonical != bytes {
+    // Older Arrow snapshots predate the active-view registry field. Accept
+    // only that specific omission by normalizing it to the serde default
+    // before applying the usual canonical-byte check.
+    let mut canonical_state = serde_json::to_value(&state)
+        .map_err(|error| SnapshotCodecError::Invalid(error.to_string()))?;
+    if !had_active_view_registries {
+        let Some(object) = canonical_state.as_object_mut() else {
+            return Err(SnapshotCodecError::Invalid(
+                "snapshot state is not an object".into(),
+            ));
+        };
+        object.remove("active_view_registries");
+    }
+    let canonical_envelope = Envelope {
+        schema_version: envelope.schema_version,
+        state: canonicalize(canonical_state),
+    };
+    let canonical = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+        &canonical_envelope,
+        MAX_SNAPSHOT_EXPANDED_BYTES,
+    )
+    .map_err(|e| SnapshotCodecError::Invalid(e.to_string()))?;
+    if canonical.as_bytes() != bytes {
         return Err(SnapshotCodecError::Invalid(
             "snapshot is not canonical or contains duplicate/unknown fields".into(),
         ));
@@ -280,6 +305,26 @@ mod tests {
         .is_ok());
         assert!(!bytes.starts_with(b"{"));
         assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn older_arrow_snapshot_without_active_registry_defaults_empty() {
+        let mut legacy_state = serde_json::to_value(InMemoryMetaState::default()).unwrap();
+        legacy_state
+            .as_object_mut()
+            .unwrap()
+            .remove("active_view_registries");
+        let legacy_snapshot = velorix_core::arrow_state::ArrowState::from_serializable_bounded(
+            &Envelope {
+                schema_version: SNAPSHOT_SCHEMA_VERSION,
+                state: canonicalize(legacy_state),
+            },
+            MAX_SNAPSHOT_EXPANDED_BYTES,
+        )
+        .unwrap();
+
+        let decoded = decode(legacy_snapshot.as_bytes()).unwrap();
+        assert!(decoded.active_view_registries.is_empty());
     }
 
     #[test]

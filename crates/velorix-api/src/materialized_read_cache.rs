@@ -1,11 +1,12 @@
 //! Disposable cache for immutable objects selected by fresh authoritative metadata.
 //! Callers validate codec hashes, root bindings and identities on every returned payload.
 
+use std::sync::Arc;
 use std::{fs::File, future::Future, path::PathBuf};
 
 use anyhow::{ensure, Context};
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
+    BlockEngineConfig, Cache, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy, PsyncIoEngineConfig, RecoverMode,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,20 @@ pub struct MaterializedReadCacheKey {
     pub codec: String,
     pub checkpoint_epoch: u64,
     pub root_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DecodedOutputPageKey {
+    source: MaterializedReadCacheKey,
+    schema_fingerprint: String,
+}
+
+impl DecodedOutputPageKey {
+    fn weight(&self) -> usize {
+        self.source
+            .weight()
+            .saturating_add(self.schema_fingerprint.capacity())
+    }
 }
 
 impl MaterializedReadCacheKey {
@@ -68,6 +83,10 @@ impl MaterializedReadCacheConfig {
 
 pub struct MaterializedReadCache {
     cache: HybridCache<MaterializedReadCacheKey, Vec<u8>>,
+    decoded_output_pages: Option<
+        Cache<DecodedOutputPageKey, Arc<super::materialized_output_pages::DecodedOutputPage>>,
+    >,
+    decoded_output_page_capacity_bytes: usize,
     // Foyer owns a directory of writable blocks; concurrent processes cannot share it.
     _directory_lock: File,
 }
@@ -95,10 +114,25 @@ impl MaterializedReadCache {
         let device = FsDeviceBuilder::new(&config.directory)
             .with_capacity(config.disk_bytes)
             .build()?;
+        // Decoded pages are disposable and memory-only; reserve their share
+        // from the configured cache budget rather than adding another pool.
+        let decoded_page_memory = config.memory_bytes / 4;
+        let page_cache_memory = config.memory_bytes - decoded_page_memory;
+        let decoded_output_pages: Option<
+            Cache<DecodedOutputPageKey, Arc<super::materialized_output_pages::DecodedOutputPage>>,
+        > = (decoded_page_memory > 0).then(|| {
+            Cache::builder(decoded_page_memory)
+                .with_name("velorix-materialized-decoded-page")
+                    .with_shards(4)
+                .with_weighter(|key: &DecodedOutputPageKey, page: &Arc<super::materialized_output_pages::DecodedOutputPage>| {
+                    key.weight().saturating_add(page.cache_weight_bytes())
+                    })
+                    .build()
+        });
         let cache = HybridCacheBuilder::new()
             .with_name("velorix-materialized-read")
             .with_policy(HybridCachePolicy::WriteOnInsertion)
-            .memory(config.memory_bytes)
+            .memory(page_cache_memory)
             .with_shards(4)
             .with_weighter(|key: &MaterializedReadCacheKey, bytes: &Vec<u8>| {
                 key.weight()
@@ -119,8 +153,63 @@ impl MaterializedReadCache {
             .await?;
         Ok(Self {
             cache,
+            decoded_output_pages,
+            decoded_output_page_capacity_bytes: decoded_page_memory,
             _directory_lock: directory_lock,
         })
+    }
+
+    /// Read only previously validated decoded source pages from bounded memory.
+    pub(crate) fn decoded_output_page(
+        &self,
+        source: &MaterializedReadCacheKey,
+        schema_fingerprint: &str,
+    ) -> Option<Arc<super::materialized_output_pages::DecodedOutputPage>> {
+        let key = DecodedOutputPageKey {
+            source: source.clone(),
+            schema_fingerprint: schema_fingerprint.to_owned(),
+        };
+        self.decoded_output_pages
+            .as_ref()?
+            .get(&key)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Insert only after the source page hash, schema, and row bindings validate.
+    pub(crate) fn cache_decoded_output_page(
+        &self,
+        source: &MaterializedReadCacheKey,
+        schema_fingerprint: &str,
+        page: Arc<super::materialized_output_pages::DecodedOutputPage>,
+    ) {
+        let Some(cache) = &self.decoded_output_pages else {
+            return;
+        };
+        cache.insert(
+            DecodedOutputPageKey {
+                source: source.clone(),
+                schema_fingerprint: schema_fingerprint.to_owned(),
+            },
+            page,
+        );
+    }
+
+    pub(crate) fn decoded_output_page_capacity_bytes(&self) -> usize {
+        self.decoded_output_page_capacity_bytes
+    }
+
+    pub(crate) fn decoded_output_page_weight_bytes(
+        &self,
+        source: &MaterializedReadCacheKey,
+        schema_fingerprint: &str,
+        page: &super::materialized_output_pages::DecodedOutputPage,
+    ) -> usize {
+        DecodedOutputPageKey {
+            source: source.clone(),
+            schema_fingerprint: schema_fingerprint.to_owned(),
+        }
+        .weight()
+        .saturating_add(page.cache_weight_bytes())
     }
 
     /// Invalid disk entries and cache I/O errors are misses, never authoritative errors.
@@ -259,6 +348,27 @@ mod tests {
             }
             assert!(cache.get(&other, validate).await.is_none(), "field {field}");
         }
+        let total_limit = 64 * 1024;
+        assert!(cache.cache.memory().usage() <= total_limit * 3 / 4);
+        assert!(cache.decoded_output_pages.as_ref().unwrap().usage() <= total_limit / 4);
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn decoded_page_capacity_scales_with_configured_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.memory_bytes = 128 * 1024 * 1024;
+        let total_limit = cfg.memory_bytes;
+        let cache = MaterializedReadCache::open(cfg).await.unwrap();
+
+        assert_eq!(cache.decoded_output_page_capacity_bytes(), total_limit / 4);
+        assert!(cache.decoded_output_page_capacity_bytes() > 16 * 1024 * 1024);
+        let decoded_usage = cache.decoded_output_pages.as_ref().unwrap().usage();
+        let raw_usage = cache.cache.memory().usage();
+        assert!(decoded_usage <= total_limit / 4);
+        assert!(raw_usage <= total_limit * 3 / 4);
+        assert!(decoded_usage.saturating_add(raw_usage) <= total_limit);
         cache.close().await.unwrap();
     }
 

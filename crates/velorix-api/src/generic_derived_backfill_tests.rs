@@ -71,10 +71,7 @@ async fn query_rows(router: &Router, view: &str) -> Vec<Value> {
 
 async fn assert_pending(state: &ApiState) {
     // A query performs work; inspect durable progress without advancing it.
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("derived_copy")
+    let active = tests::read_test_active_view(state, "derived_copy")
         .await
         .unwrap();
     let record = read_latest_standing_runtime_checkpoint_header(
@@ -181,10 +178,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
         StatusCode::OK,
     )
     .await;
-    let paged = state
-        .view_registry()
-        .unwrap()
-        .read_active("derived_paged")
+    let paged = tests::read_test_active_view(&state, "derived_paged")
         .await
         .unwrap();
     assert!(
@@ -249,10 +243,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
         "declaration fetched output pages: {:?}",
         counts.get_paths()
     );
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("derived_copy")
+    let active = tests::read_test_active_view(&state, "derived_copy")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
@@ -265,16 +256,14 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
     );
     // Simulate an interrupted older generic declaration: registration was
     // Running, but automatic bootstrap never published a checkpoint.
-    state
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            "derived_copy",
-            &active.spec_hash,
-            MaterializedViewLifecycleStatus::standing_runtime(),
-        )
-        .await
-        .unwrap();
+    tests::update_test_active_view_lifecycle(
+        &state,
+        "derived_copy",
+        &active.spec_hash,
+        MaterializedViewLifecycleStatus::standing_runtime(),
+    )
+    .await
+    .unwrap();
     counts.clear();
     let duplicate = post(
         &router,
@@ -287,10 +276,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
     .await;
     assert_eq!(duplicate["outcome"], "duplicate");
     assert_eq!(duplicate["query_enabled"], false);
-    let retried = state
-        .view_registry()
-        .unwrap()
-        .read_active("derived_copy")
+    let retried = tests::read_test_active_view(&state, "derived_copy")
         .await
         .unwrap();
     assert_eq!(retried.spec_hash, active.spec_hash);
@@ -306,6 +292,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
         !path.starts_with("v1/standing-runtime-output-pages/")
             && !path.starts_with("v1/standing-runtime-state-payloads/")
             && !path.starts_with("v1/standing-runtime-output-deltas/")
+            && !path.ends_with("/active.json")
     }));
     assert_pending(&state).await;
 
@@ -449,13 +436,7 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
     )
     .await;
     // Materialize the producer explicitly; authoritative ingest only records source rows.
-    post(
-        &router,
-        "/v1/views/derived_paged/backfill",
-        json!({"batch_limit":10}),
-        StatusCode::OK,
-    )
-    .await;
+    finish_backfill(&router, "derived_paged").await;
     assert_pending(&state).await;
     let runtime_owner = state.owner_id.clone();
     drop(router);
@@ -597,10 +578,7 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
         "SELECT user_id, score FROM baseline_source",
     )
     .await;
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("baseline_copy")
+    let active = tests::read_test_active_view(&state, "baseline_copy")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
@@ -674,16 +652,14 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
     )
     .await
     .unwrap();
-    state
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            "baseline_copy",
-            &active.spec_hash,
-            MaterializedViewLifecycleStatus::standing_runtime(),
-        )
-        .await
-        .unwrap();
+    tests::update_test_active_view_lifecycle(
+        &state,
+        "baseline_copy",
+        &active.spec_hash,
+        MaterializedViewLifecycleStatus::standing_runtime(),
+    )
+    .await
+    .unwrap();
     let before = read_latest_standing_runtime_checkpoint(&state, identity, "baseline_copy")
         .await
         .unwrap()
@@ -716,19 +692,14 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
     }
     // Advance the producer while the old baseline remains fixed. Restore the
     // old Running registry shape before exercising the backfill fast path.
-    state
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            "baseline_copy",
-            &active.spec_hash,
-            lifecycle_for_create_view_execution(
-                &MaterializedViewExecutionMode::StandingRuntime,
-                true,
-            ),
-        )
-        .await
-        .unwrap();
+    tests::update_test_active_view_lifecycle(
+        &state,
+        "baseline_copy",
+        &active.spec_hash,
+        lifecycle_for_create_view_execution(&MaterializedViewExecutionMode::StandingRuntime, true),
+    )
+    .await
+    .unwrap();
     if late_catchup {
         ingest(&router, 1, json!([{"user_id":"later","score":9,"delta":1}])).await;
         post(
@@ -739,16 +710,14 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
         )
         .await;
     }
-    state
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            "baseline_copy",
-            &active.spec_hash,
-            MaterializedViewLifecycleStatus::standing_runtime(),
-        )
-        .await
-        .unwrap();
+    tests::update_test_active_view_lifecycle(
+        &state,
+        "baseline_copy",
+        &active.spec_hash,
+        MaterializedViewLifecycleStatus::standing_runtime(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         meta.read_view_bootstrap(&identity.tenant_id, &identity.program_id, "baseline_copy")
             .await
@@ -765,10 +734,7 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
     let current_input = consumer_direct_view_inputs(&active, &before_request)
         .unwrap()
         .remove(0);
-    let producer = state
-        .view_registry()
-        .unwrap()
-        .read_active("baseline_source")
+    let producer = tests::read_test_active_view(&state, "baseline_source")
         .await
         .unwrap();
     let producer_head = capture_producer_head_cursor(
@@ -1031,10 +997,7 @@ async fn shared_root_history_case(authoritative: bool) {
         .await;
         assert_eq!(response["rows"], json!([]));
     }
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("empty_union")
+    let active = tests::read_test_active_view(&state, "empty_union")
         .await
         .unwrap();
     let checkpoint = read_latest_standing_runtime_checkpoint(

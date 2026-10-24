@@ -1,11 +1,7 @@
 use super::*;
 
 pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    let views = state
-        .view_registry()?
-        .list_active()
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let views = view_dependencies::list_active_from_meta(&state).await?;
     let mut paths = serde_json::Map::new();
 
     paths.insert(
@@ -826,6 +822,7 @@ mod openapi_spec_verification {
         )
         .await
         .unwrap();
+        let meta_store = Arc::new(velorix_control::meta_admin::InMemoryMetaStore::default());
         let state = ApiState::from_validated_authority_with_ingest_admission_startup(
             validated,
             "api-test-openapi-spec-owner",
@@ -834,9 +831,8 @@ mod openapi_spec_verification {
         .await
         .unwrap()
         .with_experimental_advanced_view_features(true)
-        .with_view_bootstrap_meta_store(Arc::new(
-            velorix_control::meta_admin::InMemoryMetaStore::default(),
-        ));
+        .with_meta_store(meta_store.clone());
+        let state = crate::tests::with_initialized_active_view_meta_store(state, meta_store).await;
         let router = crate::app(state);
         // Register one view so the spec also contains generated view query paths.
         let catalog = crate::example_fixtures::default_scores_relation_catalog().unwrap();

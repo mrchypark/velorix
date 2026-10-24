@@ -176,7 +176,7 @@ impl ObjectStoreAccessCounts {
         self.get_object_bytes.lock().unwrap().clone()
     }
 
-    fn list_prefixes(&self) -> Vec<String> {
+    pub(super) fn list_prefixes(&self) -> Vec<String> {
         self.list_prefixes.lock().unwrap().clone()
     }
 
@@ -570,7 +570,7 @@ async fn standing_runtime_checkpoint_persistence_writes_output_delta_manifest_re
         "purchases_by_user",
         &checkpoint,
         std::slice::from_ref(&output_delta),
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -1212,12 +1212,14 @@ async fn authoritative_view_cursor_resolution_fails_closed_at_every_trust_bounda
         .is_err()
     );
 
-    let state_without_meta = test_api_state_with_store(
+    let mut state_without_meta = test_api_state_with_store(
         Arc::clone(&store),
         "api-test-authoritative-view-cursor-no-meta",
         false,
     )
     .await;
+    state_without_meta.meta_store = None;
+    state_without_meta.view_bootstrap_meta_store = None;
     // Without a meta store the resolver falls back to the object-store latest
     // checkpoint cache; the cursor is still validated against the durable
     // producer commit records.
@@ -1998,7 +2000,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_
         "purchases_by_user",
         &checkpoint,
         std::slice::from_ref(&output_delta),
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -2053,7 +2055,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_output_delta_object_
         "purchases_by_user",
         &checkpoint,
         std::slice::from_ref(&output_delta),
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -2438,10 +2440,7 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
     .await;
     assert_eq!(ingest_response.0, StatusCode::CREATED);
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("scores_compact_no_side_effect")
+    let active = read_test_active_view(&state, "scores_compact_no_side_effect")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
@@ -2451,17 +2450,13 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
             .unwrap()
             .unwrap();
     assert_snapshot_and_commit_refs(&record.checkpoint.output_manifest_refs);
-    let checkpoint_key =
-        ObjectKey::parse_standing_runtime_checkpoint(record.checkpoint_key.clone())
-            .unwrap()
-            .0;
-    let publication = standing_runtime_output_manifest_record_for_checkpoint(
-        &record.checkpoint,
-        "scores_compact_no_side_effect",
-        &checkpoint_key,
-    )
-    .unwrap()
-    .unwrap();
+    let manifest_ref = record
+        .checkpoint
+        .output_manifest_refs
+        .iter()
+        .find(|reference| reference.starts_with(STANDING_RUNTIME_OUTPUT_MANIFEST_REF_PREFIX))
+        .expect("authoritative checkpoint references its published output manifest")
+        .clone();
 
     let response = compact_view_output_once(&state, "scores_compact_no_side_effect", "sync")
         .await
@@ -2469,16 +2464,6 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
 
     assert_eq!(response.outcome, "compacted");
     assert_eq!(response.compacted_manifests, 1);
-    assert!(state
-        .store
-        .get(&Path::from(publication.manifest_key.as_str()))
-        .await
-        .is_ok());
-    assert!(state
-        .store
-        .get(&Path::from(publication.page_records[0].0.as_str()))
-        .await
-        .is_ok());
     let latest =
         read_latest_standing_runtime_checkpoint(&state, identity, "scores_compact_no_side_effect")
             .await
@@ -2488,6 +2473,23 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
         latest.checkpoint.output_manifest_refs,
         record.checkpoint.output_manifest_refs
     );
+    let (_, manifest) = checkpoint_publication::read_standing_runtime_output_manifest_record(
+        &state,
+        &manifest_ref,
+        "scores_compact_no_side_effect",
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.pages.len(), response.after_pages);
+    for page in &manifest.pages {
+        checkpoint_publication::read_standing_runtime_output_page_record(
+            &state,
+            page,
+            "scores_compact_no_side_effect",
+        )
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -2617,7 +2619,7 @@ async fn standing_runtime_checkpoint_persistence_writes_state_object_and_strips_
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -2673,7 +2675,7 @@ async fn standing_runtime_checkpoint_read_hydrates_state_payload_from_state_obje
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -2697,7 +2699,7 @@ async fn standing_runtime_checkpoint_read_rejects_legacy_identity_keys() {
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -2886,7 +2888,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_miss
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -2917,7 +2919,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_miss
 
 #[tokio::test]
 async fn standing_runtime_checkpoint_read_fails_closed_when_checkpoint_object_is_corrupt() {
-    let state = test_api_state().await;
+    let state = object_only_checkpoint_codec_state().await;
     let checkpoint = test_runtime_checkpoint(Vec::new());
     let checkpoint_key = test_checkpoint_key(&checkpoint);
     state
@@ -2939,7 +2941,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_checkpoint_object_is
 
 #[tokio::test]
 async fn standing_runtime_checkpoint_read_rejects_legacy_json_record_bodies() {
-    let state = test_api_state().await;
+    let state = object_only_checkpoint_codec_state().await;
     let checkpoint = test_runtime_checkpoint(Vec::new());
     let checkpoint_key = test_checkpoint_key(&checkpoint);
     let legacy_record = test_checkpoint_record(&checkpoint_key, checkpoint.clone());
@@ -3024,7 +3026,7 @@ async fn standing_runtime_checkpoint_read_ignores_object_store_when_meta_pointer
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -3156,7 +3158,7 @@ async fn standing_runtime_checkpoint_read_keeps_old_meta_pointer_when_new_checkp
         "purchases_by_user",
         &orphaned,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&orphan_writer, &orphaned, "purchases_by_user").await,
         None,
     )
     .await
@@ -3184,7 +3186,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_manifest_hash_mismat
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -3221,7 +3223,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_pointer_body_mismatc
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -3256,7 +3258,7 @@ async fn standing_runtime_checkpoint_publish_rehydrates_empty_meta_pointer_after
         "purchases_by_user",
         &previous,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &previous, "purchases_by_user").await,
         None,
     )
     .await
@@ -3394,7 +3396,7 @@ async fn standing_runtime_checkpoint_read_fails_closed_when_state_object_is_corr
         "purchases_by_user",
         &checkpoint,
         &[],
-        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), None),
+        test_checkpoint_persist_context(&state, &checkpoint, "purchases_by_user").await,
         None,
     )
     .await
@@ -4011,7 +4013,14 @@ async fn rest_latest_by_key_cte_view_materializes_outputs() {
 async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-latest-nullable-a", false).await;
-    let router = app(state);
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
+    let router = app(state.clone());
 
     let mut catalog = test_item_status_catalog();
     catalog
@@ -4099,8 +4108,14 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
         "{query_response:?}"
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-latest-nullable-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-latest-nullable-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -4211,6 +4226,13 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
 async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -4339,7 +4361,14 @@ async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_re
     )
     .await;
 
-    let restarted_state = test_api_state_with_store(store.clone(), "api-test-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store.clone(),
+        "api-test-owner-b",
+        true,
+    )
+    .await;
     let restored = restarted_state
         .restore_standing_program_runtimes_from_active_views()
         .await
@@ -4631,6 +4660,13 @@ async fn rest_ingest_event_time_watermark_rejects_max_below_batch_event_time() {
 async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_after_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-window-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -4751,8 +4787,14 @@ async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_afte
     )
     .await;
 
-    let restarted_state =
-        test_api_state_with_store(store.clone(), "api-test-window-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store.clone(),
+        "api-test-window-owner-b",
+        true,
+    )
+    .await;
     let restored = restarted_state
         .restore_standing_program_runtimes_from_active_views()
         .await
@@ -5063,6 +5105,13 @@ async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -5147,8 +5196,14 @@ async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
         ]),
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-window-count-distinct-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-window-count-distinct-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -5177,6 +5232,13 @@ async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs(
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -5261,7 +5323,9 @@ async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs(
         ]),
     );
 
-    let restarted_state = test_api_state_with_store(
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store,
         "api-test-window-filtered-count-distinct-owner-b",
         true,
@@ -5295,6 +5359,13 @@ async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() 
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
     let mut catalog = test_purchases_event_time_catalog();
     let amount = catalog
@@ -5390,8 +5461,14 @@ async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() 
         ]),
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-window-nullable-count-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-window-nullable-count-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -5420,6 +5497,13 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
     let mut catalog = test_purchases_event_time_catalog();
     let amount = catalog
@@ -5515,7 +5599,9 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
         ]),
     );
 
-    let restarted_state = test_api_state_with_store(
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store,
         "api-test-window-filtered-nullable-count-owner-b",
         true,
@@ -5549,6 +5635,13 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -5620,7 +5713,9 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
         "{query_response:?}"
     );
 
-    let restarted_state = test_api_state_with_store(
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store.clone(),
         "api-test-filtered-group-survival-owner-b",
         true,
@@ -5721,6 +5816,13 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -5816,7 +5918,9 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
         "{query_response:?}"
     );
 
-    let restarted_state = test_api_state_with_store(
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store.clone(),
         "api-test-nullable-aggregate-survival-owner-b",
         true,
@@ -5913,6 +6017,13 @@ async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state =
         test_api_state_with_store(store.clone(), "api-test-hop-advanced-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -6005,8 +6116,14 @@ async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
         }]),
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-hop-advanced-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-hop-advanced-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -6158,6 +6275,13 @@ async fn rest_session_window_view_materialized_output_survives_api_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state =
         test_api_state_with_store(store.clone(), "api-test-session-window-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -6239,8 +6363,14 @@ async fn rest_session_window_view_materialized_output_survives_api_restart() {
         ]),
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-session-window-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-session-window-owner-b",
+        true,
+    )
+    .await;
     let restored = restarted_state
         .restore_standing_program_runtimes_from_active_views()
         .await
@@ -7178,12 +7308,16 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
         .collect::<Vec<_>>();
     assert_eq!(
         checkpoint_get_paths.len(),
-        2,
-        "direct apply reads the prior checkpoint once and probes the new immutable descriptor once"
+        3,
+        "direct apply reads the prior checkpoint once, probes the candidate descriptor before creation, and verifies the newly created Meta checkpoint object"
     );
     assert_ne!(
         checkpoint_get_paths[0], checkpoint_get_paths[1],
         "checkpoint publication must not reread the prior checkpoint"
+    );
+    assert_eq!(
+        checkpoint_get_paths[1], checkpoint_get_paths[2],
+        "candidate-key GETs are the legacy-descriptor collision probe and post-create Meta pointer verification"
     );
     let checkpoint_list_prefixes = object_access_counts
         .list_prefixes()
@@ -7192,8 +7326,8 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
         .collect::<Vec<_>>();
     assert_eq!(
         checkpoint_list_prefixes.len(),
-        1,
-        "direct apply without meta_store falls back to listing checkpoint epochs"
+        0,
+        "Meta-authoritative direct apply does not list checkpoint epochs"
     );
 }
 
@@ -7323,8 +7457,9 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
         .filter(|path| path.starts_with("v1/ingest/"))
         .count();
     assert_eq!(
-        ingest_list_count, baseline_ingest_list_count,
-        "relation-scoped materialized ingest should not add committed-ingest replay listing beyond the append/admission baseline"
+        ingest_list_count,
+        baseline_ingest_list_count + 1,
+        "first fenced bootstrap activation needs one legacy-ingest coverage listing; later ingests must not repeat it"
     );
     assert_eq!(
         ingest_get_count, baseline_ingest_get_count,
@@ -7347,10 +7482,14 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
 
 #[tokio::test]
 async fn rest_ingest_commits_metadata_source_cut_only_after_durable_append() {
-    let meta_store = Arc::new(InMemoryMetaStore::default());
-    let state = test_api_state()
-        .await
-        .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (state, meta_store) =
+        test_api_state_with_uninitialized_active_registry(store, "source-cut-owner").await;
+    let state = with_initialized_active_view_meta_store(
+        state,
+        Arc::clone(&meta_store) as Arc<dyn MetaStore>,
+    )
+    .await;
     let router = app(state.clone());
     let catalog = test_scores_catalog();
     let schema_fingerprint = catalog.schema_fingerprint.to_string();
@@ -7379,7 +7518,11 @@ async fn rest_ingest_commits_metadata_source_cut_only_after_durable_append() {
         }),
     )
     .await;
-    assert_eq!(ingest_response.0, StatusCode::CREATED);
+    assert_eq!(
+        ingest_response.0,
+        StatusCode::CREATED,
+        "{ingest_response:?}"
+    );
 
     let cut = meta_store
         .capture_ingest_source_cut(CaptureIngestSourceCutRequest {
@@ -7398,17 +7541,19 @@ async fn rest_ingest_commits_metadata_source_cut_only_after_durable_append() {
 
 #[tokio::test]
 async fn rest_ingest_does_not_commit_source_cut_when_durable_append_fails() {
-    let meta_store = Arc::new(InMemoryMetaStore::default());
     let failing_store = Arc::new(ArmedPrefixFailingObjectStore::new(
         Arc::new(InMemory::new()),
     ));
-    let state = test_api_state_with_store(
+    let (state, meta_store) = test_api_state_with_uninitialized_active_registry(
         Arc::clone(&failing_store) as Arc<dyn ObjectStore>,
         "api-test-source-cut-append-failure",
-        false,
     )
-    .await
-    .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
+    .await;
+    let state = with_initialized_active_view_meta_store(
+        state,
+        Arc::clone(&meta_store) as Arc<dyn MetaStore>,
+    )
+    .await;
     let router = app(state);
     let catalog = test_scores_catalog();
     let schema_fingerprint = catalog.schema_fingerprint.to_string();
@@ -7433,7 +7578,7 @@ async fn rest_ingest_does_not_commit_source_cut_when_durable_append_fails() {
     });
     failing_store.arm("v1/ingest/");
     let failed = call_json(&router, Method::POST, "/v1/ingest", ingest.clone()).await;
-    assert_eq!(failed.0, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(failed.0, StatusCode::INTERNAL_SERVER_ERROR, "{failed:?}");
 
     let request = CaptureIngestSourceCutRequest {
         relations: vec![IngestSourceRelationIdentityV1 {
@@ -7465,9 +7610,13 @@ async fn rest_ingest_does_not_commit_source_cut_when_durable_append_fails() {
 #[tokio::test]
 async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
     let meta_store = Arc::new(InMemoryMetaStore::default());
-    let state = test_api_state()
-        .await
-        .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
+    let state = with_initialized_active_view_meta_store(
+        test_api_state().await,
+        Arc::clone(&meta_store) as Arc<dyn MetaStore>,
+    )
+    .await;
+    let restart_meta = Arc::clone(&meta_store) as Arc<dyn MetaStore>;
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state.clone());
     let relation_response = call_json(
         &router,
@@ -7547,22 +7696,17 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
         1
     );
 
-    let admitted = state
-        .view_registry()
-        .unwrap()
-        .read_active("source_cut_scores_by_user")
+    let admitted = read_test_active_view(&state, "source_cut_scores_by_user")
         .await
         .unwrap();
-    state
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            "source_cut_scores_by_user",
-            &admitted.spec_hash,
-            MaterializedViewLifecycleStatus::standing_runtime(),
-        )
-        .await
-        .unwrap();
+    update_test_active_view_lifecycle(
+        &state,
+        "source_cut_scores_by_user",
+        &admitted.spec_hash,
+        MaterializedViewLifecycleStatus::standing_runtime(),
+    )
+    .await
+    .unwrap();
     let premature_query = call_json(
         &router,
         Method::POST,
@@ -7575,16 +7719,14 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
         .as_str()
         .unwrap()
         .contains("authoritative activation is incomplete"));
-    state
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            "source_cut_scores_by_user",
-            &admitted.spec_hash,
-            admitted.lifecycle,
-        )
-        .await
-        .unwrap();
+    update_test_active_view_lifecycle(
+        &state,
+        "source_cut_scores_by_user",
+        &admitted.spec_hash,
+        admitted.lifecycle,
+    )
+    .await
+    .unwrap();
 
     let pinned_batch_key =
         ObjectKey::ingest_batch("view-bootstrap-source-cut-stream", 0, 0, 1).unwrap();
@@ -7732,10 +7874,14 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
 
     // Caught-up restore is read-only and must coexist with the live writer;
     // no lease takeover or checkpoint publication is needed.
-    let restarted_state =
-        test_api_state_with_store(Arc::clone(&state.store), "source-cut-restart-owner", true)
-            .await
-            .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
+    let restarted_state = restart_test_api_state_with_store(
+        Arc::clone(&restart_meta),
+        restart_owner_id.clone(),
+        Arc::clone(&state.store),
+        "source-cut-restart-owner",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -7862,6 +8008,13 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -7964,8 +8117,14 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
     assert_eq!(global.0, StatusCode::OK, "{global:?}");
     assert_eq!(global.1["rows"], json!([{"count": 3}]));
 
-    let restarted_state =
-        test_public_api_state_with_store(store, "api-test-general-group-keys-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-general-group-keys-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -8200,8 +8359,9 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
         .filter(|path| path.starts_with("v1/ingest/"))
         .count();
     assert_eq!(
-        ingest_list_count, baseline_ingest_list_count,
-        "relation batch materialized ingest should not add committed-ingest replay listing beyond the append/admission baseline"
+        ingest_list_count,
+        baseline_ingest_list_count + 1,
+        "first fenced bootstrap activation needs one legacy-ingest coverage listing; the next ingest must reuse its committed checkpoint"
     );
     assert_eq!(
         ingest_get_count, baseline_ingest_get_count,
@@ -8230,6 +8390,13 @@ async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_r
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state =
         test_api_state_with_store(store.clone(), "api-test-row-number-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -8309,8 +8476,14 @@ async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_r
         ])
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-row-number-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-row-number-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -8569,10 +8742,7 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
         .unwrap_or_default()
         .contains("injected materialization failure after durable append"));
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("retry_scores_by_user")
+    let active = read_test_active_view(&state, "retry_scores_by_user")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap().clone();
@@ -8807,8 +8977,8 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         1
     );
     assert_eq!(
-        first_ingest.1["materialization"]["checkpoint_pointer_writes"],
-        0
+        first_ingest.1["materialization"]["checkpoint_pointer_writes"], 1,
+        "Meta-authoritative checkpoint publication writes its pointer"
     );
     assert_eq!(
         first_ingest.1["materialization"]["checkpoint_publication_writes"],
@@ -8828,10 +8998,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
     assert!(first_ingest.1["timings"].get("stages").is_none());
     assert_eq!(first_ingest.1["descriptor"]["relation_id"], "scores");
 
-    let active = inspection_state
-        .view_registry()
-        .unwrap()
-        .list_active()
+    let active = list_test_active_views(&inspection_state)
         .await
         .unwrap()
         .into_iter()
@@ -8977,8 +9144,8 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         1
     );
     assert_eq!(
-        epoch_ingest.1["materialization"]["checkpoint_pointer_writes"],
-        0
+        epoch_ingest.1["materialization"]["checkpoint_pointer_writes"], 1,
+        "Meta-authoritative checkpoint publication updates its pointer"
     );
     assert_eq!(
         epoch_ingest.1["materialization"]["checkpoint_publication_writes"],
@@ -9149,7 +9316,9 @@ async fn rest_materialization_rejects_output_delta_over_runtime_budget() {
     assert!(query_response.1["error"]
         .as_str()
         .unwrap_or_default()
-        .contains("not fully materialized"));
+        .contains(
+            "MATERIALIZATION_LAG: authoritative activation is incomplete for view `budgeted_scores_by_user`"
+        ));
 }
 
 #[tokio::test]
@@ -11592,6 +11761,13 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
     let state =
         test_api_state_with_store(store.clone(), "api-test-scalar-aggregate-modifiers", false)
             .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let mut nullable_accounts_catalog = test_accounts_catalog();
@@ -11996,9 +12172,14 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
     assert!(!view_ids.contains(&"scalar_sum_filter_rejected"));
     assert!(!view_ids.contains(&"scalar_typed_projection_rejected"));
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-scalar-aggregate-modifiers-restarted", true)
-            .await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-scalar-aggregate-modifiers-restarted",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -12512,7 +12693,7 @@ async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
 async fn rest_order_by_limit_top_k_view_materializes_outputs() {
     let state =
         test_api_state_with_store(Arc::new(InMemory::new()), "api-test-top-k-owner", false).await;
-    let router = app(state);
+    let router = app(state.clone());
 
     let relation_response = call_json(
         &router,
@@ -12546,6 +12727,16 @@ async fn rest_order_by_limit_top_k_view_materializes_outputs() {
         };
     let view_response = call_json(&router, Method::POST, "/v1/views", json!(view_request)).await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
+    assert_eq!(
+        read_test_active_view(&state, "top_purchaser")
+            .await
+            .unwrap()
+            .api
+            .unwrap()
+            .url_path
+            .as_deref(),
+        Some("/purchases/top")
+    );
 
     let first_ingest = call_json(
         &router,
@@ -12931,6 +13122,52 @@ impl MetaStore for DurableCapabilityMetaStore {
             .await
     }
 
+    async fn read_demand_metadata_batch(
+        &self,
+        request: meta::ReadDemandMetadataBatchRequest,
+    ) -> Result<meta::ReadDemandMetadataBatchResponse, MetaStoreError> {
+        self.inner.read_demand_metadata_batch(request).await
+    }
+
+    async fn read_active_view_registry_snapshot(
+        &self,
+        request: meta::ActiveViewRegistryReadRequestV1,
+    ) -> Result<meta::ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        self.inner.read_active_view_registry_snapshot(request).await
+    }
+
+    async fn create_active_view_record(
+        &self,
+        request: meta::CreateActiveViewRecordRequestV1,
+    ) -> Result<meta::CreateActiveViewRecordOutcomeV1, MetaStoreError> {
+        self.inner.create_active_view_record(request).await
+    }
+
+    async fn compare_exchange_active_view_record(
+        &self,
+        request: meta::CompareExchangeActiveViewRecordRequestV1,
+    ) -> Result<meta::CompareExchangeActiveViewRecordOutcomeV1, MetaStoreError> {
+        self.inner
+            .compare_exchange_active_view_record(request)
+            .await
+    }
+
+    async fn import_active_view_registry(
+        &self,
+        request: meta::ImportActiveViewRegistryRequestV1,
+    ) -> Result<meta::ImportActiveViewRegistryOutcomeV1, MetaStoreError> {
+        self.inner.import_active_view_registry(request).await
+    }
+
+    async fn promote_view_bootstrap_with_active_view_record(
+        &self,
+        request: meta::PromoteViewBootstrapWithActiveViewRecordRequestV1,
+    ) -> Result<PromoteViewBootstrapOutcome, MetaStoreError> {
+        self.inner
+            .promote_view_bootstrap_with_active_view_record(request)
+            .await
+    }
+
     async fn reserve_ingest_range(
         &self,
         reservation: IngestRangeReservation,
@@ -13160,23 +13397,25 @@ async fn test_authoritative_api_state_with_store(
     )
     .await
     .unwrap();
-    ApiState::from_validated_authority_with_ingest_admission_startup(
+    let state = ApiState::from_validated_authority_with_ingest_admission_startup(
         validated,
         "api-authoritative-process",
         false,
     )
     .await
-    .unwrap()
-    .with_meta_store(meta_store)
-    .with_authoritative_relation_ingest(
-        owner_id,
-        "unit-authoritative",
-        "test-authoritative",
-        "memory",
-        "api-authoritative-test",
-        30_000,
-    )
-    .unwrap()
+    .unwrap();
+    let state = state.with_view_bootstrap_meta_store(Arc::clone(&meta_store));
+    with_initialized_active_view_meta_store(state, meta_store)
+        .await
+        .with_authoritative_relation_ingest(
+            owner_id,
+            "unit-authoritative",
+            "test-authoritative",
+            "memory",
+            "api-authoritative-test",
+            30_000,
+        )
+        .unwrap()
 }
 
 #[tokio::test]
@@ -13243,23 +13482,37 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
     // Neither a normal pending declaration nor an older incorrectly Running
     // declaration may materialize source data during process reconstruction.
     for legacy_running in [false, true] {
-        let active = state
-            .view_registry()
-            .unwrap()
-            .read_active("source_first_total")
+        let active = read_test_active_view(&state, "source_first_total")
             .await
             .unwrap();
         if legacy_running {
-            state
-                .view_registry()
-                .unwrap()
-                .update_standing_runtime_lifecycle(
+            update_test_active_view_lifecycle(
+                &state,
+                &active.spec.view_id,
+                &active.spec_hash,
+                MaterializedViewLifecycleStatus::standing_runtime(),
+            )
+            .await
+            .unwrap();
+        }
+        if legacy_running {
+            // Process reconstruction is a lease takeover scenario. Expire the
+            // previous fixture owner's lease explicitly before starting the
+            // replacement API state; do not bypass the fencing check.
+            let identity = active_standing_runtime_identity(&active).unwrap();
+            let owner = meta
+                .read_standing_runtime_owner(
+                    &identity.tenant_id,
+                    &identity.program_id,
                     &active.spec.view_id,
-                    &active.spec_hash,
-                    MaterializedViewLifecycleStatus::standing_runtime(),
                 )
                 .await
+                .unwrap()
+                .expect("restored fixture runtime has an owner lease");
+            meta.renew_standing_runtime_owner(standing_runtime_owner_token_from_claim(&owner), 1)
+                .await
                 .unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
         state = test_authoritative_api_state_with_store(
             store.clone(),
@@ -13292,10 +13545,7 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
                 .unwrap(),
             1
         );
-        let active = state
-            .view_registry()
-            .unwrap()
-            .read_active("source_first_total")
+        let active = read_test_active_view(&state, "source_first_total")
             .await
             .unwrap();
         if !legacy_running {
@@ -13389,7 +13639,7 @@ async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta
         meta.clone(),
     )
     .await;
-    let router = app(state);
+    let router = app(state.clone());
 
     let relation = call_json(
         &router,
@@ -13539,10 +13789,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
     .await;
     assert_eq!(ingest.0, StatusCode::CREATED, "{ingest:?}");
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .list_active()
+    let active = list_test_active_views(&state)
         .await
         .unwrap()
         .into_iter()
@@ -14403,10 +14650,12 @@ async fn backfill_progress_counts_weighted_batches_across_packed_epochs_without_
         Arc::new(InMemory::new()),
         counts.clone(),
     ));
-    let state = test_api_state_with_store(store, "weighted-progress-owner", false)
-        .await
-        .with_meta_store(Arc::new(meta::InMemoryMetaStore::default()))
-        .with_experimental_advanced_view_features(true);
+    let state = with_initialized_active_view_meta_store(
+        test_api_state_with_store(store, "weighted-progress-owner", false).await,
+        Arc::new(meta::InMemoryMetaStore::default()),
+    )
+    .await
+    .with_experimental_advanced_view_features(true);
     let router = app(state.clone());
     let registered = call_json(
         &router,
@@ -15729,6 +15978,13 @@ async fn raw_sql_count_and_sum_use_complete_materialized_input_despite_page_caps
 async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-semi-anti-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     for catalog in [test_scores_catalog(), test_accounts_catalog()] {
@@ -15840,8 +16096,14 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
         assert_eq!(response.1["rows"], expected);
     }
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-semi-anti-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-semi-anti-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -15894,6 +16156,13 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
 async fn rest_two_relation_join_view_materialized_output_survives_api_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-join-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     for catalog in [test_scores_catalog(), test_accounts_catalog()] {
@@ -16006,8 +16275,14 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
     assert_eq!(relations_ingest.1["materialized_through"], 3);
     assert_join_rows(&query_response.1, 3, 17);
 
-    let restarted_state =
-        test_api_state_with_store(store.clone(), "api-test-join-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store.clone(),
+        "api-test-join-owner-b",
+        true,
+    )
+    .await;
     let restored = restarted_state
         .restore_standing_program_runtimes_from_active_views()
         .await
@@ -16036,6 +16311,13 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
     let state =
         test_public_api_state_with_store(store.clone(), "api-test-three-input-join-owner-a", false)
             .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state.clone());
     let catalogs = test_three_input_composite_catalogs();
     for catalog in &catalogs {
@@ -16069,10 +16351,7 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
     assert_eq!(view.0, StatusCode::CREATED, "{view:?}");
     assert_eq!(view.1["query_enabled"], true);
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("three_input_join_count")
+    let active = read_test_active_view(&state, "three_input_join_count")
         .await
         .unwrap();
     let published = active
@@ -16146,10 +16425,7 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
     )
     .await;
     assert_eq!(reordered_view.0, StatusCode::CREATED, "{reordered_view:?}");
-    let reordered_active = state
-        .view_registry()
-        .unwrap()
-        .read_active("three_input_join_count_reordered")
+    let reordered_active = read_test_active_view(&state, "three_input_join_count_reordered")
         .await
         .unwrap();
     let reordered_plan = reordered_active
@@ -16319,9 +16595,14 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
     assert_eq!(payload["graph"]["operators"].as_array().unwrap().len(), 4);
 
     drop(router);
-    drop(state);
-    let restarted_state =
-        test_public_api_state_with_store(store, "api-test-three-input-join-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-three-input-join-owner-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -16396,6 +16677,13 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state.clone());
     let mut scores = test_scores_catalog();
     scores.incremental_adapter.adapter_id = CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string();
@@ -16427,10 +16715,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
     assert_eq!(view.1["output_relations"][0]["primary_key"], json!([]));
     assert_eq!(view.1["output_relations"][0]["columns"][0]["name"], "count");
 
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("score_self_join_count")
+    let active = read_test_active_view(&state, "score_self_join_count")
         .await
         .unwrap();
     let logical_plan = active
@@ -16521,8 +16806,9 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
     assert!(!first_checkpoint.checkpoint.output_manifest_refs.is_empty());
 
     drop(router);
-    drop(state);
-    let restarted_state = test_public_api_state_with_store(
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store.clone() as Arc<dyn ObjectStore>,
         "api-test-self-join-owner-b",
         true,
@@ -16584,8 +16870,9 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
     );
 
     drop(restarted_router);
-    drop(restarted_state);
-    let recovered_state = test_public_api_state_with_store(
+    let recovered_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store as Arc<dyn ObjectStore>,
         "api-test-self-join-owner-c",
         true,
@@ -16707,6 +16994,13 @@ async fn run_join_differential_api_trace(
         false,
     )
     .await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     if common_dag_reference {
         state.register_standing_program_runtime_factory(
             MATERIALIZED_VIEW_RUNTIME_NAME,
@@ -16783,12 +17077,7 @@ async fn run_join_differential_api_trace(
     )
     .await;
     assert_eq!(initial_query.0, StatusCode::OK, "{initial_query:?}");
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active(view_id)
-        .await
-        .unwrap();
+    let active = read_test_active_view(&state, view_id).await.unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap().clone();
     let initial_record = read_latest_standing_runtime_checkpoint(&state, &identity, view_id)
         .await
@@ -16802,8 +17091,9 @@ async fn run_join_differential_api_trace(
     let initial_canonical_checkpoint = canonical_join_api_checkpoint(&initial_record.checkpoint);
 
     drop(router);
-    drop(state);
-    let restarted_state = test_api_state_with_store(
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
         store,
         &format!("api-test-differential-{view_id}-{mode}-b"),
         true,
@@ -16952,6 +17242,13 @@ async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state =
         test_public_api_state_with_store(store.clone(), "api-test-percentiles-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
     let score_samples = test_relation_catalog_for_e2e(
         "score_samples",
@@ -17074,8 +17371,14 @@ async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart
         assert_eq!(response.1["rows"], *expected, "{response:?}");
     }
 
-    let restarted_state =
-        test_public_api_state_with_store(store, "api-test-percentiles-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-percentiles-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -17234,6 +17537,13 @@ async fn rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs()
 async fn rest_two_relation_join_count_only_view_materialized_output_survives_api_restart() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-join-count-only-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     for catalog in [test_scores_catalog(), test_accounts_catalog()] {
@@ -17339,8 +17649,14 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
         ])
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-join-count-only-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-join-count-only-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -18484,6 +18800,13 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state =
         test_api_state_with_store(store.clone(), "api-test-join-count-distinct-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     for catalog in [test_scores_catalog(), test_accounts_catalog()] {
@@ -18583,8 +18906,14 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
         ])
     );
 
-    let restarted_state =
-        test_api_state_with_store(store, "api-test-join-count-distinct-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-join-count-distinct-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -19616,6 +19945,308 @@ async fn test_api_state() -> ApiState {
     test_api_state_with_store(store, "api-test-owner", false).await
 }
 
+pub(super) async fn with_initialized_active_view_meta_store(
+    state: ApiState,
+    meta_store: Arc<dyn meta::MetaStore>,
+) -> ApiState {
+    let scope = view_dependencies::active_view_registry_scope(&state);
+    let snapshot = meta_store
+        .read_active_view_registry_snapshot(meta::ActiveViewRegistryReadRequestV1 {
+            scope: scope.clone(),
+        })
+        .await
+        .unwrap();
+    if !snapshot.imported {
+        meta_store
+            .import_active_view_registry(meta::ImportActiveViewRegistryRequestV1 {
+                scope,
+                records: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    state.with_meta_store(meta_store)
+}
+
+pub(super) async fn test_api_state_with_uninitialized_active_registry(
+    store: Arc<dyn ObjectStore>,
+    owner_id: &str,
+) -> (ApiState, Arc<InMemoryMetaStore>) {
+    let validated = validate_operator_authority(
+        ObjectStoreAuthorityRef {
+            store_id: "test".to_string(),
+            namespace: "unit".to_string(),
+        },
+        store,
+        "memory",
+        "api-test",
+    )
+    .await
+    .unwrap();
+    let meta_store = Arc::new(InMemoryMetaStore::default());
+    let state = ApiState::from_validated_authority_with_ingest_admission_startup(
+        validated, owner_id, false,
+    )
+    .await
+    .unwrap()
+    .with_meta_store(meta_store.clone())
+    .with_experimental_advanced_view_features(true);
+    (state, meta_store)
+}
+
+#[tokio::test]
+async fn first_admission_initializes_empty_meta_active_registry() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let (state, meta_store) =
+        test_api_state_with_uninitialized_active_registry(store, "fresh-registry-owner").await;
+    let scope = view_dependencies::active_view_registry_scope(&state);
+    assert!(
+        !meta_store
+            .read_active_view_registry_snapshot(meta::ActiveViewRegistryReadRequestV1 {
+                scope: scope.clone(),
+            })
+            .await
+            .unwrap()
+            .imported
+    );
+
+    let router = app(state);
+    let catalog = crate::example_fixtures::default_scores_relation_catalog().unwrap();
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog":catalog}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let mut request = crate::example_fixtures::default_positive_scores_view_request(
+        &crate::example_fixtures::default_scores_relation_catalog().unwrap(),
+    )
+    .unwrap();
+    request.view_id = "fresh_registry_view".into();
+    let created = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        serde_json::to_value(request).unwrap(),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+
+    let snapshot = meta_store
+        .read_active_view_registry_snapshot(meta::ActiveViewRegistryReadRequestV1 { scope })
+        .await
+        .unwrap();
+    assert!(snapshot.imported);
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].record.view_id, "fresh_registry_view");
+}
+
+#[tokio::test]
+async fn first_admission_refuses_to_auto_import_nonempty_legacy_registry() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let catalog = crate::example_fixtures::default_scores_relation_catalog().unwrap();
+    let mut request =
+        crate::example_fixtures::default_positive_scores_view_request(&catalog).unwrap();
+    request.view_id = "legacy_registry_fixture".into();
+    // Create a valid active record through normal admission, then place that
+    // record in the legacy S3 location to model a pre-cutover registry.
+    let seed_state = with_initialized_active_view_meta_store(
+        test_api_state_with_store(Arc::clone(&store), "legacy-seed-owner", false).await,
+        Arc::new(InMemoryMetaStore::default()),
+    )
+    .await;
+    let seed_router = app(seed_state.clone());
+    let relation = call_json(
+        &seed_router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog":catalog}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+    let created = call_json(
+        &seed_router,
+        Method::POST,
+        "/v1/views",
+        serde_json::to_value(request.clone()).unwrap(),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    let seed_snapshot = view_dependencies::read_active_view_registry_snapshot(&seed_state)
+        .await
+        .unwrap();
+    let active_record = seed_snapshot
+        .records
+        .iter()
+        .find(|versioned| versioned.record.view_id == request.view_id)
+        .expect("admitted seed view is recorded in Meta");
+    store
+        .put(
+            &Path::from(format!("v1/views/{}/active.json", request.view_id)),
+            bytes::Bytes::from(serde_json::to_vec(&active_record.record).unwrap()).into(),
+        )
+        .await
+        .unwrap();
+
+    let (state, meta_store) = test_api_state_with_uninitialized_active_registry(
+        Arc::clone(&store),
+        "legacy-registry-owner",
+    )
+    .await;
+
+    let router = app(state.clone());
+    let response = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        serde_json::to_value(request).unwrap(),
+    )
+    .await;
+    assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE, "{response:?}");
+    assert!(response.1["error"]
+        .as_str()
+        .unwrap()
+        .contains("run POST /v1/admin/import-active-view-registry"));
+
+    let snapshot = meta_store
+        .read_active_view_registry_snapshot(meta::ActiveViewRegistryReadRequestV1 {
+            scope: view_dependencies::active_view_registry_scope(&state),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !snapshot.imported,
+        "admission must not auto-import legacy state"
+    );
+    assert!(snapshot.records.is_empty());
+    assert_eq!(
+        state
+            .view_registry()
+            .unwrap()
+            .list_active_records()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn api_path_lookup_hydrates_only_the_matching_immutable_spec() {
+    let counts = ObjectStoreAccessCounts::default();
+    let store: Arc<dyn ObjectStore> = Arc::new(CountingObjectStore::new(
+        Arc::new(InMemory::new()),
+        counts.clone(),
+    ));
+    let state = test_api_state_with_store(store, "api-path-spec-read-owner", false).await;
+    let router = app(state.clone());
+    let catalog = crate::example_fixtures::default_scores_relation_catalog().unwrap();
+    let relation = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": catalog.clone()}),
+    )
+    .await;
+    assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
+
+    for (view_id, url_path) in [
+        ("api_path_unselected", "/metrics/unselected"),
+        ("api_path_selected", "/metrics/selected"),
+    ] {
+        let mut request =
+            crate::example_fixtures::default_positive_scores_view_request(&catalog).unwrap();
+        request.view_id = view_id.to_string();
+        request.url_path = Some(url_path.to_string());
+        let created = call_json(
+            &router,
+            Method::POST,
+            "/v1/views",
+            serde_json::to_value(request).unwrap(),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
+    }
+
+    counts.clear();
+    let (active, parameters, _) =
+        query_serving::read_active_view_by_api_path(&state, "metrics/selected")
+            .await
+            .unwrap();
+    assert_eq!(active.spec.view_id, "api_path_selected");
+    assert!(parameters.is_empty());
+    let spec_gets = counts
+        .get_paths()
+        .into_iter()
+        .filter(|path| path.contains("/views/") && path.contains("/spec-sha256/"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        spec_gets.len(),
+        1,
+        "a public API path lookup should hydrate only its selected immutable view spec"
+    );
+}
+
+pub(super) async fn read_test_active_view(
+    state: &ApiState,
+    view_id: &str,
+) -> Result<ActiveMaterializedView, ApiError> {
+    view_dependencies::read_active_from_meta(state, view_id).await
+}
+
+pub(super) async fn list_test_active_views(
+    state: &ApiState,
+) -> Result<Vec<ActiveMaterializedView>, ApiError> {
+    view_dependencies::list_active_from_meta(state).await
+}
+
+pub(super) async fn update_test_active_view_lifecycle(
+    state: &ApiState,
+    view_id: &str,
+    expected_spec_hash: &str,
+    lifecycle: MaterializedViewLifecycleStatus,
+) -> Result<(), ApiError> {
+    view_dependencies::update_active_view_lifecycle_admin(
+        state,
+        view_id,
+        expected_spec_hash,
+        lifecycle,
+    )
+    .await
+}
+
+pub(super) async fn set_test_active_view_query_policy(
+    state: &ApiState,
+    view_id: &str,
+    query_policy_id: Option<String>,
+) {
+    let snapshot = view_dependencies::read_active_view_registry_snapshot(state)
+        .await
+        .unwrap();
+    let versioned = snapshot
+        .records
+        .iter()
+        .find(|versioned| versioned.record.view_id == view_id)
+        .unwrap_or_else(|| panic!("missing active test view {view_id}"));
+    let mut record = versioned.record.clone();
+    record
+        .api
+        .as_mut()
+        .expect("active test view has API metadata")
+        .query_policy_id = query_policy_id;
+    view_dependencies::compare_exchange_active_view_record(
+        state,
+        view_id,
+        versioned.generation,
+        record,
+        None,
+    )
+    .await
+    .unwrap();
+}
+
 pub(super) async fn test_api_state_with_store(
     store: Arc<dyn ObjectStore>,
     owner_id: &str,
@@ -19624,6 +20255,61 @@ pub(super) async fn test_api_state_with_store(
     test_public_api_state_with_store(store, owner_id, reconstruct_ingest_admission)
         .await
         .with_experimental_advanced_view_features(true)
+}
+
+// Restart fixtures retain durable Meta state just as they retain the object
+// store. Reusing the owner identity models a restart of the same test process;
+// lease takeover/fencing behavior is covered by the dedicated owner tests.
+async fn restart_test_api_state_with_store(
+    meta_store: Arc<dyn MetaStore>,
+    process_owner_id: String,
+    store: Arc<dyn ObjectStore>,
+    _fixture_label: &str,
+    reconstruct_ingest_admission: bool,
+) -> ApiState {
+    let mut restarted =
+        test_api_state_with_store(store, &process_owner_id, reconstruct_ingest_admission).await;
+    restarted.meta_store = Some(Arc::clone(&meta_store));
+    restarted.view_bootstrap_meta_store = Some(meta_store);
+    restarted.owner_id = process_owner_id;
+    restarted
+}
+
+async fn test_checkpoint_persist_context(
+    state: &ApiState,
+    checkpoint: &RuntimeCheckpoint,
+    view_id: &str,
+) -> StandingRuntimeCheckpointPersistContext {
+    let owner = state
+        .acquire_standing_runtime_owner(&checkpoint.identity, view_id)
+        .await
+        .unwrap()
+        .expect("Meta-backed checkpoint fixture requires its runtime owner");
+    StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner))
+}
+
+async fn object_only_checkpoint_codec_state() -> ApiState {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let authority = validate_operator_authority(
+        ObjectStoreAuthorityRef {
+            store_id: "checkpoint-codec-test".into(),
+            namespace: "standalone".into(),
+        },
+        store,
+        "memory",
+        "checkpoint-codec-test",
+    )
+    .await
+    .unwrap();
+    // These two tests exercise only object-store record decoding. Keep this
+    // isolated state Meta-free so they test the legacy object-only read path.
+    ApiState::from_validated_authority_with_ingest_admission_startup(
+        authority,
+        "checkpoint-codec-test",
+        false,
+    )
+    .await
+    .unwrap()
 }
 
 async fn test_public_api_state_with_store(
@@ -19642,14 +20328,16 @@ async fn test_public_api_state_with_store(
     )
     .await
     .unwrap();
-    ApiState::from_validated_authority_with_ingest_admission_startup(
+    let meta_store = Arc::new(InMemoryMetaStore::default());
+    let state = ApiState::from_validated_authority_with_ingest_admission_startup(
         validated,
         owner_id,
         reconstruct_ingest_admission,
     )
     .await
     .unwrap()
-    .with_view_bootstrap_meta_store(Arc::new(InMemoryMetaStore::default()))
+    .with_view_bootstrap_meta_store(meta_store.clone());
+    with_initialized_active_view_meta_store(state, meta_store).await
 }
 
 struct FailingApplyRuntimeFactory {
@@ -20402,6 +21090,13 @@ async fn rest_join_families_materialize_retract_and_restart() {
     for interval in [false, true] {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state = test_public_api_state_with_store(store.clone(), "join-family-a", false).await;
+        let restart_meta = Arc::clone(
+            state
+                .meta_store
+                .as_ref()
+                .expect("restart fixture requires Meta"),
+        );
+        let restart_owner_id = state.owner_id.clone();
         let router = app(state);
         let (catalogs, sql, left_rows, right_rows, expected, after_retract) = if interval {
             (
@@ -20504,7 +21199,14 @@ async fn rest_join_families_materialize_retract_and_restart() {
                 "interval={interval}: {response:?}"
             );
         }
-        let restarted = test_public_api_state_with_store(store, "join-family-b", true).await;
+        let restarted = restart_test_api_state_with_store(
+            restart_meta.clone(),
+            restart_owner_id.clone(),
+            store,
+            "join-family-b",
+            true,
+        )
+        .await;
         assert_eq!(
             restarted
                 .restore_standing_program_runtimes_from_active_views()
@@ -20567,6 +21269,13 @@ async fn rest_join_families_materialize_retract_and_restart() {
 async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-temporal-asof-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
     let rides = test_temporal_asof_catalog("rides", "ride_id", "booking_start");
     let prices = test_temporal_asof_catalog("prices", "vehicle_id", "price");
@@ -20688,7 +21397,14 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
     assert_eq!(query.0, StatusCode::OK, "{query:?}");
     assert_eq!(query.1["rows"], expected_before_retract, "{query:?}");
 
-    let restarted_state = test_api_state_with_store(store, "api-test-temporal-asof-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-temporal-asof-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restarted_state
             .restore_standing_program_runtimes_from_active_views()
@@ -20786,6 +21502,13 @@ async fn rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_resto
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state =
         test_api_state_with_store(store.clone(), "api-test-recursive-outer-first-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
     let catalog = test_edges_catalog_for_e2e();
     let relation_version = catalog.relation_schema.relation_version.clone();
@@ -20864,8 +21587,14 @@ async fn rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_resto
         "{query_response:?}"
     );
 
-    let restored_state =
-        test_api_state_with_store(store, "api-test-recursive-outer-first-b", true).await;
+    let restored_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store,
+        "api-test-recursive-outer-first-b",
+        true,
+    )
+    .await;
     assert_eq!(
         restored_state
             .restore_standing_program_runtimes_from_active_views()
@@ -21612,6 +22341,13 @@ async fn scenario_list_views_empty_then_create() {
 async fn rest_three_level_filter_aggregate_topk_chain_exact() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let state = test_api_state_with_store(store.clone(), "api-test-chain-owner-a", false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
     let relation_response = call_json(
@@ -21889,8 +22625,14 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
     )
     .await;
 
-    let restarted_state =
-        test_api_state_with_store(store.clone(), "api-test-chain-owner-b", true).await;
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta.clone(),
+        restart_owner_id.clone(),
+        store.clone(),
+        "api-test-chain-owner-b",
+        true,
+    )
+    .await;
     let restored = restarted_state
         .restore_standing_program_runtimes_from_active_views()
         .await
@@ -22515,12 +23257,7 @@ async fn rest_correction_configuration_rejects_invalid_horizons_and_shapes() {
             "{response:?}"
         );
         assert!(
-            state
-                .view_registry()
-                .unwrap()
-                .read_active(id)
-                .await
-                .is_err()
+            read_test_active_view(&state, id).await.is_err()
         );
     }
     for (id, sql) in [
@@ -22536,12 +23273,7 @@ async fn rest_correction_configuration_rejects_invalid_horizons_and_shapes() {
         }
         let response = call_json(&router, Method::POST, "/v1/views", request).await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
-        let active = state
-            .view_registry()
-            .unwrap()
-            .read_active(id)
-            .await
-            .unwrap();
+        let active = read_test_active_view(&state, id).await.unwrap();
         let VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan } =
             &active.runtime.unwrap().logical_plan.unwrap().execution
         else {
@@ -22660,6 +23392,13 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         }
     };
     let state = new_state(false).await;
+    let restart_meta = Arc::clone(
+        state
+            .meta_store
+            .as_ref()
+            .expect("far-late restart fixture requires Meta"),
+    );
+    let restart_owner_id = state.owner_id.clone();
     let router = app(state.clone());
     let relation = call_json(
         &router,
@@ -22708,7 +23447,18 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
     )
     .await;
     assert_eq!(advanced.0, StatusCode::CREATED, "{advanced:?}");
-    let restarted = new_state(true).await;
+    let restarted = if authoritative {
+        new_state(true).await
+    } else {
+        restart_test_api_state_with_store(
+            restart_meta.clone(),
+            restart_owner_id.clone(),
+            store.clone(),
+            "far-late-restarted",
+            true,
+        )
+        .await
+    };
     assert_eq!(
         restarted
             .restore_standing_program_runtimes_from_active_views()
@@ -22716,10 +23466,7 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
             .unwrap(),
         1
     );
-    let active = restarted
-        .view_registry()
-        .unwrap()
-        .read_active("cold_aggregates")
+    let active = read_test_active_view(&restarted, "cold_aggregates")
         .await
         .unwrap();
     let identity = active.runtime.unwrap().standing_program_identity;
@@ -22875,7 +23622,18 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
             .all(|path| !path.contains("/windows/")),
         "idempotent retry should not reload cold state"
     );
-    let final_state = new_state(true).await;
+    let final_state = if authoritative {
+        new_state(true).await
+    } else {
+        restart_test_api_state_with_store(
+            restart_meta.clone(),
+            restart_owner_id.clone(),
+            store.clone(),
+            "far-late-final",
+            true,
+        )
+        .await
+    };
     assert_eq!(
         final_state
             .restore_standing_program_runtimes_from_active_views()
@@ -22979,7 +23737,18 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
             .unwrap();
         assert_eq!(bob["total"], 25);
         assert_eq!(bob["count"], 2);
-        let recovered = new_state(true).await;
+        let recovered = if authoritative {
+            new_state(true).await
+        } else {
+            restart_test_api_state_with_store(
+                restart_meta.clone(),
+                restart_owner_id.clone(),
+                store.clone(),
+                "far-late-recovered",
+                true,
+            )
+            .await
+        };
         assert_eq!(
             recovered
                 .restore_standing_program_runtimes_from_active_views()
@@ -23066,10 +23835,7 @@ async fn rest_window_archival_drains_multiple_bounded_export_chunks() {
     let rows = (0..130).map(|key| json!({"user_id": format!("user-{key}"), "amount": key, "event_time": 10_000_000_000i64, "delta": 1})).collect::<Vec<_>>();
     let ingested = call_json(&router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "archive-chunks-stream", "partition_id": 0, "start_offset_inclusive": 0, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 10_080_000_000_000i64, "watermark_ns": 10_080_000_000_000i64}, "rows": rows})).await;
     assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("archive_chunks")
+    let active = read_test_active_view(&state, "archive_chunks")
         .await
         .unwrap();
     let identity = active.runtime.unwrap().standing_program_identity;
@@ -23115,6 +23881,7 @@ async fn correction_restart_regression(authoritative: bool) {
         owner: &str,
         reconstruct: bool,
         meta: Option<Arc<DurableCapabilityMetaStore>>,
+        previous: Option<&ApiState>,
     ) -> ApiState {
         match meta {
             Some(meta) => {
@@ -23130,13 +23897,21 @@ async fn correction_restart_regression(authoritative: bool) {
                 state.owner_id = "correction-runtime-owner".to_string();
                 state
             }
-            None => test_api_state_with_store(store, owner, reconstruct).await,
+            None => {
+                let mut state = test_api_state_with_store(store, owner, reconstruct).await;
+                if let Some(previous) = previous {
+                    state.meta_store = previous.meta_store.clone();
+                    state.view_bootstrap_meta_store = previous.view_bootstrap_meta_store.clone();
+                    state.owner_id = previous.owner_id.clone();
+                }
+                state
+            }
         }
     }
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let meta = authoritative
         .then(|| Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default())));
-    let state = state_for_mode(store.clone(), "api-correction-a", false, meta.clone()).await;
+    let state = state_for_mode(store.clone(), "api-correction-a", false, meta.clone(), None).await;
     let router = app(state.clone());
     let relation = call_json(
         &router,
@@ -23152,14 +23927,16 @@ async fn correction_restart_regression(authoritative: bool) {
     if authoritative {
         seed_legacy_eager_checkpoint_for_compatibility(&state, "correctable").await;
     }
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("correctable")
-        .await
-        .unwrap();
+    let active = read_test_active_view(&state, "correctable").await.unwrap();
     let binding = active.runtime.unwrap();
-    let reconstructed = state_for_mode(store.clone(), "api-correction-b", true, meta.clone()).await;
+    let reconstructed = state_for_mode(
+        store.clone(),
+        "api-correction-b",
+        true,
+        meta.clone(),
+        Some(&state),
+    )
+    .await;
     assert_eq!(
         reconstructed
             .restore_standing_program_runtimes_from_active_views()
@@ -23167,10 +23944,7 @@ async fn correction_restart_regression(authoritative: bool) {
             .unwrap(),
         1
     );
-    let restored_active = reconstructed
-        .view_registry()
-        .unwrap()
-        .read_active("correctable")
+    let restored_active = read_test_active_view(&reconstructed, "correctable")
         .await
         .unwrap();
     assert_eq!(restored_active.runtime.as_ref(), Some(&binding));
@@ -23219,7 +23993,14 @@ async fn correction_restart_regression(authoritative: bool) {
     .await;
     assert_eq!(corrected.1["rows"][0]["total"], 17);
     assert_eq!(corrected.1["rows"][0]["count"], 2);
-    let restarted = state_for_mode(store.clone(), "api-correction-c", true, meta.clone()).await;
+    let restarted = state_for_mode(
+        store.clone(),
+        "api-correction-c",
+        true,
+        meta.clone(),
+        Some(&reconstructed),
+    )
+    .await;
     assert_eq!(
         restarted
             .restore_standing_program_runtimes_from_active_views()
@@ -23384,8 +24165,14 @@ async fn correction_restart_regression(authoritative: bool) {
         StatusCode::OK,
         "accepted retry after expiry: {accepted_retry:?}"
     );
-    let after_rejection =
-        state_for_mode(store.clone(), "api-correction-d", true, meta.clone()).await;
+    let after_rejection = state_for_mode(
+        store.clone(),
+        "api-correction-d",
+        true,
+        meta.clone(),
+        Some(&restarted),
+    )
+    .await;
     assert_eq!(
         after_rejection
             .restore_standing_program_runtimes_from_active_views()
@@ -23393,7 +24180,7 @@ async fn correction_restart_regression(authoritative: bool) {
             .unwrap(),
         1
     );
-    let router = app(after_rejection);
+    let router = app(after_rejection.clone());
     let mut replacement = batch(6, 4, 150_000_000_000i64, 1, 180_000_000_000i64);
     replacement["rows"].as_array_mut().unwrap().push(
         json!({"user_id": "alice", "amount": 6, "event_time": 160_000_000_000i64, "delta": 1}),
@@ -23421,7 +24208,14 @@ async fn correction_restart_regression(authoritative: bool) {
         StatusCode::CREATED,
         "replacement at rejected partition offset zero: {partition_valid:?}"
     );
-    let final_state = state_for_mode(store, "api-correction-e", true, meta).await;
+    let final_state = state_for_mode(
+        store,
+        "api-correction-e",
+        true,
+        meta,
+        Some(&after_rejection),
+    )
+    .await;
     assert_eq!(
         final_state
             .restore_standing_program_runtimes_from_active_views()
@@ -23687,25 +24481,18 @@ fn authoritative_mode_requires_owner_and_metadata_without_legacy_fallback() {
 async fn seed_legacy_eager_checkpoint_for_compatibility(state: &ApiState, view_id: &str) {
     let mut legacy = state.clone();
     legacy.relation_ingest_mode = RelationIngestMode::Legacy;
-    let active = legacy
-        .view_registry()
-        .unwrap()
-        .read_active(view_id)
-        .await
-        .unwrap();
+    let active = read_test_active_view(&legacy, view_id).await.unwrap();
     bootstrap_legacy_view_if_empty(&legacy, &active)
         .await
         .unwrap();
-    legacy
-        .view_registry()
-        .unwrap()
-        .update_standing_runtime_lifecycle(
-            view_id,
-            &active.spec_hash,
-            MaterializedViewLifecycleStatus::standing_runtime(),
-        )
-        .await
-        .unwrap();
+    update_test_active_view_lifecycle(
+        &legacy,
+        view_id,
+        &active.spec_hash,
+        MaterializedViewLifecycleStatus::standing_runtime(),
+    )
+    .await
+    .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
     let checkpoint = read_latest_standing_runtime_checkpoint(state, identity, view_id)
         .await
@@ -23759,12 +24546,7 @@ async fn explicit_http_scope_migrates_an_existing_eager_checkpoint() {
     )
     .await;
     assert!(status.is_success(), "{status}: {body}");
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active("http_scope")
-        .await
-        .unwrap();
+    let active = read_test_active_view(&state, "http_scope").await.unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
     let old = read_latest_standing_runtime_checkpoint(&state, identity, "http_scope")
         .await

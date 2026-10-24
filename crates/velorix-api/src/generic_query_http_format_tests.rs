@@ -60,9 +60,11 @@ async fn generic_fixture() -> (ApiState, Router, ObjectStoreAccessCounts) {
         Arc::new(InMemory::new()),
         counts.clone(),
     ));
-    let state = test_api_state_with_store(store, "generic-format-owner", false)
-        .await
-        .with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    let state = tests::with_initialized_active_view_meta_store(
+        test_api_state_with_store(store, "generic-format-owner", false).await,
+        Arc::new(InMemoryMetaStore::default()),
+    )
+    .await;
     let policy = QueryPolicy {
         max_concurrent_queries: Some(1),
         ..QueryPolicy::default()
@@ -450,18 +452,7 @@ async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
                 Some("application/json"),
             ),
         ] {
-            let key = Path::from(format!("v1/views/{view}/active.json"));
-            let bytes = state.store.get(&key).await.unwrap().bytes().await.unwrap();
-            let mut active: Value = serde_json::from_slice(&bytes).unwrap();
-            active["api"]["query_policy_id"] = json!(policy_id);
-            state
-                .store
-                .put(
-                    &key,
-                    bytes::Bytes::from(serde_json::to_vec(&active).unwrap()).into(),
-                )
-                .await
-                .unwrap();
+            tests::set_test_active_view_query_policy(&state, view, Some(policy_id.clone())).await;
             let store = Arc::new(DelayedMaterializedPageStore {
                 inner: state.store.clone(),
                 delay: Duration::from_millis(300),
@@ -471,12 +462,7 @@ async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
             delayed.store = store.clone();
             if !succeeds {
                 // Prove the native read itself completes; the regression is the SQL handoff.
-                let active = delayed
-                    .view_registry()
-                    .unwrap()
-                    .read_active(view)
-                    .await
-                    .unwrap();
+                let active = tests::read_test_active_view(&delayed, view).await.unwrap();
                 let page = crate::query_serving::standing_runtime_page(
                     &delayed,
                     &active,
@@ -529,14 +515,17 @@ async fn generic_raw_and_template_sql_share_page_deadline_and_release_permit() {
 
 #[tokio::test]
 async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap() {
-    let state = test_api_state_with_store(
-        Arc::new(InMemory::new()),
-        "large-left_table-format-owner",
-        false,
+    let state = tests::with_initialized_active_view_meta_store(
+        test_api_state_with_store(
+            Arc::new(InMemory::new()),
+            "large-left_table-format-owner",
+            false,
+        )
+        .await
+        .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024),
+        Arc::new(InMemoryMetaStore::default()),
     )
-    .await
-    .with_standing_runtime_budget_limits(100_000, 16 * 1024 * 1024)
-    .with_meta_store(Arc::new(InMemoryMetaStore::default()));
+    .await;
     let router = app(state.clone());
     let catalog = test_relation_catalog_for_e2e(
         "left_table",
@@ -631,8 +620,6 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
 #[tokio::test]
 async fn generic_direct_http_source_budgets_reject_before_page_reads() {
     let (state, router, counts) = generic_fixture().await;
-    let key = Path::from("v1/views/format_group/active.json");
-    let original = state.store.get(&key).await.unwrap().bytes().await.unwrap();
     let policies = [
         QueryPolicy {
             max_scan_files: Some(0),
@@ -659,16 +646,7 @@ async fn generic_direct_http_source_budgets_reject_before_page_reads() {
             .create_for_production_table_scan("default", &id, policy)
             .await
             .unwrap();
-        let mut record: Value = serde_json::from_slice(&original).unwrap();
-        record["api"]["query_policy_id"] = json!(id);
-        state
-            .store
-            .put(
-                &key,
-                bytes::Bytes::from(serde_json::to_vec(&record).unwrap()).into(),
-            )
-            .await
-            .unwrap();
+        tests::set_test_active_view_query_policy(&state, "format_group", Some(id)).await;
         for method in [Method::GET, Method::POST] {
             for accept in [None, Some("application/json")] {
                 counts.clear();
@@ -702,17 +680,18 @@ async fn generic_direct_http_source_budgets_reject_before_page_reads() {
                 }
             }
         }
+        tests::set_test_active_view_query_policy(
+            &state,
+            "format_group",
+            Some("format-policy".to_string()),
+        )
+        .await;
     }
 }
 
 // Publish a second checkpoint with the current checkpoint and output codecs.
 async fn publish_current_checkpoint_fixture(state: &ApiState, view: &str) -> ApiState {
-    let active = state
-        .view_registry()
-        .unwrap()
-        .read_active(view)
-        .await
-        .unwrap();
+    let active = tests::read_test_active_view(state, view).await.unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();
     let mut record = read_latest_standing_runtime_checkpoint(state, identity, view)
         .await
@@ -830,8 +809,6 @@ async fn generic_http_source_budgets_apply_with_cache_disabled_and_warmed() {
         if cached {
             state = state.with_materialized_read_cache(cache.clone());
         }
-        let key = Path::from("v1/views/format_group/active.json");
-        let original = state.store.get(&key).await.unwrap().bytes().await.unwrap();
         // Two successful reads populate and hit the descriptor/manifest cache.
         let router = app(state.clone());
         for _ in 0..2 {
@@ -878,16 +855,7 @@ async fn generic_http_source_budgets_apply_with_cache_disabled_and_warmed() {
                 .create_for_production_table_scan("default", &id, policy)
                 .await
                 .unwrap();
-            let mut active: Value = serde_json::from_slice(&original).unwrap();
-            active["api"]["query_policy_id"] = json!(id);
-            state
-                .store
-                .put(
-                    &key,
-                    bytes::Bytes::from(serde_json::to_vec(&active).unwrap()).into(),
-                )
-                .await
-                .unwrap();
+            tests::set_test_active_view_query_policy(&state, "format_group", Some(id)).await;
             for method in [Method::GET, Method::POST] {
                 for accept in [None, Some("application/json")] {
                     counts.clear();
@@ -912,7 +880,12 @@ async fn generic_http_source_budgets_apply_with_cache_disabled_and_warmed() {
                 }
             }
         }
-        state.store.put(&key, original.into()).await.unwrap();
+        tests::set_test_active_view_query_policy(
+            &state,
+            "format_group",
+            Some("format-policy".to_string()),
+        )
+        .await;
     }
     cache.close().await.unwrap();
 }
@@ -921,10 +894,7 @@ async fn generic_http_source_budgets_apply_with_cache_disabled_and_warmed() {
 async fn generic_no_meta_discovery_is_bounded_and_detects_concurrent_new_head() {
     let (original, _, counts) = generic_fixture().await;
     let current = publish_current_checkpoint_fixture(&original, "format_group").await;
-    let active = current
-        .view_registry()
-        .unwrap()
-        .read_active("format_group")
+    let active = tests::read_test_active_view(&current, "format_group")
         .await
         .unwrap();
     let identity = active_standing_runtime_identity(&active).unwrap();

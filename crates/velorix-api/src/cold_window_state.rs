@@ -233,11 +233,7 @@ async fn retained_event_time_inputs(
         .view_ids
         .first()
         .ok_or_else(|| ApiError::bad_request("window runtime has no view identity"))?;
-    let active = state
-        .view_registry()?
-        .read_active(view_id)
-        .await
-        .map_err(materialized_view_registry_error_to_api)?;
+    let active = view_dependencies::read_active_from_meta(state, view_id).await?;
     let Some(VelorixLogicalViewExecutionV1::TumblingEventTimeAggregate { plan }) = active
         .runtime
         .as_ref()
