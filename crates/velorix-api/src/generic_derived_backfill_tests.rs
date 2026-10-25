@@ -1,4 +1,4 @@
-use super::*;
+use super::{bounded_demand_requests::post, *};
 
 fn append_only_scores_catalog() -> VelorixRelationCatalogV1 {
     let mut schema = test_scores_catalog().relation_schema;
@@ -10,13 +10,6 @@ fn append_only_scores_catalog() -> VelorixRelationCatalogV1 {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
     )
     .unwrap()
-}
-
-// Register as a child of tests.rs; reuse its authoritative metadata/store fixture.
-async fn post(router: &Router, path: &str, body: Value, expected: StatusCode) -> Value {
-    let (status, value) = call_json(router, Method::POST, path, body).await;
-    assert_eq!(status, expected, "{path}: {value}");
-    value
 }
 
 async fn declare(router: &Router, view: &str, input: &str, version: &str, sql: &str) {

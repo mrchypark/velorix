@@ -8,6 +8,7 @@ pub(super) struct BackfillOwnerLease {
     identity: StandingProgramIdentity,
     view_id: String,
     pub(super) failure: Arc<Mutex<Option<String>>>,
+    failure_signal: tokio::sync::watch::Sender<Option<String>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
@@ -18,22 +19,62 @@ impl BackfillOwnerLease {
         state: &ApiState,
         identity: &StandingProgramIdentity,
         view_id: &str,
-    ) -> Result<Self, ApiError> {
+    ) -> Result<Arc<Self>, ApiError> {
         let owner = state
             .acquire_standing_runtime_owner(identity, view_id)
             .await?;
+        Self::start_with_token(state, identity, view_id, owner).await
+    }
+
+    pub(super) async fn start_acquired(
+        state: &ApiState,
+        identity: &StandingProgramIdentity,
+        view_id: &str,
+        owner: StandingRuntimeOwnerClaim,
+    ) -> Result<Arc<Self>, ApiError> {
+        if owner.tenant_id != identity.tenant_id
+            || owner.program_id != identity.program_id
+            || owner.view_id != view_id
+            || owner.owner_id != state.owner_id
+        {
+            return Err(ApiError::conflict(
+                "acquired view owner claim does not match the local view",
+            ));
+        }
+        state.set_standing_runtime_owner(identity, view_id, owner.clone())?;
+        Self::start_with_token(
+            state,
+            identity,
+            view_id,
+            Some(standing_runtime_owner_token_from_claim(&owner)),
+        )
+        .await
+    }
+
+    async fn start_with_token(
+        state: &ApiState,
+        identity: &StandingProgramIdentity,
+        view_id: &str,
+        owner: Option<StandingRuntimeOwnerToken>,
+    ) -> Result<Arc<Self>, ApiError> {
+        if state.meta_store.is_some() && owner.is_none() {
+            return Err(ApiError::service_unavailable(
+                "view materialization owner claim is required",
+            ));
+        }
         let mut lease = Self {
             owner,
             state: state.clone(),
             identity: identity.clone(),
             view_id: view_id.into(),
             failure: Arc::new(Mutex::new(None)),
+            failure_signal: tokio::sync::watch::channel(None).0,
             stop: None,
             worker: None,
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let (Some(meta), Some(token)) = (state.meta_store.clone(), lease.owner.clone()) else {
-            return Ok(lease);
+            return Ok(Arc::new(lease));
         };
         let interval =
             std::time::Duration::from_millis((state.standing_runtime_owner_ttl_ms / 3).max(1));
@@ -43,6 +84,7 @@ impl BackfillOwnerLease {
         let worker_identity = identity.clone();
         let worker_view = view_id.to_string();
         let failure = Arc::clone(&lease.failure);
+        let failure_signal = lease.failure_signal.clone();
         let ttl = state.standing_runtime_owner_ttl_ms;
         let stopped_flag = Arc::clone(&lease.stopped);
         lease.worker = Some(
@@ -135,6 +177,7 @@ impl BackfillOwnerLease {
                                     if let Ok(mut failure) = failure.lock() {
                                         *failure = Some(diagnostic.clone());
                                     }
+                                    failure_signal.send_replace(Some(diagnostic.clone()));
                                     if let Some(ready) = ready.take() {
                                         let _ = ready.send(Err(diagnostic));
                                     }
@@ -158,7 +201,7 @@ impl BackfillOwnerLease {
             .await
             .map_err(|_| ApiError::internal("owner renewal worker stopped during setup"))?
             .map_err(ApiError::conflict)?;
-        Ok(lease)
+        Ok(Arc::new(lease))
     }
 
     pub(super) fn ensure_owned(&self) -> Result<(), ApiError> {
@@ -174,6 +217,36 @@ impl BackfillOwnerLease {
         }
         Ok(())
     }
+
+    pub(super) fn while_owned<'a, T: 'a>(
+        &'a self,
+        future: impl std::future::Future<Output = Result<T, ApiError>> + 'a,
+    ) -> impl std::future::Future<Output = Result<T, ApiError>> + 'a {
+        let future = Box::pin(future);
+        async move {
+            let mut failure = self.failure_signal.subscribe();
+            select_while_owned(&mut failure, || self.ensure_owned(), future).await
+        }
+    }
+}
+
+async fn select_while_owned<T>(
+    failure: &mut tokio::sync::watch::Receiver<Option<String>>,
+    ensure_owned: impl Fn() -> Result<(), ApiError>,
+    future: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    ensure_owned()?;
+    let result = tokio::select! {
+        biased;
+        changed = failure.changed() => {
+            let _ = changed;
+            ensure_owned()?;
+            Err(ApiError::conflict("view owner renewal stopped during preparation"))
+        }
+        result = future => result,
+    };
+    ensure_owned()?;
+    result
 }
 
 fn renewal_failure_diagnostic(
@@ -230,5 +303,89 @@ impl Drop for BackfillOwnerLease {
         // The isolated worker owns its runtime until shutdown; an
         // in-flight RPC is bounded by the renewal timeout and cannot reacquire.
         self.worker.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn renewal_failure_cancels_pending_prep_before_next_action() {
+        let (signal, mut failure) = tokio::sync::watch::channel(None);
+        let renewal_failed = Arc::new(AtomicBool::new(false));
+        let future_dropped = Arc::new(AtomicBool::new(false));
+        let next_action_count = Arc::new(AtomicUsize::new(0));
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+
+        let failed = Arc::clone(&renewal_failed);
+        let dropped = Arc::clone(&future_dropped);
+        let next_action = Arc::clone(&next_action_count);
+        let task = tokio::spawn(async move {
+            let prep = async move {
+                let _drop_flag = DropFlag(dropped);
+                let _ = started.send(());
+                std::future::pending::<Result<(), ApiError>>().await
+            };
+            let result = select_while_owned(
+                &mut failure,
+                || {
+                    if failed.load(Ordering::Acquire) {
+                        Err(ApiError::conflict("injected owner renewal failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                prep,
+            )
+            .await;
+            if result.is_ok() {
+                next_action.fetch_add(1, Ordering::AcqRel);
+            }
+            result
+        });
+
+        started_rx.await.expect("prep future started");
+        renewal_failed.store(true, Ordering::Release);
+        signal.send_replace(Some("injected renewal failure".into()));
+
+        assert!(task.await.expect("cancellation task completed").is_err());
+        assert!(future_dropped.load(Ordering::Acquire));
+        assert_eq!(next_action_count.load(Ordering::Acquire), 0);
+
+        let (signal, mut failure) = tokio::sync::watch::channel(None);
+        let renewal_failed = Arc::new(AtomicBool::new(true));
+        let prep_start_count = Arc::new(AtomicUsize::new(0));
+        signal.send_replace(Some("injected renewal failure".into()));
+
+        let failed = Arc::clone(&renewal_failed);
+        let prep_start = Arc::clone(&prep_start_count);
+        let result = select_while_owned(
+            &mut failure,
+            || {
+                if failed.load(Ordering::Acquire) {
+                    Err(ApiError::conflict("injected owner renewal failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            async move {
+                prep_start.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(prep_start_count.load(Ordering::Acquire), 0);
     }
 }

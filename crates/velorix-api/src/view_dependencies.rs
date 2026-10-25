@@ -274,6 +274,12 @@ impl ActiveViewReadSnapshot {
         &self.active_views
     }
 
+    pub(super) fn view(&self, view_id: &str) -> Option<&ActiveMaterializedView> {
+        self.active_views
+            .iter()
+            .find(|active| active.spec.view_id == view_id)
+    }
+
     pub(super) fn registry_snapshot(&self) -> ActiveViewRegistrySnapshotV1 {
         ActiveViewRegistrySnapshotV1 {
             snapshot_revision: self.revision,
@@ -1045,6 +1051,7 @@ pub(super) async fn input_bindings_for_resolved_inputs(
     state: &ApiState,
     tenant_id: &str,
     inputs: &[ResolvedAdmissionInputV1],
+    capture_bootstrap: bool,
 ) -> Result<Vec<StandingInputBindingV1>, ApiError> {
     let mut bindings = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -1068,10 +1075,14 @@ pub(super) async fn input_bindings_for_resolved_inputs(
                 let edge_id =
                     view_dependency_edge_id(tenant_id, &producer_identity.program_id, binding)
                         .map_err(ApiError::bad_request)?;
-                let bootstrap_cursor = capture_optional_producer_bootstrap_cursor(
-                    state, tenant_id, producer, binding, &edge_id,
-                )
-                .await?;
+                let bootstrap_cursor = if capture_bootstrap {
+                    capture_optional_producer_bootstrap_cursor(
+                        state, tenant_id, producer, binding, &edge_id,
+                    )
+                    .await?
+                } else {
+                    None
+                };
                 bindings.push(StandingInputBindingV1::PublishedView {
                     edge_id,
                     producer_tenant_id: tenant_id.to_string(),
@@ -1450,7 +1461,7 @@ pub(super) async fn bootstrap_legacy_view_if_empty(
             "legacy bootstrap requires legacy ingest mode",
         ));
     }
-    Box::pin(bootstrap_legacy_view_checkpoint(state, active, false)).await
+    bootstrap_legacy_view_checkpoint(state, active, false).await
 }
 
 pub(super) async fn upgrade_existing_published_bootstrap(
@@ -1467,15 +1478,31 @@ pub(super) async fn upgrade_existing_published_bootstrap(
     bootstrap_legacy_view_checkpoint(state, active, true).await
 }
 
-async fn bootstrap_legacy_view_checkpoint(
+fn bootstrap_legacy_view_checkpoint<'a>(
+    state: &'a ApiState,
+    active: &'a ActiveMaterializedView,
+    require_existing: bool,
+) -> impl std::future::Future<Output = Result<(), ApiError>> + Send + 'a {
+    Box::pin(bootstrap_legacy_view_checkpoint_inner(
+        state,
+        active,
+        require_existing,
+    ))
+}
+
+async fn bootstrap_legacy_view_checkpoint_inner(
     state: &ApiState,
     active: &ActiveMaterializedView,
     require_existing: bool,
 ) -> Result<(), ApiError> {
+    state.require_local_materialization()?;
     let identity = active_standing_runtime_identity(active)
         .ok_or_else(|| ApiError::bad_request("legacy bootstrap runtime identity missing"))?;
     let operation = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let _guard = operation.lock().await;
+    let lease =
+        owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?;
+    lease.ensure_owned()?;
     let published_inputs = active
         .runtime
         .as_ref()
@@ -1487,7 +1514,13 @@ async fn bootstrap_legacy_view_checkpoint(
     }
     if let Some(previous) = &previous {
         if published_inputs {
-            resolve_consumer_bootstrap_inputs_locked(state, active, Some(previous)).await?;
+            lease
+                .while_owned(resolve_consumer_bootstrap_inputs_locked(
+                    state,
+                    active,
+                    Some(previous),
+                ))
+                .await?;
             consumer_direct_view_inputs(active, previous)?;
         }
         if !published_inputs || previous.published_input_bootstrap.is_some() {
@@ -1500,7 +1533,13 @@ async fn bootstrap_legacy_view_checkpoint(
         ));
     }
     let inputs = if published_inputs {
-        resolve_consumer_bootstrap_inputs_locked(state, active, previous.as_ref()).await?
+        lease
+            .while_owned(resolve_consumer_bootstrap_inputs_locked(
+                state,
+                active,
+                previous.as_ref(),
+            ))
+            .await?
     } else {
         Vec::new()
     };
@@ -1508,14 +1547,21 @@ async fn bootstrap_legacy_view_checkpoint(
     let mut direct_inputs = Vec::with_capacity(inputs.len());
     let mut proofs = Vec::with_capacity(inputs.len());
     let mut bootstrap_inputs = Vec::with_capacity(inputs.len());
+    let mut source_prep_traced = false;
     for input in &inputs {
-        let (record, proof, pages) =
-            checkpoint_publication::read_authoritative_cursor_checkpoint_with_snapshot_pages(
-                state,
-                &input.bootstrap_cursor.producer_tenant_id,
-                &input.binding,
-                &input.bootstrap_cursor,
-                true,
+        if !source_prep_traced {
+            demand_materialization::source_prep_diagnostic(&lease)?;
+            source_prep_traced = true;
+        }
+        let (record, proof, pages) = lease
+            .while_owned(
+                checkpoint_publication::read_authoritative_cursor_checkpoint_with_snapshot_pages(
+                    state,
+                    &input.bootstrap_cursor.producer_tenant_id,
+                    &input.binding,
+                    &input.bootstrap_cursor,
+                    true,
+                ),
             )
             .await?;
         let manifests = record
@@ -1529,12 +1575,15 @@ async fn bootstrap_legacy_view_checkpoint(
                 "legacy bootstrap requires one output manifest",
             ));
         };
-        let (_, manifest) = checkpoint_publication::read_standing_runtime_output_manifest_record(
-            state,
-            manifest_ref,
-            &input.binding.producer_view_id,
-        )
-        .await?;
+        let (_, manifest) = lease
+            .while_owned(
+                checkpoint_publication::read_standing_runtime_output_manifest_record(
+                    state,
+                    manifest_ref,
+                    &input.binding.producer_view_id,
+                ),
+            )
+            .await?;
         if manifest.checkpoint_key != record.checkpoint_key
             || manifest.checkpoint_content_hash != record.checkpoint.state_root.content_hash
             || manifest.tenant_id != record.checkpoint.identity.tenant_id
@@ -1580,8 +1629,10 @@ async fn bootstrap_legacy_view_checkpoint(
         let mut relation_batches = Vec::with_capacity(snapshots.len());
         let mut applied_rows = 0u64;
         for snapshot in snapshots {
+            lease.ensure_owned()?;
             let rows = snapshot.net_rows().map_err(ApiError::bad_request)?;
             for row in &rows {
+                lease.ensure_owned()?;
                 let weight = u64::try_from(row.weight).map_err(|_| {
                     ApiError::bad_request("legacy bootstrap snapshot has negative multiplicity")
                 })?;
@@ -1664,8 +1715,6 @@ async fn bootstrap_legacy_view_checkpoint(
         })
         .transpose()?
         .unwrap_or(if published_inputs { 1 } else { 0 });
-    let lease =
-        owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?;
     let (runtime, _) = restore_standing_runtime_resident_locked(state, active)
         .await?
         .ok_or_else(|| ApiError::service_unavailable("legacy bootstrap runtime unavailable"))?;
@@ -1713,12 +1762,22 @@ async fn bootstrap_legacy_view_checkpoint(
 /// Reads and validates all producer output commits strictly after the given
 /// cursor, in ascending lineage order. Fails closed on any lineage,
 /// identity, or content mismatch.
+#[cfg(test)]
 pub(super) async fn read_validated_producer_commits_after_cursor(
     state: &ApiState,
     binding: &PublishedRelationBindingV1,
     cursor: &CausalViewCursorV1,
 ) -> Result<Vec<ValidatedProducerCommitV1>, ApiError> {
-    read_producer_commits_after_cursor_inner(state, binding, cursor, false).await
+    read_producer_commits_after_cursor_inner(state, binding, cursor, false, None).await
+}
+
+pub(super) async fn read_validated_producer_commits_after_cursor_with_lease(
+    state: &ApiState,
+    binding: &PublishedRelationBindingV1,
+    cursor: &CausalViewCursorV1,
+    lease: &owner_lease::BackfillOwnerLease,
+) -> Result<Vec<ValidatedProducerCommitV1>, ApiError> {
+    read_producer_commits_after_cursor_inner(state, binding, cursor, false, Some(lease)).await
 }
 
 pub(super) async fn read_producer_deltas_after_bootstrap_cursor(
@@ -1726,7 +1785,7 @@ pub(super) async fn read_producer_deltas_after_bootstrap_cursor(
     binding: &PublishedRelationBindingV1,
     cursor: &CausalViewCursorV1,
 ) -> Result<Vec<ValidatedProducerCommitV1>, ApiError> {
-    read_producer_commits_after_cursor_inner(state, binding, cursor, true).await
+    read_producer_commits_after_cursor_inner(state, binding, cursor, true, None).await
 }
 
 async fn read_producer_commits_after_cursor_inner(
@@ -1734,16 +1793,20 @@ async fn read_producer_commits_after_cursor_inner(
     binding: &PublishedRelationBindingV1,
     cursor: &CausalViewCursorV1,
     metadata_only: bool,
+    lease: Option<&owner_lease::BackfillOwnerLease>,
 ) -> Result<Vec<ValidatedProducerCommitV1>, ApiError> {
-    let mut latest = latest_checkpoint_record_for_scope_inner(
+    let latest = latest_checkpoint_record_for_scope_inner(
         state,
         &cursor.producer_tenant_id,
         &cursor.producer_program_id,
         &cursor.producer_view_id,
         metadata_only,
     )
-    .await?
-    .ok_or_else(|| {
+    .await?;
+    if let Some(lease) = lease {
+        lease.ensure_owned()?;
+    }
+    let mut latest = latest.ok_or_else(|| {
         ApiError::bad_request(format!(
             "producer view `{}` has no authoritative checkpoint",
             cursor.producer_view_id
@@ -1753,6 +1816,9 @@ async fn read_producer_commits_after_cursor_inner(
     let mut hops = 0usize;
     const MAX_LINEAGE_HOPS: usize = 4_096;
     loop {
+        if let Some(lease) = lease {
+            lease.ensure_owned()?;
+        }
         hops += 1;
         if hops > MAX_LINEAGE_HOPS {
             return Err(ApiError::bad_request(format!(
@@ -1777,6 +1843,9 @@ async fn read_producer_commits_after_cursor_inner(
                 }
             } else {
                 validate_authoritative_view_cursor_commit(state, binding, cursor, &latest).await?;
+                if let Some(lease) = lease {
+                    lease.ensure_owned()?;
+                }
             }
             break;
         }
@@ -1809,6 +1878,9 @@ async fn read_producer_commits_after_cursor_inner(
                     &previous,
                 )
                 .await?;
+            if let Some(lease) = lease {
+                lease.ensure_owned()?;
+            }
             if boundary
                 .published_input_bootstrap
                 .as_ref()
@@ -1846,6 +1918,9 @@ async fn read_producer_commits_after_cursor_inner(
             )
             .await?
         };
+        if let Some(lease) = lease {
+            lease.ensure_owned()?;
+        }
     }
     lineage.reverse();
     let mut commits = Vec::with_capacity(lineage.len());
@@ -1907,6 +1982,9 @@ async fn read_producer_commits_after_cursor_inner(
         } else {
             authoritative_producer_commit_for_checkpoint(state, binding, &record).await?
         };
+        if let Some(lease) = lease {
+            lease.ensure_owned()?;
+        }
         let (_key, delta_record) = {
             let commit_refs = record
                 .checkpoint
@@ -1923,6 +2001,9 @@ async fn read_producer_commits_after_cursor_inner(
             )
             .await?
         };
+        if let Some(lease) = lease {
+            lease.ensure_owned()?;
+        }
         let output_delta = serde_json::from_value::<DeltaBatch>(delta_record.output_delta.clone())
             .map_err(|error| {
                 ApiError::bad_request(format!(
@@ -2110,6 +2191,7 @@ pub(super) async fn apply_validated_producer_commit_to_consumer(
     cursor: &CausalViewCursorV1,
     commit: &ValidatedProducerCommitV1,
 ) -> Result<(), ApiError> {
+    state.require_local_materialization()?;
     let Some(identity) = active_standing_runtime_identity(active) else {
         return Err(ApiError::bad_request(format!(
             "consumer view `{}` has no standing runtime identity",
@@ -2120,18 +2202,49 @@ pub(super) async fn apply_validated_producer_commit_to_consumer(
     let _operation_guard = operation_lock.lock().await;
     let lease =
         owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?;
+    apply_validated_producer_commit_to_consumer_locked(
+        state, active, binding, edge_id, cursor, commit, lease,
+    )
+    .await
+}
+
+async fn apply_validated_producer_commit_to_consumer_locked(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    binding: &PublishedRelationBindingV1,
+    edge_id: &str,
+    cursor: &CausalViewCursorV1,
+    commit: &ValidatedProducerCommitV1,
+    lease: Arc<owner_lease::BackfillOwnerLease>,
+) -> Result<(), ApiError> {
+    state.require_local_materialization()?;
+    let identity = active_standing_runtime_identity(active)
+        .ok_or_else(|| ApiError::bad_request("consumer view has no standing runtime identity"))?;
+    lease.ensure_owned()?;
     // Published consumers resume from their durable baseline/cursors below;
     // their cache-miss replay plan must never trigger physical-source replay.
-    let (runtime, _) = restore_standing_runtime_resident_locked(state, active)
+    let (runtime, _) = lease
+        .while_owned(restore_standing_runtime_resident_locked(state, active))
         .await?
         .ok_or_else(|| ApiError::service_unavailable("consumer runtime could not be restored"))?;
-    let previous_checkpoint =
-        read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
-    lease.ensure_owned()?;
+    let previous_checkpoint = lease
+        .while_owned(read_latest_standing_runtime_checkpoint(
+            state,
+            identity,
+            &active.spec.view_id,
+        ))
+        .await?;
     let previous = previous_checkpoint.as_ref().ok_or_else(|| {
         ApiError::bad_request("consumer requires a complete baseline checkpoint before replay")
     })?;
-    resolve_consumer_bootstrap_inputs_locked(state, active, Some(previous)).await?;
+    lease
+        .while_owned(resolve_consumer_bootstrap_inputs_locked(
+            state,
+            active,
+            Some(previous),
+        ))
+        .await?;
+    lease.ensure_owned()?;
     let mut direct_inputs = consumer_direct_view_inputs(active, previous)?;
     let input = direct_inputs
         .iter_mut()
@@ -2348,14 +2461,50 @@ pub(super) struct DependencyDrainSummary {
 pub(super) async fn drain_published_view_dependencies(
     state: &ApiState,
 ) -> Result<DependencyDrainSummary, ApiError> {
-    let snapshot = ActiveViewReadSnapshot::load(state).await?;
-    drain_published_view_dependencies_from_snapshot(state, &snapshot).await
+    drain_published_view_dependencies_skipping(state, &BTreeSet::new()).await
 }
 
-pub(super) async fn drain_published_view_dependencies_from_snapshot(
+pub(super) fn drain_published_view_dependencies_skipping<'a>(
+    state: &'a ApiState,
+    skipped_views: &'a BTreeSet<String>,
+) -> impl std::future::Future<Output = Result<DependencyDrainSummary, ApiError>> + Send + 'a {
+    Box::pin(drain_published_view_dependencies_skipping_inner(
+        state,
+        skipped_views,
+    ))
+}
+
+async fn drain_published_view_dependencies_skipping_inner(
+    state: &ApiState,
+    skipped_views: &BTreeSet<String>,
+) -> Result<DependencyDrainSummary, ApiError> {
+    let snapshot = ActiveViewReadSnapshot::load(state).await?;
+    drain_published_view_dependencies_from_snapshot_skipping(state, &snapshot, skipped_views).await
+}
+
+pub(super) fn drain_published_view_dependencies_from_snapshot<'a>(
+    state: &'a ApiState,
+    snapshot: &'a ActiveViewReadSnapshot,
+) -> impl std::future::Future<Output = Result<DependencyDrainSummary, ApiError>> + Send + 'a {
+    Box::pin(drain_published_view_dependencies_from_snapshot_inner(
+        state, snapshot,
+    ))
+}
+
+async fn drain_published_view_dependencies_from_snapshot_inner(
     state: &ApiState,
     snapshot: &ActiveViewReadSnapshot,
 ) -> Result<DependencyDrainSummary, ApiError> {
+    drain_published_view_dependencies_from_snapshot_skipping(state, snapshot, &BTreeSet::new())
+        .await
+}
+
+async fn drain_published_view_dependencies_from_snapshot_skipping(
+    state: &ApiState,
+    snapshot: &ActiveViewReadSnapshot,
+    skipped_views: &BTreeSet<String>,
+) -> Result<DependencyDrainSummary, ApiError> {
+    state.require_local_materialization()?;
     state.validate_standing_runtime_fencing_or_evict().await?;
     let active_views = snapshot.views();
     let edges = view_dependency_edges_from_snapshot(active_views)?;
@@ -2374,6 +2523,9 @@ pub(super) async fn drain_published_view_dependencies_from_snapshot(
         if !processed.insert(view_id.clone()) {
             continue;
         }
+        if skipped_views.contains(&view_id) {
+            continue;
+        }
         let Some(active) = active_views
             .iter()
             .find(|active| active.spec.view_id == view_id)
@@ -2386,6 +2538,24 @@ pub(super) async fn drain_published_view_dependencies_from_snapshot(
         let Some(identity) = active_standing_runtime_identity(active) else {
             continue;
         };
+        if let Some(meta_store) = state.meta_store.as_ref() {
+            let owner = meta_store
+                .read_standing_runtime_owner(
+                    &identity.tenant_id,
+                    &identity.program_id,
+                    &active.spec.view_id,
+                )
+                .await
+                .map_err(meta_error_to_api)?;
+            if owner
+                .as_ref()
+                .is_some_and(|owner| owner.owner_id != state.owner_id)
+            {
+                // Published catchup is startup work too. Leave a view owned
+                // by another API untouched; immutable output remains readable.
+                continue;
+            }
+        }
         let Some(runtime_binding) = active.runtime.as_ref() else {
             continue;
         };
@@ -2411,47 +2581,89 @@ pub(super) async fn drain_published_view_dependencies_from_snapshot(
         if published_inputs.is_empty() {
             continue;
         }
+        let mut latest =
+            read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
+        if latest.is_none() && !state.authoritative_relation_ingest_enabled() {
+            // Legacy mode eagerly bootstraps a declared consumer when its
+            // producer first publishes output. Admission may have happened
+            // before that first producer checkpoint existed, so there was
+            // no baseline to capture at declaration time.
+            match bootstrap_legacy_view_if_empty(state, active).await {
+                Ok(()) => {}
+                Err(error)
+                    if error.status == StatusCode::CONFLICT
+                        && error
+                            .message
+                            .starts_with("standing runtime owner conflict for ") =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            latest = read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
+                .await?;
+        }
+        let Some(latest) = latest else {
+            // The consumer has no checkpoint yet; its admission-time
+            // baseline bootstrap is responsible for initializing state.
+            continue;
+        };
+        if latest
+            .published_input_bootstrap
+            .as_ref()
+            .is_some_and(|progress| !progress.is_complete())
+        {
+            continue;
+        }
+        let mut pending_edges = Vec::with_capacity(published_inputs.len());
         for (edge_id, _producer_program_id, binding, _baseline_cursor) in published_inputs {
-            let mut latest =
-                read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
-                    .await?;
-            if latest.is_none() && !state.authoritative_relation_ingest_enabled() {
-                // Legacy mode eagerly bootstraps a declared consumer when its
-                // producer first publishes output. Admission may have happened
-                // before that first producer checkpoint existed, so there was
-                // no baseline to capture at declaration time.
-                bootstrap_legacy_view_if_empty(state, active).await?;
-                latest =
-                    read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
-                        .await?;
-            }
-            let Some(latest) = latest else {
-                // The consumer has no checkpoint yet; its admission-time
-                // baseline bootstrap is responsible for initializing state.
-                continue;
-            };
-            if latest
-                .published_input_bootstrap
-                .as_ref()
-                .is_some_and(|progress| !progress.is_complete())
-            {
-                continue;
-            }
-            // A consumer checkpoint must carry the cursor for every
-            // configured published-view edge. Falling back to the
-            // admission-time baseline cursor could reapply already-consumed
-            // commits, so a missing cursor fails closed.
-            let mut cursor = consumer_edge_cursor(&latest, edge_id)?.ok_or_else(|| {
+            // Falling back to the admission-time baseline cursor could
+            // reapply commits, so a missing cursor fails closed.
+            let cursor = consumer_edge_cursor(&latest, edge_id)?.ok_or_else(|| {
                 ApiError::bad_request(format!(
                     "consumer view `{}` checkpoint is missing the dependency cursor for edge `{edge_id}`",
                     active.spec.view_id
                 ))
             })?;
-            let commits =
-                read_validated_producer_commits_after_cursor(state, binding, &cursor).await?;
+            pending_edges.push((edge_id, binding, cursor));
+        }
+        // One view lease covers every dependency edge and is established
+        // before any producer commit artifact is read.
+        let lease =
+            match owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error)
+                    if error.status == StatusCode::CONFLICT
+                        && error
+                            .message
+                            .starts_with("standing runtime owner conflict for ") =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+        lease.ensure_owned()?;
+        demand_materialization::source_prep_diagnostic(&lease)?;
+        for (edge_id, binding, mut cursor) in pending_edges {
+            let commits = lease
+                .while_owned(read_validated_producer_commits_after_cursor_with_lease(
+                    state, binding, &cursor, &lease,
+                ))
+                .await?;
             for commit in &commits {
-                apply_validated_producer_commit_to_consumer(
-                    state, active, binding, edge_id, &cursor, commit,
+                let operation_lock =
+                    state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
+                let _operation_guard = operation_lock.lock().await;
+                apply_validated_producer_commit_to_consumer_locked(
+                    state,
+                    active,
+                    binding,
+                    edge_id,
+                    &cursor,
+                    commit,
+                    Arc::clone(&lease),
                 )
                 .await?;
                 cursor.output_epoch = commit.logical_epoch;

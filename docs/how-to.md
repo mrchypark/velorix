@@ -132,6 +132,107 @@ curl -fsS http://127.0.0.1:8080/readyz
 `/readyz` should report `"status":"ready"`, an object store configured with
 conditional updates, and `"standing_runtime_fencing_mode":"unsafe-dev-only"`.
 
+For an isolated local experiment with multiple API processes, set
+`VELORIX_API_REPLICA_COUNT` to the actual process count and
+`VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-multi-api`. Set
+`VELORIX_API_OWNER_ENDPOINT` on every process to its reachable HTTP(S) origin
+(for example, `http://127.0.0.1:8080`); this origin is stored with each runtime
+owner claim so requests can reach the current leaseholder. Multi-replica startup
+fails if the endpoint is missing or is not a plain HTTP(S) origin. This explicit
+mode requires loopback API/TLS listeners and an `http://` loopback Meta endpoint;
+readiness reports `unsafe-dev-multi-api`. It skips the Meta fencing-capability
+validation, while runtime-owner acquisition and owner-checked checkpoint
+publication remain active. It is not a production or multi-writer-safety
+guarantee. The existing `unsafe-dev-only` mode remains single-replica only.
+
+### Split API and worker services
+
+For v0.5.0, the `velorix-api` image defaults to
+`VELORIX_SERVICE_ROLE=api`, and the `velorix-worker` image defaults to
+`VELORIX_SERVICE_ROLE=worker`. This changes the API image's default from the
+binary's `all` role: deployments that need the previous combined API/compute
+behavior must set `VELORIX_SERVICE_ROLE=all` explicitly. The all-in-one image
+is named `ghcr.io/mrchypark/velorix-all`. In its default `all` mode it requires
+`VELORIX_META_BACKEND=rhiza-kv`, `VELORIX_META_MODE`, `VELORIX_META_BIND`, and
+`VELORIX_META_GRPC_ENDPOINT`. Set the local client endpoint to
+`http://127.0.0.1:<bind-port>`; with `VELORIX_META_TRANSPORT_SECURITY=native-mtls`,
+use `https://127.0.0.1:<bind-port>` and the existing Meta TLS client settings.
+Choose the Meta bind host for the Rhiza peer topology and restrict non-loopback
+listeners through deployment network policy; the entrypoint validates the
+client endpoint host and port, not the server bind host. It starts Meta, runs
+the authenticated Rhiza capability smoke (`auth_enforced=true`,
+`production_multi_writer_safe=false`) using the configured TLS when enabled,
+then starts the API with role `all`.
+
+Configure an external readiness probe against the API `/readyz` endpoint; the
+entrypoint does not wait for API readiness. Allow at least 20 seconds for
+container shutdown: the supervisor gives each tracked child up to 5 seconds
+after TERM before KILL and wait. The CI entrypoint contract uses stub processes
+and does not validate a real Rhiza-backed container launch.
+
+`VELORIX_SERVICE_ROLE` defaults to `all`; set it to `api` or `worker` to run
+separate services. Split mode requires `VELORIX_API_BEARER_TOKEN` and
+`VELORIX_META_GRPC_ENDPOINT`. Configure the API and every worker with the same
+complete comma-separated list of up to 32 reachable worker HTTP(S) origins in
+`VELORIX_WORKER_ENDPOINTS`. Scale API and worker services independently; update
+the list on every API and worker when workers are added or removed. Each
+process needs its own bind address,
+`VELORIX_API_OWNER_ENDPOINT`, `VELORIX_OPERATOR_ID`, and
+`VELORIX_MATERIALIZED_READ_CACHE_DIR`. Worker endpoints and owner addresses must
+be stable addresses reaching each worker directly; do not use a shared load
+balancer that randomly distributes requests across workers, because owner-bound
+RPCs reaching another process can cause hop/pending loops. All processes must use the same Meta
+authority, S3-compatible endpoint, bucket, prefix, AWS credentials, Meta token,
+and API bearer token. Keep secrets in your secret manager and pass them through
+environment references. For secure Meta connections, reuse the native mTLS
+settings described in [the Meta setup](#use-existing-rhiza-meta-for-the-default-server).
+
+For upgrades, drain and stop API/worker/ingest-writer processes and any other
+metadata writers; upgrade and start Meta first, then start the matching API,
+worker, and ingest-writer release.
+After the new release records owner endpoints in Meta snapshots, rolling Meta
+back to an older binary is not safe: older Meta rejects the new snapshot field.
+Rollback requires restoring a consistent Meta backup taken before cutover before
+starting the older API/worker release. Do not infer old-binary compatibility from
+unchanged snapshot or checkpoint schema-version numbers.
+
+The commands below assume the shared Meta TLS, storage, credentials, and
+fencing environment from the preceding setup is already exported in both
+processes. Also export the same stable `$INGEST_OWNER_ID` as
+`VELORIX_RELATION_INGEST_OWNER_ID` in both; the API uses it as the source
+publisher identity. Common environment includes secret references, never
+literal secret values. The example invokes the binary directly; launcher
+forwarding of these settings has not been verified.
+
+```sh
+# API process
+VELORIX_SERVICE_ROLE=api \
+VELORIX_WORKER_ENDPOINTS=http://127.0.0.1:8081 \
+VELORIX_API_BIND=127.0.0.1:8080 \
+VELORIX_API_OWNER_ENDPOINT=http://127.0.0.1:8080 \
+VELORIX_OPERATOR_ID=api-1 \
+VELORIX_MATERIALIZED_READ_CACHE_DIR=/var/tmp/velorix-api-1-cache \
+./target/release/velorix-api
+
+# Worker process, inheriting the shared environment; one worker replica
+VELORIX_SERVICE_ROLE=worker \
+VELORIX_WORKER_ENDPOINTS=http://127.0.0.1:8081 \
+VELORIX_API_BIND=127.0.0.1:8081 \
+VELORIX_API_OWNER_ENDPOINT=http://127.0.0.1:8081 \
+VELORIX_OPERATOR_ID=worker-1 \
+VELORIX_MATERIALIZED_READ_CACHE_DIR=/var/tmp/velorix-worker-1-cache \
+./target/release/velorix-api
+```
+
+Compute replica count is zero for `api`, `VELORIX_API_REPLICA_COUNT` for `all`,
+and the worker endpoint list length (at least one) for `worker`.
+
+`VELORIX_WORKER_MAX_CONCURRENT_JOBS` (default `4`) limits concurrent worker RPC
+admissions per process; it does not limit `all` role local execution. It is an
+admission limit alongside existing runtime and Foyer cache limits, not an OS
+CPU or RSS cap. Split roles block public mutating routes on workers. See the
+[split-role behavior and view constraints](development/generic-view-pipeline.md#split-api-and-worker-roles).
+
 ### Materialized Read Cache
 
 The API caches verified immutable materialized read bytes in a Foyer hybrid

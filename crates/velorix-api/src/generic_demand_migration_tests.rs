@@ -432,6 +432,7 @@ async fn derived_pause_resume_preserves_cursors_without_physical_source_cut() {
         &active,
         true,
         demand_materialization::DemandOrder::Forward,
+        None,
     )
     .await
     .unwrap();
@@ -440,6 +441,7 @@ async fn derived_pause_resume_preserves_cursors_without_physical_source_cut() {
         &active,
         false,
         demand_materialization::DemandOrder::Reverse,
+        None,
     )
     .await
     .unwrap();

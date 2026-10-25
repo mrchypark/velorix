@@ -23,10 +23,19 @@ jobs:
         include:
           - name: api
             dockerfile: Dockerfile.api
+            target: api
+          - name: worker
+            dockerfile: Dockerfile.api
+            target: worker
           - name: meta
             dockerfile: Dockerfile.meta
+            target: runtime
           - name: ingest-writer
             dockerfile: Dockerfile.ingest-writer
+            target: runtime
+          - name: all
+            dockerfile: Dockerfile.all-in-one
+            target: runtime
     steps:
       - name: Checkout Velorix source
         uses: actions/checkout@v5
@@ -52,6 +61,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
           platforms: linux/amd64
           push: true
           provenance: false

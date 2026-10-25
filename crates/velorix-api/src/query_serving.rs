@@ -558,16 +558,10 @@ async fn query_physical_demand(
     let first_record = if continuation {
         None
     } else {
-        let scheduler_wait_started = std::time::Instant::now();
-        let turn = state.demand_scheduler.query_turn().await;
-        view_dependencies::demand_stage(
-            "scheduler_wait",
-            scheduler_wait_started.elapsed(),
-            0,
-            0,
-            0,
-        );
-        let scheduler_hold_timer = DemandStageTimer::start("scheduler_hold");
+        // Priority spans remote waits; only the worker's per-view lock serializes work.
+        let foreground = state.demand_scheduler.foreground_guard();
+        let foreground_timer = DemandStageTimer::start("foreground_hold");
+        let materialization_timer = DemandStageTimer::start("demand_materialization");
         let outcome = demand_materialization::materialize_demand_with_snapshot(
             &state,
             &active,
@@ -577,9 +571,10 @@ async fn query_physical_demand(
             Some(registry_snapshot.clone()),
         )
         .await?;
+        drop(materialization_timer);
         if !outcome.complete {
-            drop(turn);
-            drop(scheduler_hold_timer);
+            drop(foreground);
+            drop(foreground_timer);
             return Ok((
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({"materialization": outcome})),
@@ -608,8 +603,8 @@ async fn query_physical_demand(
                 "demand checkpoint changed before query pinning",
             ));
         }
-        drop(turn);
-        drop(scheduler_hold_timer);
+        drop(foreground);
+        drop(foreground_timer);
         Some(record)
     };
     let prepare_started = std::time::Instant::now();
@@ -1834,6 +1829,7 @@ pub(super) async fn run_active_view_backfill_step(
     range: Option<&BackfillRangeRequest>,
     scope: Option<&BackfillScopeRequest>,
 ) -> Result<ActiveViewBackfillStepOutcome, ApiError> {
+    state.require_local_materialization()?;
     let relations = active
         .spec
         .input_relations
@@ -1948,21 +1944,32 @@ async fn replay_existing_published_commits(
     }
     let identity = active_standing_runtime_identity(active)
         .ok_or_else(|| ApiError::bad_request("consumer runtime identity missing"))?;
+    // Hold one owner lease across the checkpoint/cursor reads and every
+    // producer artifact traversal so a foreign replica never starts replay.
+    let lease =
+        owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?;
+    lease.ensure_owned()?;
     let Some(record) =
         read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
     else {
         return Ok(outcome);
     };
     for input in consumer_direct_view_inputs(active, &record)? {
+        lease.ensure_owned()?;
         let mut cursor = input.cursor;
-        let commits =
-            read_validated_producer_commits_after_cursor(state, &input.published_relation, &cursor)
-                .await?;
+        let commits = view_dependencies::read_validated_producer_commits_after_cursor_with_lease(
+            state,
+            &input.published_relation,
+            &cursor,
+            &lease,
+        )
+        .await?;
         for commit in commits {
             if batch_limit.is_some_and(|limit| outcome.applied_batches >= limit) {
                 outcome.remaining_batches += 1;
                 continue;
             }
+            lease.ensure_owned()?;
             apply_validated_producer_commit_to_consumer(
                 state,
                 active,

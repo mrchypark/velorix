@@ -236,6 +236,274 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_a_b_a_handoff_discards_and_restores_resident_runtime() {
+        let (state, _router, store, meta) = fixture().await;
+        let (active, _cached) = pinned(&state, "a_stage").await;
+        let identity = active_standing_runtime_identity(&active).unwrap();
+        let view_id = &active.spec.view_id;
+        let initial = read_latest_standing_runtime_checkpoint(&state, identity, view_id)
+            .await
+            .unwrap()
+            .expect("fixture has a durable runtime checkpoint");
+        let owner_a = state.owner_id.clone();
+        let owner_a_claim = meta
+            .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+            .await
+            .unwrap()
+            .expect("fixture has a live owner A lease");
+        assert_eq!(owner_a_claim.owner_id, owner_a);
+        meta.expire_standing_runtime_owner_for_test(
+            &identity.tenant_id,
+            &identity.program_id,
+            view_id,
+        )
+        .await
+        .unwrap();
+        let b_state = crate::tests::test_api_state_with_store(store, "residency-owner", false)
+            .await
+            .with_owner_endpoint("http://owner-b.example:8080")
+            .unwrap()
+            .with_meta_store(meta.clone());
+        let b_router = app(b_state.clone());
+        ingest(&b_router, 1, json!([{"item":2,"reading":20,"delta":2}])).await;
+        let latest = read_latest_standing_runtime_checkpoint(&b_state, identity, view_id)
+            .await
+            .unwrap()
+            .expect("owner B published a newer durable checkpoint");
+        assert!(latest.checkpoint.logical_epoch > initial.checkpoint.logical_epoch);
+        let owner_b = meta
+            .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+            .await
+            .unwrap()
+            .expect("owner B retains its live lease");
+        assert_eq!(owner_b.owner_id, b_state.owner_id);
+
+        let claim = |owner_id: &str, owner_epoch, expires_at_unix_ms| StandingRuntimeOwnerClaim {
+            tenant_id: identity.tenant_id.clone(),
+            program_id: identity.program_id.clone(),
+            view_id: view_id.clone(),
+            owner_id: owner_id.into(),
+            owner_endpoint: owner_a_claim.owner_endpoint.clone(),
+            owner_epoch,
+            expires_at_unix_ms,
+        };
+        let old_epoch = owner_a_claim.owner_epoch;
+        assert!(state.standing_runtime(identity, view_id).unwrap().is_some());
+
+        // A same-owner, same-epoch renewal preserves the resident cache.
+        state
+            .set_standing_runtime_owner(identity, view_id, claim(&owner_a, old_epoch, 200))
+            .unwrap();
+        assert!(state.standing_runtime(identity, view_id).unwrap().is_some());
+
+        // Observing B through Meta must evict A's resident even though A still
+        // has a local marker for its now-expired authoritative lease.
+        let spec_hash = view_spec_hash(&active.spec).unwrap();
+        assert!(matches!(
+            owner_routing::resolve_view_owner_inner(
+                &state,
+                &active,
+                &spec_hash,
+                None,
+                false,
+                owner_routing::unix_now_ms().saturating_add(30_000)
+            )
+            .await
+            .unwrap(),
+            crate::owner_routing::ViewOwnerRoute::Remote { .. }
+        ));
+        assert!(state.standing_runtime(identity, view_id).unwrap().is_none());
+        assert!(state
+            .standing_runtime_local_state(&standing_runtime_key(identity, view_id))
+            .unwrap()
+            .committed_checkpoint
+            .is_none());
+        assert_eq!(
+            state
+                .standing_runtime_local_state(&standing_runtime_key(identity, view_id))
+                .unwrap()
+                .owner
+                .as_ref()
+                .map(|owner| (&owner.owner_id, owner.owner_epoch)),
+            Some((&owner_b.owner_id, owner_b.owner_epoch))
+        );
+        state
+            .set_standing_runtime_owner(identity, view_id, claim(&owner_a, old_epoch, 350))
+            .expect_err("delayed pre-handoff claim must not be accepted");
+        assert_eq!(
+            state
+                .standing_runtime_local_state(&standing_runtime_key(identity, view_id))
+                .unwrap()
+                .owner
+                .as_ref()
+                .map(|owner| (&owner.owner_id, owner.owner_epoch)),
+            Some((&owner_b.owner_id, owner_b.owner_epoch))
+        );
+        assert!(state
+            .set_standing_runtime_owner(
+                identity,
+                view_id,
+                claim(&owner_a, owner_b.owner_epoch, 375),
+            )
+            .is_err());
+        meta.expire_standing_runtime_owner_for_test(
+            &identity.tenant_id,
+            &identity.program_id,
+            view_id,
+        )
+        .await
+        .unwrap();
+        let resumed = state
+            .acquire_standing_runtime_owner(identity, view_id)
+            .await
+            .unwrap()
+            .expect("A reacquires after B's lease is deterministically expired");
+        assert_eq!(resumed.owner_id, owner_a);
+        assert_eq!(resumed.owner_epoch, owner_b.owner_epoch + 1);
+        assert!(state.standing_runtime(identity, view_id).unwrap().is_none());
+        assert_eq!(
+            state
+                .standing_runtime_local_state(&standing_runtime_key(identity, view_id))
+                .unwrap()
+                .owner
+                .unwrap()
+                .owner_id,
+            owner_a
+        );
+
+        let operation = state
+            .standing_runtime_operation_lock(identity, view_id)
+            .unwrap();
+        let _guard = operation.lock().await;
+        let (restored, _) = restore_standing_runtime_resident_locked(&state, &active)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.lock().unwrap().logical_epoch(),
+            latest.checkpoint.logical_epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_owner_updates_keep_highest_epoch_and_preserve_renewed_resident() {
+        let (state, _router, _store, meta) = fixture().await;
+        let (active, _old_runtime) = pinned(&state, "a_stage").await;
+        let identity = active_standing_runtime_identity(&active).unwrap();
+        let view_id = active.spec.view_id.clone();
+        let previous = meta
+            .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, &view_id)
+            .await
+            .unwrap()
+            .expect("fixture has a current owner claim");
+        // Generate both competing callbacks through Meta so the subsequent
+        // restore sees the same real fence as the callback that wins locally.
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            meta.expire_standing_runtime_owner_for_test(
+                &identity.tenant_id,
+                &identity.program_id,
+                &view_id,
+            )
+            .await
+            .unwrap();
+            let outcome = meta
+                .acquire_standing_runtime_owner_with_endpoint(
+                    AcquireStandingRuntimeOwnerRequest {
+                        tenant_id: identity.tenant_id.clone(),
+                        program_id: identity.program_id.clone(),
+                        view_id: view_id.clone(),
+                        owner_id: state.owner_id.clone(),
+                        ttl_ms: state.standing_runtime_owner_ttl_ms,
+                    },
+                    state.owner_endpoint.clone(),
+                )
+                .await
+                .unwrap();
+            let AcquireStandingRuntimeOwnerOutcome::Acquired(claim) = outcome else {
+                panic!("an expired fixture lease must advance its epoch");
+            };
+            claims.push(claim);
+        }
+        let higher_claim = claims.pop().unwrap();
+        let lower_claim = claims.pop().unwrap();
+        assert_eq!(lower_claim.owner_epoch, previous.owner_epoch + 1);
+        let highest_epoch = higher_claim.owner_epoch;
+        let renewal_token = standing_runtime_owner_token_from_claim(&higher_claim);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let lower_state = state.clone();
+        let lower_identity = identity.clone();
+        let lower_view = view_id.clone();
+        let lower_barrier = barrier.clone();
+        let lower = tokio::task::spawn_blocking(move || {
+            lower_barrier.wait();
+            lower_state.set_standing_runtime_owner(&lower_identity, &lower_view, lower_claim)
+        });
+        let higher_state = state.clone();
+        let higher_identity = identity.clone();
+        let higher_view = view_id.clone();
+        let higher_barrier = barrier.clone();
+        let higher = tokio::task::spawn_blocking(move || {
+            higher_barrier.wait();
+            higher_state.set_standing_runtime_owner(&higher_identity, &higher_view, higher_claim)
+        });
+        let (lower, higher) = tokio::join!(lower, higher);
+        let _lower = lower.unwrap();
+        let higher = higher.unwrap();
+        assert!(higher.is_ok());
+        assert_eq!(
+            state
+                .standing_runtime_local_state(&standing_runtime_key(identity, &view_id))
+                .unwrap()
+                .owner
+                .unwrap()
+                .owner_epoch,
+            highest_epoch
+        );
+        assert!(state
+            .standing_runtime(identity, &view_id)
+            .unwrap()
+            .is_none());
+
+        let operation = state
+            .standing_runtime_operation_lock(identity, &view_id)
+            .unwrap();
+        let _guard = operation.lock().await;
+        let (fresh, _) = restore_standing_runtime_resident_locked(&state, &active)
+            .await
+            .unwrap()
+            .unwrap();
+        let refresh_barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut refreshes = Vec::new();
+        for _ in 0..2 {
+            let refresh_state = state.clone();
+            let refresh_identity = identity.clone();
+            let refresh_view = view_id.clone();
+            let refresh_barrier = refresh_barrier.clone();
+            let refresh_claim = meta
+                .renew_standing_runtime_owner(
+                    renewal_token.clone(),
+                    state.standing_runtime_owner_ttl_ms,
+                )
+                .await
+                .unwrap();
+            refreshes.push(tokio::task::spawn_blocking(move || {
+                refresh_barrier.wait();
+                refresh_state.set_standing_runtime_owner(
+                    &refresh_identity,
+                    &refresh_view,
+                    refresh_claim,
+                )
+            }));
+        }
+        for refresh in refreshes {
+            refresh.await.unwrap().unwrap();
+        }
+        let resident = state.standing_runtime(identity, &view_id).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&fresh, &resident));
+    }
+
+    #[tokio::test]
     async fn resident_pruning_skips_busy_referenced_dirty_and_uncheckpointed() {
         let (state, _router, _store, _meta) = fixture().await;
         let mut entries = Vec::new();
@@ -359,12 +627,26 @@ mod tests {
         drop(state);
         let restarted = crate::tests::test_api_state_with_store(store, "residency-owner", false)
             .await
-            .with_meta_store(meta)
+            .with_meta_store(meta.clone())
             .with_standing_runtime_resident_limit(2);
+        let b_active = crate::tests::read_test_active_view(&restarted, "b_stage")
+            .await
+            .unwrap();
+        let b_identity = active_standing_runtime_identity(&b_active).unwrap();
+        let owner = meta
+            .read_standing_runtime_owner(&b_identity.tenant_id, &b_identity.program_id, "b_stage")
+            .await
+            .unwrap()
+            .expect("the stopped process still owns an unexpired fencing lease");
+        assert_ne!(owner.owner_id, restarted.owner_id);
         restarted
             .restore_standing_program_runtimes_from_active_views()
             .await
             .unwrap();
+        assert!(restarted
+            .standing_runtime(b_identity, "b_stage")
+            .unwrap()
+            .is_none());
         // Startup itself must enforce residency even when replay has no work
         // and therefore publishes no checkpoints.
         assert!(restarted.standing_runtimes.runtimes.lock().unwrap().len() <= 2);

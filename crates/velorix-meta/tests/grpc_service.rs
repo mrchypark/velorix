@@ -698,6 +698,27 @@ async fn grpc_conditional_owner_renewal_retains_epoch_and_rejects_foreign_token(
 }
 
 #[tokio::test]
+async fn grpc_acquire_owner_rejects_non_origin_endpoints() {
+    let service = MetaGrpcService::new(InMemoryMetaStore::default());
+    for endpoint in [
+        "ftp://api.example",
+        "http:///missing-host",
+        "http://user:pass@api.example",
+        "http://api.example/path",
+        "http://api.example?route=elsewhere",
+        "http://api.example#fragment",
+    ] {
+        let mut request = proto_owner_request("owner-a");
+        request.owner_endpoint = endpoint.to_string();
+        let error = service
+            .acquire_standing_runtime_owner(Request::new(request))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{endpoint}");
+    }
+}
+
+#[tokio::test]
 async fn grpc_meta_store_round_trips_through_service_endpoint() {
     let endpoint = spawn_meta_service().await;
     let store = GrpcMetaStore::connect(endpoint).await.unwrap();
@@ -1798,6 +1819,7 @@ async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
     let endpoint = spawn_meta_service_for(backend).await;
     let store = GrpcMetaStore::connect(endpoint).await.unwrap();
     let catalog = common::orders_relation_catalog("v1");
+    let schema_fingerprint = catalog.schema_fingerprint.as_str().to_string();
     store.store_relation_catalog(catalog.clone()).await.unwrap();
     let key = RelationPartitionAuthorityKey {
         namespace: "tenant-a".into(),
@@ -1827,7 +1849,7 @@ async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
         payload_digest: "sha256:orders".into(),
         relation_id: key.relation_id.clone(),
         relation_version: "v1".into(),
-        schema_fingerprint: "sha256:schema".into(),
+        schema_fingerprint: schema_fingerprint.clone(),
         writer_epoch: 1,
     };
     assert_eq!(
@@ -1863,7 +1885,7 @@ async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
                 relation_id: "orders".into(),
                 relation_version: "v1".into(),
                 relation_generation: 1,
-                schema_fingerprint: "sha256:schema".into(),
+                schema_fingerprint: schema_fingerprint.clone(),
             }],
         })
         .await
@@ -1883,7 +1905,7 @@ async fn grpc_relation_source_cuts_round_trip_relation_wide_publications() {
                     relation_id: "orders".into(),
                     relation_version: "v1".into(),
                     relation_generation: 1,
-                    schema_fingerprint: "sha256:schema".into(),
+                    schema_fingerprint,
                 }],
             }),
             relation_catalogs: vec![DemandRelationCatalogLookup {
@@ -2143,6 +2165,7 @@ fn proto_owner_request(owner_id: &str) -> ProtoAcquireStandingRuntimeOwnerReques
         view_id: "view".to_string(),
         owner_id: owner_id.to_string(),
         ttl_ms: 30_000,
+        owner_endpoint: String::new(),
     }
 }
 

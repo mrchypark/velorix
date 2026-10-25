@@ -29,3 +29,9 @@ COPY --from=builder /workspace/velorix-api /usr/local/bin/velorix-api
 USER 65532:65532
 EXPOSE 8080 8443
 ENTRYPOINT ["/usr/local/bin/velorix-api"]
+
+FROM runtime AS worker
+ENV VELORIX_SERVICE_ROLE=worker
+
+FROM runtime AS api
+ENV VELORIX_SERVICE_ROLE=api

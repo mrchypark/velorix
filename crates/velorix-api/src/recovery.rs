@@ -74,6 +74,7 @@ pub(super) async fn migrate_legacy_single_key_runtime(
     state: &ApiState,
     active: &ActiveMaterializedView,
 ) -> Result<(), ApiError> {
+    state.require_local_materialization()?;
     let identity = active_standing_runtime_identity(active).ok_or_else(|| {
         ApiError::bad_request("legacy runtime rebuild requires a standing runtime identity")
     })?;
@@ -112,6 +113,12 @@ pub(super) async fn migrate_legacy_single_key_runtime(
             "legacy runtime rebuild requires authoritative relation ingest",
         ));
     };
+    let acquired_owner = state
+        .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::service_unavailable("legacy runtime rebuild requires owner fencing")
+        })?;
     let old_record = read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id)
         .await?
         .ok_or_else(|| ApiError::bad_request("legacy runtime rebuild checkpoint is missing"))?;
@@ -167,12 +174,6 @@ pub(super) async fn migrate_legacy_single_key_runtime(
         stable_bytes_hash(old_record.checkpoint_key.as_bytes())
     ))
     .map_err(ApiError::bad_request)?;
-    let _owner = state
-        .acquire_standing_runtime_owner(identity, &active.spec.view_id)
-        .await?
-        .ok_or_else(|| {
-            ApiError::service_unavailable("legacy runtime rebuild requires owner fencing")
-        })?;
     let apply_result = apply_standing_runtime_changes_and_checkpoint_many(
         state,
         Arc::clone(&shared_runtime),
@@ -194,6 +195,11 @@ pub(super) async fn migrate_legacy_single_key_runtime(
         .ok_or_else(|| {
             ApiError::service_unavailable("legacy runtime rebuild owner lease expired")
         })?;
+    if owner != acquired_owner {
+        return Err(ApiError::conflict(
+            "legacy runtime rebuild owner fence changed during preparation",
+        ));
+    }
     persist_standing_runtime_checkpoint(
         state,
         &active.spec.view_id,
@@ -542,6 +548,7 @@ async fn replay_committed_ingest_into_standing_runtime_limited_locked_inner(
     range: Option<&BackfillRangeRequest>,
     scope: Option<&BackfillScopeRequest>,
 ) -> Result<StandingRuntimeBackfillReplayOutcome, ApiError> {
+    state.require_local_materialization()?;
     if active.spec.input_relations.is_empty() {
         return Ok(StandingRuntimeBackfillReplayOutcome::default());
     }
@@ -559,10 +566,49 @@ async fn replay_committed_ingest_into_standing_runtime_limited_locked_inner(
     if let Some(scope) = scope {
         validate_backfill_scope(scope)?;
     }
-    let Some(runtime) = state.standing_runtime(identity, &active.spec.view_id)? else {
+    let mut replay_lease = None;
+    let legacy_empty_replay = !state.authoritative_relation_ingest_enabled()
+        && replay_plan.replay_checkpoints.is_empty()
+        && range.is_none()
+        && scope.is_none();
+    let legacy_has_committed_inputs = if legacy_empty_replay {
+        let ingest_log =
+            IngestLog::new_catalog_checked(Arc::clone(&state.store), state.capabilities.as_ref())
+                .map_err(ApiError::internal)?;
+        // Listing committed descriptors is metadata-only; an empty log keeps
+        // pure checkpoint restore lease-free, while any possible input is
+        // fenced before the legacy replay path opens payloads.
+        !ingest_log
+            .list_committed()
+            .await
+            .map_err(ApiError::internal)?
+            .is_empty()
+    } else {
+        false
+    };
+    if legacy_empty_replay && !legacy_has_committed_inputs {
+        // Do not perform a second committed-log listing after this empty
+        // snapshot: a concurrent append belongs to a later replay operation.
+        return Ok(StandingRuntimeBackfillReplayOutcome::default());
+    }
+    if state.authoritative_relation_ingest_enabled()
+        || !replay_plan.replay_checkpoints.is_empty()
+        || range.is_some()
+        || scope.is_some()
+        || legacy_has_committed_inputs
+    {
+        // Replay may inspect and decode source artifacts. Fence that work
+        // before preparing any input so a competing owner causes no local
+        // artifact reads or partial replay.
+        replay_lease = Some(
+            owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?,
+        );
+    }
+    // Claim acquisition can evict an older resident. Capture only the runtime
+    // restored under the current claim, and refresh coverage after acquisition.
+    let Some((runtime, _)) = restore_standing_runtime_resident_locked(state, active).await? else {
         return Ok(StandingRuntimeBackfillReplayOutcome::default());
     };
-    let mut replay_lease = None;
     let replay_plan =
         match read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?
         {

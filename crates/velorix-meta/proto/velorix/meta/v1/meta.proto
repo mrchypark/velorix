@@ -408,6 +408,7 @@ message StandingRuntimeOwnerClaim {
   string owner_id = 4;
   uint64 owner_epoch = 5;
   uint64 expires_at_unix_ms = 6;
+  string owner_endpoint = 7;
 }
 
 message StandingRuntimeOwnerToken {
@@ -424,6 +425,7 @@ message AcquireStandingRuntimeOwnerRequest {
   string view_id = 3;
   string owner_id = 4;
   uint64 ttl_ms = 5;
+  string owner_endpoint = 6;
 }
 
 message AcquireStandingRuntimeOwnerResponse {

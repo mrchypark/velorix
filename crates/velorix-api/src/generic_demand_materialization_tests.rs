@@ -1,8 +1,14 @@
 use super::*;
+
+#[path = "worker_capacity_http_tests.rs"]
+mod worker_capacity_http_tests;
 use crate::demand_published::{
     capture_demand_published_artifacts, demand_published_artifact_key,
     load_demand_published_artifact,
 };
+
+#[path = "demand_concurrency_tests.rs"]
+mod concurrency;
 
 #[test]
 fn demand_recovery_preserves_lineage_without_claiming_completed_coverage() {
@@ -1213,33 +1219,19 @@ async fn empty_scope_cannot_certify_by_ignoring_scanned_byte_budget() {
     );
 }
 
-// Deterministic scheduler contract, separate from HTTP demand assertions above.
-// Holding the boundary models an in-flight atomic checkpoint; polling foreground
-// once registers the waiter before releasing it. No timing sleeps are involved.
+// Foreground priority is an RAII signal, independent of the explicit-work gate.
 #[tokio::test]
-async fn foreground_waiter_wins_next_checkpoint_boundary_over_explicit_work() {
+async fn foreground_priority_does_not_wait_for_explicit_work_and_cancels_cleanly() {
     let scheduler = Arc::new(demand_materialization::DemandScheduler::default());
     let boundary = scheduler
         .explicit_turn()
         .expect("idle explicit work may start");
-    let mut foreground = Box::pin(scheduler.query_turn());
-    std::future::poll_fn(|cx| {
-        assert!(
-            std::future::Future::poll(foreground.as_mut(), cx).is_pending(),
-            "foreground must not interrupt an atomic checkpoint"
-        );
-        std::task::Poll::Ready(())
-    })
-    .await;
+    let foreground = scheduler.foreground_guard();
     drop(boundary);
     assert!(
         scheduler.explicit_turn().is_none(),
-        "explicit work must yield to a foreground waiter at the boundary"
+        "explicit work must yield while foreground work is active"
     );
-    let foreground = tokio::time::timeout(Duration::from_secs(1), foreground)
-        .await
-        .unwrap();
-    assert!(scheduler.explicit_turn().is_none());
     drop(foreground);
     assert!(
         scheduler.explicit_turn().is_some(),
@@ -1247,12 +1239,7 @@ async fn foreground_waiter_wins_next_checkpoint_boundary_over_explicit_work() {
     );
 
     let boundary = scheduler.explicit_turn().unwrap();
-    let mut cancelled = Box::pin(scheduler.query_turn());
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(cancelled.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
+    let cancelled = scheduler.foreground_guard();
     drop(cancelled);
     drop(boundary);
     assert!(

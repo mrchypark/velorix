@@ -53,6 +53,8 @@ pub struct RhizaKvMetaStore {
     cache: Arc<RwLock<Option<CachedRootState>>>,
     /// Serializes full snapshot loads so one root change decodes once.
     full_load_lock: Arc<Mutex<()>>,
+    /// Serializes same-process mutations before they read the root and clock.
+    write_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     full_loads: Arc<AtomicUsize>,
     /// Forces one simulated CAS conflict for the retry regression test.
@@ -95,6 +97,7 @@ impl RhizaKvMetaStore {
             snapshot,
             cache: Arc::new(RwLock::new(None)),
             full_load_lock: Arc::new(Mutex::new(())),
+            write_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             full_loads: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -191,6 +194,7 @@ impl RhizaKvMetaStore {
     {
         let started = std::time::Instant::now();
         let mut cache_hit = None;
+        let _write_guard = self.write_lock.lock().await;
         let mut result = Err(MetaStoreError::RhizaContention {
             attempts: MAX_CAS_ATTEMPTS,
         });
@@ -664,6 +668,26 @@ impl MetaStore for RhizaKvMetaStore {
         .await
     }
 
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        self.mutate(
+            "acquire_standing_runtime_owner_with_endpoint",
+            move |store| {
+                let request = request.clone();
+                let owner_endpoint = owner_endpoint.clone();
+                async move {
+                    store
+                        .acquire_standing_runtime_owner_with_endpoint(request, owner_endpoint)
+                        .await
+                }
+            },
+        )
+        .await
+    }
+
     async fn renew_standing_runtime_owner(
         &self,
         owner: StandingRuntimeOwnerToken,
@@ -1124,6 +1148,77 @@ mod tests {
         let after_apply = store.full_loads();
         store.read_relation_catalog("orders", "v1").await.unwrap();
         assert_eq!(store.full_loads(), after_apply);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cloned_owner_claims_and_renewals_preserve_owner() {
+        let (_directory, store) = store().await;
+        let request = AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner".into(),
+            ttl_ms: 60_000,
+        };
+        let endpoint = "http://owner.example:8080";
+        let initial = store
+            .acquire_standing_runtime_owner_with_endpoint(request.clone(), endpoint.into())
+            .await
+            .unwrap();
+        let AcquireStandingRuntimeOwnerOutcome::Acquired(initial) = initial else {
+            panic!("initial owner claim was not acquired");
+        };
+        const CALLERS: usize = 24;
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
+        let mut tasks = Vec::new();
+        for index in 0..CALLERS {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            let mut request = request.clone();
+            let token = initial.token();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                if index % 3 == 0 {
+                    return store.renew_standing_runtime_owner(token, 60_000).await;
+                }
+                let advertised_endpoint = if index % 3 == 1 {
+                    endpoint
+                } else {
+                    request.owner_id = format!("foreign-{index}");
+                    "http://foreign.example:8080"
+                };
+                let outcome = store
+                    .acquire_standing_runtime_owner_with_endpoint(
+                        request,
+                        advertised_endpoint.into(),
+                    )
+                    .await?;
+                match outcome {
+                    AcquireStandingRuntimeOwnerOutcome::Renewed(claim) if index % 3 == 1 => {
+                        Ok(claim)
+                    }
+                    AcquireStandingRuntimeOwnerOutcome::Conflict(claim) if index % 3 == 2 => {
+                        Ok(claim)
+                    }
+                    other => panic!("unexpected concurrent owner outcome: {other:?}"),
+                }
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            let claim = task.await.unwrap().unwrap();
+            assert_eq!(claim.owner_id, initial.owner_id);
+            assert_eq!(claim.owner_epoch, initial.owner_epoch);
+            assert_eq!(claim.owner_endpoint.as_deref(), Some(endpoint));
+        }
+        let current = store
+            .read_standing_runtime_owner("tenant", "program", "view")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.owner_id, initial.owner_id);
+        assert_eq!(current.owner_epoch, initial.owner_epoch);
+        assert_eq!(current.owner_endpoint.as_deref(), Some(endpoint));
     }
 
     #[tokio::test]

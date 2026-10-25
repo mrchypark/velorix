@@ -170,16 +170,17 @@ pub(crate) fn build_relation_ingest_source_cuts(
     >::new();
     for (authority, reservation) in reservations {
         reservation.validate()?;
+        if authority.namespace != request.namespace {
+            continue;
+        }
         let requested_relation = request.relations.iter().find(|candidate| {
             candidate.relation_id == reservation.relation_id
                 && candidate.relation_version == reservation.relation_version
-                && candidate.schema_fingerprint == reservation.schema_fingerprint
         });
-        if requested_relation.is_none() {
+        let Some(requested_relation) = requested_relation else {
             continue;
-        }
-        if authority.namespace != request.namespace
-            || authority.relation_id != reservation.relation_id
+        };
+        if authority.relation_id != reservation.relation_id
             || authority.stream_id != reservation.stream_id
             || authority.partition_id != reservation.partition_id
         {
@@ -190,7 +191,13 @@ pub(crate) fn build_relation_ingest_source_cuts(
                 reason: "reservation authority scope mismatch",
             });
         }
-        let relation = requested_relation.expect("checked above").clone();
+        if requested_relation.schema_fingerprint.as_str() != reservation.schema_fingerprint.as_str()
+        {
+            return Err(MetaStoreError::Serialization(
+                "relation source-cut reservation fingerprint mismatch".into(),
+            ));
+        }
+        let relation = requested_relation.clone();
         if requested.contains(&relation) {
             grouped
                 .entry((
@@ -205,6 +212,22 @@ pub(crate) fn build_relation_ingest_source_cuts(
 
     let mut publication_map = BTreeMap::new();
     for publication in publications {
+        if publication.authority_key.namespace != request.namespace {
+            continue;
+        }
+        let Some(relation) = request.relations.iter().find(|relation| {
+            relation.relation_id == publication.reservation.relation_id
+                && relation.relation_version == publication.reservation.relation_version
+        }) else {
+            continue;
+        };
+        if relation.schema_fingerprint.as_str()
+            != publication.reservation.schema_fingerprint.as_str()
+        {
+            return Err(MetaStoreError::Serialization(
+                "relation source-cut publication fingerprint mismatch".into(),
+            ));
+        }
         let key = relation_source_entry_key(&publication.authority_key, &publication.reservation);
         if publication_map.insert(key, publication).is_some() {
             return Err(MetaStoreError::Serialization(
@@ -605,6 +628,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(duplicate, MetaStoreError::Serialization(_)));
+    }
+
+    #[test]
+    fn relation_source_cut_rejects_publication_with_wrong_schema_fingerprint() {
+        let reservation = reservation();
+        let mut mismatched = publication(
+            authority("orders"),
+            reservation.clone(),
+            "request-mismatched",
+        );
+        mismatched.reservation.schema_fingerprint = "sha256:other-schema".into();
+
+        let error = build_relation_ingest_source_cuts(
+            &request(),
+            [(authority("orders"), reservation)],
+            [mismatched],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MetaStoreError::Serialization(message) if message.contains("fingerprint")
+        ));
     }
 }
 
