@@ -521,6 +521,45 @@ impl ArrowState {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_ref().map_or(&[], |s| s.bytes.as_slice())
     }
+    /// Conservative bytes retained by the shared decoded state allocation.
+    /// Includes encoded storage, Arrow arrays and schema allocations, and the
+    /// row-boundary index capacity. Excludes the inline ArrowState Arc.
+    pub fn allocated_retained_bytes(&self) -> usize {
+        let Some(inner) = &self.0 else {
+            return 0;
+        };
+        let schema = inner.batch.schema();
+        let schema_bytes = std::mem::size_of_val(schema.as_ref())
+            .saturating_add(std::mem::size_of_val(&schema.fields))
+            .saturating_add(schema.fields.len() * std::mem::size_of::<arrow::datatypes::Field>())
+            .saturating_add(
+                schema
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        field.name().capacity().saturating_add(
+                            field
+                                .metadata()
+                                .iter()
+                                .map(|(key, value)| key.capacity() + value.capacity() + 128)
+                                .sum::<usize>(),
+                        )
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                schema
+                    .metadata
+                    .iter()
+                    .map(|(key, value)| key.capacity() + value.capacity() + 128)
+                    .sum::<usize>(),
+            );
+        std::mem::size_of_val(inner)
+            .saturating_add(inner.bytes.capacity())
+            .saturating_add(inner.ends.capacity() * std::mem::size_of::<usize>())
+            .saturating_add(inner.batch.get_array_memory_size())
+            .saturating_add(schema_bytes)
+    }
     /// Expanded typed-tree bytes; compression must never bypass resource budgets.
     pub fn len(&self) -> usize {
         self.0.as_ref().map_or(0, |s| s.size)
@@ -602,6 +641,21 @@ pub fn from_state<T: DeserializeOwned>(state: &ArrowState) -> Result<T, StateErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_allocation_weight_includes_arrow_arrays_indexes_and_encoded_capacity() {
+        let state = ArrowState::from_serializable(&vec!["compressible".repeat(8192); 8]).unwrap();
+        let inner = state.0.as_ref().unwrap();
+        let minimum = std::mem::size_of_val(inner)
+            + inner.bytes.capacity()
+            + inner.ends.capacity() * std::mem::size_of::<usize>()
+            + inner.batch.get_array_memory_size();
+
+        assert!(state.allocated_retained_bytes() >= minimum);
+        assert!(inner.batch.get_array_memory_size() > 0);
+        assert!(inner.bytes.capacity() >= inner.bytes.len());
+        assert!(inner.ends.capacity() >= inner.ends.len());
+    }
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
     struct State {
         runtime_kind: String,

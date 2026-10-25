@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
     io::Cursor,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -187,6 +187,7 @@ pub mod materialized_read_cache;
 mod openapi;
 mod output_delta_record;
 mod owner_lease;
+mod owner_routing;
 mod query_response;
 mod query_serving;
 mod recovery;
@@ -194,6 +195,7 @@ mod runtime_residency;
 mod scope_dependencies;
 mod view_admission;
 mod view_dependencies;
+mod worker_role;
 
 use checkpoint_publication::*;
 use ingest_epoch::*;
@@ -233,6 +235,12 @@ pub struct ApiState {
     view_bootstrap_meta_store: Option<Arc<dyn MetaStore>>,
     meta_store_endpoint: Option<String>,
     owner_id: String,
+    owner_endpoint: String,
+    service_role: worker_role::ServiceRole,
+    worker_endpoints: Vec<String>,
+    compute_slots: Arc<tokio::sync::Semaphore>,
+    max_compute_jobs: usize,
+    worker_selection_cursor: Arc<std::sync::atomic::AtomicUsize>,
     relation_ingest_mode: RelationIngestMode,
     relation_ingest_config: Option<RelationIngestApiConfig>,
     relation_ingest_publishers: Arc<Mutex<HashMap<String, RelationIngestPublisher>>>,
@@ -350,6 +358,7 @@ type RelationOperationLockMap = HashMap<(String, String), Arc<AsyncMutex<()>>>;
 struct StandingRuntimeRegistry {
     runtimes: Mutex<HashMap<StandingRuntimeKey, SharedStandingRuntime>>,
     operation_locks: Mutex<HashMap<StandingRuntimeKey, Arc<AsyncMutex<()>>>>,
+    owner_updates: Mutex<()>,
     // ponytail: Shared by this API state only; distributed admission needs a metadata fence.
     relation_operation_locks: Mutex<RelationOperationLockMap>,
     local_state: Mutex<HashMap<StandingRuntimeKey, StandingRuntimeLocalState>>,
@@ -1072,6 +1081,12 @@ impl ApiState {
             view_bootstrap_meta_store: None,
             meta_store_endpoint: None,
             owner_id,
+            owner_endpoint: "http://127.0.0.1:8080".to_string(),
+            service_role: worker_role::ServiceRole::All,
+            worker_endpoints: Vec::new(),
+            compute_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            max_compute_jobs: 4,
+            worker_selection_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             relation_ingest_mode: RelationIngestMode::Legacy,
             relation_ingest_config: None,
             relation_ingest_publishers: Arc::new(Mutex::new(HashMap::new())),
@@ -1141,6 +1156,11 @@ impl ApiState {
     pub fn with_meta_store_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.meta_store_endpoint = Some(endpoint.into());
         self
+    }
+
+    pub fn with_owner_endpoint(mut self, endpoint: impl Into<String>) -> Result<Self, ApiError> {
+        self.owner_endpoint = owner_routing::validate_owner_endpoint(&endpoint.into())?;
+        Ok(self)
     }
 
     pub fn with_authoritative_relation_ingest(
@@ -1503,17 +1523,21 @@ impl ApiState {
         identity: &StandingProgramIdentity,
         view_id: &str,
     ) -> Result<Option<StandingRuntimeOwnerToken>, ApiError> {
+        self.require_local_materialization()?;
         let Some(meta_store) = &self.meta_store else {
             return Ok(None);
         };
         let outcome = meta_store
-            .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
-                tenant_id: identity.tenant_id.clone(),
-                program_id: identity.program_id.clone(),
-                view_id: view_id.to_string(),
-                owner_id: self.owner_id.clone(),
-                ttl_ms: self.standing_runtime_owner_ttl_ms,
-            })
+            .acquire_standing_runtime_owner_with_endpoint(
+                AcquireStandingRuntimeOwnerRequest {
+                    tenant_id: identity.tenant_id.clone(),
+                    program_id: identity.program_id.clone(),
+                    view_id: view_id.to_string(),
+                    owner_id: self.owner_id.clone(),
+                    ttl_ms: self.standing_runtime_owner_ttl_ms,
+                },
+                self.owner_endpoint.clone(),
+            )
             .await
             .map_err(meta_error_to_api)?;
         match outcome {
@@ -1523,7 +1547,7 @@ impl ApiState {
                 Ok(Some(standing_runtime_owner_token_from_claim(&claim)))
             }
             AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
-                self.remove_standing_runtime_with_state(identity, view_id)?;
+                self.set_standing_runtime_owner(identity, view_id, claim.clone())?;
                 Err(ApiError::conflict(format!(
                     "standing runtime owner conflict for `{}/{}/{}`: current owner `{}` epoch {}",
                     identity.tenant_id,
@@ -1542,13 +1566,70 @@ impl ApiState {
         view_id: &str,
         owner: StandingRuntimeOwnerClaim,
     ) -> Result<(), ApiError> {
+        if owner.tenant_id != identity.tenant_id
+            || owner.program_id != identity.program_id
+            || owner.view_id != view_id
+        {
+            return Err(ApiError::conflict(
+                "standing runtime owner claim does not match its local identity",
+            ));
+        }
+        let _owner_update = self
+            .standing_runtimes
+            .owner_updates
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime owner update lock poisoned"))?;
         let key = standing_runtime_key(identity, view_id);
+        let mut runtimes = self
+            .standing_runtimes
+            .runtimes
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime registry lock poisoned"))?;
         let mut states = self
             .standing_runtimes
             .local_state
             .lock()
             .map_err(|_| ApiError::internal("standing runtime local state lock poisoned"))?;
+        let previous_owner = states.get(&key).and_then(|state| state.owner.as_ref());
+        if let Some(previous) = previous_owner {
+            if owner.owner_epoch < previous.owner_epoch {
+                return Err(ApiError::conflict(
+                    "standing runtime owner claim is older than the current local fence",
+                ));
+            }
+            if owner.owner_epoch == previous.owner_epoch && owner.owner_id != previous.owner_id {
+                return Err(ApiError::conflict(
+                    "standing runtime owner claim conflicts at the current epoch",
+                ));
+            }
+        }
+        // Keep the established registry-before-local-state lock order used by
+        // eviction. A missing owner marker with resident state is not proof
+        // that the cached runtime belongs to this claim.
+        let owner_changed = previous_owner.map_or_else(
+            || {
+                runtimes.contains_key(&key)
+                    || states
+                        .get(&key)
+                        .is_some_and(|state| state.committed_checkpoint.is_some())
+            },
+            |previous| {
+                previous.owner_id != owner.owner_id || previous.owner_epoch != owner.owner_epoch
+            },
+        );
+        // A new owner fence cannot reuse this process's prior runtime or its
+        // cached checkpoint pointer. Same-epoch renewals keep both intact.
+        let evicted = if owner_changed {
+            let evicted = runtimes.remove(&key);
+            states.entry(key.clone()).or_default().committed_checkpoint = None;
+            evicted
+        } else {
+            None
+        };
         states.entry(key).or_default().owner = Some(owner);
+        drop(states);
+        drop(runtimes);
+        drop(evicted);
         Ok(())
     }
 
@@ -1578,14 +1659,6 @@ impl ApiState {
             .lock()
             .map_err(|_| ApiError::internal("standing runtime local state lock poisoned"))?;
         Ok(states.get(key).cloned().unwrap_or_default())
-    }
-
-    fn remove_standing_runtime_with_state(
-        &self,
-        identity: &StandingProgramIdentity,
-        view_id: &str,
-    ) -> Result<(), ApiError> {
-        remove_standing_runtime(self, identity, view_id)
     }
 
     fn clear_standing_runtimes(&self) -> Result<(), ApiError> {
@@ -1689,6 +1762,12 @@ impl ApiState {
         &self,
         allow_legacy_rebuild: bool,
     ) -> Result<usize, ApiError> {
+        if self.service_role != worker_role::ServiceRole::All
+            && allow_legacy_rebuild
+            && self.legacy_rebuild_view_id.is_some()
+        {
+            return Err(ApiError::bad_request("legacy rebuild is unsupported in split roles; run the explicit migration in all role"));
+        }
         self.validate_standing_runtime_fencing_or_evict().await?;
         if let Some(meta_store) = &self.meta_store {
             let registry = meta_store
@@ -1702,11 +1781,45 @@ impl ApiState {
                 // import operation; do not discover or adopt S3 pointers here.
                 return Ok(0);
             }
+            if self.service_role != worker_role::ServiceRole::All {
+                // Count declarations without hydrating operator state, including legacy views.
+                return Ok(registry.records.len());
+            }
+        }
+        if self.service_role != worker_role::ServiceRole::All {
+            return Err(ApiError::service_unavailable(
+                "split startup requires shared metadata",
+            ));
         }
         let active_views = view_dependencies::list_active_from_meta(self).await?;
         let mut restored = 0;
+        let mut foreign_owned_views = BTreeSet::new();
 
         for active in active_views {
+            if let (Some(meta_store), Some(identity)) = (
+                self.meta_store.as_ref(),
+                active_standing_runtime_identity(&active),
+            ) {
+                let current_owner = meta_store
+                    .read_standing_runtime_owner(
+                        &identity.tenant_id,
+                        &identity.program_id,
+                        &active.spec.view_id,
+                    )
+                    .await
+                    .map_err(meta_error_to_api)?;
+                if current_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.owner_id != self.owner_id)
+                {
+                    // A live foreign writer owns replay and publication. Startup
+                    // may still serve its immutable checkpoint, but must not
+                    // restore and replay that view into a competing runtime.
+                    foreign_owned_views.insert(active.spec.view_id.clone());
+                    restored += 1;
+                    continue;
+                }
+            }
             // Registry records are durable and independently queryable. Merely
             // opening the service must not start materialization of every view.
             // An explicitly selected legacy migration remains an opt-in action.
@@ -1744,15 +1857,39 @@ impl ApiState {
             let operation_guard = operation.lock().await;
             match ensure_standing_runtime_for_active_view(self, &active).await {
                 Ok(Some(replay_plan)) => {
-                    replay_committed_ingest_into_standing_runtime_locked(
+                    match replay_committed_ingest_into_standing_runtime_locked(
                         self,
                         &active,
                         &replay_plan,
                     )
-                    .await?;
-                    restored += 1;
+                    .await
+                    {
+                        Ok(()) => restored += 1,
+                        Err(error)
+                            if error.status == StatusCode::CONFLICT
+                                && error
+                                    .message
+                                    .starts_with("standing runtime owner conflict for ") =>
+                        {
+                            // A writer may claim ownership after the read-only
+                            // startup check. Replay fences before input reads;
+                            // on this race it removes the local candidate, and
+                            // startup can still serve the immutable checkpoint.
+                            restored += 1;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Ok(None) => {}
+                Err(error)
+                    if error.status == StatusCode::CONFLICT
+                        && error
+                            .message
+                            .starts_with("standing runtime owner conflict for ") =>
+                {
+                    foreign_owned_views.insert(active.spec.view_id.clone());
+                    restored += 1;
+                }
                 Err(error)
                     if allow_legacy_rebuild
                         && self.legacy_rebuild_targeted(&active.spec.view_id)
@@ -1770,7 +1907,11 @@ impl ApiState {
         }
 
         if !self.authoritative_relation_ingest_enabled() {
-            drain_published_view_dependencies(self).await?;
+            view_dependencies::drain_published_view_dependencies_skipping(
+                self,
+                &foreign_owned_views,
+            )
+            .await?;
         }
         // Legacy replay and explicit migration may have loaded operator state.
         self.prune_standing_runtime_residents()?;
@@ -1820,6 +1961,14 @@ impl ApiState {
 }
 
 pub fn app(state: ApiState) -> Router {
+    let worker_routes = Router::new()
+        .route("/internal/v1/worker/status", get(worker_role::status))
+        .route("/internal/v1/worker/claim", post(worker_role::claim))
+        .route("/internal/v1/worker/declare", post(worker_role::declare))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            worker_role::require_worker_auth,
+        ));
     let protected_routes = Router::new()
         .route("/v1/relations", post(create_relation))
         .route(
@@ -1833,6 +1982,10 @@ pub fn app(state: ApiState) -> Router {
             get(get_query_policy),
         )
         .route("/v1/views", get(list_views).post(create_view))
+        .route(
+            "/internal/v1/views/{view_id}/demand-step",
+            post(owner_routing::demand_step_rpc),
+        )
         .route("/v1/views/{view_id}", get(get_view))
         .route(
             "/v1/views/{view_id}/backfill",
@@ -1878,6 +2031,7 @@ pub fn app(state: ApiState) -> Router {
         .route("/readyz", get(readyz))
         .merge(protected_routes)
         .merge(admin_routes)
+        .merge(worker_routes)
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(state)
 }
@@ -1887,6 +2041,23 @@ async fn require_api_auth(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let internal = request.uri().path().starts_with("/internal/");
+    if state.service_role == worker_role::ServiceRole::Worker && !internal {
+        if request.method() == axum::http::Method::POST
+            && (request.uri().path() == "/v1/relations/ingest"
+                || request.uri().path().ends_with("/ingest"))
+        {
+            return Err(ApiError::bad_request("worker role does not accept public ingest; use the api role for authoritative demand input or all role for legacy eager input"));
+        }
+        return Err(ApiError::service_unavailable(
+            "worker role serves internal compute RPCs only",
+        ));
+    }
+    if internal && state.api_bearer_token.is_none() {
+        return Err(ApiError::unauthorized(
+            "worker RPC requires bearer authentication",
+        ));
+    }
     let Some(expected) = state.api_bearer_token.as_deref() else {
         return Ok(next.run(request).await);
     };
@@ -2021,6 +2192,14 @@ pub async fn run_from_env() -> anyhow::Result<()> {
             .with_api_bearer_token(token)
             .map_err(|error| anyhow!("invalid VELORIX_API_BEARER_TOKEN: {error}"))?;
     }
+    state = state
+        .with_owner_endpoint(config.owner_endpoint.clone())
+        .map_err(|error| anyhow!("invalid VELORIX_API_OWNER_ENDPOINT: {error}"))?;
+    state = state.with_service_role(
+        config.service_role,
+        config.worker_endpoints.clone(),
+        config.max_compute_jobs,
+    )?;
     if let Some(token) = config.admin_bearer_token {
         state = state
             .with_admin_bearer_token(token)
@@ -2713,6 +2892,9 @@ async fn readyz(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> 
     };
     Ok(Json(json!({
         "status": "ready",
+        "service_role": state.service_role,
+        "local_materialization": state.allows_local_materialization(),
+        "split_legacy_compute": "unsupported; use all role",
         "relation_ingest": {
             "mode": state.relation_ingest_mode.as_str(),
             "authoritative": state.authoritative_relation_ingest_enabled(),
@@ -2899,6 +3081,7 @@ async fn get_standing_runtime_owners(
 async fn acquire_standing_runtime_owners(
     State(state): State<ApiState>,
 ) -> Result<Json<StandingRuntimeOwnerAcquireResponse>, ApiError> {
+    state.require_local_materialization()?;
     let active_views = view_dependencies::list_active_from_meta(&state).await?;
     let mut outcomes = Vec::new();
 
@@ -2922,13 +3105,16 @@ async fn acquire_standing_runtime_owners(
         };
 
         let outcome = meta_store
-            .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
-                tenant_id: identity.tenant_id.clone(),
-                program_id: identity.program_id.clone(),
-                view_id: view_id.clone(),
-                owner_id: state.owner_id.clone(),
-                ttl_ms: state.standing_runtime_owner_ttl_ms,
-            })
+            .acquire_standing_runtime_owner_with_endpoint(
+                AcquireStandingRuntimeOwnerRequest {
+                    tenant_id: identity.tenant_id.clone(),
+                    program_id: identity.program_id.clone(),
+                    view_id: view_id.clone(),
+                    owner_id: state.owner_id.clone(),
+                    ttl_ms: state.standing_runtime_owner_ttl_ms,
+                },
+                state.owner_endpoint.clone(),
+            )
             .await
             .map_err(meta_error_to_api)?;
         let (outcome_name, current_owner) = match outcome {
@@ -2941,7 +3127,7 @@ async fn acquire_standing_runtime_owners(
                 ("renewed", Some(claim))
             }
             AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
-                state.remove_standing_runtime_with_state(identity, &view_id)?;
+                state.set_standing_runtime_owner(identity, &view_id, claim.clone())?;
                 ("conflict", Some(claim))
             }
         };
@@ -2969,9 +3155,6 @@ async fn standing_runtime_owner_report(
     let mut owners = Vec::new();
 
     for active in active_views {
-        if !standing_runtime_can_accept_incremental_ingest(&active) {
-            continue;
-        }
         let Some(identity) = active_standing_runtime_identity(&active) else {
             continue;
         };
@@ -3161,9 +3344,8 @@ async fn run_view_backfill(
                 "demand backfill controls require an authoritative demand-managed view",
             ));
         }
-        let outcome =
-            run_view_backfill_step(&state, &view_id, request.batch_limit, None, None).await?;
-        return Ok((StatusCode::OK, Json(outcome)).into_response());
+        return owner_routing::route_published_backfill_step(&state, &active, request.batch_limit)
+            .await;
     }
     let mut budget = request.budget.clone().unwrap_or_default();
     if let Some(limit) = request.batch_limit {
@@ -3183,14 +3365,13 @@ async fn run_view_backfill(
             .into_response());
     };
     if request.action != demand_materialization::DemandAction::Step {
-        demand_materialization::set_demand_control(
+        return owner_routing::route_demand_control(
             &state,
             &active,
             request.action == demand_materialization::DemandAction::Pause,
             request.order,
         )
-        .await?;
-        return Ok(Json(serde_json::json!({"materialization":{"status":if request.action == demand_materialization::DemandAction::Pause {"paused"} else {"resumed"},"complete":false}})).into_response());
+        .await;
     }
     if let Some(identity) = active_standing_runtime_identity(&active) {
         if checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
@@ -8605,6 +8786,10 @@ impl IntoResponse for ApiError {
 #[derive(Clone, Debug)]
 struct ApiConfig {
     bind: SocketAddr,
+    owner_endpoint: String,
+    service_role: worker_role::ServiceRole,
+    worker_endpoints: Vec<String>,
+    max_compute_jobs: usize,
     materialized_read_cache: Option<materialized_read_cache::MaterializedReadCacheConfig>,
     tls: Option<ApiTlsConfig>,
     endpoint: String,
@@ -8744,13 +8929,51 @@ impl ApiConfig {
                 "VELORIX_OUTPUT_COMPACTION_INTERVAL_EPOCHS is experimental and disabled for the public 1.0 API"
             ));
         }
+        let service_role = worker_role::ServiceRole::parse(
+            optional_nonempty_env("VELORIX_SERVICE_ROLE").as_deref(),
+        )?;
+        let worker_endpoints = worker_role::parse_worker_endpoints(
+            optional_nonempty_env("VELORIX_WORKER_ENDPOINTS").as_deref(),
+        )?;
+        let max_compute_jobs = parse_positive_usize_env("VELORIX_WORKER_MAX_CONCURRENT_JOBS", 4)?;
+        worker_role::validate_split_config(
+            service_role,
+            &worker_endpoints,
+            api_bearer_token.is_some(),
+            meta_grpc_endpoint.is_some(),
+        )?;
         let api_replica_count =
             parse_api_replica_count(std::env::var("VELORIX_API_REPLICA_COUNT").ok().as_deref())?;
+        let compute_replica_count =
+            service_role.compute_replica_count(api_replica_count, worker_endpoints.len());
+        let owner_endpoint = match optional_nonempty_env("VELORIX_API_OWNER_ENDPOINT") {
+            Some(endpoint) => owner_routing::validate_owner_endpoint(&endpoint)
+                .map_err(|error| anyhow!("invalid VELORIX_API_OWNER_ENDPOINT: {error}"))?,
+            None if compute_replica_count > 1 => anyhow::bail!(
+                "VELORIX_API_OWNER_ENDPOINT is required for multiple compute replicas"
+            ),
+            None => {
+                let advertised_bind = tls.as_ref().map(|tls| tls.bind).unwrap_or(bind);
+                let host = if advertised_bind.ip().is_unspecified() {
+                    "127.0.0.1".to_string()
+                } else {
+                    advertised_bind.ip().to_string()
+                };
+                let scheme = if tls.is_some() { "https" } else { "http" };
+                format!("{scheme}://{host}:{}", advertised_bind.port())
+            }
+        };
         let standing_runtime_fencing = StandingRuntimeFencingMode::from_env(
             std::env::var("VELORIX_STANDING_RUNTIME_FENCING")
                 .ok()
                 .as_deref(),
-            api_replica_count,
+            compute_replica_count.max(1),
+        )?;
+        validate_unsafe_dev_multi_api_config(
+            standing_runtime_fencing,
+            bind,
+            tls.as_ref(),
+            meta_grpc_endpoint.as_deref(),
         )?;
         let standing_runtime_owner_ttl_ms =
             parse_positive_u64_env("VELORIX_STANDING_RUNTIME_OWNER_TTL_MS", 30_000)?;
@@ -8767,6 +8990,10 @@ impl ApiConfig {
         )?;
         Ok(Self {
             bind,
+            owner_endpoint,
+            service_role,
+            worker_endpoints,
+            max_compute_jobs,
             materialized_read_cache,
             tls,
             endpoint,
@@ -8993,6 +9220,7 @@ fn api_tls_config_from_values(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StandingRuntimeFencingMode {
     SingleWriter,
+    UnsafeDevMultiApi,
     LogicalFencing,
     Required,
 }
@@ -9013,24 +9241,65 @@ impl StandingRuntimeFencingMode {
                     Ok(Self::SingleWriter)
                 }
             }
+            Some("unsafe-dev-multi-api") => {
+                if api_replica_count <= 1 {
+                    Err(anyhow!(
+                        "VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-multi-api requires VELORIX_API_REPLICA_COUNT greater than one"
+                    ))
+                } else {
+                    Ok(Self::UnsafeDevMultiApi)
+                }
+            }
             Some(other) => Err(anyhow!(
-                "unsupported VELORIX_STANDING_RUNTIME_FENCING `{other}`; expected `required`, `production`, `multi-writer`, `logical-fencing`, or `unsafe-dev-only`"
+                "unsupported VELORIX_STANDING_RUNTIME_FENCING `{other}`; expected `required`, `production`, `multi-writer`, `logical-fencing`, `unsafe-dev-only`, or `unsafe-dev-multi-api`"
             )),
             None => Ok(Self::Required),
         }
     }
 
     fn requires_metadata(self) -> bool {
-        !matches!(self, Self::SingleWriter)
+        !matches!(self, Self::SingleWriter | Self::UnsafeDevMultiApi)
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::SingleWriter => "unsafe-dev-only",
+            Self::UnsafeDevMultiApi => "unsafe-dev-multi-api",
             Self::LogicalFencing => "logical-fencing",
             Self::Required => "required",
         }
     }
+}
+
+fn validate_unsafe_dev_multi_api_config(
+    mode: StandingRuntimeFencingMode,
+    bind: SocketAddr,
+    tls: Option<&ApiTlsConfig>,
+    meta_endpoint: Option<&str>,
+) -> anyhow::Result<()> {
+    if mode != StandingRuntimeFencingMode::UnsafeDevMultiApi {
+        return Ok(());
+    }
+    if !bind.ip().is_loopback() || tls.is_some_and(|tls| !tls.bind.ip().is_loopback()) {
+        return Err(anyhow!(
+            "unsafe-dev-multi-api requires loopback API listeners"
+        ));
+    }
+    let endpoint = meta_endpoint
+        .ok_or_else(|| anyhow!("unsafe-dev-multi-api requires a local loopback Meta endpoint"))?;
+    let uri = endpoint
+        .parse::<axum::http::Uri>()
+        .context("invalid VELORIX_META_GRPC_ENDPOINT")?;
+    let is_loopback_ip = uri
+        .host()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback());
+    if uri.scheme_str() != Some("http") || !is_loopback_ip {
+        return Err(anyhow!(
+            "unsafe-dev-multi-api requires an http:// loopback VELORIX_META_GRPC_ENDPOINT"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_api_replica_count(value: Option<&str>) -> anyhow::Result<u32> {
@@ -9226,7 +9495,8 @@ fn validate_standing_runtime_fencing_for_mode(
     mode: StandingRuntimeFencingMode,
 ) -> anyhow::Result<()> {
     match mode {
-        StandingRuntimeFencingMode::SingleWriter => Ok(()),
+        StandingRuntimeFencingMode::SingleWriter
+        | StandingRuntimeFencingMode::UnsafeDevMultiApi => Ok(()),
         StandingRuntimeFencingMode::LogicalFencing => {
             validate_logical_standing_runtime_fencing(capability)
         }

@@ -92,6 +92,57 @@ with progress; that status alone does not establish completion. Demand `scope`,
 rejected in Legacy mode. The authoritative 202/200 progress contract below must
 not be applied to Legacy backfill responses.
 
+With multiple API replicas, configure a reachable `VELORIX_API_OWNER_ENDPOINT`
+for every process. Meta stores that HTTP(S) origin with the runtime-owner claim
+and preserves it across renewal. Demand routes resolve ownership separately for
+each view in the dependency closure; a foreign owner receives an internal
+`POST /internal/v1/views/{view_id}/demand-step` carrying the pinned spec hash,
+expected owner epoch, request scope/order/priority, remaining budget, absolute
+deadline, and bounded hop count. The internal response includes checkpoint epoch
+and work units for accurate caller accounting, while the public response shape
+and its 200-complete/202-pending behavior remain unchanged. A route refreshes the
+claim after forwarding failure; when the lease remains live beyond the request
+deadline, demand returns pending rather than starting local preparation.
+
+### Split API and worker roles
+
+`VELORIX_SERVICE_ROLE` accepts `all` (default), `api`, or `worker`. Split
+services require `VELORIX_API_BEARER_TOKEN` and `VELORIX_META_GRPC_ENDPOINT`;
+an API role also requires `VELORIX_WORKER_ENDPOINTS`, a comma-separated list
+of at most 32 worker HTTP(S) origins. Configure the same complete worker list
+on every API and worker, and update all of them when workers are added or
+removed. Compute replica count is zero for `api`, `VELORIX_API_REPLICA_COUNT`
+for `all`, and the worker endpoint list length (at least one) for `worker`.
+Every process shares the same Meta and S3
+authority, bucket, prefix, and credentials, while keeping a distinct cache
+directory, owner endpoint, and bind address.
+
+Worker endpoints and owner addresses must reach individual workers directly
+through stable addresses; a shared load balancer distributing requests across
+workers can send owner-bound RPCs to another process and cause hop/pending loops.
+
+Authoritative ingest is the default and requires a stable, nonempty
+`VELORIX_RELATION_INGEST_OWNER_ID`; the API uses it as the source publisher
+identity. Split services inherit the same stable value and the shared Meta TLS,
+storage, and fencing configuration described in the startup guide.
+
+The API accepts public source input and delegates compute admission to workers.
+Workers serve authenticated internal RPCs only and reject public mutating
+routes. Split ingest and compute support authoritative demand-managed views;
+the code rejects split mode before ingest if authoritative ingest is disabled
+or existing views use eager checkpoints. Use `all` to retain legacy eager
+behavior. New declarations still do not automatically backfill historical
+input. Existing owner-sticky work remains with its current owner; newly claimed
+work can select a worker with available job/runtime capacity. A single hot view
+is not divided among workers. Warm-worker-down requests retain the existing
+HTTP 200/202 completion/pending contract; cold work with no available worker
+remains pending (202). `VELORIX_WORKER_MAX_CONCURRENT_JOBS` defaults to 4 and
+limits worker RPC admission per process only; it does not gate local execution
+in `all` mode or impose CPU/RSS hard limits. Existing memory, query/runtime,
+and Foyer limits continue to apply.
+
+See [the split-service startup example](../how-to.md#split-api-and-worker-services).
+
 Existing durable checkpoints without demand metadata retain eager ingest
 behavior even with authoritative ingest enabled. Enabling the flag is therefore
 not a blanket migration of existing views or Legacy source history. The demand
@@ -249,7 +300,7 @@ The current `POST /v1/views/{view_id}/query` JSON envelope accepts optional
 | `batch_limit` | 1 | Work units per request |
 | `max_rows` | 4,000 | Input row inspection budget |
 | `max_bytes` | 67,108,864 | Source read/decode acceptance budget |
-| `max_duration_ms` | 1,000 | Cooperative duration limit |
+| `max_duration_ms` | 1,000 | Demand closure, freshness preflight, and materialization budget |
 
 The query's top-level `max_rows` still limits returned output rows, separately
 from `materialization.budget.max_rows`. An ordinary bound query's simple output
@@ -342,15 +393,19 @@ resume and restart continue that progress without applying it twice. The final
 API must distinguish stopping new work from interrupting an in-flight operator
 operation; no instantaneous cancellation guarantee is implied here.
 
-Work-unit limits and cooperative stopping checks are not strict resource bounds.
+Work-unit limits and the duration deadline are not strict resource bounds.
 A source adapter's `max_bytes` is a strict serialized-read cap; decoded-size
 acceptance is checked after Arrow decoding and therefore does not bound peak
 allocation or RSS. Authentication may require one whole object as the minimum
 work unit. An undersized budget must return the required-budget error rather
-than silently perform a larger read. A `max_duration_ms` limit is checked at
-cooperative stopping points, not enforced by preempting an in-flight operation.
-A page or commit budget limits scheduled progress, while a nonpaged snapshot or
-stateful dependency closure can still be large. Operator expansion, snapshot,
+than silently perform a larger read. `max_duration_ms` includes demand-closure
+loading and read-only freshness preflight. Its async timeout can cancel an
+awaited operation and return HTTP 202 `dependency_pending`; that status means
+completion and freshness were not established within budget, not that unfinished
+compute is proven to remain. Synchronous CPU work cannot be preempted, so the
+deadline may be exceeded until that work yields. This is not a whole-request HTTP
+deadline. A page or commit budget limits scheduled progress, while a nonpaged
+snapshot or stateful dependency closure can still be large. Operator expansion, snapshot,
 and state-payload guards reject work exceeding their respective limits; they do
 not bound total process RSS, CPU time, all validation I/O, or elapsed request time. Retained
 state restoration and checkpoint copies remain relevant even for a narrow

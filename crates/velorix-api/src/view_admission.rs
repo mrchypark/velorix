@@ -3,7 +3,7 @@ use super::*;
 pub(super) async fn create_view(
     State(state): State<ApiState>,
     Json(request): Json<CreateViewRequest>,
-) -> Result<(StatusCode, Json<ViewResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     initialize_empty_active_view_registry_for_admission(&state).await?;
     let _admission_timer =
         checkpoint_publication::CursorPhaseTimer::new(&request.view_id, 0, "admission_total");
@@ -37,19 +37,7 @@ pub(super) async fn create_view(
                 .await,
         );
     }
-    // Validate source-cut identities without using emptiness as readiness evidence.
-    let requires_backfill =
-        standing_runtime_create_requires_backfill(&state, &history_spec).await?;
     let demand_managed = state.authoritative_relation_ingest_enabled();
-    if !demand_managed {
-        for input in &resolved_inputs {
-            if let ResolvedAdmissionInputV1::PublishedView { producer, .. } = input {
-                if view_query_availability(&producer.lifecycle) {
-                    bootstrap_legacy_view_if_empty(&state, producer).await?;
-                }
-            }
-        }
-    }
     validate_materialized_runtime_spec_admission(&spec)?;
     state.validate_standing_runtime_fencing_or_evict().await?;
     let spec_hash = view_spec_hash(&spec).map_err(ApiError::bad_request)?;
@@ -57,7 +45,15 @@ pub(super) async fn create_view(
         .await?
         .into_iter()
         .find(|active| active.spec.view_id == spec.view_id && active.spec_hash == spec_hash);
-    let input_bindings = if let Some(runtime) =
+    if state.service_role != worker_role::ServiceRole::All {
+        if !demand_managed {
+            return Err(ApiError::bad_request("split declaration requires authoritative demand mode; legacy execution requires all role"));
+        }
+        if let Some(existing) = existing.as_ref() {
+            worker_role::validate_compute_view(&state, existing).await?;
+        }
+    }
+    let mut input_bindings = if let Some(runtime) =
         existing.as_ref().and_then(|active| active.runtime.as_ref())
     {
         // An interrupted declaration owns its original immutable baseline.
@@ -75,7 +71,9 @@ pub(super) async fn create_view(
         }
         runtime.input_bindings.clone()
     } else {
-        input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs).await?
+        // The immutable producer binding determines identity; capturing its
+        // output cursor is payload work and waits for the consumer's lease.
+        input_bindings_for_resolved_inputs(&state, "default", &resolved_inputs, false).await?
     };
     let mut runtime_binding = materialized_view_runtime_binding_for_spec(
         &catalogs,
@@ -99,24 +97,80 @@ pub(super) async fn create_view(
         &spec.output_relations,
     )
     .await?;
+    if !state.allows_local_materialization() {
+        return worker_role::forward_declaration(
+            &state,
+            &request,
+            &runtime_binding.standing_program_identity,
+        )
+        .await;
+    }
+    let metadata_only = demand_managed && !has_published_inputs;
+    let admission_lease = worker_role::AdmissionLease::start(
+        &state,
+        &runtime_binding.standing_program_identity,
+        &spec.view_id,
+        metadata_only,
+    )
+    .await?;
+    // Legacy history detection decodes source envelopes. Both it and producer
+    // baseline proofs must run only after this consumer owns a renewable claim.
+    let requires_backfill = if metadata_only {
+        false
+    } else {
+        admission_lease
+            .while_owned(standing_runtime_create_requires_backfill(
+                &state,
+                &history_spec,
+            ))
+            .await?
+    };
+    if !demand_managed {
+        for input in &resolved_inputs {
+            if let ResolvedAdmissionInputV1::PublishedView { producer, .. } = input {
+                if view_query_availability(&producer.lifecycle) {
+                    admission_lease
+                        .while_owned(bootstrap_legacy_view_if_empty(&state, producer))
+                        .await?;
+                }
+            }
+        }
+    }
+    if existing.is_none() {
+        input_bindings = admission_lease
+            .while_owned(input_bindings_for_resolved_inputs(
+                &state,
+                "default",
+                &resolved_inputs,
+                true,
+            ))
+            .await?;
+        // A baseline cursor is not part of the immutable input identity hash.
+        runtime_binding.input_bindings = input_bindings.clone();
+    }
     // Serialize view-on-view admissions in-process so concurrent creates
     // cannot both pass the acyclic check against the same graph snapshot; the
     // authoritative meta-store graph revision CAS extends the fence across
     // processes.
-    let _graph_guard = state.view_dependency_graph_mutex.lock().await;
+    let _graph_guard = admission_lease
+        .while_owned(async { Ok(state.view_dependency_graph_mutex.clone().lock_owned().await) })
+        .await?;
     let candidate_edges = dependency_edges_from_input_bindings(
         &runtime_binding.standing_program_identity.tenant_id,
         &runtime_binding.standing_program_identity.program_id,
         &spec.view_id,
         &input_bindings,
     )?;
-    let existing_edges = view_dependency_edges_from_active_views(&state).await?;
+    let existing_edges = admission_lease
+        .while_owned(view_dependency_edges_from_active_views(&state))
+        .await?;
     for candidate in &candidate_edges {
         validate_view_dependency_graph_with_candidate(&existing_edges, candidate)?;
     }
-    let pending_runtime = if existing.is_some() {
+    let pending_runtime = if existing.is_some() || demand_managed {
         None
     } else {
+        admission_lease.ensure_owned()?;
         build_standing_runtime_for_runtime_binding(
             &state,
             &spec,
@@ -127,9 +181,15 @@ pub(super) async fn create_view(
         )?
     };
     let execution_mode = MaterializedViewExecutionMode::StandingRuntime;
-    let bootstrap =
-        begin_authoritative_view_bootstrap(&state, &spec, &runtime_binding, &input_bindings)
-            .await?;
+    admission_lease.ensure_owned()?;
+    let bootstrap = admission_lease
+        .while_owned(begin_authoritative_view_bootstrap(
+            &state,
+            &spec,
+            &runtime_binding,
+            &input_bindings,
+        ))
+        .await?;
     runtime_binding.published_relations = published_relation_bindings_for_spec(
         &spec,
         &runtime_binding,
@@ -195,28 +255,35 @@ pub(super) async fn create_view(
     } else if let Some(runtime) = pending_runtime {
         let operation_lock =
             state.standing_runtime_operation_lock(runtime.program_identity(), &spec.view_id)?;
-        let _operation_guard = operation_lock.lock().await;
-        let outcome = register_materialized_view_execution(
-            &state,
-            &spec,
-            Some(api_metadata.clone()),
-            runtime_binding.clone(),
-            Some(lifecycle.clone()),
-        )
-        .await?;
+        let _operation_guard = admission_lease
+            .while_owned(async { Ok(operation_lock.lock_owned().await) })
+            .await?;
+        let outcome = admission_lease
+            .while_owned(register_materialized_view_execution(
+                &state,
+                &spec,
+                Some(api_metadata.clone()),
+                runtime_binding.clone(),
+                Some(lifecycle.clone()),
+            ))
+            .await?;
+        // Registration awaits Meta; renewal may fail during that call. Never
+        // install the prepared runtime after the admission fence is lost.
+        admission_lease.ensure_owned()?;
         if view_query_availability(&lifecycle) {
             insert_standing_runtime(&state, &spec.view_id, runtime)?;
         }
         outcome
     } else {
-        register_materialized_view_execution(
-            &state,
-            &spec,
-            Some(api_metadata.clone()),
-            runtime_binding.clone(),
-            Some(lifecycle.clone()),
-        )
-        .await?
+        admission_lease
+            .while_owned(register_materialized_view_execution(
+                &state,
+                &spec,
+                Some(api_metadata.clone()),
+                runtime_binding.clone(),
+                Some(lifecycle.clone()),
+            ))
+            .await?
     };
     if !demand_managed && has_published_inputs && view_query_availability(&lifecycle) {
         let active = view_dependencies::read_active_from_meta(&state, &spec.view_id).await?;
@@ -245,7 +312,8 @@ pub(super) async fn create_view(
             Some(outcome_text),
             state.experimental_advanced_view_features,
         )?),
-    ))
+    )
+        .into_response())
 }
 
 /// A fresh installation may establish the empty Meta registry on its first
@@ -868,6 +936,12 @@ pub(super) async fn ensure_standing_runtime_for_active_view(
     let Some(runtime_binding) = active.runtime.as_ref() else {
         return Ok(None);
     };
+    state
+        .acquire_standing_runtime_owner(
+            &runtime_binding.standing_program_identity,
+            &active.spec.view_id,
+        )
+        .await?;
     let Some((runtime, replay_plan)) = restore_or_build_standing_runtime_for_runtime_binding(
         state,
         &active.spec,
@@ -904,6 +978,7 @@ pub(super) fn build_standing_runtime_for_runtime_binding(
     expected_input_schemas: &[RelationSchema],
     expected_output_schemas: &[RelationSchema],
 ) -> Result<Option<Box<dyn StandingProgramRuntime + Send>>, ApiError> {
+    state.require_local_materialization()?;
     let identity = &runtime_binding.standing_program_identity;
     if state.standing_runtime(identity, &spec.view_id)?.is_some() {
         return Ok(None);
@@ -966,6 +1041,7 @@ async fn restore_standing_runtime_resident_locked_inner(
     state: &ApiState,
     active: &ActiveMaterializedView,
 ) -> Result<Option<(SharedStandingRuntime, Option<StandingRuntimeReplayPlan>)>, ApiError> {
+    state.require_local_materialization()?;
     let Some(identity) = active_standing_runtime_identity(active) else {
         return Ok(None);
     };
@@ -1010,6 +1086,7 @@ pub(super) async fn restore_or_build_standing_runtime_for_runtime_binding(
     )>,
     ApiError,
 > {
+    state.require_local_materialization()?;
     let identity = &runtime_binding.standing_program_identity;
     if state.standing_runtime(identity, &spec.view_id)?.is_some() {
         return Ok(None);
@@ -1201,6 +1278,7 @@ pub(super) fn insert_standing_runtime(
     view_id: &str,
     runtime: Box<dyn StandingProgramRuntime + Send>,
 ) -> Result<(), ApiError> {
+    state.require_local_materialization()?;
     let key = standing_runtime_key(runtime.program_identity(), view_id);
     let mut runtimes = state
         .standing_runtimes

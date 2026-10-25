@@ -331,6 +331,11 @@ pub(super) async fn ingest_epoch(
     }
     timer.set_workload(batch_count, total_rows);
 
+    if state.service_role != worker_role::ServiceRole::All {
+        let snapshot = ActiveViewReadSnapshot::load(&state).await?;
+        worker_role::validate_split_ingest(&state, &snapshot).await?;
+    }
+
     let mut prepared_batches = Vec::with_capacity(request.batches.len());
     let mut catalog_cache: HashMap<(String, String), VelorixRelationCatalogV1> = HashMap::new();
     for batch in request.batches {
@@ -462,22 +467,6 @@ pub(super) async fn ingest_epoch(
             }
         }
         timer.mark("ensure_runtime");
-        let mut preacquired_ingest_relations = BTreeSet::new();
-        for prepared in &prepared_batches {
-            let key = (
-                prepared.request.relation_id.as_str(),
-                prepared.request.relation_version.as_str(),
-            );
-            if preacquired_ingest_relations.insert(key) {
-                preacquire_standing_runtime_owners_for_ingest_with_snapshot(
-                    &state,
-                    &prepared.request,
-                    &view_snapshot,
-                )
-                .await?;
-            }
-        }
-        timer.mark("preacquire_owner");
         let materialization = materialize_prepared_ingest_epoch_for_ack_mode(
             &state,
             &epoch_manifest,
@@ -488,8 +477,13 @@ pub(super) async fn ingest_epoch(
             &view_snapshot,
         )
         .await?;
-        drain_published_view_dependencies_from_snapshot(&state, &view_snapshot).await?;
+        if state.allows_local_materialization() {
+            drain_published_view_dependencies_from_snapshot(&state, &view_snapshot).await?;
+        }
         for active in view_snapshot.views() {
+            if !state.allows_local_materialization() {
+                continue;
+            }
             // Ingest reconciles active graphs only. Historical baselines,
             // including durable partial published-input checkpoints, are
             // activated by explicit backfill after coverage is complete.
@@ -587,22 +581,6 @@ pub(super) async fn ingest_epoch(
         }
     }
     timer.mark("ensure_runtime");
-    let mut preacquired_ingest_relations = BTreeSet::new();
-    for prepared in &prepared_batches {
-        let key = (
-            prepared.request.relation_id.as_str(),
-            prepared.request.relation_version.as_str(),
-        );
-        if preacquired_ingest_relations.insert(key) {
-            preacquire_standing_runtime_owners_for_ingest_with_snapshot(
-                &state,
-                &prepared.request,
-                &view_snapshot,
-            )
-            .await?;
-        }
-    }
-    timer.mark("preacquire_owner");
     if state.meta_store.is_some() {
         for prepared in &prepared_batches {
             reserve_ingest_range(
@@ -869,6 +847,21 @@ pub(super) async fn materialize_prepared_ingest_epoch_for_ack_mode(
     locked_view_ids: &BTreeSet<String>,
     view_snapshot: &ActiveViewReadSnapshot,
 ) -> Result<IngestMaterializationResponse, ApiError> {
+    if !state.allows_local_materialization() {
+        for active in view_snapshot.views() {
+            if prepared_batches
+                .iter()
+                .any(|batch| view_uses_prepared_ingest_batch(active, batch))
+                && !is_demand_managed_view(state, active).await?
+            {
+                return Err(ApiError::conflict("eager view appeared during demand ingest; retry the durable input through its worker"));
+            }
+        }
+        return Ok(materialization_response(
+            "deferred",
+            PreparedStandingRuntimeApplySummary::default(),
+        ));
+    }
     match ack_mode {
         IngestAckMode::Materialized => {
             let summary = apply_standing_runtime_ingest_epoch(
@@ -1927,12 +1920,6 @@ async fn preflight_correction_ingest(
             )
             .await?,
         );
-        preacquire_standing_runtime_owners_for_ingest_with_snapshot(
-            state,
-            &prepared.request,
-            view_snapshot,
-        )
-        .await?;
     }
     active_views.sort_by(|left, right| {
         let left =
@@ -1961,6 +1948,9 @@ async fn preflight_correction_ingest(
     for active in &active_views {
         let identity = active_standing_runtime_identity(active)
             .ok_or_else(|| ApiError::bad_request("correction view is missing runtime identity"))?;
+        state
+            .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+            .await?;
         if state
             .standing_runtime(identity, &active.spec.view_id)?
             .is_none()
@@ -2005,6 +1995,9 @@ async fn ensure_standing_runtimes_for_ingest_with_snapshot(
     request: &IngestRowsRequest,
     snapshot: &ActiveViewReadSnapshot,
 ) -> Result<Vec<SharedStandingRuntime>, ApiError> {
+    // Acquisition can invalidate a resident from an older or unknown fence.
+    // Resolve it before retaining any runtime Arc, including cache hits.
+    preacquire_standing_runtime_owners_for_ingest_with_snapshot(state, request, snapshot).await?;
     let active_views = snapshot.views();
     let mut runtime_pins = Vec::new();
     for active in active_views {
@@ -2030,7 +2023,7 @@ async fn ensure_standing_runtimes_for_ingest_with_snapshot(
         if is_demand_managed_view(state, active).await? {
             continue;
         }
-        let Some((runtime, replay)) =
+        let Some((_runtime_pin, replay)) =
             restore_standing_runtime_resident_locked(state, active).await?
         else {
             // Source-only initial backfill reconciliation may demote this view.
@@ -2045,6 +2038,11 @@ async fn ensure_standing_runtimes_for_ingest_with_snapshot(
                 return Err(error);
             }
         }
+        let runtime = state
+            .standing_runtime(identity, &active.spec.view_id)?
+            .ok_or_else(|| {
+                ApiError::service_unavailable("ingest runtime unavailable after replay")
+            })?;
         runtime_pins.push(runtime);
     }
     Ok(runtime_pins)
@@ -2232,9 +2230,12 @@ async fn apply_standing_runtime_prepared_ingests_with_snapshot(
         if is_demand_managed_view(state, active).await? {
             continue;
         }
+        let owner = state
+            .acquire_standing_runtime_owner(identity, &active.spec.view_id)
+            .await?;
         // Deferred materialization can outlive the request's runtime pins.
         // Reload and catch up under the operation lock before checking coverage.
-        let Some((runtime, replay)) =
+        let Some((_runtime_pin, replay)) =
             restore_standing_runtime_resident_locked(state, active).await?
         else {
             continue;
@@ -2247,6 +2248,11 @@ async fn apply_standing_runtime_prepared_ingests_with_snapshot(
                 return Err(error);
             }
         }
+        let runtime = state
+            .standing_runtime(identity, &active.spec.view_id)?
+            .ok_or_else(|| {
+                ApiError::service_unavailable("ingest runtime unavailable after replay")
+            })?;
         let mut uncovered_prepared_batches = matching_prepared_batches.clone();
         let previous_checkpoint =
             read_latest_standing_runtime_checkpoint(state, identity, &active.spec.view_id).await?;
@@ -2286,9 +2292,6 @@ async fn apply_standing_runtime_prepared_ingests_with_snapshot(
         if input_batches.is_empty() {
             continue;
         }
-        let owner = state
-            .acquire_standing_runtime_owner(identity, &active.spec.view_id)
-            .await?;
         let idempotency_key = epoch_ingest_idempotency_key(
             &active.spec.view_id,
             uncovered_prepared_batches.iter().copied(),
@@ -2553,6 +2556,7 @@ pub(super) async fn apply_standing_runtime_changes_and_checkpoint_with_demand_mo
     budget_limits: StandingRuntimeBudgetLimits,
     demand_mode: Option<velorix_core::standing_program::DemandFrontierMode>,
 ) -> Result<StandingRuntimeApplyResult, ApiError> {
+    state.require_local_materialization()?;
     let before = runtime
         .lock()
         .map_err(|_| ApiError::internal("standing runtime lock poisoned"))?

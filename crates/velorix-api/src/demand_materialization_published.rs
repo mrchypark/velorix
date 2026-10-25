@@ -10,6 +10,275 @@ struct PositiveBaselineCommitContext<'a> {
     active: &'a ActiveMaterializedView,
     identity: &'a StandingProgramIdentity,
     bootstrap: &'a velorix_control::meta_admin::PublishedInputBootstrapProgressV1,
+    lease: Arc<owner_lease::BackfillOwnerLease>,
+    compute_slot: ComputeSlot,
+}
+
+pub(super) async fn fresh_complete_demand_preflight(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    request: &DemandRequest,
+    snapshot: &view_dependencies::ActiveViewReadSnapshot,
+) -> Result<Option<DemandOutcome>, ApiError> {
+    let Some(identity) = active_standing_runtime_identity(active) else {
+        return Ok(None);
+    };
+    let previous = if let Some(meta) = &state.meta_store {
+        let consumer_head_stage = DemandQueryStageTimer::new("consumer_head_meta_rpc");
+        let Some(pointer) = meta
+            .read_standing_runtime_checkpoint(
+                &identity.tenant_id,
+                &identity.program_id,
+                &active.spec.view_id,
+            )
+            .await
+            .map_err(meta_error_to_api)?
+        else {
+            drop(consumer_head_stage);
+            return Ok(None);
+        };
+        drop(consumer_head_stage);
+        let consumer_checkpoint_stage =
+            DemandQueryStageTimer::new("checkpoint_foyer_lookup_decode_validate");
+        let previous =
+            checkpoint_publication::read_standing_runtime_checkpoint_header_from_pointer_with_schema_shared(
+                state,
+                &identity.tenant_id,
+                &identity.program_id,
+                &active.spec.view_id,
+                &pointer,
+                &identity.output_schema_hash,
+            )
+            .await?;
+        drop(consumer_checkpoint_stage);
+        if previous.checkpoint.identity != *identity {
+            return Err(ApiError::bad_request("checkpoint header identity mismatch"));
+        }
+        Some(previous)
+    } else {
+        let _fallback_stage =
+            DemandQueryStageTimer::new("consumer_checkpoint_fallback_list_decode");
+        checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
+            state,
+            identity,
+            &active.spec.view_id,
+        )
+        .await?
+        .map(Arc::new)
+    };
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let Some(progress) = previous.demand_materialization.as_ref() else {
+        return Ok(None);
+    };
+    let checkpoint_validation_stage =
+        DemandQueryStageTimer::new("demand_checkpoint_state_validation");
+    progress.validate_checkpoint(&previous.checkpoint)?;
+    drop(checkpoint_validation_stage);
+    let Some(published) = published_relation_binding_for_active_view(active)? else {
+        return Ok(None);
+    };
+    if progress.spec_hash != active.spec_hash
+        || progress.plan_hash != published.producer_plan_hash
+        || progress.output_schema_hash != identity.output_schema_hash
+    {
+        return Ok(None);
+    }
+
+    let _lineage_stage = DemandQueryStageTimer::new("producer_lineage_freshness");
+    let inputs = view_dependencies::resolve_consumer_bootstrap_inputs_locked(
+        state,
+        active,
+        Some(previous.as_ref()),
+    )
+    .await?;
+    let mut ordered_inputs = inputs.iter().collect::<Vec<_>>();
+    ordered_inputs.sort_by(|left, right| left.edge.edge_id.cmp(&right.edge.edge_id));
+    if ordered_inputs
+        .windows(2)
+        .any(|pair| pair[0].edge.edge_id == pair[1].edge.edge_id)
+    {
+        return Ok(None);
+    }
+
+    let mut heads = BTreeMap::new();
+    for input in ordered_inputs {
+        let producer_active_stage =
+            DemandQueryStageTimer::new("producer_active_request_snapshot_lookup");
+        let producer_active = snapshot
+            .view(&input.binding.producer_view_id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "published demand producer is absent from the fresh request snapshot",
+                )
+            })?;
+        drop(producer_active_stage);
+        let Some(producer_identity) = active_standing_runtime_identity(&producer_active) else {
+            return Ok(None);
+        };
+        let Some(active_binding) = published_relation_binding_for_active_view(&producer_active)?
+        else {
+            return Ok(None);
+        };
+        let active_plan_hash = producer_active
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.logical_plan.as_ref())
+            .and_then(|plan| plan.plan_hash.as_deref());
+        if producer_identity.tenant_id != input.bootstrap_cursor.producer_tenant_id
+            || producer_identity.program_id != input.bootstrap_cursor.producer_program_id
+            || producer_active.spec.view_id != input.binding.producer_view_id
+            || active_binding != input.binding
+            || active_plan_hash != Some(input.binding.producer_plan_hash.as_str())
+        {
+            return Ok(None);
+        }
+        let Some(meta) = state.meta_store.as_ref() else {
+            return Ok(None);
+        };
+        let producer_head_stage = DemandQueryStageTimer::new("producer_head_meta_rpc");
+        let Some(pointer) = meta
+            .read_standing_runtime_checkpoint(
+                &input.bootstrap_cursor.producer_tenant_id,
+                &input.bootstrap_cursor.producer_program_id,
+                &input.bootstrap_cursor.producer_view_id,
+            )
+            .await
+            .map_err(meta_error_to_api)?
+        else {
+            return Ok(None);
+        };
+        drop(producer_head_stage);
+        if pointer.logical_epoch < input.bootstrap_cursor.output_epoch {
+            return Ok(None);
+        }
+        let mut producer_checkpoint_stage =
+            DemandQueryStageTimer::new("checkpoint_foyer_lookup_decode_validate");
+        let mut producer =
+            checkpoint_publication::read_standing_runtime_checkpoint_header_from_pointer_shared(
+                state,
+                &producer_identity.tenant_id,
+                &producer_identity.program_id,
+                &input.binding.producer_view_id,
+                &pointer,
+            )
+            .await?;
+        drop(producer_checkpoint_stage);
+        let mut hops = 0usize;
+        const MAX_PREFLIGHT_LINEAGE_HOPS: usize = 4_096;
+        loop {
+            hops += 1;
+            if hops > MAX_PREFLIGHT_LINEAGE_HOPS
+                || producer.checkpoint.identity != *producer_identity
+            {
+                return Ok(None);
+            }
+            let partial = producer
+                .published_input_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| !bootstrap.is_complete())
+                || producer
+                    .demand_materialization
+                    .as_ref()
+                    .is_some_and(|demand| !demand.full_complete);
+            if !partial {
+                break;
+            }
+            let Some(previous) = producer.previous_checkpoint.clone() else {
+                return Ok(None);
+            };
+            if previous.logical_epoch >= producer.checkpoint.logical_epoch
+                || previous.logical_epoch < input.bootstrap_cursor.output_epoch
+            {
+                return Ok(None);
+            }
+            producer_checkpoint_stage =
+                DemandQueryStageTimer::new("checkpoint_foyer_lookup_decode_validate");
+            producer =
+                checkpoint_publication::read_standing_runtime_checkpoint_header_from_pointer_shared(
+                    state,
+                    &producer_identity.tenant_id,
+                    &producer_identity.program_id,
+                    &input.binding.producer_view_id,
+                    &previous,
+                )
+                .await?;
+            drop(producer_checkpoint_stage);
+        }
+        let mut head_cursor = input.bootstrap_cursor.clone();
+        head_cursor.output_epoch = producer.checkpoint.logical_epoch;
+        head_cursor.commit_digest = match checkpoint_publication::producer_cursor_digest_from_header(
+            &producer,
+            &input.binding,
+        ) {
+            Ok(digest) => digest,
+            Err(_) => return Ok(None),
+        };
+        head_cursor.validate().map_err(ApiError::bad_request)?;
+        heads.insert(input.edge.edge_id.clone(), head_cursor);
+    }
+    if heads.len() != inputs.len() {
+        return Ok(None);
+    }
+    drop(_lineage_stage);
+    let _coverage_stage = DemandQueryStageTimer::new("demand_coverage_scope_validation");
+    let cut_hash = stable_bytes_hash(&serde_json::to_vec(&heads).map_err(ApiError::internal)?);
+    let scope_hash = demand_materialization::scope_hash(
+        request.scope.as_ref().map(|scope| scope.predicate.as_str()),
+    )?;
+    if !progress.certificates.iter().any(|certificate| {
+        certificate.scope_hash == scope_hash && certificate.captured_cut_hash == cut_hash
+    }) {
+        return Ok(None);
+    }
+
+    let Some(bootstrap) = previous.published_input_bootstrap.as_ref() else {
+        return Ok(None);
+    };
+    if !bootstrap.is_complete() {
+        return Ok(None);
+    }
+    let applied_inputs = view_dependencies::consumer_direct_view_inputs(active, &previous)?;
+    if applied_inputs.len() != heads.len()
+        || applied_inputs
+            .iter()
+            .any(|input| heads.get(&input.cursor.input_edge) != Some(&input.cursor))
+    {
+        return Ok(None);
+    }
+    for input in &inputs {
+        let head = heads
+            .get(&input.edge.edge_id)
+            .ok_or_else(|| ApiError::bad_request("published preflight head missing"))?;
+        let frontiers = previous
+            .checkpoint
+            .input_frontiers
+            .iter()
+            .filter(|frontier| {
+                frontier.relation_id == input.binding.relation.relation_id
+                    && frontier.relation_version == input.binding.relation.relation_version
+                    && frontier.stream_id == input.binding.output_stream_id
+                    && frontier.partition_id == 0
+                    && frontier.committed_offset_exclusive >= head.output_epoch
+            })
+            .count();
+        if frontiers != 1 {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(DemandOutcome {
+        checkpoint_epoch: Some(previous.checkpoint.logical_epoch),
+        work_units: 0,
+        status: "complete".into(),
+        complete: true,
+        processed_rows: 0,
+        read_bytes: 0,
+        remaining_rows: 0,
+        dependency_mode: "full_closure".into(),
+    }))
 }
 
 async fn flush_positive_baseline_group(
@@ -30,8 +299,10 @@ async fn flush_positive_baseline_group(
         std::mem::take(inputs),
         DemandPublication {
             bootstrap: Some(context.bootstrap.clone()),
+            compute_slot: context.compute_slot.clone(),
             ..DemandPublication::default()
         },
+        Arc::clone(&context.lease),
         guard,
     )
     .await?;
@@ -49,14 +320,23 @@ pub(super) async fn materialize_published_demand(
     active: &ActiveMaterializedView,
     request: &DemandRequest,
     query_priority: bool,
+    lease: Arc<owner_lease::BackfillOwnerLease>,
+    compute_slot: ComputeSlot,
 ) -> Result<DemandOutcome, ApiError> {
+    state.require_local_materialization()?;
     request.budget.validate()?;
     let identity = active_standing_runtime_identity(active)
         .ok_or_else(|| ApiError::bad_request("published demand runtime missing"))?;
+    lease.ensure_owned()?;
     let operation = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let mut guard = operation.lock_owned().await;
-    let (mut previous, migration_bytes) =
-        migration::read_checkpoint(state, active, request.budget.max_bytes).await?;
+    let (mut previous, migration_bytes) = lease
+        .while_owned(migration::read_checkpoint(
+            state,
+            active,
+            request.budget.max_bytes,
+        ))
+        .await?;
     let inputs = if previous
         .as_ref()
         .is_some_and(|r| r.demand_materialization.is_none())
@@ -66,23 +346,46 @@ pub(super) async fn materialize_published_demand(
         // head or perform unaccounted header reads to fill missing evidence.
         view_dependencies::persisted_consumer_bootstrap_inputs(active)?
     } else {
-        view_dependencies::resolve_consumer_bootstrap_inputs_locked(
-            state,
-            active,
-            previous.as_ref(),
-        )
-        .await?
+        lease
+            .while_owned(view_dependencies::resolve_consumer_bootstrap_inputs_locked(
+                state,
+                active,
+                previous.as_ref(),
+            ))
+            .await?
     };
+    lease.ensure_owned()?;
     let published = published_relation_binding_for_active_view(active)?
         .ok_or_else(|| ApiError::bad_request("consumer published binding missing"))?;
-    let (artifacts, inventory_bytes) = capture_demand_published_artifacts(
-        state,
-        &inputs,
-        request.budget.max_bytes.saturating_sub(migration_bytes),
-        previous.as_ref(),
-        &published,
-    )
-    .await?;
+    let mut ordered_inputs = inputs.iter().collect::<Vec<_>>();
+    ordered_inputs.sort_by(|left, right| left.edge.edge_id.cmp(&right.edge.edge_id));
+    if ordered_inputs
+        .windows(2)
+        .any(|pair| pair[0].edge.edge_id == pair[1].edge.edge_id)
+    {
+        return Err(ApiError::bad_request("duplicate published input edge"));
+    }
+    let mut artifacts = Vec::new();
+    let mut inventory_bytes = 0usize;
+    for input in ordered_inputs {
+        lease.ensure_owned()?;
+        let (mut captured, bytes) = lease
+            .while_owned(capture_demand_published_artifacts(
+                state,
+                std::slice::from_ref(input),
+                request
+                    .budget
+                    .max_bytes
+                    .saturating_sub(migration_bytes.saturating_add(inventory_bytes)),
+                previous.as_ref(),
+                &published,
+            ))
+            .await?;
+        inventory_bytes = inventory_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ApiError::bad_request("published inventory byte overflow"))?;
+        artifacts.append(&mut captured);
+    }
     let mut read_bytes = migration_bytes
         .checked_add(inventory_bytes)
         .ok_or_else(|| ApiError::bad_request("migration read byte overflow"))?;
@@ -149,12 +452,12 @@ pub(super) async fn materialize_published_demand(
                 .as_ref()
                 .map(|record| record.checkpoint.logical_epoch),
             work_units: 0,
-            status: "complete",
+            status: "complete".into(),
             complete: true,
             processed_rows: 0,
             read_bytes,
             remaining_rows: 0,
-            dependency_mode: "full_closure",
+            dependency_mode: "full_closure".into(),
         });
     }
     let scan_scope = scope_hash(None)?;
@@ -218,13 +521,17 @@ pub(super) async fn materialize_published_demand(
         active,
         identity,
         bootstrap: &bootstrap,
+        lease: Arc::clone(&lease),
+        compute_slot: compute_slot.clone(),
     };
     let started = std::time::Instant::now();
     let mut processed_rows = 0u64;
     let mut units = 0usize;
     let mut pending_group: Option<PositiveBaselinePageGroup> = None;
     let mut pending_inputs = Vec::new();
+    let mut source_prep_traced = false;
     for (key, artifact) in &keyed {
+        lease.ensure_owned()?;
         let artifact_group = artifact.positive_baseline_page_group()?;
         if !pending_inputs.is_empty() && artifact_group != pending_group {
             guard = flush_positive_baseline_group(
@@ -252,13 +559,18 @@ pub(super) async fn materialize_published_demand(
         {
             break;
         }
-        let loaded = load_demand_published_artifact(
-            state,
-            artifact,
-            request.budget.max_bytes.saturating_sub(read_bytes),
-        )
-        .await;
-        let (input, bytes) = match loaded {
+        if !source_prep_traced {
+            demand_materialization::source_prep_diagnostic(&lease)?;
+            source_prep_traced = true;
+        }
+        let (input, bytes) = match lease
+            .while_owned(load_demand_published_artifact(
+                state,
+                artifact,
+                request.budget.max_bytes.saturating_sub(read_bytes),
+            ))
+            .await
+        {
             Ok(loaded) => loaded,
             Err(error)
                 if !pending_inputs.is_empty()
@@ -280,10 +592,13 @@ pub(super) async fn materialize_published_demand(
         read_bytes = read_bytes
             .checked_add(bytes)
             .ok_or_else(|| ApiError::bad_request("published read count overflow"))?;
-        let rows_total = input.batches.iter().try_fold(0u64, |sum, batch| {
-            sum.checked_add(batch.num_rows() as u64)
-                .ok_or_else(|| ApiError::bad_request("published ordinal count overflow"))
-        })?;
+        let mut rows_total = 0u64;
+        for batch in &input.batches {
+            lease.ensure_owned()?;
+            rows_total = rows_total
+                .checked_add(batch.num_rows() as u64)
+                .ok_or_else(|| ApiError::bad_request("published ordinal count overflow"))?;
+        }
         // A signed producer commit is indivisible: a replacement may retract
         // and insert the same retained identity in different record positions.
         // Snapshot pages are positive bags and remain safely sliceable.
@@ -326,17 +641,19 @@ pub(super) async fn materialize_published_demand(
             request.budget.max_rows - processed_rows as usize,
         ) {
             count = interval[1] - interval[0];
-            let (staged, slice) = entry.stage_inspection(
+            let (staged, slice) = entry.stage_inspection_with_lease(
                 &input,
                 &scan_scope,
                 interval,
                 &vec![true; count as usize],
+                &lease,
             )?;
             *entry = staged;
             selected = slice;
         } else {
             selected.batches.clear();
         }
+        lease.ensure_owned()?;
         let frontier = previous
             .as_ref()
             .and_then(|record| {
@@ -366,8 +683,10 @@ pub(super) async fn materialize_published_demand(
                 vec![selected],
                 DemandPublication {
                     bootstrap: Some(bootstrap.clone()),
+                    compute_slot: compute_slot.clone(),
                     ..DemandPublication::default()
                 },
+                Arc::clone(&lease),
                 guard,
             )
             .await?;
@@ -476,7 +795,9 @@ pub(super) async fn materialize_published_demand(
                 cursor_proofs: proofs,
                 source_cuts: None,
                 validated_source_publications: Vec::new(),
+                compute_slot: compute_slot.clone(),
             },
+            Arc::clone(&lease),
             guard,
         )
         .await?;
@@ -492,11 +813,11 @@ pub(super) async fn materialize_published_demand(
     Ok(DemandOutcome {
         checkpoint_epoch,
         work_units: units,
-        status: if complete { "complete" } else { "incomplete" },
+        status: (if complete { "complete" } else { "incomplete" }).into(),
         complete,
         processed_rows,
         read_bytes,
         remaining_rows,
-        dependency_mode: "full_closure",
+        dependency_mode: "full_closure".into(),
     })
 }

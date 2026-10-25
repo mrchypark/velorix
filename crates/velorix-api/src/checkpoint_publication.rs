@@ -1035,7 +1035,7 @@ async fn read_authoritative_cursor_checkpoint_inner(
         }
         let (record, validated_deltas, snapshot_pages) = if metadata_only {
             (
-                read_standing_runtime_checkpoint_header_from_pointer(
+                read_standing_runtime_checkpoint_header_from_pointer_shared(
                     state,
                     tenant_id,
                     producer_program_id,
@@ -1047,7 +1047,7 @@ async fn read_authoritative_cursor_checkpoint_inner(
                 None,
             )
         } else {
-            Box::pin(
+            let (record, validated_deltas, snapshot_pages) = Box::pin(
                 read_standing_runtime_checkpoint_record_and_deltas_from_pointer_for_scope(
                     state,
                     tenant_id,
@@ -1057,7 +1057,8 @@ async fn read_authoritative_cursor_checkpoint_inner(
                     retain_pages && pointer.logical_epoch == cursor.output_epoch,
                 ),
             )
-            .await?
+            .await?;
+            (Arc::new(record), validated_deltas, snapshot_pages)
         };
         if record.checkpoint.logical_epoch == cursor.output_epoch {
             if metadata_only {
@@ -1085,7 +1086,7 @@ async fn read_authoritative_cursor_checkpoint_inner(
                 authoritative_head_manifest_hash,
             };
             return Ok((
-                record,
+                Arc::unwrap_or_clone(record),
                 ValidatedCursorProof {
                     binding: binding.clone(),
                     head: validated_head,
@@ -1095,7 +1096,7 @@ async fn read_authoritative_cursor_checkpoint_inner(
                 snapshot_pages,
             ));
         }
-        let previous = record.previous_checkpoint.ok_or_else(|| {
+        let previous = record.previous_checkpoint.as_ref().cloned().ok_or_else(|| {
             ApiError::bad_request(format!(
                 "view cursor edge `{}` references a producer epoch missing from the authoritative checkpoint lineage",
                 cursor.input_edge
@@ -2612,12 +2613,13 @@ async fn read_latest_standing_runtime_checkpoint_inner(
             .map_err(meta_error_to_api)?
         {
             if !hydrate {
-                let record = read_standing_runtime_checkpoint_header_from_pointer(
+                let record = read_standing_runtime_checkpoint_header_from_pointer_with_schema(
                     state,
                     &identity.tenant_id,
                     &identity.program_id,
                     view_id,
                     &pointer,
+                    &identity.output_schema_hash,
                 )
                 .await?;
                 if record.checkpoint.identity != *identity {
@@ -2855,6 +2857,73 @@ pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer(
     view_id: &str,
     pointer: &StandingRuntimeCheckpointPointer,
 ) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+    read_standing_runtime_checkpoint_header_from_pointer_shared(
+        state, tenant_id, program_id, view_id, pointer,
+    )
+    .await
+    .map(|record| (*record).clone())
+}
+
+pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer_shared(
+    state: &ApiState,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    pointer: &StandingRuntimeCheckpointPointer,
+) -> Result<std::sync::Arc<StandingRuntimeCheckpointRecord>, ApiError> {
+    read_standing_runtime_checkpoint_header_from_pointer_inner(
+        state, tenant_id, program_id, view_id, pointer, None,
+    )
+    .await
+}
+
+pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer_with_schema(
+    state: &ApiState,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    pointer: &StandingRuntimeCheckpointPointer,
+    expected_schema_hash: &str,
+) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+    read_standing_runtime_checkpoint_header_from_pointer_with_schema_shared(
+        state,
+        tenant_id,
+        program_id,
+        view_id,
+        pointer,
+        expected_schema_hash,
+    )
+    .await
+    .map(|record| (*record).clone())
+}
+
+pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer_with_schema_shared(
+    state: &ApiState,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    pointer: &StandingRuntimeCheckpointPointer,
+    expected_schema_hash: &str,
+) -> Result<std::sync::Arc<StandingRuntimeCheckpointRecord>, ApiError> {
+    read_standing_runtime_checkpoint_header_from_pointer_inner(
+        state,
+        tenant_id,
+        program_id,
+        view_id,
+        pointer,
+        Some(expected_schema_hash),
+    )
+    .await
+}
+
+async fn read_standing_runtime_checkpoint_header_from_pointer_inner(
+    state: &ApiState,
+    tenant_id: &str,
+    program_id: &str,
+    view_id: &str,
+    pointer: &StandingRuntimeCheckpointPointer,
+    expected_schema_hash: Option<&str>,
+) -> Result<std::sync::Arc<StandingRuntimeCheckpointRecord>, ApiError> {
     let record_timer = CursorPhaseTimer::new(
         view_id,
         pointer.logical_epoch,
@@ -2873,6 +2942,7 @@ pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer(
         state,
         &ObjectPath::from(pointer.checkpoint_key.clone()),
         MAX_CHECKPOINT_RECORD_BYTES as u64,
+        expected_schema_hash,
     )
     .await?;
     if encoded_size > MAX_CHECKPOINT_RECORD_BYTES as u64 {
@@ -2887,7 +2957,7 @@ pub(super) async fn read_standing_runtime_checkpoint_header_from_pointer(
         )));
     }
     if record.checkpoint_key.is_empty() {
-        record.checkpoint_key = pointer.checkpoint_key.clone();
+        std::sync::Arc::make_mut(&mut record).checkpoint_key = pointer.checkpoint_key.clone();
     }
     let identity = record.checkpoint.identity.clone();
     if identity.tenant_id != tenant_id
@@ -3466,7 +3536,7 @@ pub(super) async fn read_object_bytes_bounded(
 pub(super) enum CachedCheckpointRecordRead {
     Miss,
     Hit {
-        record: Box<StandingRuntimeCheckpointRecord>,
+        record: std::sync::Arc<StandingRuntimeCheckpointRecord>,
         size: u64,
     },
     OverBudget {
@@ -3479,7 +3549,9 @@ pub(super) async fn read_cached_checkpoint_record(
     path: &ObjectPath,
     max_bytes: u64,
     canonical_validations: &mut usize,
+    expected_schema_hash: Option<&str>,
 ) -> Result<CachedCheckpointRecordRead, ApiError> {
+    *canonical_validations = 0;
     let Some(cache) = &state.materialized_read_cache else {
         return Ok(CachedCheckpointRecordRead::Miss);
     };
@@ -3487,6 +3559,24 @@ pub(super) async fn read_cached_checkpoint_record(
         return Ok(CachedCheckpointRecordRead::Miss);
     }
     let key = checkpoint_read_cache_key(state, path)?;
+    let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(path.to_string())
+        .map_err(ApiError::bad_request)?;
+    if let Some((record, size)) = cache.decoded_checkpoint_record(
+        &key,
+        &parts.tenant_id,
+        &parts.program_id,
+        &parts.view_id,
+        expected_schema_hash,
+        &key.codec,
+    ) {
+        if size > max_bytes {
+            return Ok(CachedCheckpointRecordRead::OverBudget { size });
+        }
+        if let Some(account) = &state.materialized_read_cache_hit_accountant {
+            account(path.as_ref(), size)?;
+        }
+        return Ok(CachedCheckpointRecordRead::Hit { record, size });
+    }
     let object_path = path.to_string();
     let content_hash = key.content_hash.clone();
     let decoded = std::sync::Mutex::new(None);
@@ -3519,20 +3609,35 @@ pub(super) async fn read_cached_checkpoint_record(
         .into_inner()
         .map_err(|_| ApiError::internal("checkpoint cache validation lock poisoned"))?
         .ok_or_else(|| ApiError::internal("checkpoint cache validator returned no record"))?;
-    Ok(CachedCheckpointRecordRead::Hit {
-        record: Box::new(record),
-        size,
-    })
+    if expected_schema_hash
+        .is_some_and(|expected| record.checkpoint.identity.output_schema_hash != expected)
+    {
+        return Err(ApiError::bad_request(
+            "checkpoint output schema differs from the expected checkpoint identity",
+        ));
+    }
+    let record = std::sync::Arc::new(record);
+    cache_decoded_checkpoint_record(state, &key, &parts, &record, size);
+    Ok(CachedCheckpointRecordRead::Hit { record, size })
 }
 
 pub(super) async fn read_checkpoint_record_bounded(
     state: &ApiState,
     path: &ObjectPath,
     max_bytes: u64,
-) -> Result<(StandingRuntimeCheckpointRecord, u64), ApiError> {
+    expected_schema_hash: Option<&str>,
+) -> Result<(std::sync::Arc<StandingRuntimeCheckpointRecord>, u64), ApiError> {
     let mut canonical_validations = 0;
-    match read_cached_checkpoint_record(state, path, max_bytes, &mut canonical_validations).await? {
-        CachedCheckpointRecordRead::Hit { record, size } => return Ok((*record, size)),
+    match read_cached_checkpoint_record(
+        state,
+        path,
+        max_bytes,
+        &mut canonical_validations,
+        expected_schema_hash,
+    )
+    .await?
+    {
+        CachedCheckpointRecordRead::Hit { record, size } => return Ok((record, size)),
         CachedCheckpointRecordRead::OverBudget { .. } => {
             return Err(ApiError::bad_request(
                 "native read exceeds query scan or memory byte budget",
@@ -3540,7 +3645,15 @@ pub(super) async fn read_checkpoint_record_bounded(
         }
         CachedCheckpointRecordRead::Miss => {}
     }
-    read_uncached_checkpoint_record(state, path, Some(max_bytes)).await
+    let (record, size) = read_uncached_checkpoint_record(state, path, Some(max_bytes)).await?;
+    if expected_schema_hash
+        .is_some_and(|expected| record.checkpoint.identity.output_schema_hash != expected)
+    {
+        return Err(ApiError::bad_request(
+            "checkpoint output schema differs from the expected checkpoint identity",
+        ));
+    }
+    Ok((record, size))
 }
 
 /// Read and decode an uncached checkpoint once, then insert only the exact
@@ -3549,7 +3662,7 @@ pub(super) async fn read_uncached_checkpoint_record(
     state: &ApiState,
     path: &ObjectPath,
     max_bytes: Option<u64>,
-) -> Result<(StandingRuntimeCheckpointRecord, u64), ApiError> {
+) -> Result<(std::sync::Arc<StandingRuntimeCheckpointRecord>, u64), ApiError> {
     if !path.as_ref().ends_with(".checkpoint.arrow") {
         return Err(ApiError::bad_request(
             "checkpoint record path has an unsupported object suffix",
@@ -3560,6 +3673,10 @@ pub(super) async fn read_uncached_checkpoint_record(
     let object_path = path.to_string();
     let record = decode_checkpoint_cache_record(&object_path, &key.content_hash, &bytes)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let record = std::sync::Arc::new(record);
+    let (_, parts) = ObjectKey::parse_standing_runtime_checkpoint(path.to_string())
+        .map_err(ApiError::bad_request)?;
+    cache_decoded_checkpoint_record(state, &key, &parts, &record, bytes.len() as u64);
     if let Some(cache) = &state.materialized_read_cache {
         cache
             .insert(key, bytes.clone(), |candidate| {
@@ -3572,6 +3689,379 @@ pub(super) async fn read_uncached_checkpoint_record(
             .map_err(|_| ApiError::internal("validated checkpoint cache insert failed"))?;
     }
     Ok((record, bytes.len() as u64))
+}
+
+fn cache_decoded_checkpoint_record(
+    state: &ApiState,
+    key: &materialized_read_cache::MaterializedReadCacheKey,
+    parts: &StandingRuntimeCheckpointKeyParts,
+    record: &std::sync::Arc<StandingRuntimeCheckpointRecord>,
+    encoded_size: u64,
+) {
+    if let Some(cache) = &state.materialized_read_cache {
+        cache.cache_decoded_checkpoint_record(
+            key,
+            &parts.tenant_id,
+            &parts.program_id,
+            &parts.view_id,
+            &key.codec,
+            std::sync::Arc::clone(record),
+            encoded_size,
+        );
+    }
+}
+
+/// Estimate retained decoded heap from the record's owned fields. This avoids
+/// serializing a second, potentially highly-compressible JSON copy just to
+/// size a memory-cache entry. Collection node overhead is deliberately
+/// conservative; Vec allocations use capacity and nested owned values are
+/// counted recursively.
+pub(super) fn checkpoint_record_heap_weight(
+    record: &StandingRuntimeCheckpointRecord,
+) -> Option<usize> {
+    use velorix_core::standing_program as sp;
+
+    fn add(total: &mut usize, value: usize) {
+        *total = total.saturating_add(value);
+    }
+    fn strings(values: &[String], capacity: usize) -> usize {
+        capacity
+            .saturating_mul(std::mem::size_of::<String>())
+            .saturating_add(values.iter().map(|value| value.capacity()).sum::<usize>())
+    }
+    fn map_entry<K, V>() -> usize {
+        std::mem::size_of::<(K, V)>().saturating_add(128)
+    }
+    fn frontier(value: &sp::RelationFrontier) -> usize {
+        value
+            .relation_id
+            .capacity()
+            .saturating_add(value.relation_version.capacity())
+            .saturating_add(value.stream_id.capacity())
+    }
+    fn event_frontier(value: &sp::InputEventTimeFrontier) -> usize {
+        value
+            .relation_id
+            .capacity()
+            .saturating_add(value.relation_version.capacity())
+            .saturating_add(value.schema_fingerprint.capacity())
+            .saturating_add(value.stream_id.capacity())
+            .saturating_add(value.event_time_column_id.capacity())
+    }
+    fn relation_coverage_weight(
+        relations: &[sp::RuntimeCheckpointRelationCoverageV1],
+        capacity: usize,
+    ) -> usize {
+        let mut size =
+            capacity.saturating_mul(std::mem::size_of::<sp::RuntimeCheckpointRelationCoverageV1>());
+        for relation in relations {
+            add(
+                &mut size,
+                relation
+                    .relation_id
+                    .capacity()
+                    .saturating_add(relation.relation_version.capacity())
+                    .saturating_add(relation.schema_fingerprint.capacity())
+                    .saturating_add(
+                        relation.partitions.capacity()
+                            * std::mem::size_of::<sp::RuntimeCheckpointPartitionCoverageV1>(),
+                    )
+                    .saturating_add(relation.partitions.len() * 128)
+                    .saturating_add(
+                        relation
+                            .partitions
+                            .iter()
+                            .map(|part| part.stream_id.capacity())
+                            .sum::<usize>(),
+                    ),
+            );
+        }
+        size
+    }
+    fn coverage(value: &sp::RuntimeCheckpointInputCoverageV1) -> usize {
+        std::mem::size_of_val(value)
+            .saturating_add(value.plan_hash.capacity())
+            .saturating_add(relation_coverage_weight(
+                &value.relations,
+                value.relations.capacity(),
+            ))
+    }
+    fn causal_cut(value: &sp::CausalCutV1) -> usize {
+        let mut size = std::mem::size_of_val(value).saturating_add(
+            value.direct_view_cursors.capacity() * std::mem::size_of::<sp::CausalViewCursorV1>(),
+        );
+        add(
+            &mut size,
+            relation_coverage_weight(
+                &value.direct_source_frontiers,
+                value.direct_source_frontiers.capacity(),
+            ),
+        );
+        for cursor in &value.direct_view_cursors {
+            add(
+                &mut size,
+                cursor.input_edge.capacity()
+                    + cursor.producer_tenant_id.capacity()
+                    + cursor.producer_program_id.capacity()
+                    + cursor.producer_view_id.capacity()
+                    + cursor.output_stream.capacity()
+                    + cursor.commit_digest.capacity(),
+            );
+        }
+        size
+    }
+
+    let mut size = std::mem::size_of_val(record)
+        .saturating_add(record.record_kind.capacity())
+        .saturating_add(record.view_id.capacity())
+        .saturating_add(record.checkpoint_key.capacity())
+        .saturating_add(record.manifest_hash.capacity());
+    if let Some(pointer) = &record.previous_checkpoint {
+        add(&mut size, std::mem::size_of_val(pointer));
+        for text in [
+            &pointer.tenant_id,
+            &pointer.program_id,
+            &pointer.view_id,
+            &pointer.checkpoint_key,
+            &pointer.content_hash,
+            &pointer.manifest_hash,
+            &pointer.plan_hash,
+            &pointer.coverage_hash,
+            &pointer.previous_checkpoint_key,
+            &pointer.previous_manifest_hash,
+        ] {
+            add(&mut size, text.capacity());
+        }
+        add(
+            &mut size,
+            strings(
+                &pointer.output_manifest_refs,
+                pointer.output_manifest_refs.capacity(),
+            ),
+        );
+        if let Some(value) = &pointer.input_coverage {
+            add(&mut size, coverage(value));
+        }
+        if let Some(value) = &pointer.published_input_bootstrap {
+            add(&mut size, bootstrap_weight(value));
+        }
+    }
+    let checkpoint = &record.checkpoint;
+    let identity = &checkpoint.identity;
+    add(
+        &mut size,
+        std::mem::size_of_val(checkpoint)
+            .saturating_add(std::mem::size_of_val(identity))
+            .saturating_add(identity.tenant_id.capacity())
+            .saturating_add(identity.program_id.capacity())
+            .saturating_add(strings(&identity.view_ids, identity.view_ids.capacity()))
+            .saturating_add(identity.sql_hash.capacity())
+            .saturating_add(identity.input_catalog_hash.capacity())
+            .saturating_add(identity.output_schema_hash.capacity())
+            .saturating_add(identity.planner_identity.capacity())
+            .saturating_add(identity.runtime_compatibility.capacity())
+            .saturating_add(identity.checkpoint_codec_identity.capacity())
+            .saturating_add(match &identity.native_code_policy {
+                sp::NativeCodePolicy::DisabledNoExternalDependencies => 0,
+                sp::NativeCodePolicy::NativeCodeOrExternalDependenciesPresent { reason } => {
+                    reason.capacity()
+                }
+            })
+            .saturating_add(
+                identity.builtin_runtime_identities.capacity()
+                    * std::mem::size_of::<sp::BuiltinRuntimeIdentity>(),
+            )
+            .saturating_add(
+                identity
+                    .builtin_runtime_identities
+                    .iter()
+                    .map(|item| item.name.capacity() + item.version.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(strings(
+                &identity.runtime_capabilities,
+                identity.runtime_capabilities.capacity(),
+            ))
+            .saturating_add(
+                checkpoint.input_frontiers.capacity() * std::mem::size_of::<sp::RelationFrontier>(),
+            )
+            .saturating_add(
+                checkpoint
+                    .input_frontiers
+                    .iter()
+                    .map(frontier)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                checkpoint.input_event_time_frontiers.capacity()
+                    * std::mem::size_of::<sp::InputEventTimeFrontier>(),
+            )
+            .saturating_add(
+                checkpoint
+                    .input_event_time_frontiers
+                    .iter()
+                    .map(event_frontier)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                checkpoint.output_frontiers.capacity() * std::mem::size_of::<sp::ViewFrontier>(),
+            )
+            .saturating_add(
+                checkpoint
+                    .output_frontiers
+                    .iter()
+                    .map(|item| item.view_id.capacity())
+                    .sum::<usize>(),
+            )
+            .saturating_add(checkpoint.checkpoint_codec_identity.capacity())
+            .saturating_add(checkpoint.state_root.object_key.capacity())
+            .saturating_add(checkpoint.state_root.content_hash.capacity())
+            .saturating_add(strings(
+                &checkpoint.output_manifest_refs,
+                checkpoint.output_manifest_refs.capacity(),
+            )),
+    );
+    if let Some(payload) = &checkpoint.state_payload {
+        add(
+            &mut size,
+            std::mem::size_of_val(payload)
+                .saturating_add(payload.codec_identity.capacity())
+                .saturating_add(payload.payload.allocated_retained_bytes()),
+        );
+    }
+    if let Some(value) = &checkpoint.input_coverage {
+        add(&mut size, coverage(value));
+    }
+    if let Some(value) = &checkpoint.causal_cut {
+        add(&mut size, causal_cut(value));
+    }
+    add(
+        &mut size,
+        record.replay_checkpoints.capacity() * std::mem::size_of::<ReplayCheckpoint>(),
+    );
+    for replay in &record.replay_checkpoints {
+        add(
+            &mut size,
+            std::mem::size_of_val(replay) + replay.stream_id.capacity(),
+        );
+        add(
+            &mut size,
+            replay
+                .relation_id
+                .as_ref()
+                .map_or(0, |value| value.capacity())
+                + replay
+                    .relation_version
+                    .as_ref()
+                    .map_or(0, |value| value.capacity()),
+        );
+    }
+    if let Some(demand) = &record.demand_materialization {
+        add(
+            &mut size,
+            std::mem::size_of_val(demand)
+                .saturating_add(demand.spec_hash.capacity())
+                .saturating_add(demand.plan_hash.capacity())
+                .saturating_add(demand.output_schema_hash.capacity())
+                .saturating_add(
+                    demand
+                        .event_time_replay_id
+                        .as_ref()
+                        .map_or(0, |value| value.capacity()),
+                )
+                .saturating_add(
+                    demand.event_time_output_readiness.capacity()
+                        * std::mem::size_of::<sp::InputEventTimeFrontier>(),
+                )
+                .saturating_add(
+                    demand
+                        .event_time_output_readiness
+                        .iter()
+                        .map(event_frontier)
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    demand.artifacts.len()
+                        * map_entry::<String, demand_materialization::DemandArtifactProgress>(),
+                )
+                .saturating_add(
+                    demand.certificates.capacity()
+                        * std::mem::size_of::<demand_materialization::DemandCertificate>(),
+                ),
+        );
+        for (key, artifact) in &demand.artifacts {
+            add(
+                &mut size,
+                key.capacity()
+                    + artifact.artifact_key.capacity()
+                    + artifact.artifact_hash.capacity()
+                    + processed_spans_weight(&artifact.applied)
+                    + artifact.inspected.len()
+                        * map_entry::<String, velorix_core::processed_spans::ProcessedSpans>(),
+            );
+            for (scope, spans) in &artifact.inspected {
+                add(&mut size, scope.capacity() + processed_spans_weight(spans));
+            }
+            if let Some(watermark) = &artifact.source_watermark {
+                add(&mut size, std::mem::size_of_val(watermark));
+                if let Some(value) = &watermark.watermark {
+                    add(
+                        &mut size,
+                        std::mem::size_of_val(value)
+                            + value.stream_id.capacity()
+                            + value.event_time_column_id.capacity(),
+                    );
+                }
+            }
+        }
+        for certificate in &demand.certificates {
+            add(
+                &mut size,
+                certificate
+                    .scope_sql
+                    .as_ref()
+                    .map_or(0, |value| value.capacity())
+                    + certificate.scope_hash.capacity()
+                    + certificate.captured_cut_hash.capacity(),
+            );
+        }
+    }
+    if let Some(value) = &record.published_input_bootstrap {
+        add(&mut size, bootstrap_weight(value));
+    }
+    Some(size)
+}
+
+fn processed_spans_weight(spans: &velorix_core::processed_spans::ProcessedSpans) -> usize {
+    std::mem::size_of_val(spans).saturating_add(spans.allocated_span_bytes())
+}
+
+fn bootstrap_weight(
+    value: &velorix_control::meta_admin::PublishedInputBootstrapProgressV1,
+) -> usize {
+    use velorix_core::standing_program::CausalViewCursorV1;
+    let mut size = std::mem::size_of_val(value)
+        .saturating_add(value.plan_hash.capacity())
+        .saturating_add(
+            value.inputs.capacity()
+                * std::mem::size_of::<velorix_control::meta_admin::PublishedInputBootstrapCursorV1>(
+                ),
+        );
+    for input in &value.inputs {
+        let cursor: &CausalViewCursorV1 = &input.captured_cursor;
+        size = size
+            .saturating_add(input.input_edge.capacity())
+            .saturating_add(input.output_manifest_ref.capacity())
+            .saturating_add(input.output_manifest_hash.capacity())
+            .saturating_add(input.output_schema_hash.capacity())
+            .saturating_add(cursor.input_edge.capacity())
+            .saturating_add(cursor.producer_tenant_id.capacity())
+            .saturating_add(cursor.producer_program_id.capacity())
+            .saturating_add(cursor.producer_view_id.capacity())
+            .saturating_add(cursor.output_stream.capacity())
+            .saturating_add(cursor.commit_digest.capacity());
+    }
+    size
 }
 
 fn decode_checkpoint_cache_record(
@@ -3596,7 +4086,7 @@ fn decode_checkpoint_cache_record(
     Ok(record)
 }
 
-fn checkpoint_read_cache_key(
+pub(super) fn checkpoint_read_cache_key(
     state: &ApiState,
     path: &ObjectPath,
 ) -> Result<materialized_read_cache::MaterializedReadCacheKey, ApiError> {

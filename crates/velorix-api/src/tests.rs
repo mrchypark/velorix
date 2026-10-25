@@ -1,4 +1,6 @@
 use super::*;
+#[path = "bounded_demand_test_requests.rs"]
+mod bounded_demand_requests;
 use crate::example_fixtures::default_positive_scores_view_request;
 #[path = "generic_demand_materialization_tests.rs"]
 mod generic_demand_materialization_tests;
@@ -19,7 +21,7 @@ use object_store::{
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -40,6 +42,112 @@ use velorix_core::{
         RuntimeCheckpointStatePayload, ViewFrontier,
     },
 };
+
+#[test]
+fn unsafe_dev_multi_api_mode_is_explicit_and_keeps_other_modes_guarded() {
+    let mode = StandingRuntimeFencingMode::from_env(Some("unsafe-dev-multi-api"), 3).unwrap();
+    assert_eq!(mode, StandingRuntimeFencingMode::UnsafeDevMultiApi);
+    assert_eq!(mode.as_str(), "unsafe-dev-multi-api");
+    assert!(!mode.requires_metadata());
+
+    assert!(StandingRuntimeFencingMode::from_env(Some("unsafe-dev-multi-api"), 1).is_err());
+    assert!(StandingRuntimeFencingMode::from_env(Some("unsafe-dev-only"), 3).is_err());
+    assert_eq!(
+        StandingRuntimeFencingMode::from_env(Some("logical-fencing"), 3).unwrap(),
+        StandingRuntimeFencingMode::LogicalFencing
+    );
+    assert_eq!(
+        StandingRuntimeFencingMode::from_env(Some("required"), 3).unwrap(),
+        StandingRuntimeFencingMode::Required
+    );
+
+    let conservative_capability = StandingRuntimeFencingCapability {
+        capability_schema_version: 0,
+        backend_name: "local-meta".into(),
+        owner_scope_kind: String::new(),
+        linearizable_owner_lease: false,
+        durable_monotonic_owner_epoch: false,
+        authoritative_backend_time: false,
+        owner_validated_checkpoint_publish: false,
+        publish_checks_owner_and_latest_atomically: false,
+        publish_rejects_expired_owner: false,
+        latest_read_linearizable: false,
+        publish_rejects_scope_mismatch: false,
+        max_owner_ttl_ms: 0,
+        control_plane_auth_enforced: false,
+        production_multi_writer_safe: false,
+        backend_time_source_kind: String::new(),
+        backend_time_blocked_reason: String::new(),
+        lease_authority_kind: String::new(),
+        lease_expiry_semantics: String::new(),
+        bounded_wall_clock_failover: false,
+        failover_time_bound_ms: 0,
+        multi_writer_fencing_safe: false,
+        production_bounded_failover_safe: false,
+    };
+    assert!(validate_standing_runtime_fencing_for_mode(&conservative_capability, mode).is_ok());
+    assert!(validate_standing_runtime_fencing_for_mode(
+        &conservative_capability,
+        StandingRuntimeFencingMode::LogicalFencing
+    )
+    .is_err());
+    assert!(validate_standing_runtime_fencing_for_mode(
+        &conservative_capability,
+        StandingRuntimeFencingMode::Required
+    )
+    .is_err());
+}
+
+#[test]
+fn unsafe_dev_multi_api_requires_loopback_api_and_meta_endpoints() {
+    let mode = StandingRuntimeFencingMode::UnsafeDevMultiApi;
+    let loopback_bind = "127.0.0.1:8080".parse().unwrap();
+    let loopback_tls = ApiTlsConfig {
+        bind: "[::1]:8443".parse().unwrap(),
+        cert_path: "cert.pem".into(),
+        key_path: "key.pem".into(),
+    };
+
+    assert!(validate_unsafe_dev_multi_api_config(
+        mode,
+        loopback_bind,
+        Some(&loopback_tls),
+        Some("http://127.0.0.1:9090")
+    )
+    .is_ok());
+    assert!(validate_unsafe_dev_multi_api_config(
+        mode,
+        "0.0.0.0:8080".parse().unwrap(),
+        None,
+        Some("http://127.0.0.1:9090")
+    )
+    .is_err());
+    assert!(validate_unsafe_dev_multi_api_config(
+        mode,
+        loopback_bind,
+        Some(&ApiTlsConfig {
+            bind: "0.0.0.0:8443".parse().unwrap(),
+            cert_path: "cert.pem".into(),
+            key_path: "key.pem".into(),
+        }),
+        Some("http://127.0.0.1:9090")
+    )
+    .is_err());
+    for endpoint in [
+        None,
+        Some("https://127.0.0.1:9090"),
+        Some("http://meta:9090"),
+    ] {
+        assert!(validate_unsafe_dev_multi_api_config(mode, loopback_bind, None, endpoint).is_err());
+    }
+    assert!(validate_unsafe_dev_multi_api_config(
+        StandingRuntimeFencingMode::SingleWriter,
+        "0.0.0.0:8080".parse().unwrap(),
+        None,
+        None
+    )
+    .is_ok());
+}
 
 fn template_result_schema() -> RelationSchema {
     RelationSchema {
@@ -1070,6 +1178,155 @@ async fn mixed_source_view_causal_cut_survives_authoritative_restart() {
             .await
             .is_err()
     );
+}
+
+async fn capture_proof_test_input(
+    advance_head: bool,
+) -> (
+    ApiState,
+    view_dependencies::ConsumerViewDependencyInputV1,
+    PublishedRelationBindingV1,
+    String,
+) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta_store = Arc::new(InMemoryMetaStore::default());
+    let state = test_api_state_with_store(Arc::clone(&store), "api-test-capture-proof", false)
+        .await
+        .with_meta_store(Arc::clone(&meta_store) as Arc<dyn MetaStore>);
+    let (checkpoint, binding, empty_delta) =
+        test_checkpoint_with_named_published_relation_contract("upstream_orders", 2, "upstream");
+    let identity_schema_hash = checkpoint.identity.output_schema_hash.clone();
+    let owner = state
+        .acquire_standing_runtime_owner(&checkpoint.identity, "upstream_orders")
+        .await
+        .unwrap()
+        .unwrap();
+    persist_standing_runtime_checkpoint(
+        &state,
+        "upstream_orders",
+        &checkpoint,
+        std::slice::from_ref(&empty_delta),
+        StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner.clone()))
+            .with_published_relation(Some(binding.clone())),
+        None,
+    )
+    .await
+    .unwrap();
+    let first =
+        read_latest_standing_runtime_checkpoint(&state, &checkpoint.identity, "upstream_orders")
+            .await
+            .unwrap()
+            .unwrap();
+    let (_, commit) = read_standing_runtime_output_delta_record(
+        &state,
+        test_output_commit_ref(&first.checkpoint),
+        "upstream_orders",
+    )
+    .await
+    .unwrap();
+    let cursor = CausalViewCursorV1 {
+        input_edge: "upstream_orders->consumer".to_string(),
+        producer_tenant_id: checkpoint.identity.tenant_id.clone(),
+        producer_program_id: checkpoint.identity.program_id.clone(),
+        producer_view_id: "upstream_orders".to_string(),
+        producer_generation: binding.producer_view_generation,
+        output_stream: binding.output_stream_id.clone(),
+        output_epoch: checkpoint.logical_epoch,
+        commit_digest: commit
+            .producer_commit
+            .as_ref()
+            .unwrap()
+            .producer_commit_digest
+            .clone(),
+    };
+    if advance_head {
+        let next = advanced_test_runtime_checkpoint(&checkpoint, 1, "upstream-next");
+        persist_standing_runtime_checkpoint(
+            &state,
+            "upstream_orders",
+            &next,
+            std::slice::from_ref(&empty_delta),
+            StandingRuntimeCheckpointPersistContext::new(None, Vec::new(), Some(owner))
+                .with_published_relation(Some(binding.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let edge = ViewDependencyEdgeV1 {
+        schema_version: 1,
+        edge_id: cursor.input_edge.clone(),
+        tenant_id: cursor.producer_tenant_id.clone(),
+        consumer_program_id: "consumer".to_string(),
+        consumer_view_id: "consumer".to_string(),
+        consumer_generation: 1,
+        input_relation_id: binding.relation.relation_id.clone(),
+        input_relation_version: binding.relation.relation_version.clone(),
+        producer_program_id: cursor.producer_program_id.clone(),
+        producer_view_id: binding.producer_view_id.clone(),
+        producer_generation: binding.producer_view_generation,
+        producer_plan_hash: binding.producer_plan_hash.clone(),
+        output_stream_id: binding.output_stream_id.clone(),
+        output_schema_hash: binding.output_schema_hash.clone(),
+        key_descriptor_hash: binding.key_descriptor_hash.clone(),
+        delta_codec_identity: binding.delta_codec_identity.clone(),
+        frontier_kind: binding.frontier_kind.clone(),
+    };
+    let (_, consumer_binding, _) =
+        test_checkpoint_with_named_published_relation_contract("consumer", 1, "consumer");
+    (
+        state,
+        view_dependencies::ConsumerViewDependencyInputV1 {
+            edge,
+            binding,
+            bootstrap_cursor: cursor,
+        },
+        consumer_binding,
+        identity_schema_hash,
+    )
+}
+
+#[tokio::test]
+async fn demand_capture_accepts_historical_checkpoint_identity_schema_distinct_from_binding() {
+    let (state, input, consumer_binding, identity_schema_hash) =
+        capture_proof_test_input(true).await;
+    assert_ne!(identity_schema_hash, input.binding.output_schema_hash);
+
+    let (artifacts, _) = demand_published::capture_demand_published_artifacts(
+        &state,
+        &[input],
+        16 * 1024 * 1024,
+        None,
+        &consumer_binding,
+    )
+    .await
+    .unwrap();
+    assert!(!artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn demand_capture_rejects_captured_binding_schema_mutation_with_original_cursor_digest() {
+    let (state, mut input, consumer_binding, _) = capture_proof_test_input(false).await;
+    input.binding.relation.schema_fingerprint = format!("sha256:{}", "f".repeat(64));
+    input.binding = published_relation_binding_v1(
+        &input.binding.producer_view_id,
+        input.binding.producer_view_generation,
+        &input.binding.producer_plan_hash,
+        &input.binding.relation,
+    )
+    .unwrap();
+    input.edge.output_schema_hash = input.binding.output_schema_hash.clone();
+
+    let error = demand_published::capture_demand_published_artifacts(
+        &state,
+        &[input.clone()],
+        16 * 1024 * 1024,
+        None,
+        &consumer_binding,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.message.contains("captured cursor digest mismatch"));
 }
 
 #[tokio::test]
@@ -13060,8 +13317,9 @@ async fn append_admitted_ingest_without_runtime_apply(
 /// non-durable capabilities; this wrapper models the durable metadata contract
 /// while forwarding every operation to the real in-memory implementation.
 #[derive(Clone)]
-struct DurableCapabilityMetaStore {
+pub(super) struct DurableCapabilityMetaStore {
     inner: Arc<InMemoryMetaStore>,
+    active_view_snapshot_reads: Arc<AtomicUsize>,
     guard_race: Option<Arc<GuardRaceHook>>,
     renewal_delay: Option<Arc<RenewalDelayHook>>,
 }
@@ -13081,9 +13339,10 @@ struct GuardRaceHook {
 }
 
 impl DurableCapabilityMetaStore {
-    fn new(inner: InMemoryMetaStore) -> Self {
+    pub(super) fn new(inner: InMemoryMetaStore) -> Self {
         Self {
             inner: Arc::new(inner),
+            active_view_snapshot_reads: Arc::new(AtomicUsize::new(0)),
             guard_race: None,
             renewal_delay: None,
         }
@@ -13092,6 +13351,14 @@ impl DurableCapabilityMetaStore {
     fn with_guard_race(mut self, guard_race: Arc<GuardRaceHook>) -> Self {
         self.guard_race = Some(guard_race);
         self
+    }
+
+    pub(super) fn reset_active_view_snapshot_reads(&self) {
+        self.active_view_snapshot_reads.store(0, Ordering::SeqCst);
+    }
+
+    pub(super) fn active_view_snapshot_reads(&self) -> usize {
+        self.active_view_snapshot_reads.load(Ordering::SeqCst)
     }
 }
 
@@ -13133,6 +13400,8 @@ impl MetaStore for DurableCapabilityMetaStore {
         &self,
         request: meta::ActiveViewRegistryReadRequestV1,
     ) -> Result<meta::ActiveViewRegistrySnapshotV1, MetaStoreError> {
+        self.active_view_snapshot_reads
+            .fetch_add(1, Ordering::SeqCst);
         self.inner.read_active_view_registry_snapshot(request).await
     }
 
@@ -13194,6 +13463,16 @@ impl MetaStore for DurableCapabilityMetaStore {
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
         self.inner.acquire_standing_runtime_owner(request).await
+    }
+
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        self.inner
+            .acquire_standing_runtime_owner_with_endpoint(request, owner_endpoint)
+            .await
     }
 
     async fn renew_standing_runtime_owner(
@@ -13448,8 +13727,7 @@ async fn authoritative_relation_ingest_requires_stable_owner_id() {
 #[tokio::test]
 async fn authoritative_source_first_backfill_discovers_partitions_without_runtime_frontiers() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let meta: Arc<dyn MetaStore> =
-        Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
+    let meta = Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
     let mut state =
         test_authoritative_api_state_with_store(store.clone(), "source-first-owner", meta.clone())
             .await;
@@ -13479,6 +13757,25 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
             "sql":"SELECT user_id, SUM(score) AS total, COUNT(*) AS count FROM scores GROUP BY user_id"})).await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
     assert_eq!(response.1["coverage"]["state"], "backfill_required");
+    let owner_report = call_json(
+        &router,
+        Method::GET,
+        "/v1/standing-runtime/owners",
+        json!({}),
+    )
+    .await;
+    assert_eq!(owner_report.0, StatusCode::OK, "{owner_report:?}");
+    assert!(
+        owner_report.1["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|owner| {
+                owner["view_id"] == "source_first_total" && owner["current_owner"].is_null()
+            }),
+        "deferred declaration must be reported without acquiring an owner: {:?}",
+        owner_report.1
+    );
     // Neither a normal pending declaration nor an older incorrectly Running
     // declaration may materialize source data during process reconstruction.
     for legacy_running in [false, true] {
@@ -13495,12 +13792,10 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
             .await
             .unwrap();
         }
-        if legacy_running {
-            // Process reconstruction is a lease takeover scenario. Expire the
-            // previous fixture owner's lease explicitly before starting the
-            // replacement API state; do not bypass the fencing check.
+        {
+            // All-mode reconstruction may have claimed a lease in the previous iteration.
             let identity = active_standing_runtime_identity(&active).unwrap();
-            let owner = meta
+            if meta
                 .read_standing_runtime_owner(
                     &identity.tenant_id,
                     &identity.program_id,
@@ -13508,11 +13803,17 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
                 )
                 .await
                 .unwrap()
-                .expect("restored fixture runtime has an owner lease");
-            meta.renew_standing_runtime_owner(standing_runtime_owner_token_from_claim(&owner), 1)
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(2)).await;
+                .is_some()
+            {
+                meta.inner
+                    .expire_standing_runtime_owner_for_test(
+                        &identity.tenant_id,
+                        &identity.program_id,
+                        &active.spec.view_id,
+                    )
+                    .await
+                    .unwrap();
+            }
         }
         state = test_authoritative_api_state_with_store(
             store.clone(),
@@ -13575,6 +13876,24 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
         )
         .await;
         assert_eq!(response.0, StatusCode::OK, "{response:?}");
+        let owner_report = call_json(
+            &router,
+            Method::GET,
+            "/v1/standing-runtime/owners",
+            json!({}),
+        )
+        .await;
+        assert_eq!(owner_report.0, StatusCode::OK, "{owner_report:?}");
+        assert!(
+            owner_report.1["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|owner| owner["view_id"] == "source_first_total"
+                    && owner["current_owner"].is_object()),
+            "backfill must acquire a calculation owner: {:?}",
+            owner_report.1
+        );
         let response = call_json(
             &router,
             Method::POST,
@@ -23576,6 +23895,12 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
             velorix_core::arrow_state::to_state(&legacy).unwrap();
         old.state_root.content_hash =
             stable_bytes_hash(old.state_payload.as_ref().unwrap().payload.as_bytes());
+        // Install the legacy-runtime fixture under a real local owner fence;
+        // acquiring its first claim later must invalidate an unmarked resident.
+        restarted
+            .acquire_standing_runtime_owner(&old.identity, "cold_aggregates")
+            .await
+            .unwrap();
         let runtime =
             velorix_runtime::materialized_view_runtime::restore_standing_runtime(old).unwrap();
         insert_standing_runtime(&restarted, "cold_aggregates", runtime).unwrap();

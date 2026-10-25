@@ -146,6 +146,12 @@ impl ProcessedSpans {
     pub fn as_spans(&self) -> Vec<[u64; 2]> {
         self.spans.clone()
     }
+
+    /// Bytes retained by the owned span allocation, excluding the inline
+    /// `ProcessedSpans` fields counted by callers.
+    pub fn allocated_span_bytes(&self) -> usize {
+        self.spans.capacity() * std::mem::size_of::<[u64; 2]>()
+    }
 }
 
 #[cfg(test)]

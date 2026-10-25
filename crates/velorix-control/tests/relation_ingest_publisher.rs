@@ -153,6 +153,16 @@ impl MetaStore for FaultMeta {
         self.inner.acquire_standing_runtime_owner(request).await
     }
 
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        self.inner
+            .acquire_standing_runtime_owner_with_endpoint(request, owner_endpoint)
+            .await
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         tenant_id: &str,

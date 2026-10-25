@@ -254,6 +254,8 @@ pub struct StandingRuntimeOwnerClaim {
     pub program_id: String,
     pub view_id: String,
     pub owner_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_endpoint: Option<String>,
     pub owner_epoch: u64,
     pub expires_at_unix_ms: u64,
 }
@@ -697,27 +699,86 @@ pub(crate) async fn read_demand_metadata_batch_from_state(
     store: InMemoryMetaStore,
     request: ReadDemandMetadataBatchRequest,
 ) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
+    request.validate()?;
+    let guard = store.inner.read().await;
     let source_cuts = match request.source_cuts {
-        Some(request) => Some(store.capture_relation_ingest_source_cuts(request).await?),
+        Some(source_request) => {
+            for relation in &source_request.relations {
+                let catalog = guard
+                    .relation_catalogs
+                    .get(&(
+                        relation.relation_id.clone(),
+                        relation.relation_version.clone(),
+                    ))
+                    .ok_or_else(|| MetaStoreError::RelationCatalogNotFound {
+                        relation_id: relation.relation_id.clone(),
+                        relation_version: relation.relation_version.clone(),
+                    })?;
+                if catalog.schema_fingerprint.as_str() != relation.schema_fingerprint.as_str() {
+                    return Err(MetaStoreError::Serialization(
+                        "demand source-cut fingerprint does not match registered relation catalog"
+                            .into(),
+                    ));
+                }
+            }
+            // Retain same-scope fingerprint mismatches for the builder to reject.
+            let is_requested = |reservation: &IngestRangeReservation| {
+                source_request.relations.iter().any(|relation| {
+                    relation.relation_id == reservation.relation_id
+                        && relation.relation_version == reservation.relation_version
+                })
+            };
+            let reservations = guard
+                .relation_ingest_reservations
+                .values()
+                .flatten()
+                .filter_map(|reservation| {
+                    let authority = guard.relation_authority_reservation_keys.get(reservation)?;
+                    (authority.namespace == source_request.namespace && is_requested(reservation))
+                        .then(|| (authority.clone(), reservation.clone()))
+                })
+                .collect::<Vec<_>>();
+            let publications = guard
+                .relation_authoritative_ingest_publications
+                .values()
+                .filter(|publication| {
+                    publication.authority_key.namespace == source_request.namespace
+                        && is_requested(&publication.reservation)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            Some(source_cut::build_relation_ingest_source_cuts(
+                &source_request,
+                reservations,
+                publications,
+            )?)
+        }
         None => None,
     };
     let mut relation_catalogs = Vec::with_capacity(request.relation_catalogs.len());
     for lookup in request.relation_catalogs {
         relation_catalogs.push(
-            store
-                .read_relation_catalog(&lookup.relation_id, &lookup.relation_version)
-                .await?,
+            guard
+                .relation_catalogs
+                .get(&(lookup.relation_id.clone(), lookup.relation_version.clone()))
+                .cloned()
+                .ok_or(MetaStoreError::RelationCatalogNotFound {
+                    relation_id: lookup.relation_id,
+                    relation_version: lookup.relation_version,
+                })?,
         );
     }
     let standing_runtime_checkpoint = match request.standing_runtime_checkpoint {
         Some(lookup) => {
-            store
-                .read_standing_runtime_checkpoint(
-                    &lookup.tenant_id,
-                    &lookup.program_id,
-                    &lookup.view_id,
-                )
-                .await?
+            validate_standing_runtime_scope(
+                &lookup.tenant_id,
+                &lookup.program_id,
+                &lookup.view_id,
+            )?;
+            guard
+                .standing_runtime_checkpoints
+                .get(&(lookup.tenant_id, lookup.program_id, lookup.view_id))
+                .cloned()
         }
         None => None,
     };
@@ -1082,6 +1143,16 @@ pub trait MetaStore: Send + Sync + 'static {
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError>;
 
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        _request: AcquireStandingRuntimeOwnerRequest,
+        _owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        Err(MetaStoreError::UnsupportedCapability(
+            "standing_runtime_owner_endpoint",
+        ))
+    }
+
     /// Creates transport bound to the calling executor for independent renewal.
     /// In-process stores need no replacement. Transport-backed wrappers must
     /// forward this hook so renewal does not depend on the request executor.
@@ -1433,6 +1504,16 @@ where
         (**self).acquire_standing_runtime_owner(request).await
     }
 
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        (**self)
+            .acquire_standing_runtime_owner_with_endpoint(request, owner_endpoint)
+            .await
+    }
+
     async fn renew_standing_runtime_owner(
         &self,
         owner: StandingRuntimeOwnerToken,
@@ -1618,6 +1699,75 @@ struct InMemoryIngestPublication {
 }
 
 impl InMemoryMetaStore {
+    async fn acquire_owner_claim(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: Option<String>,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        request.validate()?;
+        let now = self.evaluation_time_ms()?;
+        let expires_at_unix_ms = now
+            .checked_add(request.ttl_ms)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        let key = standing_runtime_owner_scope_key(
+            &request.tenant_id,
+            &request.program_id,
+            &request.view_id,
+        );
+        let mut guard = self.inner.write().await;
+        let current = guard.standing_runtime_owners.get(&key).cloned();
+        match current {
+            Some(current)
+                if current.expires_at_unix_ms > now && current.owner_id != request.owner_id =>
+            {
+                Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(current))
+            }
+            Some(current) if current.expires_at_unix_ms > now => {
+                let claim = StandingRuntimeOwnerClaim {
+                    tenant_id: request.tenant_id,
+                    program_id: request.program_id,
+                    view_id: request.view_id,
+                    owner_id: request.owner_id,
+                    owner_endpoint: owner_endpoint.or(current.owner_endpoint),
+                    owner_epoch: current.owner_epoch,
+                    expires_at_unix_ms,
+                };
+                guard.standing_runtime_owners.insert(key, claim.clone());
+                Ok(AcquireStandingRuntimeOwnerOutcome::Renewed(claim))
+            }
+            Some(current) => {
+                let owner_epoch = current
+                    .owner_epoch
+                    .checked_add(1)
+                    .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
+                let claim = StandingRuntimeOwnerClaim {
+                    tenant_id: request.tenant_id,
+                    program_id: request.program_id,
+                    view_id: request.view_id,
+                    owner_id: request.owner_id,
+                    owner_endpoint,
+                    owner_epoch,
+                    expires_at_unix_ms,
+                };
+                guard.standing_runtime_owners.insert(key, claim.clone());
+                Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim))
+            }
+            None => {
+                let claim = StandingRuntimeOwnerClaim {
+                    tenant_id: request.tenant_id,
+                    program_id: request.program_id,
+                    view_id: request.view_id,
+                    owner_id: request.owner_id,
+                    owner_endpoint,
+                    owner_epoch: 1,
+                    expires_at_unix_ms,
+                };
+                guard.standing_runtime_owners.insert(key, claim.clone());
+                Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim))
+            }
+        }
+    }
+
     #[cfg(any(test, feature = "rhiza-backend"))]
     pub(crate) fn from_state_for_evaluation(state: InMemoryMetaState, now_unix_ms: u64) -> Self {
         let mut state = state;
@@ -1659,6 +1809,24 @@ impl InMemoryMetaStore {
     /// Production callers never provide time through the authority API.
     pub async fn set_partition_authority_clock_for_test(&self, now_unix_ms: u64) {
         self.inner.write().await.partition_authority_now_unix_ms = now_unix_ms;
+    }
+
+    #[doc(hidden)]
+    pub async fn expire_standing_runtime_owner_for_test(
+        &self,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+    ) -> Result<(), MetaStoreError> {
+        validate_standing_runtime_scope(tenant_id, program_id, view_id)?;
+        let key = standing_runtime_owner_scope_key(tenant_id, program_id, view_id);
+        let mut state = self.inner.write().await;
+        let owner = state
+            .standing_runtime_owners
+            .get_mut(&key)
+            .ok_or(MetaStoreError::StandingRuntimeOwnerMismatch)?;
+        owner.expires_at_unix_ms = 0;
+        Ok(())
     }
 }
 
@@ -1940,13 +2108,7 @@ impl MetaStore for InMemoryMetaStore {
         &self,
         request: ReadDemandMetadataBatchRequest,
     ) -> Result<ReadDemandMetadataBatchResponse, MetaStoreError> {
-        request.validate()?;
-        let state = self.inner.read().await.clone();
-        let store = Self {
-            inner: Arc::new(RwLock::new(state)),
-            evaluation_now_unix_ms: self.evaluation_now_unix_ms,
-        };
-        read_demand_metadata_batch_from_state(store, request).await
+        read_demand_metadata_batch_from_state(self.clone(), request).await
     }
 
     async fn reserve_ingest_range(
@@ -2609,65 +2771,17 @@ impl MetaStore for InMemoryMetaStore {
         &self,
         request: AcquireStandingRuntimeOwnerRequest,
     ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
-        request.validate()?;
-        let now = self.evaluation_time_ms()?;
-        let expires_at_unix_ms = now
-            .checked_add(request.ttl_ms)
-            .ok_or(MetaStoreError::TimestampOverflow)?;
-        let key = standing_runtime_owner_scope_key(
-            &request.tenant_id,
-            &request.program_id,
-            &request.view_id,
-        );
-        let mut guard = self.inner.write().await;
-        let current = guard.standing_runtime_owners.get(&key).cloned();
-        match current {
-            Some(current)
-                if current.expires_at_unix_ms > now && current.owner_id != request.owner_id =>
-            {
-                Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(current))
-            }
-            Some(current) if current.expires_at_unix_ms > now => {
-                let claim = StandingRuntimeOwnerClaim {
-                    tenant_id: request.tenant_id,
-                    program_id: request.program_id,
-                    view_id: request.view_id,
-                    owner_id: request.owner_id,
-                    owner_epoch: current.owner_epoch,
-                    expires_at_unix_ms,
-                };
-                guard.standing_runtime_owners.insert(key, claim.clone());
-                Ok(AcquireStandingRuntimeOwnerOutcome::Renewed(claim))
-            }
-            Some(current) => {
-                let owner_epoch = current
-                    .owner_epoch
-                    .checked_add(1)
-                    .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
-                let claim = StandingRuntimeOwnerClaim {
-                    tenant_id: request.tenant_id,
-                    program_id: request.program_id,
-                    view_id: request.view_id,
-                    owner_id: request.owner_id,
-                    owner_epoch,
-                    expires_at_unix_ms,
-                };
-                guard.standing_runtime_owners.insert(key, claim.clone());
-                Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim))
-            }
-            None => {
-                let claim = StandingRuntimeOwnerClaim {
-                    tenant_id: request.tenant_id,
-                    program_id: request.program_id,
-                    view_id: request.view_id,
-                    owner_id: request.owner_id,
-                    owner_epoch: 1,
-                    expires_at_unix_ms,
-                };
-                guard.standing_runtime_owners.insert(key, claim.clone());
-                Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim))
-            }
-        }
+        self.acquire_owner_claim(request, None).await
+    }
+
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        validate_owner_endpoint(&owner_endpoint)?;
+        self.acquire_owner_claim(request, Some(owner_endpoint))
+            .await
     }
 
     async fn read_standing_runtime_owner(
@@ -3464,6 +3578,26 @@ impl AcquireStandingRuntimeOwnerRequest {
         }
         Ok(())
     }
+}
+
+fn validate_owner_endpoint(endpoint: &str) -> Result<(), MetaStoreError> {
+    let Some((scheme, authority)) = endpoint.split_once("://") else {
+        return Err(MetaStoreError::Serialization(
+            "invalid owner endpoint origin".into(),
+        ));
+    };
+    if !matches!(scheme, "http" | "https")
+        || authority.is_empty()
+        || authority.contains(['/', '\\', '?', '#', '@'])
+    {
+        return Err(MetaStoreError::Serialization(
+            "owner endpoint must be an HTTP(S) origin without credentials, path, query, or fragment".into(),
+        ));
+    }
+    tonic::transport::Endpoint::from_shared(endpoint.to_owned()).map_err(|error| {
+        MetaStoreError::Serialization(format!("invalid owner endpoint: {error}"))
+    })?;
+    Ok(())
 }
 
 impl PublishStandingRuntimeCheckpointRequest {
@@ -4762,21 +4896,44 @@ where
         &self,
         request: Request<proto::ReadDemandMetadataBatchRequest>,
     ) -> Result<Response<proto::ReadDemandMetadataBatchResponse>, Status> {
+        let total_started = std::time::Instant::now();
         self.authorize(&request)?;
-        let request: ReadDemandMetadataBatchRequest =
-            serde_json::from_slice(&request.into_inner().request_json)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let request_json = request.into_inner().request_json;
+        let request_bytes = request_json.len();
+        let decode_started = std::time::Instant::now();
+        let request: ReadDemandMetadataBatchRequest = serde_json::from_slice(&request_json)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let json_decode = decode_started.elapsed();
+        let validate_started = std::time::Instant::now();
         request
             .validate()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let request_validate = validate_started.elapsed();
+        let store_started = std::time::Instant::now();
         let response = self
             .store
             .read_demand_metadata_batch(request)
             .await
             .map_err(meta_status)?;
+        let store_elapsed = store_started.elapsed();
+        let encode_started = std::time::Instant::now();
+        let response_json =
+            serde_json::to_vec(&response).map_err(|error| Status::internal(error.to_string()))?;
+        let json_encode = encode_started.elapsed();
+        let total = total_started.elapsed();
+        if std::env::var_os("VELORIX_META_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "meta_diag op=read_demand_metadata_batch request_bytes={request_bytes} response_bytes={} json_decode_us={} request_validate_us={} store_us={} json_encode_us={} total_us={}",
+                response_json.len(),
+                json_decode.as_micros(),
+                request_validate.as_micros(),
+                store_elapsed.as_micros(),
+                json_encode.as_micros(),
+                total.as_micros(),
+            );
+        }
         Ok(Response::new(proto::ReadDemandMetadataBatchResponse {
-            response_json: serde_json::to_vec(&response)
-                .map_err(|error| Status::internal(error.to_string()))?,
+            response_json,
         }))
     }
 
@@ -4784,22 +4941,47 @@ where
         &self,
         request: Request<proto::ActiveViewRegistrySnapshotRequest>,
     ) -> Result<Response<proto::ActiveViewRegistrySnapshotResponse>, Status> {
+        let total_started = std::time::Instant::now();
         self.authorize(&request)?;
         let request_json = request.into_inner().request_json;
+        let request_bytes = request_json.len();
+        let request_validate_started = std::time::Instant::now();
         validate_active_view_rpc_payload_size(request_json.len())?;
+        let request_validate = request_validate_started.elapsed();
+        let decode_started = std::time::Instant::now();
         let request: ActiveViewRegistryReadRequestV1 = serde_json::from_slice(&request_json)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let json_decode = decode_started.elapsed();
+        let store_started = std::time::Instant::now();
         let response = self
             .store
             .read_active_view_registry_snapshot(request)
             .await
             .map_err(meta_status)?;
+        let store_elapsed = store_started.elapsed();
+        let encode_started = std::time::Instant::now();
         let response_json =
             serde_json::to_vec(&response).map_err(|error| Status::internal(error.to_string()))?;
+        let json_encode = encode_started.elapsed();
+        let response_validate_started = std::time::Instant::now();
         if response_json.len() > MAX_META_GRPC_MESSAGE_BYTES - 256 {
             return Err(Status::resource_exhausted(
                 "active view registry snapshot exceeds 8 MiB",
             ));
+        }
+        let response_validate = response_validate_started.elapsed();
+        let total = total_started.elapsed();
+        if std::env::var_os("VELORIX_META_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "meta_diag op=read_active_view_registry_snapshot request_bytes={request_bytes} response_bytes={} json_decode_us={} request_validate_us={} store_us={} response_validate_us={} json_encode_us={} total_us={}",
+                response_json.len(),
+                json_decode.as_micros(),
+                request_validate.as_micros(),
+                store_elapsed.as_micros(),
+                response_validate.as_micros(),
+                json_encode.as_micros(),
+                total.as_micros(),
+            );
         }
         Ok(Response::new(proto::ActiveViewRegistrySnapshotResponse {
             response_json,
@@ -4927,17 +5109,21 @@ where
     ) -> Result<Response<proto::AcquireStandingRuntimeOwnerResponse>, Status> {
         self.authorize(&request)?;
         let request = request.into_inner();
-        let outcome = self
-            .store
-            .acquire_standing_runtime_owner(AcquireStandingRuntimeOwnerRequest {
-                tenant_id: request.tenant_id,
-                program_id: request.program_id,
-                view_id: request.view_id,
-                owner_id: request.owner_id,
-                ttl_ms: request.ttl_ms,
-            })
-            .await
-            .map_err(meta_status)?;
+        let acquire = AcquireStandingRuntimeOwnerRequest {
+            tenant_id: request.tenant_id,
+            program_id: request.program_id,
+            view_id: request.view_id,
+            owner_id: request.owner_id,
+            ttl_ms: request.ttl_ms,
+        };
+        let outcome = if request.owner_endpoint.is_empty() {
+            self.store.acquire_standing_runtime_owner(acquire).await
+        } else {
+            self.store
+                .acquire_standing_runtime_owner_with_endpoint(acquire, request.owner_endpoint)
+                .await
+        }
+        .map_err(meta_status)?;
 
         Ok(Response::new(proto::AcquireStandingRuntimeOwnerResponse {
             outcome: acquire_standing_runtime_owner_outcome(&outcome).to_string(),
@@ -5822,6 +6008,7 @@ fn standing_runtime_owner_claim_to_proto(
         owner_id: claim.owner_id,
         owner_epoch: claim.owner_epoch,
         expires_at_unix_ms: claim.expires_at_unix_ms,
+        owner_endpoint: claim.owner_endpoint.unwrap_or_default(),
     }
 }
 
@@ -5833,8 +6020,30 @@ fn standing_runtime_owner_claim_from_proto(
         program_id: claim.program_id,
         view_id: claim.view_id,
         owner_id: claim.owner_id,
+        owner_endpoint: (!claim.owner_endpoint.is_empty()).then_some(claim.owner_endpoint),
         owner_epoch: claim.owner_epoch,
         expires_at_unix_ms: claim.expires_at_unix_ms,
+    }
+}
+
+fn acquire_standing_runtime_owner_outcome_from_proto(
+    response: proto::AcquireStandingRuntimeOwnerResponse,
+    expected_owner_endpoint: Option<&str>,
+) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+    let claim = response
+        .claim
+        .ok_or_else(|| MetaStoreError::UnexpectedOutcome("missing owner claim".to_string()))
+        .map(standing_runtime_owner_claim_from_proto)?;
+    let endpoint_matches = expected_owner_endpoint
+        .is_none_or(|expected| claim.owner_endpoint.as_deref() == Some(expected));
+    match response.outcome.as_str() {
+        "acquired" if endpoint_matches => Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim)),
+        "renewed" if endpoint_matches => Ok(AcquireStandingRuntimeOwnerOutcome::Renewed(claim)),
+        "acquired" | "renewed" => Err(MetaStoreError::UnexpectedOutcome(
+            "owner endpoint protocol acknowledgement missing or mismatched".into(),
+        )),
+        "conflict" => Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(claim)),
+        other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
     }
 }
 
@@ -6818,6 +7027,7 @@ impl MetaStore for GrpcMetaStore {
                     view_id: request.view_id,
                     owner_id: request.owner_id,
                     ttl_ms: request.ttl_ms,
+                    owner_endpoint: String::new(),
                 },
             ))
             .await
@@ -6828,16 +7038,37 @@ impl MetaStore for GrpcMetaStore {
                 _ => MetaStoreError::Remote(error.to_string()),
             })?
             .into_inner();
-        let claim = response
-            .claim
-            .ok_or_else(|| MetaStoreError::UnexpectedOutcome("missing owner claim".to_string()))
-            .map(standing_runtime_owner_claim_from_proto)?;
-        match response.outcome.as_str() {
-            "acquired" => Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim)),
-            "renewed" => Ok(AcquireStandingRuntimeOwnerOutcome::Renewed(claim)),
-            "conflict" => Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(claim)),
-            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
-        }
+        acquire_standing_runtime_owner_outcome_from_proto(response, None)
+    }
+
+    async fn acquire_standing_runtime_owner_with_endpoint(
+        &self,
+        request: AcquireStandingRuntimeOwnerRequest,
+        owner_endpoint: String,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        validate_owner_endpoint(&owner_endpoint)?;
+        let expected_owner_endpoint = owner_endpoint.clone();
+        let response = self
+            .client()
+            .acquire_standing_runtime_owner(self.request(
+                proto::AcquireStandingRuntimeOwnerRequest {
+                    tenant_id: request.tenant_id,
+                    program_id: request.program_id,
+                    view_id: request.view_id,
+                    owner_id: request.owner_id,
+                    ttl_ms: request.ttl_ms,
+                    owner_endpoint,
+                },
+            ))
+            .await
+            .map_err(|error| match error.code() {
+                tonic::Code::FailedPrecondition => MetaStoreError::UnsupportedCapability(
+                    "linearizable_standing_runtime_owner_lease",
+                ),
+                _ => MetaStoreError::Remote(error.to_string()),
+            })?
+            .into_inner();
+        acquire_standing_runtime_owner_outcome_from_proto(response, Some(&expected_owner_endpoint))
     }
 
     async fn renew_standing_runtime_owner(
@@ -7356,6 +7587,37 @@ mod relation_partition_authority_tests {
 mod demand_metadata_batch_validation_tests {
     use super::*;
 
+    fn catalog(relation_id: &str, version: &str) -> VelorixRelationCatalogV1 {
+        use velorix_core::relation::{
+            ArrowPhysicalTypeV1, RelationColumnV1, RelationOperationV1, RelationSemanticRoleV1,
+            VelorixLogicalTypeV1, VelorixRelationSchemaV1, CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID,
+        };
+
+        let relation_schema = VelorixRelationSchemaV1 {
+            relation_id: relation_id.into(),
+            relation_name: relation_id.into(),
+            relation_version: version.into(),
+            columns: vec![RelationColumnV1 {
+                column_id: "weight".into(),
+                name: "weight".into(),
+                logical_type: VelorixLogicalTypeV1::Int64,
+                physical_arrow_type: ArrowPhysicalTypeV1::Int64,
+                nullable: false,
+                ordinal: 0,
+                semantic_role: RelationSemanticRoleV1::Weight,
+            }],
+            primary_key_column_ids: vec![],
+            weight_column_id: "weight".into(),
+            allowed_operations: vec![RelationOperationV1::Insert],
+            event_time_column_id: None,
+        };
+        VelorixRelationCatalogV1::from_relation_schema(
+            relation_schema,
+            CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
+        )
+        .unwrap()
+    }
+
     fn request(source_cut_relation_count: usize) -> ReadDemandMetadataBatchRequest {
         ReadDemandMetadataBatchRequest {
             source_cuts: Some(CaptureRelationIngestSourceCutsRequest {
@@ -7393,5 +7655,423 @@ mod demand_metadata_batch_validation_tests {
                 max: MAX_DEMAND_METADATA_BATCH_LOOKUPS,
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn batch_source_cut_ignores_unrequested_relation_records() {
+        let store = InMemoryMetaStore::default();
+        let orders_catalog = catalog("orders", "v1");
+        let orders_fingerprint = orders_catalog.schema_fingerprint.to_string();
+        let inventory_catalog = catalog("inventory", "v1");
+        let inventory_fingerprint = inventory_catalog.schema_fingerprint.to_string();
+        let requested = IngestRangeReservation {
+            stream_id: "orders-stream".into(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 10,
+            batch_key: "orders-batch".into(),
+            payload_digest: "sha256:orders".into(),
+            relation_id: "orders".into(),
+            relation_version: "v1".into(),
+            schema_fingerprint: orders_fingerprint.clone(),
+            writer_epoch: 1,
+        };
+        let unrelated = IngestRangeReservation {
+            stream_id: "customers-stream".into(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 20,
+            batch_key: "customers-batch".into(),
+            payload_digest: "sha256:customers".into(),
+            relation_id: "customers".into(),
+            relation_version: "v2".into(),
+            schema_fingerprint: "sha256:customers-schema".into(),
+            writer_epoch: 2,
+        };
+        let requested_authority = RelationPartitionAuthorityKey {
+            namespace: "tenant".into(),
+            relation_id: "orders".into(),
+            stream_id: requested.stream_id.clone(),
+            partition_id: requested.partition_id,
+        };
+        let unrelated_authority = RelationPartitionAuthorityKey {
+            namespace: "tenant".into(),
+            relation_id: "customers".into(),
+            stream_id: unrelated.stream_id.clone(),
+            partition_id: unrelated.partition_id,
+        };
+        {
+            let mut state = store.inner.write().await;
+            state
+                .relation_catalogs
+                .insert(("orders".into(), "v1".into()), orders_catalog);
+            state
+                .relation_catalogs
+                .insert(("inventory".into(), "v1".into()), inventory_catalog);
+            state.relation_ingest_reservations.insert(
+                (requested.stream_id.clone(), requested.partition_id),
+                vec![requested.clone()],
+            );
+            state.relation_ingest_reservations.insert(
+                (unrelated.stream_id.clone(), unrelated.partition_id),
+                vec![unrelated.clone()],
+            );
+            state
+                .relation_authority_reservation_keys
+                .insert(requested.clone(), requested_authority.clone());
+            state
+                .relation_authority_reservation_keys
+                .insert(unrelated.clone(), unrelated_authority.clone());
+            state.relation_authoritative_ingest_publications.insert(
+                "orders-request".into(),
+                RelationAuthoritativeIngestPublication {
+                    reservation: requested,
+                    authority_key: requested_authority,
+                    request_id: "orders-request".into(),
+                    request_digest: "sha256:orders-request".into(),
+                    object_key: "objects/orders".into(),
+                    object_digest: "sha256:orders-object".into(),
+                },
+            );
+            state.relation_authoritative_ingest_publications.insert(
+                "customers-request".into(),
+                RelationAuthoritativeIngestPublication {
+                    reservation: unrelated,
+                    authority_key: unrelated_authority,
+                    request_id: "customers-request".into(),
+                    request_digest: "sha256:customers-request".into(),
+                    object_key: "objects/customers".into(),
+                    object_digest: "sha256:customers-object".into(),
+                },
+            );
+        }
+
+        let result = store
+            .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+                source_cuts: Some(CaptureRelationIngestSourceCutsRequest {
+                    namespace: "tenant".into(),
+                    relations: vec![
+                        IngestSourceRelationIdentityV1 {
+                            relation_id: "orders".into(),
+                            relation_version: "v1".into(),
+                            relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                            schema_fingerprint: orders_fingerprint,
+                        },
+                        IngestSourceRelationIdentityV1 {
+                            relation_id: "inventory".into(),
+                            relation_version: "v1".into(),
+                            relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                            schema_fingerprint: inventory_fingerprint,
+                        },
+                    ],
+                }),
+                relation_catalogs: vec![],
+                standing_runtime_checkpoint: None,
+            })
+            .await
+            .unwrap();
+
+        let cuts = result.source_cuts.unwrap();
+        assert_eq!(cuts.len(), 2);
+        assert_eq!(cuts[0].relation.relation_id, "orders");
+        assert_eq!(cuts[0].cut.partitions[0].publications.len(), 1);
+        assert_eq!(
+            cuts[0].cut.partitions[0].publications[0].request_id,
+            "orders-request"
+        );
+        assert_eq!(cuts[1].relation.relation_id, "inventory");
+        assert!(cuts[1].cut.partitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_source_cut_fingerprint_that_differs_from_catalog() {
+        let store = InMemoryMetaStore::default();
+        let relation_catalog = catalog("orders", "v1");
+        store
+            .inner
+            .write()
+            .await
+            .relation_catalogs
+            .insert(("orders".into(), "v1".into()), relation_catalog);
+
+        let result = store
+            .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+                source_cuts: Some(CaptureRelationIngestSourceCutsRequest {
+                    namespace: "tenant".into(),
+                    relations: vec![IngestSourceRelationIdentityV1 {
+                        relation_id: "orders".into(),
+                        relation_version: "v1".into(),
+                        relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                        schema_fingerprint: "sha256:request".into(),
+                    }],
+                }),
+                relation_catalogs: vec![],
+                standing_runtime_checkpoint: None,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MetaStoreError::Serialization(message)) if message.contains("fingerprint")
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_stored_source_cut_fingerprint_mismatches() {
+        let store = InMemoryMetaStore::default();
+        let relation_catalog = catalog("orders", "v1");
+        let fingerprint = relation_catalog.schema_fingerprint.to_string();
+        let reservation = IngestRangeReservation {
+            stream_id: "orders-stream".into(),
+            partition_id: 0,
+            start_offset_inclusive: 0,
+            end_offset_exclusive: 10,
+            batch_key: "orders-batch".into(),
+            payload_digest: "sha256:orders".into(),
+            relation_id: "orders".into(),
+            relation_version: "v1".into(),
+            schema_fingerprint: "sha256:stored".into(),
+            writer_epoch: 1,
+        };
+        let authority = RelationPartitionAuthorityKey {
+            namespace: "tenant".into(),
+            relation_id: "orders".into(),
+            stream_id: reservation.stream_id.clone(),
+            partition_id: reservation.partition_id,
+        };
+        {
+            let mut state = store.inner.write().await;
+            state
+                .relation_catalogs
+                .insert(("orders".into(), "v1".into()), relation_catalog);
+            state.relation_ingest_reservations.insert(
+                (reservation.stream_id.clone(), reservation.partition_id),
+                vec![reservation.clone()],
+            );
+            state
+                .relation_authority_reservation_keys
+                .insert(reservation.clone(), authority.clone());
+            state.relation_authoritative_ingest_publications.insert(
+                "orders-request".into(),
+                RelationAuthoritativeIngestPublication {
+                    reservation,
+                    authority_key: authority,
+                    request_id: "orders-request".into(),
+                    request_digest: "sha256:orders-request".into(),
+                    object_key: "objects/orders".into(),
+                    object_digest: "sha256:orders-object".into(),
+                },
+            );
+        }
+
+        let result = store
+            .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+                source_cuts: Some(CaptureRelationIngestSourceCutsRequest {
+                    namespace: "tenant".into(),
+                    relations: vec![IngestSourceRelationIdentityV1 {
+                        relation_id: "orders".into(),
+                        relation_version: "v1".into(),
+                        relation_generation: INGEST_SOURCE_IDENTITY_GENERATION_V1,
+                        schema_fingerprint: fingerprint,
+                    }],
+                }),
+                relation_catalogs: vec![],
+                standing_runtime_checkpoint: None,
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MetaStoreError::Serialization(message)) if message.contains("fingerprint")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod standing_runtime_owner_endpoint_tests {
+    use super::*;
+
+    fn owner_response(
+        outcome: &str,
+        owner_endpoint: &str,
+    ) -> proto::AcquireStandingRuntimeOwnerResponse {
+        proto::AcquireStandingRuntimeOwnerResponse {
+            outcome: outcome.into(),
+            claim: Some(proto::StandingRuntimeOwnerClaim {
+                tenant_id: "tenant".into(),
+                program_id: "program".into(),
+                view_id: "view".into(),
+                owner_id: "owner".into(),
+                owner_epoch: 1,
+                expires_at_unix_ms: 100,
+                owner_endpoint: owner_endpoint.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn grpc_acquire_rejects_success_without_matching_endpoint_acknowledgement() {
+        // A proto3 server that predates the field drops it and returns the default empty value.
+        for returned_endpoint in ["", "http://other-owner.example:8080"] {
+            let result = acquire_standing_runtime_owner_outcome_from_proto(
+                owner_response("acquired", returned_endpoint),
+                Some("http://owner.example:8080"),
+            );
+
+            assert!(matches!(
+                result,
+                Err(MetaStoreError::UnexpectedOutcome(message))
+                    if message.contains("endpoint protocol acknowledgement")
+            ));
+        }
+    }
+
+    #[test]
+    fn grpc_acquire_accepts_matching_endpoint_acknowledgement() {
+        for outcome in ["acquired", "renewed"] {
+            let result = acquire_standing_runtime_owner_outcome_from_proto(
+                owner_response(outcome, "http://owner.example:8080"),
+                Some("http://owner.example:8080"),
+            );
+            assert!(matches!(
+                (outcome, result),
+                (
+                    "acquired",
+                    Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(_))
+                ) | (
+                    "renewed",
+                    Ok(AcquireStandingRuntimeOwnerOutcome::Renewed(_))
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn grpc_acquire_allows_conflict_with_another_owner_endpoint() {
+        let result = acquire_standing_runtime_owner_outcome_from_proto(
+            owner_response("conflict", "http://other-owner.example:8080"),
+            Some("http://owner.example:8080"),
+        );
+
+        assert!(matches!(
+            result,
+            Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(claim))
+                if claim.owner_endpoint.as_deref() == Some("http://other-owner.example:8080")
+        ));
+    }
+
+    #[test]
+    fn owner_endpoint_survives_snapshot_and_proto_roundtrips() {
+        let claim = StandingRuntimeOwnerClaim {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner".into(),
+            owner_endpoint: Some("https://api.example:8443".into()),
+            owner_epoch: 2,
+            expires_at_unix_ms: 100,
+        };
+        let mut state = InMemoryMetaState::default();
+        state.standing_runtime_owners.insert(
+            standing_runtime_owner_scope_key("tenant", "program", "view"),
+            claim,
+        );
+        let snapshot = rhiza_snapshot::encode(&state).unwrap();
+        let snapshot_claim = rhiza_snapshot::decode(&snapshot)
+            .unwrap()
+            .standing_runtime_owners
+            .remove(&standing_runtime_owner_scope_key(
+                "tenant", "program", "view",
+            ))
+            .unwrap();
+        let proto_claim = standing_runtime_owner_claim_from_proto(
+            standing_runtime_owner_claim_to_proto(snapshot_claim.clone()),
+        );
+        assert_eq!(proto_claim, snapshot_claim);
+    }
+
+    #[test]
+    fn owner_endpoint_validation_rejects_paths_and_credentials() {
+        assert!(validate_owner_endpoint("https://api.example:8443").is_ok());
+        assert!(validate_owner_endpoint("http://api.example").is_ok());
+        for endpoint in [
+            "http:///missing-host",
+            "http://api.example/path",
+            "http://api.example/",
+            "http:\\\\api.example\\path",
+            "http://user@api.example",
+            "http://api.example?x=1",
+            "http://api.example#fragment",
+        ] {
+            assert!(validate_owner_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn acquire_and_renew_preserve_the_claimed_owner_endpoint() {
+        let store = InMemoryMetaStore::from_state_for_evaluation(InMemoryMetaState::default(), 100);
+        let request = AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner-a".into(),
+            ttl_ms: 10,
+        };
+        let claim = match store
+            .acquire_standing_runtime_owner_with_endpoint(
+                request.clone(),
+                "https://api-a.example:8443".into(),
+            )
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+            other => panic!("unexpected acquire outcome: {other:?}"),
+        };
+        let renewed = store
+            .renew_standing_runtime_owner(claim.token(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            renewed.owner_endpoint.as_deref(),
+            Some("https://api-a.example:8443")
+        );
+        let conflict = match store
+            .acquire_standing_runtime_owner_with_endpoint(
+                AcquireStandingRuntimeOwnerRequest {
+                    owner_id: "owner-b".into(),
+                    ..request
+                },
+                "https://api-b.example:8443".into(),
+            )
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => claim,
+            other => panic!("unexpected acquire outcome: {other:?}"),
+        };
+        assert_eq!(conflict.owner_endpoint, renewed.owner_endpoint);
+    }
+
+    #[tokio::test]
+    async fn nested_arc_trait_objects_forward_owner_endpoint_capability() {
+        let inner: Arc<dyn MetaStore> = Arc::new(InMemoryMetaStore::default());
+        let store: Arc<dyn MetaStore> = Arc::new(inner);
+        let request = AcquireStandingRuntimeOwnerRequest {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "owner".into(),
+            ttl_ms: 10_000,
+        };
+        let claim = match store
+            .acquire_standing_runtime_owner_with_endpoint(request, "http://api.example".into())
+            .await
+            .unwrap()
+        {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+            other => panic!("unexpected acquire outcome: {other:?}"),
+        };
+        assert_eq!(claim.owner_endpoint.as_deref(), Some("http://api.example"));
     }
 }

@@ -9,7 +9,7 @@ use super::*;
 #[derive(Clone, Debug)]
 struct CapturedProof {
     head: StandingRuntimeCheckpointPointer,
-    lineage: Vec<StandingRuntimeCheckpointRecord>,
+    lineage: Vec<Arc<StandingRuntimeCheckpointRecord>>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,22 +159,29 @@ impl ReadBudget {
         &mut self,
         state: &ApiState,
         key: &str,
-    ) -> Result<StandingRuntimeCheckpointRecord, ApiError> {
+        expected_checkpoint_schema_hash: Option<&str>,
+    ) -> Result<Arc<StandingRuntimeCheckpointRecord>, ApiError> {
         let path = ObjectPath::from(key);
         let remaining = self.supplied.saturating_sub(self.used) as u64;
         let mut cache_validations = 0;
-        let cached = publication::read_cached_checkpoint_record(
-            state,
-            &path,
-            remaining,
-            &mut cache_validations,
-        )
-        .await?;
+        let cached = {
+            let _checkpoint_cache_stage = super::demand_materialization::DemandQueryStageTimer::new(
+                "checkpoint_foyer_lookup_decode",
+            );
+            publication::read_cached_checkpoint_record(
+                state,
+                &path,
+                remaining,
+                &mut cache_validations,
+                expected_checkpoint_schema_hash,
+            )
+            .await?
+        };
         self.checkpoint_canonical_validations += cache_validations;
         let (record, size) = match cached {
             publication::CachedCheckpointRecordRead::Hit { record, size } => {
                 self.checkpoint_cache_hits += 1;
-                (*record, size)
+                (record, size)
             }
             publication::CachedCheckpointRecordRead::OverBudget { size } => {
                 let required = (self.used as u64)
@@ -198,10 +205,22 @@ impl ReadBudget {
                 if required > self.supplied as u64 {
                     return Err(required_budget(required, self.supplied));
                 }
-                let (record, read_size) =
-                    publication::read_uncached_checkpoint_record(state, &path, Some(size)).await?;
+                let (record, read_size) = {
+                    let _checkpoint_cold_stage =
+                        super::demand_materialization::DemandQueryStageTimer::new(
+                            "checkpoint_cold_read_decode_validate",
+                        );
+                    publication::read_uncached_checkpoint_record(state, &path, Some(size)).await?
+                };
                 if read_size != size {
                     return Err(invalid("published object size changed"));
+                }
+                if expected_checkpoint_schema_hash.is_some_and(|expected| {
+                    record.checkpoint.identity.output_schema_hash != expected
+                }) {
+                    return Err(invalid(
+                        "checkpoint output schema differs from the expected checkpoint identity",
+                    ));
                 }
                 self.checkpoint_canonical_validations += 1;
                 (record, read_size)
@@ -257,6 +276,8 @@ async fn capture_proof(
     input: &ConsumerViewDependencyInputV1,
     budget: &mut ReadBudget,
 ) -> Result<CapturedProof, ApiError> {
+    let _lineage_stage =
+        super::demand_materialization::DemandQueryStageTimer::new("producer_lineage_freshness");
     validate_input(input)?;
     let c = &input.bootstrap_cursor;
     // Metadata authority is required; never discover an unauthenticated head by LIST.
@@ -290,14 +311,18 @@ async fn capture_proof(
         {
             return Err(invalid("published head scope mismatch"));
         }
+        // This binding hash commits to a RelationSchema, while the checkpoint
+        // identity hashes the view's output-relations payload. The captured
+        // cursor's producer-commit digest binds the former; don't compare the
+        // distinct schema commitment domains on every lineage checkpoint.
         let mut record = budget
-            .read_checkpoint_record(state, &pointer.checkpoint_key)
+            .read_checkpoint_record(state, &pointer.checkpoint_key, None)
             .await?;
         if record.manifest_hash != pointer.manifest_hash {
             return Err(invalid("published header commitment mismatch"));
         }
         if record.checkpoint_key.is_empty() {
-            record.checkpoint_key = pointer.checkpoint_key.clone();
+            Arc::make_mut(&mut record).checkpoint_key = pointer.checkpoint_key.clone();
         }
         publication::validate_standing_runtime_checkpoint_record(
             &record.checkpoint.identity,
@@ -620,6 +645,7 @@ pub(super) async fn load_demand_published_artifact(
     artifact: &DemandPublishedArtifact,
     max_bytes: usize,
 ) -> Result<(RelationInputBatch, usize), ApiError> {
+    state.require_local_materialization()?;
     let mut budget = ReadBudget::new(max_bytes);
     let header = &artifact.proof.lineage[artifact.header_index];
     if artifact.proof.head.logical_epoch < artifact.cursor.output_epoch
@@ -812,11 +838,15 @@ mod tests {
         );
         state = state.with_materialized_read_cache(cache.clone());
 
-        // The typed reader obtains the record from the same canonical decode
-        // that validates the cache hit, without an additional HEAD/GET/decode.
+        // The cold typed read canonically decodes once and seeds the bounded
+        // memory artifact cache for subsequent authority-bound reads.
         let mut typed_budget = ReadBudget::new(size);
         let typed_record = typed_budget
-            .read_checkpoint_record(&state, key.as_str())
+            .read_checkpoint_record(
+                &state,
+                key.as_str(),
+                Some(&checkpoint.identity.output_schema_hash),
+            )
             .await
             .unwrap();
         assert_eq!(typed_record.checkpoint.identity, checkpoint.identity);
@@ -832,6 +862,7 @@ mod tests {
         assert_eq!(typed_budget.used, size);
         assert_eq!(typed_budget.checkpoint_cache_misses, 1);
         assert_eq!(typed_budget.checkpoint_canonical_validations, 1);
+        assert!(cache.decoded_artifact_usage_bytes() <= cache.decoded_output_page_capacity_bytes());
 
         let backing_store = state.store.clone();
         state.store = Arc::new(InMemory::new());
@@ -844,7 +875,11 @@ mod tests {
         }));
         let mut undersized_budget = ReadBudget::new(size - 1);
         let error = undersized_budget
-            .read_checkpoint_record(&state, key.as_str())
+            .read_checkpoint_record(
+                &state,
+                key.as_str(),
+                Some(&checkpoint.identity.output_schema_hash),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -858,7 +893,11 @@ mod tests {
 
         let mut cache_budget = ReadBudget::new(size);
         let cached_record = cache_budget
-            .read_checkpoint_record(&state, key.as_str())
+            .read_checkpoint_record(
+                &state,
+                key.as_str(),
+                Some(&checkpoint.identity.output_schema_hash),
+            )
             .await
             .unwrap();
         assert_eq!(cached_record.checkpoint, typed_record.checkpoint);
@@ -867,12 +906,83 @@ mod tests {
         assert_eq!(cache_budget.used, size);
         assert_eq!(cache_budget.checkpoint_cache_hits, 1);
         assert_eq!(cache_budget.checkpoint_cache_misses, 0);
-        assert_eq!(cache_budget.checkpoint_canonical_validations, 1);
+        assert_eq!(
+            cache_budget.checkpoint_canonical_validations, 0,
+            "a validated memory-only decoded checkpoint is reused without another Arrow canonical decode"
+        );
         assert_eq!(
             hit_accounts.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "an in-budget cache hit is accounted after canonical validation"
+            "an in-budget decoded cache hit is accounted after its current byte budget check"
         );
+        assert!(ReadBudget::new(size)
+            .read_checkpoint_record(&state, key.as_str(), Some("changed-schema"))
+            .await
+            .is_err());
+
+        let source_key = publication::checkpoint_read_cache_key(&state, &path).unwrap();
+        assert!(cache
+            .decoded_checkpoint_record(
+                &source_key,
+                &checkpoint.identity.tenant_id,
+                &checkpoint.identity.program_id,
+                "purchases_by_user",
+                Some(&checkpoint.identity.output_schema_hash),
+                &source_key.codec,
+            )
+            .is_some());
+        let mut other_namespace = source_key.clone();
+        other_namespace.namespace.push_str("-other");
+        assert!(cache
+            .decoded_checkpoint_record(
+                &other_namespace,
+                &checkpoint.identity.tenant_id,
+                &checkpoint.identity.program_id,
+                "purchases_by_user",
+                Some(&checkpoint.identity.output_schema_hash),
+                &source_key.codec,
+            )
+            .is_none());
+        assert!(cache
+            .decoded_checkpoint_record(
+                &source_key,
+                "other-tenant",
+                &checkpoint.identity.program_id,
+                "purchases_by_user",
+                Some(&checkpoint.identity.output_schema_hash),
+                &source_key.codec,
+            )
+            .is_none());
+        assert!(cache
+            .decoded_checkpoint_record(
+                &source_key,
+                &checkpoint.identity.tenant_id,
+                "other-program",
+                "purchases_by_user",
+                Some(&checkpoint.identity.output_schema_hash),
+                &source_key.codec,
+            )
+            .is_none());
+        assert!(cache
+            .decoded_checkpoint_record(
+                &source_key,
+                &checkpoint.identity.tenant_id,
+                &checkpoint.identity.program_id,
+                "other-view",
+                Some(&checkpoint.identity.output_schema_hash),
+                &source_key.codec,
+            )
+            .is_none());
+        assert!(cache
+            .decoded_checkpoint_record(
+                &source_key,
+                &checkpoint.identity.tenant_id,
+                &checkpoint.identity.program_id,
+                "purchases_by_user",
+                Some("different-schema"),
+                &source_key.codec,
+            )
+            .is_none());
 
         // Keep the backing store empty for the existing warm-budget and
         // pointer-commitment assertions below.
@@ -914,18 +1024,188 @@ mod tests {
             .unwrap();
         assert_eq!(record.checkpoint.state_payload, checkpoint.state_payload);
 
-        let mut pointer = publication::standing_runtime_checkpoint_pointer_from_record(&record);
-        pointer.manifest_hash = stable_bytes_hash(b"wrong commitment");
-        let error = publication::read_standing_runtime_checkpoint_header_from_pointer(
-            &state,
-            &pointer.tenant_id,
-            &pointer.program_id,
-            &pointer.view_id,
-            &pointer,
-        )
-        .await
-        .unwrap_err();
+        let pointer = publication::standing_runtime_checkpoint_pointer_from_record(&record);
+        let first =
+            publication::read_standing_runtime_checkpoint_header_from_pointer_with_schema_shared(
+                &state,
+                &pointer.tenant_id,
+                &pointer.program_id,
+                &pointer.view_id,
+                &pointer,
+                &record.checkpoint.identity.output_schema_hash,
+            )
+            .await
+            .unwrap();
+        let second =
+            publication::read_standing_runtime_checkpoint_header_from_pointer_with_schema_shared(
+                &state,
+                &pointer.tenant_id,
+                &pointer.program_id,
+                &pointer.view_id,
+                &pointer,
+                &record.checkpoint.identity.output_schema_hash,
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let mut wrong_pointer = pointer;
+        wrong_pointer.manifest_hash = stable_bytes_hash(b"wrong commitment");
+        let error =
+            publication::read_standing_runtime_checkpoint_header_from_pointer_with_schema_shared(
+                &state,
+                &wrong_pointer.tenant_id,
+                &wrong_pointer.program_id,
+                &wrong_pointer.view_id,
+                &wrong_pointer,
+                &record.checkpoint.identity.output_schema_hash,
+            )
+            .await
+            .unwrap_err();
         assert!(error.message.contains("manifest hash mismatch"));
         cache.close().await.unwrap();
+        state.materialized_read_cache = None;
+        drop(cache);
+
+        let reopened = Arc::new(
+            MaterializedReadCache::open(MaterializedReadCacheConfig {
+                directory: directory.path().into(),
+                memory_bytes: 256 * 1024,
+                disk_bytes: 8 * 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        state = state.with_materialized_read_cache(reopened.clone());
+        let mut reopened_budget = ReadBudget::new(size);
+        let reopened_record = reopened_budget
+            .read_checkpoint_record(
+                &state,
+                key.as_str(),
+                Some(&checkpoint.identity.output_schema_hash),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened_record.manifest_hash, typed_record.manifest_hash);
+        assert_eq!(reopened_budget.checkpoint_canonical_validations, 1);
+
+        // Corrupt the persistent raw entry, then reopen again to remove all
+        // memory-only typed state. The canonical reader must reject it.
+        reopened
+            .insert(source_key, b"corrupt checkpoint payload".to_vec(), |_| {
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        reopened.close().await.unwrap();
+        state.materialized_read_cache = None;
+        drop(reopened);
+
+        let corrupt_reopen = Arc::new(
+            MaterializedReadCache::open(MaterializedReadCacheConfig {
+                directory: directory.path().into(),
+                memory_bytes: 256 * 1024,
+                disk_bytes: 8 * 1024 * 1024,
+            })
+            .await
+            .unwrap(),
+        );
+        state = state.with_materialized_read_cache(corrupt_reopen.clone());
+        assert!(ReadBudget::new(size)
+            .read_checkpoint_record(
+                &state,
+                key.as_str(),
+                Some(&checkpoint.identity.output_schema_hash),
+            )
+            .await
+            .is_err());
+        corrupt_reopen.close().await.unwrap();
+    }
+
+    #[test]
+    fn decoded_checkpoint_weight_tracks_expanded_compressible_records() {
+        let checkpoint = crate::tests::test_runtime_checkpoint(Vec::new());
+        let repeated_scope = "x".repeat(128 * 1024);
+        let record = StandingRuntimeCheckpointRecord {
+            demand_materialization: Some(demand_materialization::DemandCheckpoint {
+                schema_version: 1,
+                spec_hash: "spec".into(),
+                plan_hash: "plan".into(),
+                output_schema_hash: checkpoint.identity.output_schema_hash.clone(),
+                paused: false,
+                order: demand_materialization::DemandOrder::Forward,
+                artifacts: BTreeMap::new(),
+                certificates: vec![demand_materialization::DemandCertificate {
+                    scope_sql: Some(repeated_scope.clone()),
+                    scope_hash: demand_materialization::scope_hash(Some(&repeated_scope)).unwrap(),
+                    captured_cut_hash: "cut".into(),
+                }],
+                full_complete: false,
+                event_time_replay_id: None,
+                event_time_output_readiness: Vec::new(),
+            }),
+            published_input_bootstrap: None,
+            schema_version: 1,
+            record_kind: "standing_runtime_checkpoint_v1".into(),
+            view_id: checkpoint.identity.view_ids[0].clone(),
+            checkpoint_key: "test.checkpoint.arrow".into(),
+            previous_checkpoint: None,
+            checkpoint,
+            replay_checkpoints: Vec::new(),
+            manifest_hash: String::new(),
+        };
+        let arrow = checkpoint_record::encode(&record, 16 * 1024 * 1024).unwrap();
+        let heap_weight = publication::checkpoint_record_heap_weight(&record).unwrap();
+        let certificate = &record.demand_materialization.as_ref().unwrap().certificates[0];
+        let retained_state_bytes = record
+            .checkpoint
+            .state_payload
+            .as_ref()
+            .unwrap()
+            .payload
+            .allocated_retained_bytes();
+        let mut without_arrow = record.clone();
+        without_arrow.checkpoint.state_payload = None;
+        let without_arrow_weight =
+            publication::checkpoint_record_heap_weight(&without_arrow).unwrap();
+        let counted_owned_bytes = std::mem::size_of::<StandingRuntimeCheckpointRecord>()
+            + record.record_kind.capacity()
+            + record.view_id.capacity()
+            + record.checkpoint_key.capacity()
+            + std::mem::size_of::<demand_materialization::DemandCheckpoint>()
+            + record
+                .demand_materialization
+                .as_ref()
+                .unwrap()
+                .spec_hash
+                .capacity()
+            + record
+                .demand_materialization
+                .as_ref()
+                .unwrap()
+                .plan_hash
+                .capacity()
+            + record
+                .demand_materialization
+                .as_ref()
+                .unwrap()
+                .output_schema_hash
+                .capacity()
+            + std::mem::size_of::<demand_materialization::DemandCertificate>()
+            + certificate.scope_sql.as_ref().unwrap().capacity()
+            + certificate.scope_hash.capacity()
+            + certificate.captured_cut_hash.capacity();
+
+        assert!(
+            arrow.len() < repeated_scope.capacity() / 16,
+            "fixture is highly compressible"
+        );
+        assert!(
+            heap_weight >= counted_owned_bytes,
+            "estimator must include actual record, nested struct, and String allocations"
+        );
+        assert!(
+            heap_weight.saturating_sub(without_arrow_weight) >= retained_state_bytes,
+            "estimator must include retained Arrow arrays, indexes, and encoded capacity"
+        );
     }
 }

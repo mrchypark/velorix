@@ -5,6 +5,12 @@ use velorix_control::meta_admin::InMemoryMetaStore;
 use velorix_core::relation::*;
 
 async fn post(router: &Router, path: &str, body: Value, expected: StatusCode) -> Value {
+    let (status, value) = post_unchecked(router, path, body).await;
+    assert_eq!(status, expected, "{path}: {value}");
+    value
+}
+
+async fn post_unchecked(router: &Router, path: &str, body: Value) -> (StatusCode, Value) {
     let response = router
         .clone()
         .oneshot(
@@ -23,8 +29,7 @@ async fn post(router: &Router, path: &str, body: Value, expected: StatusCode) ->
         .await
         .unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(status, expected, "{path}: {value}");
-    value
+    (status, value)
 }
 
 fn catalog(name: &str) -> VelorixRelationCatalogV1 {
@@ -262,6 +267,7 @@ async fn active_view_read_snapshot_reuses_validated_records_and_refreshes_per_op
         .get(&other_namespace, |_| Ok::<(), ()>(()))
         .await
         .is_none());
+
     // A corrupt cache entry is discarded and refetched from the authoritative
     // immutable object; it can never be returned as a spec.
     cache
@@ -328,6 +334,58 @@ async fn active_view_read_snapshot_reuses_validated_records_and_refreshes_per_op
         0,
         "an unchanged immutable spec should reuse the validated cache"
     );
+
+    let mut refreshed_spec = second.views()[0].spec.clone();
+    refreshed_spec.sql.push_str(" /* next request spec */");
+    let refreshed_spec_hash = view_spec_hash(&refreshed_spec).unwrap();
+    let versioned = second.records.get("snapshot_view").unwrap();
+    let previous_runtime = versioned.record.runtime.as_ref().unwrap();
+    let refreshed_runtime = view_admission::materialized_view_runtime_binding_for_spec(
+        &[catalog("snapshot_source")],
+        &refreshed_spec,
+        &previous_runtime.input_bindings,
+        None,
+    )
+    .unwrap();
+    registry
+        .register_with_api_metadata_runtime_execution(
+            &refreshed_spec,
+            versioned.record.api.clone(),
+            refreshed_runtime,
+            versioned.record.lifecycle.clone(),
+        )
+        .await
+        .unwrap();
+    let mut refreshed_record = versioned.record.clone();
+    refreshed_record.spec_hash = refreshed_spec_hash.clone();
+    assert!(matches!(
+        meta_store
+            .compare_exchange_active_view_record(CompareExchangeActiveViewRecordRequestV1 {
+                scope: view_dependencies::active_view_registry_scope(&state),
+                view_id: "snapshot_view".into(),
+                expected_generation: versioned.generation,
+                record: refreshed_record,
+                owner: None,
+            })
+            .await
+            .unwrap(),
+        CompareExchangeActiveViewRecordOutcomeV1::Updated(_)
+    ));
+    counts.clear();
+    let (refreshed, _) = ActiveViewReadSnapshot::load_one(&state, "snapshot_view")
+        .await
+        .unwrap();
+    assert_eq!(refreshed.spec_hash, refreshed_spec_hash);
+    assert_eq!(refreshed.spec.sql, refreshed_spec.sql);
+    assert_eq!(
+        counts
+            .get_paths()
+            .iter()
+            .filter(|path| path.contains("spec-sha256"))
+            .count(),
+        1,
+        "the next request follows a changed Meta spec hash and loads its immutable spec"
+    );
     cache.close().await.unwrap();
 }
 
@@ -340,7 +398,9 @@ async fn two_producer_dag(join: bool) {
         object_store::memory::InMemory::new(),
     )));
     let store: Arc<dyn ObjectStore> = failing_store.clone();
-    let meta = Arc::new(velorix_control::meta_admin::InMemoryMetaStore::default());
+    let meta = Arc::new(crate::tests::DurableCapabilityMetaStore::new(
+        velorix_control::meta_admin::InMemoryMetaStore::default(),
+    ));
     let state = crate::tests::with_initialized_active_view_meta_store(
         crate::tests::test_api_state_with_store(store.clone(), "dag-owner-a", false).await,
         meta.clone(),
@@ -420,7 +480,54 @@ async fn two_producer_dag(join: bool) {
     assert_eq!(baseline.checkpoint.logical_epoch, 1);
     let inputs = consumer_direct_view_inputs(&active, &baseline).unwrap();
     assert_eq!(inputs.len(), 2);
-    assert_rows(&router, rows(join, 12, &[20])).await;
+    let api_router = app(state
+        .clone()
+        .with_service_role(worker_role::ServiceRole::Api, Vec::new(), 1)
+        .unwrap());
+    meta.reset_active_view_snapshot_reads();
+    assert_rows(&api_router, rows(join, 12, &[20])).await;
+    assert_eq!(
+        meta.active_view_snapshot_reads(),
+        1,
+        "API query uses its fresh root registry snapshot for producer bindings"
+    );
+
+    meta.reset_active_view_snapshot_reads();
+    let (scope_status, _) = post_unchecked(
+        &api_router,
+        "/v1/views/combined/query",
+        json!({"materialization":{"scope":{"where":"item = 1"}}}),
+    )
+    .await;
+    assert_ne!(scope_status, StatusCode::OK);
+
+    let producer_snapshot = ActiveViewReadSnapshot::load_demand_closure(&state, "combined")
+        .await
+        .unwrap();
+    let mut mismatched_root =
+        demand_materialization::demand_root_from_snapshot(&active, &producer_snapshot).unwrap();
+    let runtime = mismatched_root.runtime.as_mut().unwrap();
+    let published_binding = runtime
+        .input_bindings
+        .iter_mut()
+        .find_map(|input| match input {
+            StandingInputBindingV1::PublishedView {
+                published_relation, ..
+            } => Some(published_relation),
+            _ => None,
+        })
+        .unwrap();
+    published_binding.producer_plan_hash.push_str("-mismatch");
+    let error = demand_materialization::demand_dependency_order_from_snapshot(
+        &state,
+        &mismatched_root,
+        &producer_snapshot,
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .message
+        .contains("producer generation or schema differs"));
 
     // Eviction is recoverable through targeted reload. Fail only this consumer's
     // checkpoint publication so source/producer commits succeed while its durable
@@ -461,6 +568,10 @@ async fn two_producer_dag(join: bool) {
         baseline.checkpoint_key,
         "failed consumer publication must not advance the durable baseline"
     );
+    meta.reset_active_view_snapshot_reads();
+    let (api_lag_status, _) =
+        post_unchecked(&api_router, "/v1/views/combined/query", json!({})).await;
+    assert_ne!(api_lag_status, StatusCode::OK);
     let lag = post(
         &router,
         "/v1/views/combined/query",

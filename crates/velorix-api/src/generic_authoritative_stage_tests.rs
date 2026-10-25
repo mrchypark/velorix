@@ -1,13 +1,8 @@
-use super::*;
+use super::{bounded_demand_requests::post, *};
 
 // Child of tests.rs so the authoritative fixture is shared, not reimplemented.
 #[tokio::test]
 async fn authoritative_staged_families_backfill_and_restart_preserve_rows() {
-    async fn post(router: &Router, path: &str, body: Value, expected: StatusCode) -> Value {
-        let (status, value) = call_json(router, Method::POST, path, body).await;
-        assert_eq!(status, expected, "{path}: {value}");
-        value
-    }
     async fn rows(router: &Router, view: &str) -> Vec<Value> {
         let response = post(
             router,
@@ -133,11 +128,14 @@ async fn authoritative_staged_families_backfill_and_restart_preserve_rows() {
     ];
     expected_ordered.sort_by_key(Value::to_string);
     assert_eq!(snapshots[1], expected_ordered);
+    // This fixture restarts the same process; lease takeover has dedicated tests.
+    let runtime_owner = state.owner_id.clone();
     drop(router);
     drop(state);
-    let restored = test_authoritative_api_state_with_store(store, "stage-owner", meta)
+    let mut restored = test_authoritative_api_state_with_store(store, "stage-owner", meta)
         .await
         .with_experimental_advanced_view_features(true);
+    restored.owner_id = runtime_owner;
     assert_eq!(
         restored
             .restore_standing_program_runtimes_from_active_views()
@@ -196,15 +194,14 @@ async fn authoritative_replay_skips_covered_payload_gets_but_rejects_uncovered_c
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
-        let response = call_json(
+        let response = post(
             &router,
-            Method::POST,
             "/v1/views/skip_total/backfill",
             json!({"batch_limit":10}),
+            StatusCode::OK,
         )
         .await;
-        assert_eq!(response.0, StatusCode::OK, "{response:?}");
-        assert_eq!(response.1["materialization"]["complete"], true);
+        assert_eq!(response["materialization"]["complete"], true);
         if offset == 0 {
             let active = tests::read_test_active_view(&state, "skip_total")
                 .await

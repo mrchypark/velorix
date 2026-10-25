@@ -1,7 +1,48 @@
 //! Request-driven materialization controls. No task is spawned by this module.
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use velorix_core::processed_spans::ProcessedSpans;
+
+pub(super) type ComputeSlot = Option<Arc<tokio::sync::OwnedSemaphorePermit>>;
+
+/// Request-stage timer for bounded demand diagnostics. Stage names are static
+/// and deliberately exclude request, view, relation, and object identities.
+pub(super) struct DemandQueryStageTimer {
+    stage: &'static str,
+    started: Instant,
+    enabled: bool,
+}
+
+impl DemandQueryStageTimer {
+    pub(super) fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            started: Instant::now(),
+            enabled: std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some(),
+        }
+    }
+}
+
+impl Drop for DemandQueryStageTimer {
+    fn drop(&mut self) {
+        if self.enabled {
+            eprintln!(
+                "demand_query_stage stage={} elapsed_us={}",
+                self.stage,
+                self.started.elapsed().as_micros()
+            );
+        }
+    }
+}
+
+fn demand_preflight_result(result: &'static str) {
+    if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "demand_query_stage stage=completed_demand_preflight_result result={result} source_prep=0 output_write=0"
+        );
+    }
+}
 
 #[path = "demand_materialization_published.rs"]
 mod published;
@@ -147,6 +188,7 @@ impl DemandArtifactProgress {
     /// Slice an authenticated artifact without changing its physical row order.
     /// Predicate evidence must contain exactly one entry per inspected ordinal.
     /// The returned progress remains speculative until the enclosing fenced CAS.
+    #[cfg(test)]
     pub(super) fn stage_inspection(
         &self,
         input: &RelationInputBatch,
@@ -154,11 +196,38 @@ impl DemandArtifactProgress {
         interval: [u64; 2],
         may_match: &[bool],
     ) -> Result<(Self, RelationInputBatch), ApiError> {
+        self.stage_inspection_inner(input, scope, interval, may_match, None)
+    }
+
+    pub(super) fn stage_inspection_with_lease(
+        &self,
+        input: &RelationInputBatch,
+        scope: &str,
+        interval: [u64; 2],
+        may_match: &[bool],
+        lease: &owner_lease::BackfillOwnerLease,
+    ) -> Result<(Self, RelationInputBatch), ApiError> {
+        self.stage_inspection_inner(input, scope, interval, may_match, Some(lease))
+    }
+
+    fn stage_inspection_inner(
+        &self,
+        input: &RelationInputBatch,
+        scope: &str,
+        interval: [u64; 2],
+        may_match: &[bool],
+        lease: Option<&owner_lease::BackfillOwnerLease>,
+    ) -> Result<(Self, RelationInputBatch), ApiError> {
         let [start, end] = interval;
-        let rows_total = input.batches.iter().try_fold(0u64, |sum, batch| {
-            sum.checked_add(u64::try_from(batch.num_rows()).map_err(ApiError::internal)?)
-                .ok_or_else(|| ApiError::bad_request("demand artifact row count overflow"))
-        })?;
+        let mut rows_total = 0u64;
+        for batch in &input.batches {
+            if let Some(lease) = lease {
+                lease.ensure_owned()?;
+            }
+            rows_total = rows_total
+                .checked_add(u64::try_from(batch.num_rows()).map_err(ApiError::internal)?)
+                .ok_or_else(|| ApiError::bad_request("demand artifact row count overflow"))?;
+        }
         if rows_total != self.applied.rows_total()
             || start >= end
             || end > rows_total
@@ -172,6 +241,9 @@ impl DemandArtifactProgress {
         let mut batches = Vec::new();
         let mut base = 0u64;
         for batch in &input.batches {
+            if let Some(lease) = lease {
+                lease.ensure_owned()?;
+            }
             let batch_end = base + u64::try_from(batch.num_rows()).map_err(ApiError::internal)?;
             let mut ordinal = start.max(base);
             let bound = end.min(batch_end);
@@ -296,23 +368,37 @@ pub(super) fn scope_hash(scope: Option<&str>) -> Result<String, ApiError> {
     ))
 }
 
-#[derive(Debug, Serialize)]
+pub(super) fn source_prep_diagnostic(
+    lease: &owner_lease::BackfillOwnerLease,
+) -> Result<(), ApiError> {
+    lease.ensure_owned()?;
+    if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "demand_query_stage stage=source_artifact_prep_start owner_epoch={} local_owner=1",
+            lease
+                .owner
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |owner| owner.owner_epoch.to_string()),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub(super) struct DemandOutcome {
-    #[serde(skip)]
     pub(super) checkpoint_epoch: Option<u64>,
-    #[serde(skip)]
     pub(super) work_units: usize,
-    pub(super) status: &'static str,
+    pub(super) status: String,
     pub(super) complete: bool,
     pub(super) processed_rows: u64,
     pub(super) read_bytes: usize,
     pub(super) remaining_rows: u64,
-    pub(super) dependency_mode: &'static str,
+    pub(super) dependency_mode: String,
 }
 
 /// Resolve only the requested view's transitive dependencies. Repeated edges
 /// share producer work, but retain distinct edge identities at application.
-async fn demand_dependency_order_from_snapshot(
+pub(super) async fn demand_dependency_order_from_snapshot(
     _state: &ApiState,
     target: &ActiveMaterializedView,
     snapshot: &ActiveViewReadSnapshot,
@@ -419,6 +505,42 @@ pub(super) async fn materialize_demand_with_snapshot(
     pinned_snapshot: Option<ActiveViewReadSnapshot>,
 ) -> Result<DemandOutcome, ApiError> {
     request.budget.validate()?;
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(request.budget.max_duration_ms),
+        materialize_demand_with_snapshot_inner(
+            state,
+            target,
+            request,
+            order,
+            query_priority,
+            pinned_snapshot,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => Ok(DemandOutcome {
+            checkpoint_epoch: None,
+            work_units: 0,
+            status: "dependency_pending".into(),
+            complete: false,
+            processed_rows: 0,
+            read_bytes: 0,
+            remaining_rows: 1,
+            dependency_mode: "full_closure".into(),
+        }),
+    }
+}
+
+async fn materialize_demand_with_snapshot_inner(
+    state: &ApiState,
+    target: &ActiveMaterializedView,
+    request: &DemandRequest,
+    order: DemandOrder,
+    query_priority: bool,
+    pinned_snapshot: Option<ActiveViewReadSnapshot>,
+) -> Result<DemandOutcome, ApiError> {
+    let started = std::time::Instant::now();
     let snapshot = match pinned_snapshot {
         Some(snapshot) => {
             ActiveViewReadSnapshot::resolve_demand_closure(
@@ -433,31 +555,12 @@ pub(super) async fn materialize_demand_with_snapshot(
     };
     let root = demand_root_from_snapshot(target, &snapshot)?;
     let closure = demand_dependency_order_from_snapshot(state, &root, &snapshot).await?;
-    let started = std::time::Instant::now();
     let mut used_rows = 0u64;
     let mut used_bytes = 0usize;
     let mut used_units = 0usize;
     for active in closure {
-        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if (!query_priority && state.demand_scheduler.foreground.load(Ordering::Acquire) != 0)
-            || used_rows >= request.budget.max_rows as u64
-            || used_bytes >= request.budget.max_bytes
-            || used_units >= request.budget.batch_limit
-            || (used_units > 0 && elapsed >= request.budget.max_duration_ms)
-        {
-            return Ok(DemandOutcome {
-                checkpoint_epoch: None,
-                work_units: used_units,
-                status: "dependency_pending",
-                complete: false,
-                processed_rows: used_rows,
-                read_bytes: used_bytes,
-                remaining_rows: 1,
-                dependency_mode: "full_closure",
-            });
-        }
         let is_target = active.spec.view_id == target.spec.view_id;
-        let step = DemandRequest {
+        let mut step = DemandRequest {
             scope: if is_target {
                 request.scope.clone()
             } else {
@@ -467,33 +570,56 @@ pub(super) async fn materialize_demand_with_snapshot(
                 batch_limit: request.budget.batch_limit - used_units,
                 max_rows: request.budget.max_rows - used_rows as usize,
                 max_bytes: request.budget.max_bytes - used_bytes,
-                max_duration_ms: request
-                    .budget
-                    .max_duration_ms
-                    .saturating_sub(elapsed)
-                    .max(1),
+                max_duration_ms: request.budget.max_duration_ms,
             },
         };
-        let has_published = active
-            .runtime
-            .as_ref()
-            .is_some_and(view_has_published_view_inputs);
-        let mut outcome = if has_published {
-            published::materialize_published_demand(state, &active, &step, query_priority).await?
+        // A certified read needs neither a worker nor a scheduling slot.
+        let preflight_stage = DemandQueryStageTimer::new("completed_demand_preflight");
+        let preflight = fresh_complete_demand_preflight(state, &active, &step, &snapshot).await?;
+        drop(preflight_stage);
+        if let Some(mut outcome) = preflight {
+            demand_preflight_result("hit");
+            if is_target {
+                outcome.processed_rows = used_rows;
+                outcome.read_bytes = used_bytes;
+                outcome.work_units = used_units;
+                return Ok(outcome);
+            }
+            continue;
+        }
+        demand_preflight_result("miss");
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if (!query_priority && state.demand_scheduler.foreground.load(Ordering::Acquire) != 0)
+            || used_rows >= request.budget.max_rows as u64
+            || used_bytes >= request.budget.max_bytes
+            || used_units >= request.budget.batch_limit
+            || elapsed >= request.budget.max_duration_ms
+        {
+            return Ok(DemandOutcome {
+                checkpoint_epoch: None,
+                work_units: used_units,
+                status: "dependency_pending".into(),
+                complete: false,
+                processed_rows: used_rows,
+                read_bytes: used_bytes,
+                remaining_rows: 1,
+                dependency_mode: "full_closure".into(),
+            });
+        }
+        step.budget.max_duration_ms = request.budget.max_duration_ms - elapsed;
+        let step_order = if is_target {
+            order
         } else {
-            materialize_source_demand(
-                state,
-                &active,
-                &step,
-                if is_target {
-                    order
-                } else {
-                    DemandOrder::Forward
-                },
-                query_priority,
-            )
-            .await?
+            DemandOrder::Forward
         };
+        let mut outcome = owner_routing::materialize_demand_step(
+            state,
+            &active,
+            &step,
+            step_order,
+            query_priority,
+        )
+        .await?;
         used_rows = used_rows
             .checked_add(outcome.processed_rows)
             .ok_or_else(|| ApiError::bad_request("demand row budget overflow"))?;
@@ -509,7 +635,7 @@ pub(super) async fn materialize_demand_with_snapshot(
             outcome.work_units = used_units;
             if !is_target {
                 outcome.checkpoint_epoch = None;
-                outcome.dependency_mode = "full_closure";
+                outcome.dependency_mode = "full_closure".into();
             }
             return Ok(outcome);
         }
@@ -517,6 +643,277 @@ pub(super) async fn materialize_demand_with_snapshot(
     Err(ApiError::bad_request(
         "demand dependency closure omitted target",
     ))
+}
+
+/// Prove a completed demand certificate against a fresh, metadata-only cut.
+/// A miss falls through to owner routing, whose leased path captures and checks
+/// freshness again before it reads any source payload.
+async fn fresh_complete_demand_preflight(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    request: &DemandRequest,
+    snapshot: &ActiveViewReadSnapshot,
+) -> Result<Option<DemandOutcome>, ApiError> {
+    if active
+        .runtime
+        .as_ref()
+        .is_some_and(view_has_published_view_inputs)
+    {
+        return published::fresh_complete_demand_preflight(state, active, request, snapshot).await;
+    }
+
+    use super::demand_source::{
+        demand_source_artifact_key, demand_source_artifacts_from_cuts,
+        demand_source_relation_identities,
+    };
+
+    let Some(identity) = active_standing_runtime_identity(active) else {
+        return Ok(None);
+    };
+    let (Some(config), Some(meta)) = (
+        state.relation_ingest_config.as_ref(),
+        state.meta_store.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let source_relations = demand_source_relation_identities(active);
+    let meta_batch_stage = DemandQueryStageTimer::new("demand_batch_meta_rpc");
+    let batch = meta
+        .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+            source_cuts: (!source_relations.is_empty()).then(|| {
+                CaptureRelationIngestSourceCutsRequest {
+                    namespace: config.namespace.clone(),
+                    relations: source_relations.clone(),
+                }
+            }),
+            relation_catalogs: active
+                .spec
+                .input_relations
+                .iter()
+                .map(|input| DemandRelationCatalogLookup {
+                    relation_id: input.relation_id.clone(),
+                    relation_version: input.relation_version.clone(),
+                })
+                .collect(),
+            standing_runtime_checkpoint: Some(DemandStandingRuntimeCheckpointLookup {
+                tenant_id: identity.tenant_id.clone(),
+                program_id: identity.program_id.clone(),
+                view_id: active.spec.view_id.clone(),
+            }),
+        })
+        .await
+        .map_err(meta_error_to_api)?;
+    drop(meta_batch_stage);
+    let cuts = match (source_relations.is_empty(), batch.source_cuts) {
+        (true, None) => Vec::new(),
+        (false, Some(cuts)) => cuts,
+        _ => return Ok(None),
+    };
+    let Some(pointer) = batch.standing_runtime_checkpoint else {
+        return Ok(None);
+    };
+    let (cuts, artifacts) =
+        demand_source_artifacts_from_cuts(&config.namespace, &source_relations, cuts)?;
+    let checkpoint_read_stage =
+        DemandQueryStageTimer::new("checkpoint_foyer_lookup_decode_validate");
+    let previous =
+        checkpoint_publication::read_standing_runtime_checkpoint_header_from_pointer_shared(
+            state,
+            &identity.tenant_id,
+            &identity.program_id,
+            &active.spec.view_id,
+            &pointer,
+        )
+        .await?;
+    drop(checkpoint_read_stage);
+    if previous.checkpoint.identity != *identity {
+        return Ok(None);
+    }
+    let Some(progress) = previous.demand_materialization.as_ref() else {
+        return Ok(None);
+    };
+    let checkpoint_validation_stage =
+        DemandQueryStageTimer::new("demand_checkpoint_state_validation");
+    progress.validate_checkpoint(&previous.checkpoint)?;
+    drop(checkpoint_validation_stage);
+    let plan_hash = active
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.logical_plan.as_ref())
+        .and_then(|plan| plan.plan_hash.as_deref());
+    if progress.spec_hash != active.spec_hash
+        || plan_hash != Some(progress.plan_hash.as_str())
+        || progress.output_schema_hash != identity.output_schema_hash
+    {
+        return Ok(None);
+    }
+
+    let _coverage_stage = DemandQueryStageTimer::new("demand_coverage_scope_validation");
+    let scope_sql = request.scope.as_ref().map(|scope| scope.predicate.as_str());
+    let requested_scope = scope_hash(scope_sql)?;
+    let cut_hash = stable_bytes_hash(&serde_json::to_vec(&cuts).map_err(ApiError::internal)?);
+    if !progress.certificates.iter().any(|certificate| {
+        certificate.scope_hash == requested_scope && certificate.captured_cut_hash == cut_hash
+    }) {
+        return Ok(None);
+    }
+
+    let mut dependencies = scope_dependencies::ScopeDependencies::for_active(active)?;
+    if let Some(dependencies) = dependencies.as_mut() {
+        let [input] = active.spec.input_relations.as_slice() else {
+            return Ok(None);
+        };
+        let Some(catalog) = batch.relation_catalogs.iter().find(|catalog| {
+            catalog.relation_schema.relation_id == input.relation_id
+                && catalog.relation_schema.relation_version == input.relation_version
+        }) else {
+            return Ok(None);
+        };
+        dependencies.bind_source_catalog(catalog)?;
+    }
+    let output_schema = active
+        .spec
+        .output_relations
+        .first()
+        .ok_or_else(|| ApiError::bad_request("demand output schema unavailable"))?;
+    let predicate = scope_sql.map(|sql| {
+        scope_dependencies::parse_predicate(sql, &[], output_schema)
+            .unwrap_or(velorix_core::query::PagePredicate::Unknown)
+    });
+    let narrow =
+        dependencies
+            .as_ref()
+            .zip(predicate.as_ref())
+            .is_some_and(|(dependencies, predicate)| {
+                predicate_columns_known(predicate, dependencies.eligible_known_columns())
+            });
+    let scan_scope = if narrow {
+        requested_scope.clone()
+    } else {
+        scope_hash(None)?
+    };
+    for artifact in &artifacts {
+        let key = demand_source_artifact_key(artifact)?;
+        let rows = artifact
+            .publication
+            .end_offset_exclusive
+            .checked_sub(artifact.publication.start_offset_inclusive)
+            .ok_or_else(|| ApiError::bad_request("invalid demand artifact offsets"))?;
+        let covered_by_frontier = previous.checkpoint.input_frontiers.iter().any(|frontier| {
+            frontier.relation_id == artifact.relation.relation_id
+                && frontier.relation_version == artifact.relation.relation_version
+                && frontier.stream_id == artifact.stream_id
+                && frontier.partition_id == artifact.partition_id
+                && frontier.committed_offset_exclusive >= artifact.publication.end_offset_exclusive
+        });
+        if let Some(entry) = progress.artifacts.get(&key) {
+            if entry.artifact_hash != artifact.publication.object_digest
+                || entry.applied.rows_total() != rows
+            {
+                return Ok(None);
+            }
+            if !(entry.applied.is_complete() && (narrow || entry.source_watermark.is_some()))
+                && !(narrow
+                    && entry
+                        .inspected
+                        .get(&scan_scope)
+                        .is_some_and(ProcessedSpans::is_complete))
+            {
+                return Ok(None);
+            }
+        } else if !narrow || !covered_by_frontier {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(DemandOutcome {
+        checkpoint_epoch: Some(previous.checkpoint.logical_epoch),
+        work_units: 0,
+        status: "complete".into(),
+        complete: true,
+        processed_rows: 0,
+        read_bytes: 0,
+        remaining_rows: 0,
+        dependency_mode: if narrow { "scope" } else { "full_closure" }.into(),
+    }))
+}
+
+/// Execute one view step with the owner already resolved by the routing layer.
+/// The same lease fences source preparation, application, and all commits.
+pub(super) fn materialize_demand_step<'a>(
+    state: &'a ApiState,
+    active: &'a ActiveMaterializedView,
+    request: &'a DemandRequest,
+    order: DemandOrder,
+    query_priority: bool,
+    owner: Option<StandingRuntimeOwnerClaim>,
+    compute_slot: ComputeSlot,
+) -> impl std::future::Future<Output = Result<DemandOutcome, ApiError>> + Send + 'a {
+    Box::pin(materialize_demand_step_inner(
+        state,
+        active,
+        request,
+        order,
+        query_priority,
+        owner,
+        compute_slot,
+    ))
+}
+
+async fn materialize_demand_step_inner(
+    state: &ApiState,
+    active: &ActiveMaterializedView,
+    request: &DemandRequest,
+    order: DemandOrder,
+    query_priority: bool,
+    owner: Option<StandingRuntimeOwnerClaim>,
+    compute_slot: ComputeSlot,
+) -> Result<DemandOutcome, ApiError> {
+    state.require_local_materialization()?;
+    request.budget.validate()?;
+    let identity = active_standing_runtime_identity(active)
+        .ok_or_else(|| ApiError::bad_request("demand requires a standing runtime"))?;
+    let lease = match owner {
+        Some(owner) => {
+            owner_lease::BackfillOwnerLease::start_acquired(
+                state,
+                identity,
+                &active.spec.view_id,
+                owner,
+            )
+            .await?
+        }
+        None => {
+            owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?
+        }
+    };
+    lease.ensure_owned()?;
+    if active
+        .runtime
+        .as_ref()
+        .is_some_and(view_has_published_view_inputs)
+    {
+        published::materialize_published_demand(
+            state,
+            active,
+            request,
+            query_priority,
+            lease,
+            compute_slot,
+        )
+        .await
+    } else {
+        materialize_source_demand(
+            state,
+            active,
+            request,
+            order,
+            query_priority,
+            lease,
+            compute_slot,
+        )
+        .await
+    }
 }
 
 fn source_cut_watermark(
@@ -567,19 +964,22 @@ fn source_cut_watermark(
     Ok(latest)
 }
 
-/// Physical-source demand. The caller serializes request scheduling; this
-/// function holds the view operation lock across restore, apply and publication.
+/// Physical-source demand holds only this view's operation lock across
+/// preparation, restore, apply and publication.
 pub(super) async fn materialize_source_demand(
     state: &ApiState,
     active: &ActiveMaterializedView,
     request: &DemandRequest,
     order: DemandOrder,
     query_priority: bool,
+    lease: Arc<owner_lease::BackfillOwnerLease>,
+    compute_slot: ComputeSlot,
 ) -> Result<DemandOutcome, ApiError> {
     use super::demand_source::{
         demand_source_artifact_key, demand_source_artifacts_from_cuts,
         demand_source_relation_identities, load_demand_source_artifact,
     };
+    state.require_local_materialization()?;
     request.budget.validate()?;
     if active.runtime.as_ref().is_some_and(|runtime| {
         runtime
@@ -593,8 +993,10 @@ pub(super) async fn materialize_source_demand(
     }
     let identity = active_standing_runtime_identity(active)
         .ok_or_else(|| ApiError::bad_request("demand requires a standing runtime"))?;
+    lease.ensure_owned()?;
     let operation = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let mut operation_guard = operation.lock_owned().await;
+    lease.ensure_owned()?;
     let config = state.relation_ingest_config.as_ref().ok_or_else(|| {
         ApiError::service_unavailable("authoritative ingest configuration unavailable")
     })?;
@@ -604,31 +1006,34 @@ pub(super) async fn materialize_source_demand(
         .ok_or_else(|| ApiError::service_unavailable("authoritative metadata unavailable"))?;
     let source_relations = demand_source_relation_identities(active);
     let scope_certificate_started = std::time::Instant::now();
-    let batch = meta
-        .read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
-            source_cuts: (!source_relations.is_empty()).then(|| {
-                CaptureRelationIngestSourceCutsRequest {
-                    namespace: config.namespace.clone(),
-                    relations: source_relations.clone(),
-                }
-            }),
-            relation_catalogs: active
-                .spec
-                .input_relations
-                .iter()
-                .map(|input| DemandRelationCatalogLookup {
-                    relation_id: input.relation_id.clone(),
-                    relation_version: input.relation_version.clone(),
-                })
-                .collect(),
-            standing_runtime_checkpoint: Some(DemandStandingRuntimeCheckpointLookup {
-                tenant_id: identity.tenant_id.clone(),
-                program_id: identity.program_id.clone(),
-                view_id: active.spec.view_id.clone(),
-            }),
+    let batch = lease
+        .while_owned(async {
+            meta.read_demand_metadata_batch(ReadDemandMetadataBatchRequest {
+                source_cuts: (!source_relations.is_empty()).then(|| {
+                    CaptureRelationIngestSourceCutsRequest {
+                        namespace: config.namespace.clone(),
+                        relations: source_relations.clone(),
+                    }
+                }),
+                relation_catalogs: active
+                    .spec
+                    .input_relations
+                    .iter()
+                    .map(|input| DemandRelationCatalogLookup {
+                        relation_id: input.relation_id.clone(),
+                        relation_version: input.relation_version.clone(),
+                    })
+                    .collect(),
+                standing_runtime_checkpoint: Some(DemandStandingRuntimeCheckpointLookup {
+                    tenant_id: identity.tenant_id.clone(),
+                    program_id: identity.program_id.clone(),
+                    view_id: active.spec.view_id.clone(),
+                }),
+            })
+            .await
+            .map_err(meta_error_to_api)
         })
-        .await
-        .map_err(meta_error_to_api)?;
+        .await?;
     let cuts = match (source_relations.is_empty(), batch.source_cuts) {
         (true, None) => Vec::new(),
         (false, Some(cuts)) => cuts,
@@ -645,13 +1050,14 @@ pub(super) async fn materialize_source_demand(
     let cut_hash = stable_bytes_hash(&serde_json::to_vec(&cuts).map_err(ApiError::internal)?);
     let scope_sql = request.scope.as_ref().map(|scope| scope.predicate.as_str());
     let requested_scope = scope_hash(scope_sql)?;
-    let (mut previous, migration_bytes) = migration::read_checkpoint_from_pointer(
-        state,
-        active,
-        request.budget.max_bytes,
-        checkpoint_pointer,
-    )
-    .await?;
+    let (mut previous, migration_bytes) = lease
+        .while_owned(migration::read_checkpoint_from_pointer(
+            state,
+            active,
+            request.budget.max_bytes,
+            checkpoint_pointer,
+        ))
+        .await?;
     migration::validate_source_prefixes(active, previous.as_ref(), &artifacts)?;
     let plan_hash = active
         .runtime
@@ -800,12 +1206,12 @@ pub(super) async fn materialize_source_demand(
             checkpoint_epoch: previous
                 .as_ref()
                 .map(|record| record.checkpoint.logical_epoch),
-            status: "complete",
+            status: "complete".into(),
             complete: true,
             processed_rows: 0,
             read_bytes: migration_bytes,
             remaining_rows: 0,
-            dependency_mode: mode,
+            dependency_mode: mode.into(),
         });
     }
     view_dependencies::demand_stage(
@@ -845,7 +1251,9 @@ pub(super) async fn materialize_source_demand(
     let mut units = 0usize;
     let mut validated_source_publications = Vec::new();
     let mut selected_inputs = Vec::new();
+    let mut source_prep_traced = false;
     for (key, artifact) in &keyed {
+        lease.ensure_owned()?;
         if (!query_priority && state.demand_scheduler.foreground.load(Ordering::Acquire) != 0)
             || units >= request.budget.batch_limit
             || read_bytes >= request.budget.max_bytes
@@ -862,9 +1270,17 @@ pub(super) async fn materialize_source_demand(
         else {
             continue;
         };
-        let (input, bytes, proof) =
-            load_demand_source_artifact(state, artifact, request.budget.max_bytes - read_bytes)
-                .await?;
+        if !source_prep_traced {
+            source_prep_diagnostic(&lease)?;
+            source_prep_traced = true;
+        }
+        let (input, bytes, proof) = lease
+            .while_owned(load_demand_source_artifact(
+                state,
+                artifact,
+                request.budget.max_bytes - read_bytes,
+            ))
+            .await?;
         validated_source_publications.push(proof);
         read_bytes = read_bytes
             .checked_add(bytes)
@@ -874,6 +1290,7 @@ pub(super) async fn materialize_source_demand(
             let mut slices = Vec::new();
             let mut base = 0u64;
             for batch in &input.batches {
+                lease.ensure_owned()?;
                 let end = base + batch.num_rows() as u64;
                 let lo = base.max(interval[0]);
                 let hi = end.min(interval[1]);
@@ -891,19 +1308,26 @@ pub(super) async fn materialize_source_demand(
                     "dependency projection changed source ordinal count",
                 ));
             }
-            rows.iter()
-                .map(|row| {
-                    scope_dependencies::predicate_may_match(
-                        predicate.as_ref().expect("narrow predicate"),
-                        row,
-                    )
-                })
-                .collect()
+            let mut matches = Vec::with_capacity(rows.len());
+            for row in &rows {
+                lease.ensure_owned()?;
+                matches.push(scope_dependencies::predicate_may_match(
+                    predicate.as_ref().expect("narrow predicate"),
+                    row,
+                ));
+            }
+            matches
         } else {
             vec![true; count]
         };
-        let (mut staged, mut selected) =
-            progress.artifacts[key].stage_inspection(&input, &scan_scope, interval, &may_match)?;
+        lease.ensure_owned()?;
+        let (mut staged, mut selected) = progress.artifacts[key].stage_inspection_with_lease(
+            &input,
+            &scan_scope,
+            interval,
+            &may_match,
+            &lease,
+        )?;
         staged.source_watermark = Some(DemandSourceWatermark {
             watermark: input.event_time_watermark.clone(),
         });
@@ -942,9 +1366,11 @@ pub(super) async fn materialize_source_demand(
             selected_inputs,
             DemandPublication {
                 source_cuts: Some(cuts.clone()),
+                compute_slot: compute_slot.clone(),
                 validated_source_publications: validated_source_publications.clone(),
                 ..DemandPublication::default()
             },
+            Arc::clone(&lease),
             operation_guard,
         )
         .await?;
@@ -975,13 +1401,19 @@ pub(super) async fn materialize_source_demand(
             // envelope watermark evidence. Reauthenticate before advancing a
             // frontier; the source loader charges the complete immutable unit.
             for (key, artifact) in &keyed {
+                lease.ensure_owned()?;
                 if progress.artifacts[key].source_watermark.is_none() {
-                    let (input, bytes, proof) = load_demand_source_artifact(
-                        state,
-                        artifact,
-                        request.budget.max_bytes.saturating_sub(read_bytes),
-                    )
-                    .await?;
+                    if !source_prep_traced {
+                        source_prep_diagnostic(&lease)?;
+                        source_prep_traced = true;
+                    }
+                    let (input, bytes, proof) = lease
+                        .while_owned(load_demand_source_artifact(
+                            state,
+                            artifact,
+                            request.budget.max_bytes.saturating_sub(read_bytes),
+                        ))
+                        .await?;
                     validated_source_publications.push(proof);
                     read_bytes = read_bytes
                         .checked_add(bytes)
@@ -1091,9 +1523,11 @@ pub(super) async fn materialize_source_demand(
             inputs,
             DemandPublication {
                 source_cuts: Some(cuts),
+                compute_slot: compute_slot.clone(),
                 validated_source_publications,
                 ..DemandPublication::default()
             },
+            Arc::clone(&lease),
             operation_guard,
         )
         .await?;
@@ -1109,12 +1543,12 @@ pub(super) async fn materialize_source_demand(
     Ok(DemandOutcome {
         work_units: units,
         checkpoint_epoch,
-        status: if complete { "complete" } else { "incomplete" },
+        status: (if complete { "complete" } else { "incomplete" }).into(),
         complete,
         processed_rows,
         read_bytes,
         remaining_rows,
-        dependency_mode: mode,
+        dependency_mode: mode.into(),
     })
 }
 
@@ -1139,11 +1573,15 @@ pub(super) async fn set_demand_control(
     active: &ActiveMaterializedView,
     paused: bool,
     order: DemandOrder,
+    compute_slot: ComputeSlot,
 ) -> Result<(), ApiError> {
+    state.require_local_materialization()?;
     let identity = active_standing_runtime_identity(active)
         .ok_or_else(|| ApiError::bad_request("demand requires a standing runtime"))?;
     let operation = state.standing_runtime_operation_lock(identity, &active.spec.view_id)?;
     let operation_guard = operation.lock_owned().await;
+    let lease =
+        owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?;
     let previous = checkpoint_publication::read_latest_standing_runtime_checkpoint_header(
         state,
         identity,
@@ -1188,7 +1626,7 @@ pub(super) async fn set_demand_control(
         .runtime
         .as_ref()
         .is_some_and(view_has_published_view_inputs);
-    let publication = if is_published_consumer {
+    let mut publication = if is_published_consumer {
         let record = previous.as_ref().ok_or_else(|| {
             ApiError::conflict(
                 "published demand control requires an existing validated bootstrap checkpoint",
@@ -1230,11 +1668,14 @@ pub(super) async fn set_demand_control(
             direct_inputs,
             cursor_proofs: proofs,
             validated_source_publications: Vec::new(),
+            compute_slot: None,
         }
     } else {
+        lease.ensure_owned()?;
         let (cuts, _) = demand_source::capture_demand_source_artifacts(state, active).await?;
         cuts.into()
     };
+    publication.compute_slot = compute_slot;
     commit_demand_unit_locked(
         state,
         active,
@@ -1242,17 +1683,16 @@ pub(super) async fn set_demand_control(
         progress,
         Vec::new(),
         publication,
+        lease,
         operation_guard,
     )
     .await
     .map(|_| ())
 }
 
-/// Commit one already bounded unit while the caller holds the view operation
-/// lock. Progress and operator state share the existing fenced pointer CAS.
-/// The caller must not install its speculative progress before this returns.
 #[derive(Default)]
 pub(super) struct DemandPublication {
+    pub(super) compute_slot: ComputeSlot,
     pub(super) source_cuts: Option<Vec<RelationIngestSourceIdentityCutV1>>,
     pub(super) validated_source_publications: Vec<recovery::ValidatedRelationPublication>,
     pub(super) bootstrap: Option<velorix_control::meta_admin::PublishedInputBootstrapProgressV1>,
@@ -1269,6 +1709,10 @@ impl From<Vec<RelationIngestSourceIdentityCutV1>> for DemandPublication {
     }
 }
 
+/// Commit one already bounded unit while the caller holds the view operation
+/// lock. Progress and operator state share the existing fenced pointer CAS.
+/// The caller must not install its speculative progress before this returns.
+#[allow(clippy::too_many_arguments)] // Distinct inputs define the atomic fenced-commit boundary.
 pub(super) async fn commit_demand_unit_locked(
     state: &ApiState,
     active: &ActiveMaterializedView,
@@ -1276,18 +1720,30 @@ pub(super) async fn commit_demand_unit_locked(
     progress: DemandCheckpoint,
     inputs: Vec<RelationInputBatch>,
     publication: impl Into<DemandPublication>,
+    lease: Arc<owner_lease::BackfillOwnerLease>,
     operation_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<tokio::sync::OwnedMutexGuard<()>, ApiError> {
+    state.require_local_materialization()?;
     let state = state.clone();
     let active = active.clone();
-    let publication = publication.into();
+    let mut publication = publication.into();
+    let compute_slot = publication.compute_slot.take();
     // Dropping the HTTP future detaches this already-started atomic unit. The
     // task retains the operation lock until blocking apply and publication
     // have both finished; no subsequent unit is scheduled by this task.
     tokio::spawn(async move {
-        let result =
-            commit_demand_unit_inner(&state, &active, previous, progress, inputs, publication)
-                .await;
+        // Keep the worker slot until the detached atomic unit finishes.
+        let _compute_slot = compute_slot;
+        let result = commit_demand_unit_inner(
+            &state,
+            &active,
+            previous,
+            progress,
+            inputs,
+            publication,
+            lease,
+        )
+        .await;
         if let Err(error) = result {
             if let Some(identity) = active_standing_runtime_identity(&active) {
                 let removed = state
@@ -1314,6 +1770,7 @@ async fn commit_demand_unit_inner(
     progress: DemandCheckpoint,
     inputs: Vec<RelationInputBatch>,
     publication: DemandPublication,
+    lease: Arc<owner_lease::BackfillOwnerLease>,
 ) -> Result<(), ApiError> {
     let identity = active_standing_runtime_identity(active).ok_or_else(|| {
         ApiError::bad_request("demand materialization requires a standing runtime")
@@ -1345,8 +1802,7 @@ async fn commit_demand_unit_inner(
         stable_bytes_hash(&progress_bytes),
     ))
     .map_err(ApiError::bad_request)?;
-    let lease =
-        owner_lease::BackfillOwnerLease::start(state, identity, &active.spec.view_id).await?;
+    lease.ensure_owned()?;
     if state
         .standing_runtime(identity, &active.spec.view_id)?
         .is_none()
@@ -1499,7 +1955,7 @@ pub(super) struct DemandQueryRequest {
     pub(super) materialization: DemandRequest,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DemandRequest {
     #[serde(default)]
@@ -1578,10 +2034,9 @@ pub(super) struct DemandScheduler {
 
 pub(super) struct DemandTurn {
     _step: tokio::sync::OwnedMutexGuard<()>,
-    _foreground: Option<ForegroundDemand>,
 }
 
-struct ForegroundDemand(Arc<DemandScheduler>);
+pub(super) struct ForegroundDemand(Arc<DemandScheduler>);
 
 impl Drop for ForegroundDemand {
     fn drop(&mut self) {
@@ -1590,14 +2045,10 @@ impl Drop for ForegroundDemand {
 }
 
 impl DemandScheduler {
-    pub(super) async fn query_turn(self: &Arc<Self>) -> DemandTurn {
+    /// Marks local or remote foreground work without serializing query waits.
+    pub(super) fn foreground_guard(self: &Arc<Self>) -> ForegroundDemand {
         self.foreground.fetch_add(1, Ordering::AcqRel);
-        // Keep this guard across the await so cancellation removes the waiter.
-        let foreground = ForegroundDemand(Arc::clone(self));
-        DemandTurn {
-            _step: Arc::clone(&self.step).lock_owned().await,
-            _foreground: Some(foreground),
-        }
+        ForegroundDemand(Arc::clone(self))
     }
 
     pub(super) fn explicit_turn(self: &Arc<Self>) -> Option<DemandTurn> {
@@ -1608,16 +2059,32 @@ impl DemandScheduler {
         if self.foreground.load(Ordering::Acquire) != 0 {
             return None;
         }
-        Some(DemandTurn {
-            _step: step,
-            _foreground: None,
-        })
+        Some(DemandTurn { _step: step })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreground_guard_marks_priority_without_waiting_for_explicit_work() {
+        let scheduler = Arc::new(DemandScheduler::default());
+        let boundary = scheduler
+            .explicit_turn()
+            .expect("idle explicit work may start");
+
+        let foreground = scheduler.foreground_guard();
+        assert_eq!(scheduler.foreground.load(Ordering::Acquire), 1);
+        assert!(scheduler.explicit_turn().is_none());
+
+        drop(foreground);
+        assert_eq!(scheduler.foreground.load(Ordering::Acquire), 0);
+        assert!(scheduler.explicit_turn().is_none());
+
+        drop(boundary);
+        assert!(scheduler.explicit_turn().is_some());
+    }
 
     #[test]
     fn sparse_inspection_preserves_signed_rows_and_does_not_reapply_overlap() {

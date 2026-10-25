@@ -1,5 +1,6 @@
-//! Disposable cache for immutable objects selected by fresh authoritative metadata.
-//! Callers validate codec hashes, root bindings and identities on every returned payload.
+//! Disposable caches for immutable objects selected by fresh authoritative metadata.
+//! Raw payloads are validated on read; decoded artifacts are admitted only after
+//! canonical validation and rebound to fresh authority by their callers.
 
 use std::sync::Arc;
 use std::{fs::File, future::Future, path::PathBuf};
@@ -33,16 +34,68 @@ pub struct MaterializedReadCacheKey {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct DecodedOutputPageKey {
-    source: MaterializedReadCacheKey,
-    schema_fingerprint: String,
+enum DecodedArtifactKey {
+    OutputPage {
+        source: MaterializedReadCacheKey,
+        schema_fingerprint: String,
+    },
+    CheckpointRecord {
+        source: MaterializedReadCacheKey,
+        tenant_id: String,
+        program_id: String,
+        view_id: String,
+        record_codec: String,
+    },
 }
 
-impl DecodedOutputPageKey {
+// Checkpoint output schema is authenticated by the immutable source content
+// hash. Keep it out of the lookup key so callers with a different schema
+// commitment domain (published relation vs checkpoint identity) can still
+// reuse the decoded artifact; any requested checkpoint-schema assertion is
+// checked against the decoded record below.
+
+impl DecodedArtifactKey {
     fn weight(&self) -> usize {
-        self.source
-            .weight()
-            .saturating_add(self.schema_fingerprint.capacity())
+        match self {
+            Self::OutputPage {
+                source,
+                schema_fingerprint,
+            } => std::mem::size_of::<Self>()
+                .saturating_add(source.weight())
+                .saturating_add(schema_fingerprint.capacity()),
+            Self::CheckpointRecord {
+                source,
+                tenant_id,
+                program_id,
+                view_id,
+                record_codec,
+            } => std::mem::size_of::<Self>()
+                .saturating_add(source.weight())
+                .saturating_add(tenant_id.capacity())
+                .saturating_add(program_id.capacity())
+                .saturating_add(view_id.capacity())
+                .saturating_add(record_codec.capacity()),
+        }
+    }
+}
+
+enum DecodedArtifact {
+    OutputPage(Arc<super::materialized_output_pages::DecodedOutputPage>),
+    CheckpointRecord {
+        record: Arc<super::StandingRuntimeCheckpointRecord>,
+        heap_weight_bytes: usize,
+        encoded_size: u64,
+    },
+}
+
+impl DecodedArtifact {
+    fn weight(&self) -> usize {
+        match self {
+            Self::OutputPage(page) => page.cache_weight_bytes(),
+            Self::CheckpointRecord {
+                heap_weight_bytes, ..
+            } => *heap_weight_bytes,
+        }
     }
 }
 
@@ -83,9 +136,7 @@ impl MaterializedReadCacheConfig {
 
 pub struct MaterializedReadCache {
     cache: HybridCache<MaterializedReadCacheKey, Vec<u8>>,
-    decoded_output_pages: Option<
-        Cache<DecodedOutputPageKey, Arc<super::materialized_output_pages::DecodedOutputPage>>,
-    >,
+    decoded_artifacts: Option<Cache<DecodedArtifactKey, DecodedArtifact>>,
     decoded_output_page_capacity_bytes: usize,
     // Foyer owns a directory of writable blocks; concurrent processes cannot share it.
     _directory_lock: File,
@@ -114,21 +165,19 @@ impl MaterializedReadCache {
         let device = FsDeviceBuilder::new(&config.directory)
             .with_capacity(config.disk_bytes)
             .build()?;
-        // Decoded pages are disposable and memory-only; reserve their share
-        // from the configured cache budget rather than adding another pool.
-        let decoded_page_memory = config.memory_bytes / 4;
+        // Decoded artifacts avoid repeated IPC validation/recompression under bounded memory.
+        let decoded_page_memory = config.memory_bytes / 2;
         let page_cache_memory = config.memory_bytes - decoded_page_memory;
-        let decoded_output_pages: Option<
-            Cache<DecodedOutputPageKey, Arc<super::materialized_output_pages::DecodedOutputPage>>,
-        > = (decoded_page_memory > 0).then(|| {
-            Cache::builder(decoded_page_memory)
-                .with_name("velorix-materialized-decoded-page")
+        let decoded_artifacts: Option<Cache<DecodedArtifactKey, DecodedArtifact>> =
+            (decoded_page_memory > 0).then(|| {
+                Cache::builder(decoded_page_memory)
+                    .with_name("velorix-materialized-decoded-artifact")
                     .with_shards(4)
-                .with_weighter(|key: &DecodedOutputPageKey, page: &Arc<super::materialized_output_pages::DecodedOutputPage>| {
-                    key.weight().saturating_add(page.cache_weight_bytes())
+                    .with_weighter(|key: &DecodedArtifactKey, artifact: &DecodedArtifact| {
+                        key.weight().saturating_add(artifact.weight())
                     })
                     .build()
-        });
+            });
         let cache = HybridCacheBuilder::new()
             .with_name("velorix-materialized-read")
             .with_policy(HybridCachePolicy::WriteOnInsertion)
@@ -153,7 +202,7 @@ impl MaterializedReadCache {
             .await?;
         Ok(Self {
             cache,
-            decoded_output_pages,
+            decoded_artifacts,
             decoded_output_page_capacity_bytes: decoded_page_memory,
             _directory_lock: directory_lock,
         })
@@ -165,14 +214,17 @@ impl MaterializedReadCache {
         source: &MaterializedReadCacheKey,
         schema_fingerprint: &str,
     ) -> Option<Arc<super::materialized_output_pages::DecodedOutputPage>> {
-        let key = DecodedOutputPageKey {
+        let key = DecodedArtifactKey::OutputPage {
             source: source.clone(),
             schema_fingerprint: schema_fingerprint.to_owned(),
         };
-        self.decoded_output_pages
+        self.decoded_artifacts
             .as_ref()?
             .get(&key)
-            .map(|entry| Arc::clone(entry.value()))
+            .and_then(|entry| match entry.value() {
+                DecodedArtifact::OutputPage(page) => Some(Arc::clone(page)),
+                DecodedArtifact::CheckpointRecord { .. } => None,
+            })
     }
 
     /// Insert only after the source page hash, schema, and row bindings validate.
@@ -182,20 +234,27 @@ impl MaterializedReadCache {
         schema_fingerprint: &str,
         page: Arc<super::materialized_output_pages::DecodedOutputPage>,
     ) {
-        let Some(cache) = &self.decoded_output_pages else {
+        let Some(cache) = &self.decoded_artifacts else {
             return;
         };
         cache.insert(
-            DecodedOutputPageKey {
+            DecodedArtifactKey::OutputPage {
                 source: source.clone(),
                 schema_fingerprint: schema_fingerprint.to_owned(),
             },
-            page,
+            DecodedArtifact::OutputPage(page),
         );
     }
 
     pub(crate) fn decoded_output_page_capacity_bytes(&self) -> usize {
         self.decoded_output_page_capacity_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decoded_artifact_usage_bytes(&self) -> usize {
+        self.decoded_artifacts
+            .as_ref()
+            .map_or(0, |cache| cache.usage())
     }
 
     pub(crate) fn decoded_output_page_weight_bytes(
@@ -204,12 +263,93 @@ impl MaterializedReadCache {
         schema_fingerprint: &str,
         page: &super::materialized_output_pages::DecodedOutputPage,
     ) -> usize {
-        DecodedOutputPageKey {
+        DecodedArtifactKey::OutputPage {
             source: source.clone(),
             schema_fingerprint: schema_fingerprint.to_owned(),
         }
         .weight()
         .saturating_add(page.cache_weight_bytes())
+    }
+
+    pub(crate) fn decoded_checkpoint_record(
+        &self,
+        source: &MaterializedReadCacheKey,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        expected_output_schema_hash: Option<&str>,
+        record_codec: &str,
+    ) -> Option<(Arc<super::StandingRuntimeCheckpointRecord>, u64)> {
+        let key = DecodedArtifactKey::CheckpointRecord {
+            source: source.clone(),
+            tenant_id: tenant_id.to_owned(),
+            program_id: program_id.to_owned(),
+            view_id: view_id.to_owned(),
+            record_codec: record_codec.to_owned(),
+        };
+        let cache = self.decoded_artifacts.as_ref()?;
+        let started = std::time::Instant::now();
+        let result = cache.get(&key).and_then(|entry| match entry.value() {
+            DecodedArtifact::CheckpointRecord {
+                record,
+                encoded_size,
+                ..
+            } if expected_output_schema_hash.is_none_or(|expected| {
+                record.checkpoint.identity.output_schema_hash == expected
+            }) =>
+            {
+                Some((Arc::clone(record), *encoded_size))
+            }
+            DecodedArtifact::OutputPage(_) => None,
+            _ => None,
+        });
+        if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "demand_query_stage stage=decoded_checkpoint_cache_lookup elapsed_us={} hit={}",
+                started.elapsed().as_micros(),
+                usize::from(result.is_some()),
+            );
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cache_decoded_checkpoint_record(
+        &self,
+        source: &MaterializedReadCacheKey,
+        tenant_id: &str,
+        program_id: &str,
+        view_id: &str,
+        record_codec: &str,
+        record: Arc<super::StandingRuntimeCheckpointRecord>,
+        encoded_size: u64,
+    ) {
+        let Some(cache) = &self.decoded_artifacts else {
+            return;
+        };
+        let Some(decoded_size) =
+            super::checkpoint_publication::checkpoint_record_heap_weight(&record)
+        else {
+            return;
+        };
+        let heap_weight_bytes = std::mem::size_of::<DecodedArtifact>()
+            .saturating_add(std::mem::size_of_val(record.as_ref()))
+            .saturating_add(decoded_size)
+            .saturating_add(usize::try_from(encoded_size).unwrap_or(usize::MAX));
+        cache.insert(
+            DecodedArtifactKey::CheckpointRecord {
+                source: source.clone(),
+                tenant_id: tenant_id.to_owned(),
+                program_id: program_id.to_owned(),
+                view_id: view_id.to_owned(),
+                record_codec: record_codec.to_owned(),
+            },
+            DecodedArtifact::CheckpointRecord {
+                record,
+                heap_weight_bytes,
+                encoded_size,
+            },
+        );
     }
 
     /// Invalid disk entries and cache I/O errors are misses, never authoritative errors.
@@ -218,14 +358,23 @@ impl MaterializedReadCache {
         key: &MaterializedReadCacheKey,
         validate: impl Fn(&[u8]) -> Result<(), E>,
     ) -> Option<Vec<u8>> {
-        match self.cache.get(key).await {
+        let started = std::time::Instant::now();
+        let result = match self.cache.get(key).await {
             Ok(Some(entry)) if validate(entry.value()).is_ok() => Some(entry.value().clone()),
             Ok(None) => None,
             _ => {
                 self.remove(key);
                 None
             }
+        };
+        if std::env::var_os("VELORIX_DEMAND_QUERY_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "demand_query_stage stage=materialized_read_cache_get elapsed_us={} hit={}",
+                started.elapsed().as_micros(),
+                usize::from(result.is_some()),
+            );
         }
+        result
     }
 
     /// Content hashes can be codec-specific; insertion must use the production validator.
@@ -349,8 +498,8 @@ mod tests {
             assert!(cache.get(&other, validate).await.is_none(), "field {field}");
         }
         let total_limit = 64 * 1024;
-        assert!(cache.cache.memory().usage() <= total_limit * 3 / 4);
-        assert!(cache.decoded_output_pages.as_ref().unwrap().usage() <= total_limit / 4);
+        assert!(cache.cache.memory().usage() <= total_limit / 2);
+        assert!(cache.decoded_artifacts.as_ref().unwrap().usage() <= total_limit / 2);
         cache.close().await.unwrap();
     }
 
@@ -362,12 +511,12 @@ mod tests {
         let total_limit = cfg.memory_bytes;
         let cache = MaterializedReadCache::open(cfg).await.unwrap();
 
-        assert_eq!(cache.decoded_output_page_capacity_bytes(), total_limit / 4);
+        assert_eq!(cache.decoded_output_page_capacity_bytes(), total_limit / 2);
         assert!(cache.decoded_output_page_capacity_bytes() > 16 * 1024 * 1024);
-        let decoded_usage = cache.decoded_output_pages.as_ref().unwrap().usage();
+        let decoded_usage = cache.decoded_artifacts.as_ref().unwrap().usage();
         let raw_usage = cache.cache.memory().usage();
-        assert!(decoded_usage <= total_limit / 4);
-        assert!(raw_usage <= total_limit * 3 / 4);
+        assert!(decoded_usage <= total_limit / 2);
+        assert!(raw_usage <= total_limit / 2);
         assert!(decoded_usage.saturating_add(raw_usage) <= total_limit);
         cache.close().await.unwrap();
     }

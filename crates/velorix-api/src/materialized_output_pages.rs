@@ -888,6 +888,9 @@ pub(crate) struct DecodedOutputPage {
     record: StandingRuntimeOutputPageRecord,
     binding: CachedPageBinding,
     rows: DeltaBatch,
+    // Canonical BAG cardinality checked against the immutable source record
+    // before this page enters the memory-only decoded cache.
+    validated_row_count: usize,
     typed: Option<RecordBatch>,
     encoded_bytes: u64,
     expanded_source_bytes: usize,
@@ -1026,7 +1029,13 @@ async fn read_decoded_query_page_with_decoder(
     {
         validate_cached_decoded_page(&page, max_bytes, max_expanded_bytes)?;
         let binding_started = std::time::Instant::now();
-        validate_cached_page_binding(manifest, index, reference, &page)?;
+        validate_cached_page_binding(
+            manifest,
+            index,
+            reference,
+            &page,
+            Some(page.validated_row_count),
+        )?;
         let binding_validation_elapsed = binding_started.elapsed();
         let cache = state.materialized_read_cache.as_ref().ok_or_else(invalid)?;
         return Ok(DecodedOutputPageRead {
@@ -1085,14 +1094,17 @@ async fn read_decoded_query_page_with_decoder(
             typed: batch.as_ref(),
         },
         true,
+        None,
     )?;
     let binding_validation_elapsed =
         decode_binding_elapsed.saturating_add(binding_started.elapsed());
     let expanded_json_bytes = expanded_page_json_bytes(&rows)?;
+    let validated_row_count = record.row_count;
     let page = Arc::new(DecodedOutputPage {
         record,
         binding,
         rows,
+        validated_row_count,
         typed: batch,
         encoded_bytes: bytes.len() as u64,
         expanded_source_bytes,
@@ -1751,6 +1763,7 @@ fn validate_cached_page_binding(
     index: &PageIndex,
     reference: &StandingRuntimeOutputPageRef,
     page: &DecodedOutputPage,
+    validated_row_count: Option<usize>,
 ) -> Result<(), ApiError> {
     validate_cached_page_binding_parts(
         CachedPageBindingInput {
@@ -1763,12 +1776,14 @@ fn validate_cached_page_binding(
             typed: page.typed.as_ref(),
         },
         false,
+        validated_row_count,
     )
 }
 
 fn validate_cached_page_binding_parts(
     input: CachedPageBindingInput<'_>,
     validate_canonical_rows: bool,
+    validated_row_count: Option<usize>,
 ) -> Result<(), ApiError> {
     let CachedPageBindingInput {
         manifest,
@@ -1780,6 +1795,11 @@ fn validate_cached_page_binding_parts(
         typed,
     } = input;
     let arrow = codec_spec(&reference.output_encoding).is_some();
+    let row_count = match validated_row_count {
+        Some(count) if count == page.row_count => count,
+        Some(_) => return Err(invalid()),
+        None => canonical_count(rows)?,
+    };
     if page.page_index != reference.page_index
         || page.page_content_hash != reference.page_content_hash
         || page.row_count != reference.row_count
@@ -1800,7 +1820,7 @@ fn validate_cached_page_binding_parts(
                 .page_stats
                 .as_ref()
                 .and_then(|stats| stats.get(reference.page_index as usize))
-        || canonical_count(rows)? != reference.row_count
+        || row_count != reference.row_count
     {
         return Err(invalid());
     }
@@ -4013,6 +4033,64 @@ pub(crate) mod tests {
         assert_eq!(calls.swap(0, Ordering::Relaxed), 0, "warm decoded cache");
         assert!(warm.cache_hit);
         assert_eq!(warm.page.rows, cold.page.rows);
+        assert_eq!(warm.page.validated_row_count, reference.row_count);
+
+        // A trusted in-memory entry supplies the cardinality established by
+        // its cold source validation. The warm validator must not traverse the
+        // rows again; fresh page and manifest metadata still have to match it.
+        let deliberately_noncanonical_rows = DeltaBatch::from_records([
+            warm.page.rows.records()[0].clone(),
+            warm.page.rows.records()[0].clone(),
+        ]);
+        assert!(canonical_count(&deliberately_noncanonical_rows).is_err());
+        validate_cached_page_binding_parts(
+            CachedPageBindingInput {
+                manifest,
+                index: &index,
+                reference,
+                page: &warm.page.record,
+                binding: &warm.page.binding,
+                rows: &deliberately_noncanonical_rows,
+                typed: warm.page.typed.as_ref(),
+            },
+            false,
+            Some(warm.page.validated_row_count),
+        )
+        .unwrap();
+
+        let mut changed_schema_index = index.clone();
+        changed_schema_index.schema.columns[1].data_type = SqlDataType::Int64;
+        assert!(read_decoded_query_page_with_decoder(
+            &state,
+            manifest,
+            reference,
+            &changed_schema_index,
+            None,
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "same-key schema mutation");
+        let mut changed_row_count = reference.clone();
+        changed_row_count.row_count += 1;
+        assert!(read_decoded_query_page_with_decoder(
+            &state,
+            manifest,
+            &changed_row_count,
+            &index,
+            None,
+            max_expanded_bytes,
+            decode,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "same-key row-count mutation"
+        );
+
         let mut changed_manifest_binding = (*manifest).clone();
         changed_manifest_binding
             .checkpoint_content_hash
