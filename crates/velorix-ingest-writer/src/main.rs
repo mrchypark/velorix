@@ -11,11 +11,6 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use arrow::{
-    array::{ArrayRef, Int64Array, StringArray},
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
-};
 use async_trait::async_trait;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
@@ -44,7 +39,7 @@ use velorix_meta::{
     PublishPartitionCheckpointPointerRequest,
 };
 use velorix_storage::{
-    ingest_envelope::{IngestEnvelope, IngestEnvelopeEncodeRequest},
+    ingest_envelope::IngestEnvelope,
     log::{
         AppendValidatedEnvelopeOutcome, DurableIngestAdmissionRecordV1, IngestBatch,
         IngestBatchDescriptor, IngestCommitGuard, IngestCommitGuardBindingV1,
@@ -76,20 +71,6 @@ enum Command {
         writer_id: String,
         #[arg(long)]
         json: bool,
-    },
-    EncodeDefaultScoresPayload {
-        #[arg(long)]
-        output: PathBuf,
-        #[arg(long)]
-        schema_fingerprint: String,
-        #[arg(long, default_value = "scores")]
-        stream_id: String,
-        #[arg(long, default_value_t = 0)]
-        partition_id: u32,
-        #[arg(long)]
-        start_offset_inclusive: u64,
-        #[arg(long)]
-        rows_json: String,
     },
     #[command(name = "probe-kubernetes-lease-handoff", alias = "lease-handoff-probe")]
     ProbeKubernetesLeaseHandoff {
@@ -1053,16 +1034,6 @@ struct LeaseLossDuringReservationProbeArtifactV1 {
     expiry_decision_key: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct DefaultScoreRow {
-    user_id: String,
-    score: i64,
-    delta: i64,
-}
-
-mod example_fixtures;
-use example_fixtures::encode_default_scores_payload;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1095,24 +1066,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 print!("{}", format_ingest_writer_append(&artifact));
             }
-        }
-        Command::EncodeDefaultScoresPayload {
-            output,
-            schema_fingerprint,
-            stream_id,
-            partition_id,
-            start_offset_inclusive,
-            rows_json,
-        } => {
-            let payload = encode_default_scores_payload(
-                &schema_fingerprint,
-                &stream_id,
-                partition_id,
-                start_offset_inclusive,
-                &rows_json,
-            )?;
-            fs::write(&output, payload)
-                .with_context(|| format!("failed to write {}", output.display()))?;
         }
         Command::ProbeKubernetesLeaseHandoff {
             namespace,
@@ -2667,8 +2620,21 @@ fn sanitize_probe_id(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/fixtures/ingest_payload.rs"]
+mod ingest_payload_fixture;
+
+#[cfg(test)]
 mod tests {
+    use super::ingest_payload_fixture::encode_default_scores_payload;
     use super::*;
+
+    #[test]
+    fn production_cli_rejects_validation_fixture_encoder_command() {
+        let error = Cli::try_parse_from(["velorix-ingest-writer", "encode-default-scores-payload"])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
 
     fn test_partition_authority_session_for_token(
         meta_store: Arc<dyn MetaStore>,

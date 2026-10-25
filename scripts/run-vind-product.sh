@@ -3484,18 +3484,10 @@ run_ingest_writer_smoke_job() {
   local job_json="${output_dir}/ingest-writer-job.json"
   local pods_json="${output_dir}/ingest-writer-pods.json"
 
-  schema_fingerprint="$(python3 - "${output_dir}/scores-relation.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = json.load(f)
-print(body["schema_fingerprint"])
-PY
-)"
+  schema_fingerprint="$(jq -er '.schema_fingerprint | strings | select(length > 0)' "${output_dir}/scores-relation.json")"
   rows_json='[{"user_id":"u3","score":11,"delta":1},{"user_id":"u2","score":-4,"delta":1}]'
   start_offset="$(ingest_writer_run_offset_base)"
-  cargo run --locked -p velorix-ingest-writer --quiet -- encode-default-scores-payload \
+  cargo run --locked -p velorix-ingest-writer --example encode-validation-payload --quiet -- \
     --output "$payload_file" \
     --schema-fingerprint "$schema_fingerprint" \
     --stream-id scores \
@@ -3707,7 +3699,7 @@ run_ingest_writer_lifecycle_append_job() {
   local job_json="${output_dir}/${job_name}.json"
   local pods_json="${output_dir}/${job_name}-pods.json"
 
-  cargo run --locked -p velorix-ingest-writer --quiet -- encode-default-scores-payload \
+  cargo run --locked -p velorix-ingest-writer --example encode-validation-payload --quiet -- \
     --output "$payload_file" \
     --schema-fingerprint "$schema_fingerprint" \
     --stream-id scores \
@@ -3971,7 +3963,7 @@ run_ingest_writer_lifecycle_crash_restart_probe_job() {
   local job_json="${output_dir}/${job_name}.json"
   local pods_json="${output_dir}/${job_name}-pods.json"
 
-  cargo run --locked -p velorix-ingest-writer --quiet -- encode-default-scores-payload \
+  cargo run --locked -p velorix-ingest-writer --example encode-validation-payload --quiet -- \
     --output "$payload_file" \
     --schema-fingerprint "$schema_fingerprint" \
     --stream-id scores \
@@ -4162,7 +4154,7 @@ run_ingest_writer_lifecycle_lease_loss_probe_job() {
   local job_json="${output_dir}/${job_name}.json"
   local pods_json="${output_dir}/${job_name}-pods.json"
 
-  cargo run --locked -p velorix-ingest-writer --quiet -- encode-default-scores-payload \
+  cargo run --locked -p velorix-ingest-writer --example encode-validation-payload --quiet -- \
     --output "$payload_file" \
     --schema-fingerprint "$schema_fingerprint" \
     --stream-id scores \
@@ -4399,7 +4391,7 @@ run_ingest_writer_lifecycle_handoff_probe_job() {
   local stale_state_after="${output_dir}/${job_name}-stale-after.sha256"
 
   start_offset="$(($(ingest_writer_run_offset_base) + 5))"
-  cargo run --locked -p velorix-ingest-writer --quiet -- encode-default-scores-payload \
+  cargo run --locked -p velorix-ingest-writer --example encode-validation-payload --quiet -- \
     --output "$payload_file" \
     --schema-fingerprint "$schema_fingerprint" \
     --stream-id scores \
@@ -4779,15 +4771,7 @@ generate_ingest_writer_lifecycle_attestation() {
   local lease_loss_job="velorix-ingest-lifecycle-lease-loss"
   local handoff_job="velorix-ingest-lifecycle-handoff"
   local offset_base
-  schema_fingerprint="$(python3 - "${output_dir}/scores-relation.json" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    body = json.load(f)
-print(body["schema_fingerprint"])
-PY
-)"
+  schema_fingerprint="$(jq -er '.schema_fingerprint | strings | select(length > 0)' "${output_dir}/scores-relation.json")"
   offset_base="$(ingest_writer_run_offset_base)"
   release_ingest_writer_smoke_partition_lease
 

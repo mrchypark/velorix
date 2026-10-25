@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = { workspace = true }
-arrow = { workspace = true, features = ["ipc"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
@@ -20,3 +19,6 @@ velorix-control = { path = "../velorix-control" }
 velorix-k8s = { path = "../velorix-k8s" }
 velorix-meta = { path = "../velorix-meta" }
 velorix-storage = { path = "../velorix-storage" }
+
+[dev-dependencies]
+arrow = { workspace = true, features = ["ipc"] }
