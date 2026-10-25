@@ -147,6 +147,29 @@ guarantee. The existing `unsafe-dev-only` mode remains single-replica only.
 
 ### Split API and worker services
 
+For v0.5.0, the `velorix-api` image defaults to
+`VELORIX_SERVICE_ROLE=api`, and the `velorix-worker` image defaults to
+`VELORIX_SERVICE_ROLE=worker`. This changes the API image's default from the
+binary's `all` role: deployments that need the previous combined API/compute
+behavior must set `VELORIX_SERVICE_ROLE=all` explicitly. The all-in-one image
+is named `ghcr.io/mrchypark/velorix-all`. In its default `all` mode it requires
+`VELORIX_META_BACKEND=rhiza-kv`, `VELORIX_META_MODE`, `VELORIX_META_BIND`, and
+`VELORIX_META_GRPC_ENDPOINT`. Set the local client endpoint to
+`http://127.0.0.1:<bind-port>`; with `VELORIX_META_TRANSPORT_SECURITY=native-mtls`,
+use `https://127.0.0.1:<bind-port>` and the existing Meta TLS client settings.
+Choose the Meta bind host for the Rhiza peer topology and restrict non-loopback
+listeners through deployment network policy; the entrypoint validates the
+client endpoint host and port, not the server bind host. It starts Meta, runs
+the authenticated Rhiza capability smoke (`auth_enforced=true`,
+`production_multi_writer_safe=false`) using the configured TLS when enabled,
+then starts the API with role `all`.
+
+Configure an external readiness probe against the API `/readyz` endpoint; the
+entrypoint does not wait for API readiness. Allow at least 20 seconds for
+container shutdown: the supervisor gives each tracked child up to 5 seconds
+after TERM before KILL and wait. The CI entrypoint contract uses stub processes
+and does not validate a real Rhiza-backed container launch.
+
 `VELORIX_SERVICE_ROLE` defaults to `all`; set it to `api` or `worker` to run
 separate services. Split mode requires `VELORIX_API_BEARER_TOKEN` and
 `VELORIX_META_GRPC_ENDPOINT`. Configure the API and every worker with the same

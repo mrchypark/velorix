@@ -45,6 +45,8 @@ jobs:
           bash -n scripts/check-no-external-runtime-artifacts.sh
           sh -n scripts/check-rust-toolchain-contract.sh
           sh -n scripts/check-rhiza-operator-manifests-contract.sh
+          sh -n scripts/velorix-all-in-one-entrypoint.sh
+          sh -n scripts/check-all-image-entrypoint-contract.sh
           python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
 
       - name: Check first-E2E readiness contract
@@ -57,6 +59,7 @@ jobs:
           scripts/check-no-external-runtime-artifacts.sh
           sh scripts/check-rust-toolchain-contract.sh
           scripts/check-rhiza-operator-manifests-contract.sh
+          sh scripts/check-all-image-entrypoint-contract.sh
 
   msrv:
     name: MSRV check
