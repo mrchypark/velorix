@@ -7,7 +7,7 @@ use thiserror::Error;
 
 const ROOT_KEY: &str = "velorix/snapshot/root";
 // Each page is written as exactly one Rhiza KV value, and the backend
-// base64-encodes that value (~+33%) before transport. rhizadb 0.19.0 rejects
+// base64-encodes that value (~+33%) before transport. Rhiza rejects
 // any replicated mutation whose encoded command exceeds
 // `MaxReplicatedValueBytes = 128 << 10`, defined at
 // native/pkg/quepaxa/types.go:19 and enforced in native/pkg/network/server.go

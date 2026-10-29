@@ -73,7 +73,7 @@ fn base_port() -> u16 {
         .expect("RHIZA_RECOVERY_BASE_PORT must be a port")
 }
 
-/// Membership publishes public identity only. Rhiza 0.19.0 rejects a per-member
+/// Membership publishes public identity only. Rhiza rejects a per-member
 /// `token` as an unknown field, and a shared membership document must never
 /// carry any node's private peer token.
 fn members_json(base_port: u16) -> Vec<serde_json::Value> {
@@ -161,6 +161,75 @@ fn node_config(root: &Path, id: &'static str, index: usize) -> rhizadb::Config {
         base_port(),
         members_json(base_port()),
     )
+}
+
+fn single_node_config(root: &Path) -> rhizadb::Config {
+    let base_port = base_port() + 300;
+    let (_, public_key) = node_credentials("node-a");
+    rhiza_config(
+        root,
+        "node-a",
+        0,
+        CLUSTER_ID,
+        base_port,
+        vec![serde_json::json!({
+            "node_id": "node-a",
+            "url": format!("http://127.0.0.1:{base_port}"),
+            "peer_url": format!("quic://127.0.0.1:{}", base_port + 100),
+            "public_key": public_key,
+        })],
+    )
+    .set_option(
+        "ObjStorePrefix",
+        serde_json::json!(format!(
+            "{}/single-node",
+            env_or("RHIZA_RECOVERY_S3_PREFIX", "recovery-test")
+        )),
+    )
+}
+
+fn local_s3_config(root: &Path) -> rhizadb::Config {
+    rhizadb::Config::new(root.join("local-node"))
+        .node_id("local-node")
+        .cluster_id(CLUSTER_ID)
+        .local()
+        .set_option("ObjStoreProvider", serde_json::json!("s3"))
+        .set_option(
+            "ObjStoreEndpoint",
+            serde_json::json!(env_or("RHIZA_RECOVERY_S3_ENDPOINT", "127.0.0.1:29000")),
+        )
+        .set_option(
+            "ObjStoreBucket",
+            serde_json::json!(env_or("RHIZA_RECOVERY_S3_BUCKET", "velorix-rhiza-recovery")),
+        )
+        .set_option(
+            "ObjStorePrefix",
+            serde_json::json!(env_or("RHIZA_RECOVERY_S3_PREFIX", "recovery-test")),
+        )
+        .set_option("ObjStoreRegion", serde_json::json!("us-east-1"))
+        .set_option("ObjStoreInsecure", serde_json::json!(true))
+        .set_option(
+            "ObjStoreAccessKey",
+            serde_json::json!(env_or(
+                "RHIZA_RECOVERY_S3_ACCESS_KEY",
+                "velorix-test-access"
+            )),
+        )
+        .set_option(
+            "ObjStoreSecretKey",
+            serde_json::json!(env_or(
+                "RHIZA_RECOVERY_S3_SECRET_KEY",
+                "velorix-test-secret"
+            )),
+        )
+        .set_option("ObjStoreDurability", serde_json::json!("before-ack"))
+        .set_option("ObjStoreSyncInterval", serde_json::json!(100_000_000_u64))
+        .set_option("ObjStoreBatchDelay", serde_json::json!(0_u64))
+        .set_option(
+            "CheckpointInterval",
+            serde_json::json!(3_600_000_000_000_u64),
+        )
+        .set_option("CheckpointTailBytes", serde_json::json!(1_048_576_u64))
 }
 
 async fn open_node(root: &Path, index: usize) -> Node {
@@ -499,7 +568,7 @@ async fn rhiza_three_node_kv_meta_quorum_loss_and_restart_recovery() {
     ));
 
     close_node(&mut nodes[0]).await;
-    // Rhiza 0.19.0 voter registration is immutable: a registered voter must
+    // Rhiza voter registration is immutable: a registered voter must
     // still present the local identity and WAL that signed it, and the Rust
     // binding exposes no offline enrollment. So an emptied working directory
     // must refuse to open rather than re-register under the same node id and
@@ -582,6 +651,231 @@ async fn rhiza_three_node_kv_meta_quorum_loss_and_restart_recovery() {
     for node in &mut nodes {
         close_node(node).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the local Versity Gateway fixture; run scripts/check-rhiza-recovery.sh"]
+async fn rhiza_single_node_retained_restart_and_empty_state_recovery_probe() {
+    let root = match std::env::var("RHIZA_RECOVERY_WORKDIR") {
+        Ok(path) => PathBuf::from(path).join("single-node"),
+        Err(_) => TempDir::new().expect("temporary single-node root").keep(),
+    };
+    std::fs::create_dir_all(&root).expect("create single-node work root");
+    let data_dir = root.join("node-a");
+    let config = || single_node_config(&root);
+
+    let store = RhizaKvMetaStore::open_config(config())
+        .await
+        .expect("open single native voter");
+    store
+        .store_relation_catalog(common::orders_relation_catalog("v1"))
+        .await
+        .expect("write initial catalog");
+    let owner = acquire_owner(&store).await;
+    let pointer = checkpoint_pointer(1, 'd');
+    assert!(matches!(
+        store
+            .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: pointer.clone(),
+                owner: owner.clone(),
+                expected_relation_source_cuts: None,
+            })
+            .await
+            .expect("publish initial checkpoint"),
+        PublishStandingRuntimeCheckpointOutcome::Published
+    ));
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "v1")
+            .await
+            .expect("read initial catalog"),
+        common::orders_relation_catalog("v1")
+    );
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint(TENANT, PROGRAM, VIEW)
+            .await
+            .expect("read initial checkpoint"),
+        Some(pointer.clone())
+    );
+    close_store(store).await;
+
+    let store = RhizaKvMetaStore::open_config(config())
+        .await
+        .expect("restart from retained native directory");
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "v1")
+            .await
+            .expect("read catalog after retained restart"),
+        common::orders_relation_catalog("v1")
+    );
+    assert_eq!(
+        store
+            .read_standing_runtime_checkpoint(TENANT, PROGRAM, VIEW)
+            .await
+            .expect("read checkpoint after retained restart"),
+        Some(pointer.clone())
+    );
+    store
+        .store_relation_catalog(common::orders_relation_catalog("v2"))
+        .await
+        .expect("write after retained restart");
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "v2")
+            .await
+            .expect("read post-restart write"),
+        common::orders_relation_catalog("v2")
+    );
+    close_store(store).await;
+
+    let retained_dir = root.join("node-a-retained");
+    std::fs::rename(&data_dir, &retained_dir).expect("retain original native directory");
+    match RhizaKvMetaStore::open_config(config()).await {
+        Ok(store) => {
+            let restored = store
+                .read_relation_catalog("orders", "v2")
+                .await
+                .expect("read catalog after empty-directory startup");
+            if restored != common::orders_relation_catalog("v2") {
+                close_store(store).await;
+                std::fs::remove_dir_all(&data_dir).expect("remove empty replacement state");
+                std::fs::rename(&retained_dir, &data_dir).expect("restore retained state");
+                panic!("empty-directory startup opened without restoring the acknowledged catalog");
+            }
+            assert_eq!(
+                store
+                    .read_standing_runtime_checkpoint(TENANT, PROGRAM, VIEW)
+                    .await
+                    .expect("read checkpoint after empty-directory startup"),
+                Some(pointer)
+            );
+            store
+                .store_relation_catalog(common::orders_relation_catalog("v3"))
+                .await
+                .expect("write after native empty-directory restore");
+            close_store(store).await;
+            let store = RhizaKvMetaStore::open_config(config())
+                .await
+                .expect("restart after native empty-directory restore");
+            assert_eq!(
+                store
+                    .read_relation_catalog("orders", "v3")
+                    .await
+                    .expect("read post-restore write"),
+                common::orders_relation_catalog("v3")
+            );
+            close_store(store).await;
+            eprintln!("empty_state_restore=restored");
+        }
+        Err(error) => {
+            let error = error.to_string();
+            assert!(
+                error.contains("voter state continuity cannot be established"),
+                "unexpected empty-directory startup error: {error}"
+            );
+            if data_dir.exists() {
+                std::fs::remove_dir_all(&data_dir).expect("discard refused-open replacement state");
+            }
+            std::fs::rename(&retained_dir, &data_dir).expect("restore retained native directory");
+            eprintln!("empty_state_restore=unsupported");
+            eprintln!("empty_state_restore_refusal={error}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the local Versity Gateway fixture; run scripts/check-rhiza-local-recovery.sh"]
+async fn rhiza_local_mode_s3_before_ack_and_empty_state_restore() {
+    let root = match std::env::var("RHIZA_RECOVERY_WORKDIR") {
+        Ok(path) => PathBuf::from(path).join("local-s3"),
+        Err(_) => TempDir::new().expect("temporary Local S3 root").keep(),
+    };
+    std::fs::create_dir_all(&root).expect("create Local S3 work root");
+    let data_dir = root.join("local-node");
+    let config = || local_s3_config(&root);
+
+    let store = RhizaKvMetaStore::open_config(config())
+        .await
+        .expect("open Rhiza Config::local with S3 backup");
+    store
+        .store_relation_catalog(common::orders_relation_catalog("local-v1"))
+        .await
+        .expect("write Local catalog through before-ack S3 backup");
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "local-v1")
+            .await
+            .expect("read initial Local catalog"),
+        common::orders_relation_catalog("local-v1")
+    );
+    close_store(store).await;
+
+    let store = RhizaKvMetaStore::open_config(config())
+        .await
+        .expect("restart Local database from retained directory");
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "local-v1")
+            .await
+            .expect("read catalog after retained Local restart"),
+        common::orders_relation_catalog("local-v1")
+    );
+    store
+        .store_relation_catalog(common::orders_relation_catalog("local-v2"))
+        .await
+        .expect("write after retained Local restart");
+    close_store(store).await;
+
+    let retained_dir = root.join("local-node-retained");
+    std::fs::rename(&data_dir, &retained_dir).expect("retain original Local data directory");
+    let store = match RhizaKvMetaStore::open_config(config()).await {
+        Ok(store) => store,
+        Err(error) => {
+            let error = error.to_string();
+            if data_dir.exists() {
+                std::fs::remove_dir_all(&data_dir).expect("remove failed empty Local state");
+            }
+            std::fs::rename(&retained_dir, &data_dir)
+                .expect("restore retained Local data after failed open");
+            panic!("empty Local directory did not restore from S3: {error}");
+        }
+    };
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "local-v2")
+            .await
+            .expect("read catalog restored from S3"),
+        common::orders_relation_catalog("local-v2")
+    );
+    store
+        .store_relation_catalog(common::orders_relation_catalog("local-v3"))
+        .await
+        .expect("write after empty-directory S3 restore");
+    // Repeating the same keyed catalog write verifies the restore path remains
+    // usable after the first post-restore acknowledgement.
+    store
+        .store_relation_catalog(common::orders_relation_catalog("local-v3"))
+        .await
+        .expect("repeat post-restore catalog write");
+    assert_eq!(
+        store
+            .read_relation_catalog("orders", "local-v3")
+            .await
+            .expect("read post-restore catalog"),
+        common::orders_relation_catalog("local-v3")
+    );
+    close_store(store).await;
+    eprintln!("local_s3_recovery=passed");
+}
+
+async fn close_store(store: RhizaKvMetaStore) {
+    store
+        .close()
+        .await
+        .unwrap_or_else(|error| panic!("single-node native store shutdown failed: {error}"));
 }
 
 /// Native, not this crate, proves that a published key really is the one the

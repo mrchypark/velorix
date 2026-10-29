@@ -61,13 +61,14 @@ use velorix_control::{
         MetaStore, MetaStoreError, PromoteViewBootstrapOutcome, PromoteViewBootstrapRequest,
         PromoteViewBootstrapWithActiveViewRecordRequestV1, PublishIngestReservationOutcome,
         PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-        ReadDemandMetadataBatchRequest, RelationIngestCapability, RelationIngestPublicationRefV1,
+        ReacquireStandingRuntimeOwnerRequest, ReadDemandMetadataBatchRequest,
+        RelationIngestCapability, RelationIngestPublicationRefV1,
         RelationIngestSourceIdentityCutV1, RelationPartitionAuthorityKey,
         ReserveIngestRangeOutcome, StandingRuntimeCheckpointPointer,
         StandingRuntimeFencingCapability, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
         StoreRelationCatalogOutcome, ViewBootstrapControlV1, ViewBootstrapLifecycleV1,
         INGEST_SOURCE_IDENTITY_GENERATION_V1, RELATION_INGEST_SOURCE_CUT_SCHEMA_VERSION_V1,
-        STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
+        ROOT_CAS_AUTHORITY_CLOCK_KIND, STANDING_RUNTIME_BACKEND_TIME_SOURCE_RAFT_REPLICATED,
         STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
         STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
         STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
@@ -97,6 +98,7 @@ use velorix_control::{
         ReplayCheckpoint, StandingRuntimeCheckpointKeyParts,
     },
 };
+
 use velorix_core::{
     delta::DeltaBatch,
     query::{QueryBindValue, QueryPolicy},
@@ -223,6 +225,18 @@ fn validate_native_family_spec_config(path: Option<&std::ffi::OsStr>) -> anyhow:
 pub type MaterializedReadCacheHitAccountant =
     Arc<dyn Fn(&str, u64) -> Result<(), ApiError> + Send + Sync>;
 
+#[derive(Default)]
+struct StandingRuntimeReacquireState {
+    ever_owned: bool,
+    pending_expected: Option<StandingRuntimeOwnerClaim>,
+}
+
+type StandingRuntimeReacquireRegistry =
+    Arc<Mutex<BTreeMap<(String, String, String), StandingRuntimeReacquireState>>>;
+
+type StandingRuntimeReacquireLocks =
+    Arc<Mutex<BTreeMap<(String, String, String), Arc<AsyncMutex<()>>>>>;
+
 #[derive(Clone)]
 pub struct ApiState {
     store: Arc<dyn ObjectStore>,
@@ -244,6 +258,7 @@ pub struct ApiState {
     relation_ingest_mode: RelationIngestMode,
     relation_ingest_config: Option<RelationIngestApiConfig>,
     relation_ingest_publishers: Arc<Mutex<HashMap<String, RelationIngestPublisher>>>,
+    relation_ingest_startup_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     standing_runtime_owner_ttl_ms: u64,
     legacy_rebuild_view_id: Option<String>,
     standing_runtime_fencing_required: bool,
@@ -264,6 +279,8 @@ pub struct ApiState {
     background_tasks: Arc<Mutex<BackgroundTaskStatus>>,
     background_compactions: Arc<Mutex<BTreeSet<String>>>,
     standing_runtimes: Arc<StandingRuntimeRegistry>,
+    standing_runtime_reacquire_state: StandingRuntimeReacquireRegistry,
+    standing_runtime_reacquire_locks: StandingRuntimeReacquireLocks,
     standing_runtime_factories: Arc<StandingRuntimeFactoryRegistry>,
     query_runtimes: Arc<Mutex<HashMap<String, ProductionQueryRuntime>>>,
     /// Serializes view-on-view dependency admissions in-process so concurrent
@@ -1090,6 +1107,7 @@ impl ApiState {
             relation_ingest_mode: RelationIngestMode::Legacy,
             relation_ingest_config: None,
             relation_ingest_publishers: Arc::new(Mutex::new(HashMap::new())),
+            relation_ingest_startup_locks: Arc::new(Mutex::new(HashMap::new())),
             standing_runtime_owner_ttl_ms: 30_000,
             legacy_rebuild_view_id: None,
             standing_runtime_fencing_required: false,
@@ -1112,6 +1130,8 @@ impl ApiState {
             background_tasks: Arc::new(Mutex::new(BackgroundTaskStatus::default())),
             background_compactions: Arc::new(Mutex::new(BTreeSet::new())),
             standing_runtimes: Arc::new(StandingRuntimeRegistry::default()),
+            standing_runtime_reacquire_state: Arc::new(Mutex::new(BTreeMap::new())),
+            standing_runtime_reacquire_locks: Arc::new(Mutex::new(BTreeMap::new())),
             standing_runtime_factories: Arc::new(StandingRuntimeFactoryRegistry::default()),
             query_runtimes: Arc::new(Mutex::new(HashMap::new())),
             view_dependency_graph_mutex: Arc::new(AsyncMutex::new(())),
@@ -1232,6 +1252,23 @@ impl ApiState {
         {
             return Ok(publisher);
         }
+        let startup_lock = self
+            .relation_ingest_startup_locks
+            .lock()
+            .map_err(|_| ApiError::internal("relation ingest startup lock registry poisoned"))?
+            .entry(scope_key.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        let _startup_guard = startup_lock.lock().await;
+        if let Some(publisher) = self
+            .relation_ingest_publishers
+            .lock()
+            .map_err(|_| ApiError::internal("relation ingest publisher registry poisoned"))?
+            .get(&scope_key)
+            .cloned()
+        {
+            return Ok(publisher);
+        }
         let publisher = RelationIngestPublisher::from_store(
             Arc::clone(meta_store),
             ObjectStoreAuthorityRef {
@@ -1254,6 +1291,22 @@ impl ApiState {
         )
         .await
         .map_err(relation_ingest_publisher_error_to_api)?;
+        match publisher.start().await {
+            Ok(_) => {}
+            Err(RelationIngestPublisherError::AuthorityConflict { current })
+                if current.owner_id == config.owner_id =>
+            {
+                // A new API process can find the prior process's persisted
+                // token for the same stable owner. Explicitly reacquire only
+                // in this startup path; cached publishers keep using start()
+                // as their ordinary renewal path.
+                publisher
+                    .start_after_restart()
+                    .await
+                    .map_err(relation_ingest_publisher_error_to_api)?;
+            }
+            Err(error) => return Err(relation_ingest_publisher_error_to_api(error)),
+        }
         let mut publishers = self
             .relation_ingest_publishers
             .lock()
@@ -1518,6 +1571,71 @@ impl ApiState {
             .clone())
     }
 
+    pub(crate) fn standing_runtime_reacquire_lock(
+        &self,
+        identity: &StandingProgramIdentity,
+        view_id: &str,
+    ) -> Result<Arc<AsyncMutex<()>>, ApiError> {
+        let key = (
+            identity.tenant_id.clone(),
+            identity.program_id.clone(),
+            view_id.to_string(),
+        );
+        let mut locks = self
+            .standing_runtime_reacquire_locks
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime reacquire lock registry poisoned"))?;
+        Ok(locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone())
+    }
+
+    pub(crate) fn mark_standing_runtime_reacquire_attempted(
+        &self,
+        identity: &StandingProgramIdentity,
+        view_id: &str,
+        expected: &StandingRuntimeOwnerClaim,
+    ) -> Result<bool, ApiError> {
+        let mut reacquire = self
+            .standing_runtime_reacquire_state
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime reacquire registry poisoned"))?;
+        let state = reacquire
+            .entry((
+                identity.tenant_id.clone(),
+                identity.program_id.clone(),
+                view_id.to_string(),
+            ))
+            .or_default();
+        if state.ever_owned {
+            return Ok(false);
+        }
+        if let Some(pending) = &state.pending_expected {
+            return Ok(pending == expected);
+        }
+        state.pending_expected = Some(expected.clone());
+        Ok(true)
+    }
+
+    pub(crate) fn pending_standing_runtime_reacquire(
+        &self,
+        identity: &StandingProgramIdentity,
+        view_id: &str,
+    ) -> Result<Option<StandingRuntimeOwnerClaim>, ApiError> {
+        let reacquire = self
+            .standing_runtime_reacquire_state
+            .lock()
+            .map_err(|_| ApiError::internal("standing runtime reacquire registry poisoned"))?;
+        Ok(reacquire
+            .get(&(
+                identity.tenant_id.clone(),
+                identity.program_id.clone(),
+                view_id.to_string(),
+            ))
+            .and_then(|state| state.pending_expected.clone()))
+    }
+
     async fn acquire_standing_runtime_owner(
         &self,
         identity: &StandingProgramIdentity,
@@ -1573,6 +1691,20 @@ impl ApiState {
             return Err(ApiError::conflict(
                 "standing runtime owner claim does not match its local identity",
             ));
+        }
+        if owner.owner_id == self.owner_id {
+            let mut reacquire = self
+                .standing_runtime_reacquire_state
+                .lock()
+                .map_err(|_| ApiError::internal("standing runtime reacquire registry poisoned"))?;
+            reacquire
+                .entry((
+                    identity.tenant_id.clone(),
+                    identity.program_id.clone(),
+                    view_id.to_string(),
+                ))
+                .or_default()
+                .ever_owned = true;
         }
         let _owner_update = self
             .standing_runtimes
@@ -8706,6 +8838,7 @@ fn relation_ingest_publisher_error_to_api(error: RelationIngestPublisherError) -
             ApiError::service_unavailable(error)
         }
         RelationIngestPublisherError::AuthorityConflict { .. }
+        | RelationIngestPublisherError::RestartReacquireAlreadyAttempted
         | RelationIngestPublisherError::RangeConflict { .. }
         | RelationIngestPublisherError::PublicationConflict { .. }
         | RelationIngestPublisherError::StagingConflict { .. }
@@ -9546,18 +9679,22 @@ fn validate_logical_standing_runtime_fencing(
     if !capability.multi_writer_fencing_safe {
         missing.push("multi_writer_fencing_safe");
     }
-    if !matches!(
-        capability.lease_authority_kind.as_str(),
-        STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME
-    ) {
-        missing.push("recognized_lease_authority");
-    }
-    if !matches!(
-        capability.lease_expiry_semantics.as_str(),
-        STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL
-            | STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL
-    ) {
-        missing.push("recognized_lease_expiry_semantics");
+    let recognized_authority_expiry_contract = matches!(
+        (
+            capability.lease_authority_kind.as_str(),
+            capability.lease_expiry_semantics.as_str(),
+        ),
+        (
+            STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME,
+            STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL
+                | STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL,
+        ) | (
+            ROOT_CAS_AUTHORITY_CLOCK_KIND,
+            STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL,
+        )
+    );
+    if !recognized_authority_expiry_contract {
+        missing.push("recognized_lease_authority_expiry_contract");
     }
     if missing.is_empty() {
         Ok(())

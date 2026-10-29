@@ -40,16 +40,92 @@ async fn main() -> anyhow::Result<()> {
     let _program = args.next();
     match args.next().as_deref() {
         None | Some("serve") => serve().await,
+        Some("check-config") => {
+            if args.next().is_some() {
+                anyhow::bail!("`check-config` does not accept arguments");
+            }
+            check_config()
+        }
+        Some("init-local") => {
+            if args.next().is_some() {
+                anyhow::bail!("`init-local` does not accept arguments");
+            }
+            init_local().await
+        }
         Some("smoke") => run_meta_smoke(parse_meta_smoke_args(args)?).await,
         Some(other) => {
-            anyhow::bail!("unknown velorix-meta command `{other}`; expected `serve` or `smoke`")
+            anyhow::bail!(
+                "unknown velorix-meta command `{other}`; expected `serve`, `check-config`, `init-local`, or `smoke`"
+            )
         }
     }
 }
 
+#[cfg(feature = "rhiza-backend")]
+async fn init_local() -> anyhow::Result<()> {
+    let config = parse_meta_serve_config_from_env()?;
+    let explicit = require_init_local_config(&config)?;
+    let store = rhiza_kv_store_from_config(explicit).await?;
+    store.close().await?;
+    eprintln!("local Rhiza initialization completed and database closed");
+    Ok(())
+}
+
+#[cfg(feature = "rhiza-backend")]
+fn require_init_local_config(config: &MetaServeConfig) -> anyhow::Result<&RhizaExplicitConfig> {
+    if config.backend != MetaBackendKind::RhizaKv {
+        anyhow::bail!("`init-local` requires VELORIX_META_BACKEND=rhiza-kv");
+    }
+    let Some(RhizaServeConfig::Explicit(explicit)) = config.rhiza.as_ref() else {
+        anyhow::bail!("`init-local` requires explicit Rhiza Local mode");
+    };
+    if !explicit.local {
+        anyhow::bail!("`init-local` is supported only for Rhiza Local mode");
+    }
+    if explicit.object_store_provider.is_none() {
+        anyhow::bail!("`init-local` requires Rhiza object storage for recovery");
+    }
+    if explicit.object_store_durability != "before-ack" {
+        anyhow::bail!("`init-local` requires VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack");
+    }
+    Ok(explicit)
+}
+
+#[cfg(not(feature = "rhiza-backend"))]
+async fn init_local() -> anyhow::Result<()> {
+    anyhow::bail!("`init-local` requires building velorix-meta with `--features rhiza-backend`")
+}
+
+/// Apply the same environment admission checks as `serve` without opening a
+/// MetaStore, reading or writing database state, or binding a listener.
+fn check_config() -> anyhow::Result<()> {
+    let vars = env::vars().collect();
+    let config = check_config_with_vars(&vars)?;
+    println!(
+        "configuration valid: mode={:?}, backend={:?}",
+        config.mode, config.backend
+    );
+    Ok(())
+}
+
+fn check_config_with_vars(vars: &HashMap<String, String>) -> anyhow::Result<MetaServeConfig> {
+    parse_meta_serve_config(vars)
+}
+
 async fn serve() -> anyhow::Result<()> {
     let config = parse_meta_serve_config_from_env()?;
+    #[cfg(feature = "rhiza-backend")]
+    let (store, local_rhiza) = match config.rhiza.as_ref() {
+        Some(RhizaServeConfig::Explicit(explicit)) if explicit.local => {
+            let kv = rhiza_kv_store_from_config(explicit).await?;
+            let store: Arc<dyn MetaStore> = Arc::new(RhizaKvMetaStore::new(kv.clone()));
+            (store, Some(kv))
+        }
+        _ => (meta_store_from_config(&config).await?, None),
+    };
+    #[cfg(not(feature = "rhiza-backend"))]
     let store = meta_store_from_config(&config).await?;
+    let server_result: anyhow::Result<()> = async move {
     // Startup is only successful after a backend operation has completed. The
     // Operator-managed Rhiza path already waited on native local readiness
     // inside its constructor, because the Operator clones this binary for a
@@ -91,51 +167,92 @@ async fn serve() -> anyhow::Result<()> {
         None => MetaGrpcService::new(store),
     };
 
-    if config.transport_security.as_deref() == Some("native-mtls") {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let cert = std::fs::read(
-            config
-                .tls_cert_file
-                .as_ref()
-                .expect("native-mtls cert path validated before serve"),
-        )?;
-        let key = std::fs::read(
-            config
-                .tls_key_file
-                .as_ref()
-                .expect("native-mtls key path validated before serve"),
-        )?;
-        let client_ca = std::fs::read(
-            config
-                .tls_client_ca_file
-                .as_ref()
-                .expect("native-mtls client CA path validated before serve"),
-        )?;
-        Server::builder()
-            .tls_config(
-                ServerTlsConfig::new()
-                    .identity(Identity::from_pem(cert, key))
-                    .client_ca_root(Certificate::from_pem(client_ca)),
-            )?
-            .add_service(
-                VelorixMetaServer::new(service)
-                    .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
-            )
-            .serve(config.bind)
-            .await?;
-    } else {
-        Server::builder()
-            .add_service(
-                VelorixMetaServer::new(service)
-                    .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
-            )
-            .serve(config.bind)
-            .await?;
+        if config.transport_security.as_deref() == Some("native-mtls") {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let cert = std::fs::read(
+                config
+                    .tls_cert_file
+                    .as_ref()
+                    .expect("native-mtls cert path validated before serve"),
+            )?;
+            let key = std::fs::read(
+                config
+                    .tls_key_file
+                    .as_ref()
+                    .expect("native-mtls key path validated before serve"),
+            )?;
+            let client_ca = std::fs::read(
+                config
+                    .tls_client_ca_file
+                    .as_ref()
+                    .expect("native-mtls client CA path validated before serve"),
+            )?;
+            Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new()
+                        .identity(Identity::from_pem(cert, key))
+                        .client_ca_root(Certificate::from_pem(client_ca)),
+                )?
+                .add_service(
+                    VelorixMetaServer::new(service)
+                        .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
+                        .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
+                )
+                .serve_with_shutdown(config.bind, shutdown_signal())
+                .await?;
+        } else {
+            Server::builder()
+                .add_service(
+                    VelorixMetaServer::new(service)
+                        .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
+                        .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
+                )
+                .serve_with_shutdown(config.bind, shutdown_signal())
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    #[cfg(feature = "rhiza-backend")]
+    if let Some(store) = local_rhiza {
+        let close_result = store.close().await.map_err(anyhow::Error::from);
+        match (server_result, close_result) {
+            (Ok(()), Ok(())) => {
+                eprintln!("local Rhiza database closed");
+                return Ok(());
+            }
+            (Err(server), Ok(())) => {
+                eprintln!("local Rhiza database closed");
+                return Err(server);
+            }
+            (Ok(()), Err(close)) => return Err(close.context("closing local Rhiza database")),
+            (Err(server), Err(close)) => {
+                return Err(server.context(format!(
+                    "also failed to close local Rhiza database: {close:#}"
+                )));
+            }
+        }
     }
 
-    Ok(())
+    server_result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install Ctrl-C handler");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,7 +280,7 @@ struct MetaTlsFiles<'a> {
 /// This prevents a restarted no-PVC node from silently joining a different
 /// cluster or advertising an unreachable address.
 ///
-/// Membership carries public identity only. Rhiza 0.19.0 rejects the legacy
+/// Membership carries public identity only. Rhiza 0.20.0 rejects the legacy
 /// per-member `token` field, and a node's private peer token is derived from a
 /// process-only secret, so it never enters this document.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -210,9 +327,9 @@ impl fmt::Debug for RhizaMemberConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RhizaServeConfig {
     /// Velorix-owned explicit configuration, translated into a
-    /// `rhizadb::Config`. Retained for the single-node development path and for
-    /// deployments that do not run the Rhiza Operator. Boxed so the operator
-    /// variant stays small next to this one.
+    /// `rhizadb::Config`. It supports fixed-membership cluster mode and the
+    /// native standalone Local mode, without requiring the Rhiza Operator.
+    /// Boxed so the operator variant stays small next to this one.
     Explicit(Box<RhizaExplicitConfig>),
     /// The Rhiza Operator owns generation identity and rewrites the canonical
     /// `RHIZA_*` environment between generations. Native reads that environment
@@ -242,6 +359,9 @@ impl RhizaServeConfig {
 
 #[derive(Clone, Eq, PartialEq)]
 struct RhizaExplicitConfig {
+    /// Native Rhiza local mode. When set, consensus membership, peer
+    /// listeners, and object storage are intentionally absent.
+    local: bool,
     data_dir: String,
     node_id: String,
     cluster_id: String,
@@ -281,6 +401,7 @@ fn redacted_value(value: &str) -> &'static str {
 impl fmt::Debug for RhizaExplicitConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RhizaExplicitConfig")
+            .field("local", &self.local)
             .field("data_dir", &self.data_dir)
             .field("node_id", &self.node_id)
             .field("cluster_id", &self.cluster_id)
@@ -395,13 +516,26 @@ fn parse_meta_serve_config(vars: &HashMap<String, String>) -> anyhow::Result<Met
         .transpose()?
         .unwrap_or_else(|| Duration::from_secs(60));
     let rhiza = if backend == MetaBackendKind::RhizaKv {
-        Some(match parse_rhiza_operator_managed_flag(vars)? {
+        let operator_managed = parse_rhiza_operator_managed_flag(vars)?;
+        let local = match optional_config(vars, "VELORIX_RHIZA_MODE").as_deref() {
+            None | Some("cluster") => false,
+            Some("local") => true,
+            Some(other) => anyhow::bail!(
+                "unsupported VELORIX_RHIZA_MODE `{other}`; expected `cluster` or `local`"
+            ),
+        };
+        if local && operator_managed {
+            anyhow::bail!(
+                "VELORIX_RHIZA_MODE=local cannot be combined with VELORIX_RHIZA_OPERATOR_MANAGED"
+            );
+        }
+        Some(match operator_managed {
             // The Rhiza Operator owns the canonical `RHIZA_*` contract and
             // rewrites it between generations. In this mode the native engine
             // reads that environment itself, so this process must not also hold
             // a parsed Velorix copy that could shadow it.
             true => rhiza_operator_managed_config(vars, bind)?,
-            false => RhizaServeConfig::Explicit(Box::new(parse_rhiza_config(vars, &mode)?)),
+            false => RhizaServeConfig::Explicit(Box::new(parse_rhiza_config(vars, &mode, local)?)),
         })
     } else {
         None
@@ -520,10 +654,23 @@ fn validate_production_meta_serve_config(
         let RhizaServeConfig::Explicit(config) = config else {
             return Ok(());
         };
-        if config.members.len() != 3 {
+        if !config.local && config.members.len() != 3 {
             anyhow::bail!(
                 "production VELORIX_RHIZA_MEMBERS_JSON or VELORIX_RHIZA_MEMBERS_FILE must contain exactly three unique voter nodes"
             );
+        }
+        if config.local {
+            if config.object_store_provider.is_none() {
+                anyhow::bail!(
+                    "production Rhiza Local mode requires explicit durable object storage"
+                );
+            }
+            if config.object_store_durability != "before-ack" {
+                anyhow::bail!(
+                    "production Rhiza Local mode requires VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack"
+                );
+            }
+            return Ok(());
         }
         if config.object_store_provider.is_none() {
             anyhow::bail!(
@@ -794,19 +941,89 @@ fn socket_addrs_share_listener(left: SocketAddr, right: SocketAddr) -> bool {
     }
 }
 
-/// Parse fixed Rhiza membership from JSON or a secret-mounted file. Membership
-/// publishes only derived public keys; the private peer token and the admin
-/// token are retained only in the in-memory native config and never included in
-/// diagnostics. A single-node cluster authenticates no peers and may omit both;
-/// every voter in a multi-node cluster must publish a public key and this node
-/// must supply its own private peer token.
+/// Parse the explicit Rhiza config. Cluster membership publishes only derived
+/// public keys; private peer and admin tokens are retained only in native
+/// config and never included in diagnostics. Local mode carries no membership
+/// and uses the native Local archive namespace.
 fn parse_rhiza_config(
     vars: &HashMap<String, String>,
     mode: &MetaServeMode,
+    local: bool,
 ) -> anyhow::Result<RhizaExplicitConfig> {
     let data_dir = required_nonempty_config(vars, "VELORIX_RHIZA_DATA_DIR")?;
     let node_id = required_nonempty_config(vars, "VELORIX_RHIZA_NODE_ID")?;
     let cluster_id = required_nonempty_config(vars, "VELORIX_RHIZA_CLUSTER_ID")?;
+    let provider = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_PROVIDER");
+    if let Some(provider) = &provider {
+        if !matches!(provider.as_str(), "s3" | "gcs" | "azure") {
+            anyhow::bail!(
+                "unsupported VELORIX_RHIZA_OBJECT_STORE_PROVIDER `{provider}`; expected `s3`, `gcs`, or `azure`"
+            );
+        }
+    }
+    let object_store_endpoint = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_ENDPOINT")
+        .or_else(|| optional_config(vars, "AWS_ENDPOINT_URL"));
+    let object_store_bucket = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_BUCKET")
+        .or_else(|| optional_config(vars, "VELORIX_S3_BUCKET"));
+    if provider.is_some() && object_store_bucket.is_none() {
+        anyhow::bail!(
+            "VELORIX_RHIZA_OBJECT_STORE_BUCKET is required when Rhiza object storage is configured"
+        );
+    }
+    let object_store_durability = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_DURABILITY")
+        .unwrap_or_else(|| {
+            if *mode == MetaServeMode::Production || (local && provider.is_some()) {
+                "before-ack".to_string()
+            } else {
+                "async".to_string()
+            }
+        });
+    if !matches!(object_store_durability.as_str(), "async" | "before-ack") {
+        anyhow::bail!("VELORIX_RHIZA_OBJECT_STORE_DURABILITY must be `async` or `before-ack`");
+    }
+    let object_store_insecure =
+        match optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_INSECURE").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => anyhow::bail!("VELORIX_RHIZA_OBJECT_STORE_INSECURE must be exactly 0 or 1"),
+        };
+    if local {
+        reject_local_rhiza_cluster_config(vars)?;
+        return Ok(RhizaExplicitConfig {
+            local: true,
+            data_dir,
+            node_id,
+            cluster_id,
+            bind_addr: String::new(),
+            peer_addr: String::new(),
+            admin_token: None,
+            peer_token: None,
+            members: Vec::new(),
+            object_store_provider: provider,
+            object_store_endpoint,
+            object_store_bucket,
+            object_store_region: optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_REGION")
+                .or_else(|| optional_config(vars, "AWS_REGION")),
+            object_store_prefix: optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_PREFIX"),
+            object_store_access_key: optional_raw_config(
+                vars,
+                "VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY",
+            )
+            .or_else(|| optional_raw_config(vars, "AWS_ACCESS_KEY_ID")),
+            object_store_secret_key: optional_raw_config(
+                vars,
+                "VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY",
+            )
+            .or_else(|| optional_raw_config(vars, "AWS_SECRET_ACCESS_KEY")),
+            object_store_session_token: optional_raw_config(
+                vars,
+                "VELORIX_RHIZA_OBJECT_STORE_SESSION_TOKEN",
+            )
+            .or_else(|| optional_raw_config(vars, "AWS_SESSION_TOKEN")),
+            object_store_insecure,
+            object_store_durability,
+        });
+    }
     let bind_addr = required_nonempty_config(vars, "VELORIX_RHIZA_BIND_ADDR")?;
     let peer_addr = required_nonempty_config(vars, "VELORIX_RHIZA_PEER_ADDR")?;
     let admin_token = optional_raw_config(vars, "VELORIX_RHIZA_ADMIN_TOKEN");
@@ -854,42 +1071,8 @@ fn parse_rhiza_config(
         }
     }
 
-    let provider = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_PROVIDER");
-    if let Some(provider) = &provider {
-        if !matches!(provider.as_str(), "s3" | "gcs" | "azure") {
-            anyhow::bail!(
-                "unsupported VELORIX_RHIZA_OBJECT_STORE_PROVIDER `{provider}`; expected `s3`, `gcs`, or `azure`"
-            );
-        }
-    }
-    let object_store_endpoint = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_ENDPOINT")
-        .or_else(|| optional_config(vars, "AWS_ENDPOINT_URL"));
-    let object_store_bucket = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_BUCKET")
-        .or_else(|| optional_config(vars, "VELORIX_S3_BUCKET"));
-    if provider.is_some() && object_store_bucket.is_none() {
-        anyhow::bail!(
-            "VELORIX_RHIZA_OBJECT_STORE_BUCKET is required when Rhiza object storage is configured"
-        );
-    }
-    let object_store_durability = optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_DURABILITY")
-        .unwrap_or_else(|| {
-            if *mode == MetaServeMode::Production {
-                "before-ack".to_string()
-            } else {
-                "async".to_string()
-            }
-        });
-    if !matches!(object_store_durability.as_str(), "async" | "before-ack") {
-        anyhow::bail!("VELORIX_RHIZA_OBJECT_STORE_DURABILITY must be `async` or `before-ack`");
-    }
-    let object_store_insecure =
-        match optional_config(vars, "VELORIX_RHIZA_OBJECT_STORE_INSECURE").as_deref() {
-            None | Some("0") => false,
-            Some("1") => true,
-            Some(_) => anyhow::bail!("VELORIX_RHIZA_OBJECT_STORE_INSECURE must be exactly 0 or 1"),
-        };
-
     Ok(RhizaExplicitConfig {
+        local: false,
         data_dir,
         node_id,
         cluster_id,
@@ -916,6 +1099,81 @@ fn parse_rhiza_config(
         object_store_insecure,
         object_store_durability,
     })
+}
+
+fn reject_local_rhiza_cluster_config(vars: &HashMap<String, String>) -> anyhow::Result<()> {
+    const VELORIX_CLUSTER_VARS: &[&str] = &[
+        "VELORIX_RHIZA_BIND_ADDR",
+        "VELORIX_RHIZA_PEER_ADDR",
+        "VELORIX_RHIZA_ADMIN_TOKEN",
+        "VELORIX_RHIZA_PEER_TOKEN",
+        "VELORIX_RHIZA_PEER_TOKEN_FILE",
+        "VELORIX_RHIZA_MEMBERS_JSON",
+        "VELORIX_RHIZA_MEMBERS_FILE",
+    ];
+    // Keep this list aligned with rhizadb v0.21.0 native/config_env.go.
+    // RHIZA_NATIVE_LIB_DIR is a build-time loader setting, not runtime config,
+    // and is deliberately not included.
+    const NATIVE_RHIZA_CONFIG_VARS: &[&str] = &[
+        "RHIZA_CLUSTER_MEMBERS",
+        "RHIZA_ENABLE_RECONFIGURATION",
+        "RHIZA_LEARNER",
+        "RHIZA_CHECKPOINT_INTERVAL",
+        "RHIZA_CHECKPOINT_TAIL_BYTES",
+        "RHIZA_CHECKPOINT_RETAIN_COUNT",
+        "RHIZA_MAX_WAL_BYTES",
+        "RHIZA_MAX_CONCURRENT_READS",
+        "RHIZA_MAX_LONG_POLL_READS",
+        "RHIZA_OBJSTORE_SYNC_INTERVAL",
+        "RHIZA_OBJSTORE_BATCH_DELAY",
+        "RHIZA_OBJSTORE_GC_INTERVAL",
+        "RHIZA_OBJSTORE_GC_GRACE_PERIOD",
+        "RHIZA_OBJSTORE_MAX_RETRIES",
+        "RHIZA_OBJSTORE_INSECURE",
+        "RHIZA_OBJSTORE_DIR",
+        "RHIZA_FILESYSTEM_DIR",
+        "RHIZA_NODE_ID",
+        "RHIZA_PEER_TOKENS",
+        "RHIZA_PEER_TOKEN",
+        "RHIZA_CLUSTER_ID",
+        "RHIZA_DATA_DIR",
+        "RHIZA_BIND_ADDR",
+        "RHIZA_PEER_ADDR",
+        "RHIZA_ADMIN_TOKEN",
+        "RHIZA_OBJSTORE_PROVIDER",
+        "RHIZA_OBJSTORE_PREFIX",
+        "RHIZA_OBJSTORE_ENDPOINT",
+        "RHIZA_OBJSTORE_BUCKET",
+        "RHIZA_OBJSTORE_REGION",
+        "RHIZA_OBJSTORE_ACCESS_KEY",
+        "RHIZA_OBJSTORE_SECRET_KEY",
+        "RHIZA_OBJSTORE_SESSION_TOKEN",
+        "RHIZA_OBJSTORE_SERVICE_ACCOUNT",
+        "RHIZA_OBJSTORE_AZURE_TENANT_ID",
+        "RHIZA_OBJSTORE_AZURE_CLIENT_ID",
+        "RHIZA_OBJSTORE_AZURE_CLIENT_SECRET",
+        "RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT",
+        "RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT_KEY",
+        "RHIZA_OBJSTORE_AZURE_CONNECTION_STRING",
+        "RHIZA_OBJSTORE_AZURE_USER_ASSIGNED_ID",
+        "RHIZA_OBJSTORE_DURABILITY",
+        // Local is set through the embedded Config API, not ConfigFromEnv.
+        // Reject it as an ambiguous native-mode shadow if supplied anyway.
+        "RHIZA_LOCAL",
+    ];
+    let configured = VELORIX_CLUSTER_VARS
+        .iter()
+        .chain(NATIVE_RHIZA_CONFIG_VARS.iter())
+        .filter(|name| optional_config(vars, name).is_some())
+        .copied()
+        .collect::<Vec<_>>();
+    if !configured.is_empty() {
+        anyhow::bail!(
+            "VELORIX_RHIZA_MODE=local cannot be combined with cluster settings or native RHIZA_* config: {}",
+            configured.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn parse_rhiza_members_json(value: &str) -> anyhow::Result<Vec<RhizaMemberConfig>> {
@@ -984,7 +1242,7 @@ fn rhiza_peer_token(vars: &HashMap<String, String>) -> anyhow::Result<Option<Str
     Ok(Some(token.to_string()))
 }
 
-/// Validate one published `public_key`. Rhiza 0.19.0 accepts exactly one
+/// Validate one published `public_key`. Rhiza 0.20.0 accepts exactly one
 /// encoding: a standard padded base64 string of 32 bytes. The all-zero key is
 /// rejected because native treats it as "no key published".
 fn validate_rhiza_public_key(value: &str) -> anyhow::Result<[u8; 32]> {
@@ -2028,7 +2286,20 @@ fn rhiza_native_member_json(member: &RhizaMemberConfig) -> serde_json::Value {
 async fn rhiza_explicit_meta_store_from_config(
     config: &RhizaServeConfig,
 ) -> anyhow::Result<RhizaKvMetaStore> {
+    let RhizaServeConfig::Explicit(explicit) = config else {
+        unreachable!("explicit construction handles only the explicit variant")
+    };
+    Ok(RhizaKvMetaStore::new(
+        rhiza_kv_store_from_config(explicit).await?,
+    ))
+}
+
+#[cfg(feature = "rhiza-backend")]
+async fn rhiza_kv_store_from_config(
+    explicit: &RhizaExplicitConfig,
+) -> anyhow::Result<RhizaKvStore> {
     let RhizaExplicitConfig {
+        local,
         data_dir,
         node_id,
         cluster_id,
@@ -2047,22 +2318,25 @@ async fn rhiza_explicit_meta_store_from_config(
         object_store_session_token,
         object_store_insecure,
         object_store_durability,
-    } = &**match config {
-        RhizaServeConfig::Explicit(config) => config,
-        RhizaServeConfig::OperatorManaged { .. } => {
-            unreachable!("explicit construction handles only the explicit variant")
-        }
-    };
+    } = explicit;
     let members = members
         .iter()
         .map(rhiza_native_member_json)
         .collect::<Vec<_>>();
-    let mut native = rhizadb::Config::new(data_dir)
-        .node_id(node_id.clone())
-        .cluster_id(cluster_id.clone())
-        .bind_addr(bind_addr.clone())
-        .peer_addr(peer_addr.clone())
-        .set_option("Members", json!(members))
+    let mut native = if *local {
+        rhizadb::Config::new(data_dir)
+            .node_id(node_id.clone())
+            .cluster_id(cluster_id.clone())
+            .local()
+    } else {
+        rhizadb::Config::new(data_dir)
+            .node_id(node_id.clone())
+            .cluster_id(cluster_id.clone())
+            .bind_addr(bind_addr.clone())
+            .peer_addr(peer_addr.clone())
+            .set_option("Members", json!(members))
+    };
+    native = native
         .set_option("ObjStoreDurability", json!(object_store_durability))
         .set_option("ObjStoreInsecure", json!(object_store_insecure));
     if let Some(value) = &peer_token {
@@ -2095,8 +2369,7 @@ async fn rhiza_explicit_meta_store_from_config(
     if let Some(value) = &object_store_session_token {
         native = native.set_option("ObjStoreSessionToken", json!(value));
     }
-    let kv = RhizaKvStore::open_config(native).await?;
-    Ok(RhizaKvMetaStore::new(kv))
+    Ok(RhizaKvStore::open_config(native).await?)
 }
 
 #[cfg(not(feature = "rhiza-backend"))]
@@ -2430,7 +2703,7 @@ mod tests {
     const NODE_C_PUBLIC_KEY: &str = "GXLhvPu3GS35ofGR+FaL7Scove612heC7i+InZJYMNA=";
     const NODE_A_PEER_TOKEN: &str = "velorix-test-peer-token-node-a-0001";
 
-    /// Rhiza 0.19.0 membership: public identity only, never a private token.
+    /// Rhiza 0.20.0 membership: public identity only, never a private token.
     const THREE_NODE_MEMBERS: &str = r#"[{"node_id":"node-a","url":"http://meta-a:9091","peer_url":"quic://meta-a:9191","public_key":"p1Pr7TD2f8ccrYFAHg9m+fGpIwTJLXq9TeL1Q2st72k="},{"node_id":"node-b","url":"http://meta-b:9091","peer_url":"quic://meta-b:9191","public_key":"Z1Lth3pFo3C8Qf2+wUHSw/84Pk9/iBb/77ad9vXpOwo="},{"node_id":"node-c","url":"http://meta-c:9091","peer_url":"quic://meta-c:9191","public_key":"GXLhvPu3GS35ofGR+FaL7Scove612heC7i+InZJYMNA="}]"#;
 
     fn rhiza_member_json(node_id: &str, public_key: &str) -> String {
@@ -3141,6 +3414,84 @@ mod tests {
         vars
     }
 
+    #[cfg(feature = "rhiza-backend")]
+    fn init_local_test_config(overrides: &[(&str, &str)]) -> anyhow::Result<MetaServeConfig> {
+        let mut vars = production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_META_BIND", "127.0.0.1:9090"),
+        ]);
+        for name in [
+            "VELORIX_RHIZA_BIND_ADDR",
+            "VELORIX_RHIZA_PEER_ADDR",
+            "VELORIX_RHIZA_MEMBERS_JSON",
+            "VELORIX_RHIZA_PEER_TOKEN",
+        ] {
+            vars.remove(name);
+        }
+        for (name, value) in overrides {
+            if value.is_empty() {
+                vars.remove(*name);
+            } else {
+                vars.insert((*name).to_string(), (*value).to_string());
+            }
+        }
+        parse_meta_serve_config(&vars)
+    }
+
+    #[cfg(feature = "rhiza-backend")]
+    #[test]
+    fn init_local_admission_requires_local_object_store_and_before_ack() {
+        let valid = init_local_test_config(&[]).unwrap();
+        assert!(require_init_local_config(&valid).is_ok());
+
+        let mut asynchronous = valid.clone();
+        if let Some(RhizaServeConfig::Explicit(explicit)) = asynchronous.rhiza.as_mut() {
+            explicit.object_store_durability = "async".into();
+        }
+        assert!(require_init_local_config(&asynchronous)
+            .unwrap_err()
+            .to_string()
+            .contains("before-ack"));
+
+        let mut no_object_store = valid.clone();
+        if let Some(RhizaServeConfig::Explicit(explicit)) = no_object_store.rhiza.as_mut() {
+            explicit.object_store_provider = None;
+        }
+        assert!(require_init_local_config(&no_object_store)
+            .unwrap_err()
+            .to_string()
+            .contains("object storage"));
+
+        let mut non_local = valid.clone();
+        if let Some(RhizaServeConfig::Explicit(explicit)) = non_local.rhiza.as_mut() {
+            explicit.local = false;
+        }
+        assert!(require_init_local_config(&non_local)
+            .unwrap_err()
+            .to_string()
+            .contains("Local mode"));
+
+        let memory = parse_meta_serve_config_from_pairs([
+            ("VELORIX_META_MODE", "development"),
+            ("VELORIX_META_BACKEND", "memory"),
+        ])
+        .unwrap();
+        assert!(require_init_local_config(&memory)
+            .unwrap_err()
+            .to_string()
+            .contains("rhiza-kv"));
+
+        let mut operator_managed = valid;
+        operator_managed.rhiza = Some(RhizaServeConfig::OperatorManaged {
+            recovery_bind: "127.0.0.1:9190".into(),
+            learner: false,
+        });
+        assert!(require_init_local_config(&operator_managed)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit Rhiza Local"));
+    }
+
     #[test]
     fn development_rhiza_is_explicit_single_node_and_defaults_async() {
         let config = parse_meta_serve_config_from_pairs([
@@ -3216,6 +3567,177 @@ mod tests {
         assert_eq!(rhiza.members[1].public_key, NODE_B_PUBLIC_KEY);
         assert_eq!(rhiza.members[2].public_key, NODE_C_PUBLIC_KEY);
         assert_eq!(rhiza.peer_token.as_deref(), Some(NODE_A_PEER_TOKEN));
+    }
+
+    #[test]
+    fn production_rhiza_local_uses_explicit_local_mode_without_consensus_settings() {
+        let config = parse_meta_serve_config(&production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "velorix-meta-local"),
+            ("VELORIX_RHIZA_OBJECT_STORE_PREFIX", "meta/velorix"),
+            ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "before-ack"),
+        ]))
+        .unwrap();
+
+        let rhiza = expect_explicit(config.rhiza);
+        assert!(rhiza.local);
+        assert_eq!(rhiza.data_dir, "/var/lib/velorix-meta");
+        assert_eq!(rhiza.node_id, "node-a");
+        assert_eq!(rhiza.cluster_id, "velorix-meta-archive");
+        assert!(rhiza.members.is_empty());
+        assert!(rhiza.peer_token.is_none());
+        assert_eq!(rhiza.object_store_provider.as_deref(), Some("s3"));
+        assert_eq!(rhiza.object_store_prefix.as_deref(), Some("meta/velorix"));
+        assert_eq!(rhiza.object_store_durability, "before-ack");
+    }
+
+    #[test]
+    fn production_rhiza_local_rejects_consensus_settings() {
+        let error = parse_meta_serve_config(&production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN_FILE", "/run/secrets/peer"),
+        ]))
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be combined with cluster settings"));
+        assert!(error.to_string().contains("VELORIX_RHIZA_PEER_TOKEN_FILE"));
+    }
+
+    #[test]
+    fn production_rhiza_local_rejects_native_runtime_config_but_allows_build_env() {
+        for (name, value) in [
+            ("RHIZA_CLUSTER_ID", "stale-cluster"),
+            ("RHIZA_OBJSTORE_BUCKET", "stale-bucket"),
+            ("RHIZA_LOCAL", "true"),
+        ] {
+            let mut vars = production_rhiza_vars(&[
+                ("VELORIX_RHIZA_MODE", "local"),
+                ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+                ("VELORIX_RHIZA_BIND_ADDR", ""),
+                ("VELORIX_RHIZA_PEER_ADDR", ""),
+                ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+                ("VELORIX_RHIZA_PEER_TOKEN", ""),
+                ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+                ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "velorix-meta-local"),
+                ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "before-ack"),
+            ]);
+            vars.insert(name.to_string(), value.to_string());
+            let error = parse_meta_serve_config(&vars).unwrap_err();
+            assert!(
+                error.to_string().contains(name),
+                "unexpected error: {error}"
+            );
+        }
+
+        let mut vars = production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "velorix-meta-local"),
+            ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "before-ack"),
+        ]);
+        vars.insert(
+            "RHIZA_NATIVE_LIB_DIR".to_string(),
+            "/opt/rhiza/native".to_string(),
+        );
+        assert!(parse_meta_serve_config(&vars).is_ok());
+    }
+
+    #[test]
+    fn production_rhiza_local_requires_before_ack_object_storage() {
+        let missing_cluster_id = parse_meta_serve_config(&production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_CLUSTER_ID", ""),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "archive"),
+        ]))
+        .unwrap_err();
+        assert!(missing_cluster_id
+            .to_string()
+            .contains("VELORIX_RHIZA_CLUSTER_ID is required"));
+
+        let missing_store = parse_meta_serve_config(&production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", ""),
+        ]))
+        .unwrap_err();
+        assert!(missing_store
+            .to_string()
+            .contains("Local mode requires explicit durable object storage"));
+
+        let async_store = parse_meta_serve_config(&production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "archive"),
+            ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "async"),
+        ]))
+        .unwrap_err();
+        assert!(async_store
+            .to_string()
+            .contains("Local mode requires VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack"));
+    }
+
+    #[test]
+    fn check_config_does_not_open_local_data_or_contact_object_store() {
+        let temp = tempfile::tempdir().expect("temporary test root");
+        let data_dir = temp.path().join("rhiza-data");
+        let data_dir = data_dir.to_str().expect("UTF-8 temporary path");
+        let mut vars = production_rhiza_vars(&[
+            ("VELORIX_RHIZA_MODE", "local"),
+            ("VELORIX_RHIZA_DATA_DIR", data_dir),
+            ("VELORIX_RHIZA_CLUSTER_ID", "velorix-meta-archive"),
+            ("VELORIX_RHIZA_BIND_ADDR", ""),
+            ("VELORIX_RHIZA_PEER_ADDR", ""),
+            ("VELORIX_RHIZA_MEMBERS_JSON", ""),
+            ("VELORIX_RHIZA_PEER_TOKEN", ""),
+            ("VELORIX_RHIZA_OBJECT_STORE_PROVIDER", "s3"),
+            ("VELORIX_RHIZA_OBJECT_STORE_ENDPOINT", "http://127.0.0.1:1"),
+            ("VELORIX_RHIZA_OBJECT_STORE_BUCKET", "not-contacted"),
+            ("VELORIX_RHIZA_OBJECT_STORE_DURABILITY", "before-ack"),
+        ]);
+        vars.insert(
+            "RHIZA_NATIVE_LIB_DIR".to_string(),
+            "/opt/rhiza/native".to_string(),
+        );
+
+        let config = check_config_with_vars(&vars).expect("configuration should be admitted");
+
+        assert!(!std::path::Path::new(data_dir).exists());
+        let rhiza = expect_explicit(config.rhiza);
+        assert!(rhiza.local);
     }
 
     #[test]

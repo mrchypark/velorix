@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: velorix-meta-local
+  labels:
+    app.kubernetes.io/name: velorix-meta
+    app.kubernetes.io/instance: local-rhiza
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: velorix-meta
+      app.kubernetes.io/instance: local-rhiza
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: velorix-meta
+        app.kubernetes.io/instance: local-rhiza
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      initContainers:
+        - name: rhiza-init
+          # The application image owns `init-local`; Rhiza ships no init CLI/image.
+          image: velorix-meta:PIN_REQUIRED
+          imagePullPolicy: IfNotPresent
+          args:
+            - init-local
+          envFrom:
+            - configMapRef:
+                name: velorix-meta-local-config
+          env:
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-auth
+                  key: token
+            - name: VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-s3
+                  key: access_key
+            - name: VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-s3
+                  key: secret_key
+            - name: VELORIX_RHIZA_OBJECT_STORE_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-s3
+                  key: session_token
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/velorix-meta
+            - name: tls
+              mountPath: /etc/velorix-meta/tls
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 12Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 14Gi
+      containers:
+        - name: velorix-meta
+          image: velorix-meta:PIN_REQUIRED
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+          ports:
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: velorix-meta-local-config
+          env:
+            - name: VELORIX_META_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-auth
+                  key: token
+            - name: VELORIX_RHIZA_OBJECT_STORE_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-s3
+                  key: access_key
+            - name: VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-s3
+                  key: secret_key
+            - name: VELORIX_RHIZA_OBJECT_STORE_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: velorix-meta-local-s3
+                  key: session_token
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/velorix-meta
+            - name: tls
+              mountPath: /etc/velorix-meta/tls
+              readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 12Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 14Gi
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: tls
+          secret:
+            secretName: velorix-meta-local-tls
+            defaultMode: 0440

@@ -15,7 +15,7 @@ use velorix_meta::{
     MetaStore, PartitionAuthorityKey, PartitionCheckpointPointer, PublishIngestReservationOutcome,
     PublishPartitionCheckpointPointerRequest, PublishRelationIngestReservationRequest,
     PublishStandingRuntimeCheckpointOutcome, PublishStandingRuntimeCheckpointRequest,
-    RelationPartitionAuthorityKey, ReserveIngestRangeOutcome,
+    ReacquireStandingRuntimeOwnerRequest, RelationPartitionAuthorityKey, ReserveIngestRangeOutcome,
     ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
     StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
 };
@@ -153,6 +153,20 @@ async fn catalog_reserve_commit_and_reopen_are_durable() {
     );
     assert!(capabilities.partition_authority.durable_across_restart);
     assert!(!capabilities.partition_authority.production_safe);
+    assert_eq!(
+        capabilities.partition_authority.authority_clock_kind,
+        velorix_meta::ROOT_CAS_AUTHORITY_CLOCK_KIND,
+    );
+    assert!(
+        capabilities
+            .standing_runtime_fencing
+            .multi_writer_fencing_safe
+    );
+    assert!(
+        !capabilities
+            .standing_runtime_fencing
+            .production_multi_writer_safe
+    );
     let catalog = common::orders_relation_catalog("v1");
 
     assert_eq!(
@@ -255,6 +269,121 @@ async fn concurrent_clients_single_native_node_fence_the_other() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn explicit_standing_owner_reacquire_advances_epoch_and_cas_fences_stale_claim() {
+    let directory = tempdir().unwrap();
+    let store = RhizaKvMetaStore::open(
+        directory.path().display().to_string(),
+        "meta-standing-reacquire",
+    )
+    .await
+    .unwrap();
+    let scope = AcquireStandingRuntimeOwnerRequest {
+        tenant_id: "tenant".into(),
+        program_id: "program".into(),
+        view_id: "view".into(),
+        owner_id: "process-a-nonce".into(),
+        ttl_ms: 30_000,
+    };
+    let endpoint_a = "https://runtime.example".to_string();
+    let initial = match store
+        .acquire_standing_runtime_owner_with_endpoint(scope.clone(), endpoint_a.clone())
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+        other => panic!("unexpected initial owner result: {other:?}"),
+    };
+
+    let mut competing_request = scope.clone();
+    competing_request.owner_id = "process-b-nonce".into();
+    assert!(matches!(
+        store
+            .acquire_standing_runtime_owner_with_endpoint(
+                competing_request.clone(),
+                "https://runtime.example".into(),
+            )
+            .await
+            .unwrap(),
+        AcquireStandingRuntimeOwnerOutcome::Conflict(current)
+            if current == initial
+    ));
+
+    let reacquire = |owner_id: &str, owner_endpoint: &str| ReacquireStandingRuntimeOwnerRequest {
+        expected_current: initial.clone(),
+        owner_id: owner_id.into(),
+        owner_endpoint: owner_endpoint.into(),
+        ttl_ms: 30_000,
+    };
+    let second_store = store.clone();
+    let (left, right) = tokio::join!(
+        store.reacquire_standing_runtime_owner(reacquire(
+            "process-b-nonce",
+            "https://runtime.example",
+        )),
+        second_store.reacquire_standing_runtime_owner(reacquire(
+            "process-c-nonce",
+            "https://runtime.example",
+        )),
+    );
+    let outcomes = [left.unwrap(), right.unwrap()];
+    let winner = outcomes
+        .iter()
+        .find_map(|outcome| match outcome {
+            AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => Some(claim.clone()),
+            _ => None,
+        })
+        .expect("one expected-claim CAS must win");
+    assert_eq!(winner.owner_epoch, initial.owner_epoch + 1);
+    assert_ne!(winner.owner_id, initial.owner_id);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AcquireStandingRuntimeOwnerOutcome::Acquired(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AcquireStandingRuntimeOwnerOutcome::Conflict(_)))
+            .count(),
+        1
+    );
+
+    let old_token = standing_runtime_owner_token(initial.clone());
+    assert!(matches!(
+        store
+            .renew_standing_runtime_owner(old_token.clone(), 30_000)
+            .await,
+        Err(velorix_meta::MetaStoreError::StandingRuntimeOwnerMismatch)
+    ));
+    let stale_publish = store
+        .publish_standing_runtime_checkpoint(PublishStandingRuntimeCheckpointRequest {
+            expected_previous: None,
+            candidate: standing_runtime_checkpoint_pointer(1, "a"),
+            owner: old_token,
+            expected_relation_source_cuts: None,
+        })
+        .await;
+    assert!(
+        matches!(
+            stale_publish,
+            Err(velorix_meta::MetaStoreError::StandingRuntimeOwnerMismatch)
+        ),
+        "stale owner publish result: {stale_publish:?}"
+    );
+
+    let stale_expected = store
+        .reacquire_standing_runtime_owner(reacquire("process-d-nonce", "https://runtime.example"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stale_expected,
+        AcquireStandingRuntimeOwnerOutcome::Conflict(current) if current == winner
+    ));
 }
 
 #[tokio::test]

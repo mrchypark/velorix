@@ -13,15 +13,15 @@ RUN apt-get update \
 # SDK ships a Go module for it. Keep the Go/C toolchain in the image build
 # stage only; neither is part of the runtime image. The pins match
 # Dockerfile.meta exactly so both images build the same Rhiza backend.
-ARG GO_VERSION=1.27.0
-ARG GO_TARBALL_SHA256=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685
+ARG GO_VERSION=1.27.3
+ARG GO_TARBALL_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
 RUN curl --fail --silent --show-error --location \
       "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
       --output /tmp/go.tar.gz \
     && echo "${GO_TARBALL_SHA256}  /tmp/go.tar.gz" | sha256sum --check --strict \
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && rm -f /tmp/go.tar.gz \
-    && /usr/local/go/bin/go version | grep -Eq '^go version go1\.27\.0 linux/amd64$'
+    && /usr/local/go/bin/go version | grep -Eq '^go version go1\.27\.3 linux/amd64$'
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 WORKDIR /workspace

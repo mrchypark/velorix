@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
-/// The consensus layer of rhizadb 0.19.0 rejects any replicated mutation whose
+/// The consensus layer rejects any replicated mutation whose
 /// encoded command exceeds this bound, defined as
 /// `MaxReplicatedValueBytes = 128 << 10` at
 /// native/pkg/quepaxa/types.go:19 and enforced in native/pkg/network/server.go

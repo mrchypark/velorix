@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+sh "${repo_root}/scripts/check-rhiza-go-toolchain-contract.sh"
 script_path="${repo_root}/scripts/run-vind-product.sh"
 bash "${repo_root}/scripts/check-vind-external-meta-contract.sh"
 gateway_manifest=$(awk '/^cat >.*\/versitygw.yaml/ { capture=1; next } capture && /^EOF$/ { exit } capture { print }' "$script_path")
@@ -3260,10 +3261,7 @@ checks["product images build the Rhiza metadata backend with the shared Go/FFI t
         for dockerfile in ("Dockerfile.meta", "Dockerfile.all-in-one")
     )
     and all(
-        "ARG GO_VERSION=1.27.0" in (repo_root / dockerfile).read_text(encoding="utf-8")
-        and "ARG GO_TARBALL_SHA256=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685"
-        in (repo_root / dockerfile).read_text(encoding="utf-8")
-        and "GOTOOLCHAIN=local" in (repo_root / dockerfile).read_text(encoding="utf-8")
+        "GOTOOLCHAIN=local" in (repo_root / dockerfile).read_text(encoding="utf-8")
         for dockerfile in ("Dockerfile.meta", "Dockerfile.all-in-one")
     )
     and "'rhiza-backend'" in (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

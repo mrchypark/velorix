@@ -45,6 +45,12 @@ jobs:
           bash -n scripts/check-no-external-runtime-artifacts.sh
           sh -n scripts/check-rust-toolchain-contract.sh
           sh -n scripts/check-rhiza-operator-manifests-contract.sh
+          sh -n scripts/check-rhiza-go-toolchain-contract.sh
+          sh -n scripts/check-rhiza-local-k8s-contract.sh
+          sh -n scripts/check-rhiza-local-recovery.sh
+          sh -n scripts/check-rhiza-service-recovery.sh
+          sh -n scripts/check-rhiza-single-node-recovery.sh
+          sh -n scripts/rhiza-service-recovery-payloads.sh
           sh -n scripts/velorix-all-in-one-entrypoint.sh
           sh -n scripts/check-all-image-entrypoint-contract.sh
           python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
@@ -59,6 +65,7 @@ jobs:
           scripts/check-no-external-runtime-artifacts.sh
           sh scripts/check-rust-toolchain-contract.sh
           scripts/check-rhiza-operator-manifests-contract.sh
+          sh scripts/check-rhiza-go-toolchain-contract.sh
           sh scripts/check-all-image-entrypoint-contract.sh
 
   msrv:
@@ -125,13 +132,27 @@ jobs:
         with:
           components: clippy
 
-      - name: Install Go 1.27.0
+      - name: Install Go 1.27.3
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.3'
           # The published SDK's Go module is bundled inside Cargo's registry;
           # this repository has no Go module/sum path for setup-go to cache.
           cache: false
+
+      - name: Install pinned offline manifest validators
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64 \
+            -o "$RUNNER_TEMP/bin/yq"
+          echo '75d893a0d5940d1019cb7cdc60001d9e876623852c31cfc6267047bc31149fa9  '"$RUNNER_TEMP/bin/yq" \
+            | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/bin/yq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Check offline local Rhiza Kubernetes manifest contract
+        run: sh scripts/check-rhiza-local-k8s-contract.sh
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2

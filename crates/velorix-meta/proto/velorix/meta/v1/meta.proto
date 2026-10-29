@@ -26,6 +26,7 @@ service VelorixMeta {
   rpc FixViewBootstrapActivationCut(FixViewBootstrapActivationCutRequest) returns (FixViewBootstrapActivationCutResponse);
   rpc PromoteViewBootstrap(PromoteViewBootstrapRequest) returns (PromoteViewBootstrapResponse);
   rpc AcquireStandingRuntimeOwner(AcquireStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
+  rpc ReacquireStandingRuntimeOwner(ReacquireStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
   rpc RenewStandingRuntimeOwner(RenewStandingRuntimeOwnerRequest) returns (AcquireStandingRuntimeOwnerResponse);
   rpc ReadStandingRuntimeOwner(ReadStandingRuntimeOwnerRequest) returns (ReadStandingRuntimeOwnerResponse);
   rpc PublishStandingRuntimeCheckpoint(PublishStandingRuntimeCheckpointRequest) returns (PublishStandingRuntimeCheckpointResponse);
@@ -100,6 +101,7 @@ message PartitionAuthorityCapability {
   bool fenced_checkpoint_pointer_publish = 4;
   bool durable_across_restart = 5;
   bool production_safe = 6;
+  string authority_clock_kind = 7;
 }
 
 message PartitionAuthorityKey {
@@ -137,6 +139,9 @@ message AcquireRelationPartitionAuthorityRequest {
   string owner_id = 2;
   RelationPartitionAuthorityToken current_token = 3;
   uint64 ttl_ms = 4;
+  // Explicitly supersedes the exact observed same-owner token, advancing its
+  // fence epoch. This is separate from conditional same-token renewal.
+  bool explicit_reacquire = 5;
 }
 
 message AcquireRelationPartitionAuthorityResponse {
@@ -431,6 +436,13 @@ message AcquireStandingRuntimeOwnerRequest {
 message AcquireStandingRuntimeOwnerResponse {
   string outcome = 1;
   StandingRuntimeOwnerClaim claim = 2;
+}
+
+message ReacquireStandingRuntimeOwnerRequest {
+  StandingRuntimeOwnerClaim expected_current = 1;
+  string owner_id = 2;
+  string owner_endpoint = 3;
+  uint64 ttl_ms = 4;
 }
 
 message RenewStandingRuntimeOwnerRequest {
