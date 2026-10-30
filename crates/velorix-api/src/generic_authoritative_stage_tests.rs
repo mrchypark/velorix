@@ -1,4 +1,5 @@
 use super::{bounded_demand_requests::post, *};
+use crate::example_fixtures::public_relation_registration;
 
 // Child of tests.rs so the authoritative fixture is shared, not reimplemented.
 #[tokio::test]
@@ -25,7 +26,7 @@ async fn authoritative_staged_families_backfill_and_restart_preserve_rows() {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":test_scores_catalog()}),
+        public_relation_registration(&test_scores_catalog()),
         StatusCode::CREATED,
     )
     .await;
@@ -35,9 +36,9 @@ async fn authoritative_staged_families_backfill_and_restart_preserve_rows() {
         json!({
         "relation_version":"2026-05-24.v1", "stream_id":"stage-stream", "partition_id":0,
         "start_offset_inclusive":0,"rows":[
-            {"user_id":"a","score":2,"delta":1},
-            {"user_id":"b","score":3,"delta":1},
-            {"user_id":"c","score":5,"delta":1}
+            {"user_id":"a","score":2},
+            {"user_id":"b","score":3},
+            {"user_id":"c","score":5}
         ]}),
         StatusCode::CREATED,
     )
@@ -172,10 +173,13 @@ async fn authoritative_replay_skips_covered_payload_gets_but_rejects_uncovered_c
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":catalog}),
+        public_relation_registration(&catalog),
     )
     .await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
+    let catalog = read_relation_catalog(&state, "scores", "2026-05-24.v1")
+        .await
+        .unwrap();
     let response = call_json(&router, Method::POST, "/v1/views", json!({
         "view_id":"skip_total","input_relation_id":"scores","input_relation_version":"2026-05-24.v1",
         "sql":"SELECT user_id, SUM(score) AS total, COUNT(*) AS n FROM scores GROUP BY user_id"
@@ -189,7 +193,7 @@ async fn authoritative_replay_skips_covered_payload_gets_but_rejects_uncovered_c
             "/v1/relations/scores/ingest",
             json!({
                 "relation_version":"2026-05-24.v1","stream_id":"skip-stream","partition_id":0,
-                "start_offset_inclusive":offset,"rows":[{"user_id":"a","score":3,"delta":1}]
+                "start_offset_inclusive":offset,"rows":[{"user_id":"a","score":3}]
             }),
         )
         .await;

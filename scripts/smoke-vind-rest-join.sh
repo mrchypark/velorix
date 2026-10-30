@@ -212,7 +212,6 @@ python3 - \
   "$view_id" \
   "$relation_version" \
   "$api_path" <<'PY'
-import hashlib
 import json
 import sys
 
@@ -236,7 +235,7 @@ def physical(kind):
     return {"kind": kind}
 
 
-def column(column_id, kind, ordinal, role):
+def column(column_id, kind, ordinal):
     return {
         "column_id": column_id,
         "name": column_id,
@@ -244,7 +243,6 @@ def column(column_id, kind, ordinal, role):
         "physical_arrow_type": physical("utf8" if kind == "utf8" else kind),
         "nullable": False,
         "ordinal": ordinal,
-        "semantic_role": role,
     }
 
 
@@ -255,52 +253,32 @@ def schema(relation_id, columns, primary_key):
         "relation_version": relation_version,
         "columns": columns,
         "primary_key_column_ids": [primary_key],
-        "weight_column_id": "delta",
         "allowed_operations": ["insert", "delete"],
         "event_time_column_id": None,
     }
 
 
-def fingerprint(relation_schema):
-    canonical = json.dumps(relation_schema, separators=(",", ":"), ensure_ascii=False).encode()
-    digest = hashlib.sha256(b"velorix-relation-schema-v1\0" + canonical).hexdigest()
-    return f"sha256:{digest}"
-
-
 def catalog(relation_schema):
-    schema_fingerprint = fingerprint(relation_schema)
-    relation_id = relation_schema["relation_id"]
     return {
-        "schema_version": 1,
         "relation_schema": relation_schema,
-        "schema_fingerprint": schema_fingerprint,
-        "datafusion_registration": {"name": relation_id, "mode": "table"},
-        "incremental_relation": {
-            "relation_id": relation_id,
-            "schema_fingerprint": schema_fingerprint,
-        },
-        "incremental_adapter": {
-            "adapter_id": "incremental-adapter-single-key-sum-count-v1",
-        },
+        "adapter_id": "incremental-adapter-single-key-sum-count-v1",
     }
 
 
 left_schema = schema(
     left_relation_id,
     [
-        column("key_col", "utf8", 0, "primary_key"),
-        column("value_col", "int64", 1, "metadata"),
-        column("delta", "int64", 2, "weight"),
+        column("key_col", "utf8", 0),
+        column("value_col", "int64", 1),
     ],
     "key_col",
 )
 right_schema = schema(
     right_relation_id,
     [
-        column("key_col", "utf8", 0, "primary_key"),
-        column("value_col", "int64", 1, "value"),
-        column("category", "utf8", 2, "metadata"),
-        column("delta", "int64", 3, "weight"),
+        column("key_col", "utf8", 0),
+        column("value_col", "int64", 1),
+        column("category", "utf8", 2),
     ],
     "key_col",
 )
@@ -315,11 +293,9 @@ sql = (
 files = {
     left_request_path: {
         "catalog": catalog(left_schema),
-        "default_orders_sum_count": False,
     },
     right_request_path: {
         "catalog": catalog(right_schema),
-        "default_orders_sum_count": False,
     },
     view_request_path: {
         "view_id": view_id,
@@ -475,9 +451,9 @@ payloads = {
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"key_col": "key-a", "value_col": 42, "delta": 1},
-            {"key_col": "key-a", "value_col": 40, "delta": 1},
-            {"key_col": "key-b", "value_col": 15, "delta": 1},
+            {"key_col": "key-a", "value_col": 42},
+            {"key_col": "key-a", "value_col": 40},
+            {"key_col": "key-b", "value_col": 15},
         ],
     },
     right_path: {
@@ -487,8 +463,8 @@ payloads = {
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"key_col": "key-a", "value_col": -2, "category": "group-a", "delta": 1},
-            {"key_col": "key-b", "value_col": 3, "category": "group-b", "delta": 1},
+            {"key_col": "key-a", "value_col": -2, "category": "group-a"},
+            {"key_col": "key-b", "value_col": 3, "category": "group-b"},
         ],
     },
 }

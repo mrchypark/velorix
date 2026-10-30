@@ -29,7 +29,7 @@ use velorix_control::storage_admin::{
     GarbageCollectionPlan, GarbageCollectionPolicy, GarbageCollectionRunV1, IngestBatchDescriptor,
     InputRange, LatestCandidateMarker, StateObjectWrite,
 };
-use velorix_core::relation::{VelorixRelationCatalogV1, VelorixRelationSchemaV1};
+use velorix_core::public_relation::{PublicRelationCatalogV1, PublicRelationSchemaV1};
 use velorix_k8s::{
     crd::ObjectStoreAuthorityRef,
     ingest_writer::DeployedIngestWriterRuntime,
@@ -130,7 +130,7 @@ struct Cli {
 enum Command {
     /// Generate a validated POST /v1/relations request from a relation schema.
     RelationCatalog {
-        /// VelorixRelationSchemaV1 JSON file, or - for stdin.
+        /// PublicRelationSchemaV1 JSON file, or - for stdin.
         #[arg(long)]
         schema: PathBuf,
         /// Explicit incremental adapter ID.
@@ -614,7 +614,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, Serialize)]
 struct RelationCatalogRequest {
-    catalog: VelorixRelationCatalogV1,
+    catalog: PublicRelationCatalogV1,
 }
 
 fn relation_catalog_request(
@@ -631,9 +631,15 @@ fn relation_catalog_request(
         fs::read(schema_path)
             .with_context(|| format!("failed to read relation schema {}", schema_path.display()))?
     };
-    let schema: VelorixRelationSchemaV1 =
-        serde_json::from_slice(&bytes).context("failed to parse VelorixRelationSchemaV1 JSON")?;
-    let catalog = VelorixRelationCatalogV1::from_relation_schema(schema, adapter_id)
+    let relation_schema: PublicRelationSchemaV1 =
+        serde_json::from_slice(&bytes).context("failed to parse PublicRelationSchemaV1 JSON")?;
+    let catalog = PublicRelationCatalogV1 {
+        relation_schema,
+        adapter_id,
+    };
+    catalog
+        .clone()
+        .into_internal()
         .context("relation schema or adapter is not supported for ingest")?;
     Ok(RelationCatalogRequest { catalog })
 }
@@ -1474,8 +1480,7 @@ mod tests {
                     "logical_type": {"kind": "utf8"},
                     "physical_arrow_type": {"kind": "utf8"},
                     "nullable": false,
-                    "ordinal": 0,
-                    "semantic_role": "primary_key"
+                    "ordinal": 0
                 },
                 {
                     "column_id": "reading",
@@ -1483,21 +1488,10 @@ mod tests {
                     "logical_type": {"kind": "int64"},
                     "physical_arrow_type": {"kind": "int64"},
                     "nullable": false,
-                    "ordinal": 1,
-                    "semantic_role": "value"
-                },
-                {
-                    "column_id": "weight",
-                    "name": "weight",
-                    "logical_type": {"kind": "int64"},
-                    "physical_arrow_type": {"kind": "int64"},
-                    "nullable": false,
-                    "ordinal": 2,
-                    "semantic_role": "weight"
+                    "ordinal": 1
                 }
             ],
             "primary_key_column_ids": ["key"],
-            "weight_column_id": "weight",
             "allowed_operations": ["insert", "delete"],
             "event_time_column_id": null
         })
@@ -1512,16 +1506,26 @@ mod tests {
         )
         .expect("build relation catalog request");
 
-        request.catalog.validate_ingest_adapter_scope().unwrap();
-        assert_eq!(
-            request.catalog.schema_fingerprint,
-            request.catalog.incremental_relation.schema_fingerprint
-        );
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(
             value["catalog"]["relation_schema"]["relation_id"],
             "measurements"
         );
+        assert_eq!(
+            value["catalog"]["adapter_id"],
+            velorix_core::relation::CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID
+        );
+        assert_eq!(
+            value["catalog"]["relation_schema"]["columns"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(value["catalog"]["rows"].is_null());
+        assert!(value["catalog"]["relation_schema"]["weight_column_id"].is_null());
+        assert!(value["catalog"]["schema_fingerprint"].is_null());
+        assert!(value["catalog"]["incremental_relation"].is_null());
         fs::remove_file(path).unwrap();
     }
 

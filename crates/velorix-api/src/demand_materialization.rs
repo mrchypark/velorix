@@ -916,6 +916,14 @@ async fn materialize_demand_step_inner(
     }
 }
 
+fn empty_source_batch_from_internal_catalog(
+    catalog: &VelorixRelationCatalogV1,
+) -> Result<RecordBatch, ApiError> {
+    datafusion_schema_from_catalog(catalog)
+        .map(RecordBatch::new_empty)
+        .map_err(ApiError::bad_request)
+}
+
 fn source_cut_watermark(
     progress: &DemandCheckpoint,
     artifacts: &[(String, &demand_source::DemandSourceArtifact)],
@@ -1463,55 +1471,57 @@ pub(super) async fn materialize_source_demand(
             progress.event_time_output_readiness = readiness;
         }
         let inputs = if progress.full_complete {
-            cuts.iter()
-                .flat_map(|cut| {
-                    cut.cut.partitions.iter().map(|partition| {
-                        let frontier = previous
-                            .as_ref()
-                            .and_then(|record| {
-                                record.checkpoint.input_frontiers.iter().find(|frontier| {
-                                    frontier.relation_id == cut.relation.relation_id
-                                        && frontier.stream_id == partition.stream_id
-                                        && frontier.partition_id == partition.partition_id
-                                })
-                            })
-                            .map_or(0, |frontier| frontier.committed_offset_exclusive);
-                        Ok(RelationInputBatch {
-                            relation_id: cut.relation.relation_id.clone(),
-                            relation_version: cut.relation.relation_version.clone(),
-                            stream_id: partition.stream_id.clone(),
-                            partition_id: partition.partition_id,
-                            schema_fingerprint: cut.relation.schema_fingerprint.clone(),
-                            start_offset_inclusive: frontier,
-                            end_offset_exclusive: partition.committed_offset_exclusive,
-                            event_time_watermark: source_cut_watermark(
-                                &progress,
-                                &keyed,
-                                &cut.relation.relation_id,
-                                &partition.stream_id,
-                                partition.partition_id,
-                            )?,
-                            encoding: RelationInputEncodingV1::SourceRelationV1,
-                            batches: vec![RecordBatch::new_empty(
-                                arrow_schema_from_incremental_relation_schema(
-                                    active
-                                        .spec
-                                        .input_relations
-                                        .iter()
-                                        .find(|relation| {
-                                            relation.relation_id == cut.relation.relation_id
-                                                && relation.relation_version
-                                                    == cut.relation.relation_version
-                                        })
-                                        .ok_or_else(|| {
-                                            ApiError::bad_request("demand source schema missing")
-                                        })?,
-                                )?,
-                            )],
-                        })
+            let mut inputs = Vec::new();
+            for cut in &cuts {
+                let catalog = relation_catalogs
+                    .iter()
+                    .find(|catalog| {
+                        catalog.relation_schema.relation_id == cut.relation.relation_id
+                            && catalog.relation_schema.relation_version
+                                == cut.relation.relation_version
                     })
-                })
-                .collect::<Result<Vec<_>, ApiError>>()?
+                    .ok_or_else(|| ApiError::bad_request("demand source catalog missing"))?;
+                let logical_schema =
+                    catalog_input_relation_schema(catalog).map_err(ApiError::bad_request)?;
+                if catalog.schema_fingerprint.as_str() != cut.relation.schema_fingerprint.as_str()
+                    || !active.spec.input_relations.contains(&logical_schema)
+                {
+                    return Err(ApiError::bad_request(
+                        "demand source catalog identity mismatch",
+                    ));
+                }
+                for partition in &cut.cut.partitions {
+                    let frontier = previous
+                        .as_ref()
+                        .and_then(|record| {
+                            record.checkpoint.input_frontiers.iter().find(|frontier| {
+                                frontier.relation_id == cut.relation.relation_id
+                                    && frontier.stream_id == partition.stream_id
+                                    && frontier.partition_id == partition.partition_id
+                            })
+                        })
+                        .map_or(0, |frontier| frontier.committed_offset_exclusive);
+                    inputs.push(RelationInputBatch {
+                        relation_id: cut.relation.relation_id.clone(),
+                        relation_version: cut.relation.relation_version.clone(),
+                        stream_id: partition.stream_id.clone(),
+                        partition_id: partition.partition_id,
+                        schema_fingerprint: cut.relation.schema_fingerprint.clone(),
+                        start_offset_inclusive: frontier,
+                        end_offset_exclusive: partition.committed_offset_exclusive,
+                        event_time_watermark: source_cut_watermark(
+                            &progress,
+                            &keyed,
+                            &cut.relation.relation_id,
+                            &partition.stream_id,
+                            partition.partition_id,
+                        )?,
+                        encoding: RelationInputEncodingV1::SourceRelationV1,
+                        batches: vec![empty_source_batch_from_internal_catalog(catalog)?],
+                    });
+                }
+            }
+            inputs
         } else {
             Vec::new()
         };

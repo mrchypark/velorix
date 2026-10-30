@@ -1,4 +1,5 @@
 use super::{bounded_demand_requests::post, *};
+use crate::example_fixtures::public_relation_registration;
 
 fn append_only_scores_catalog() -> VelorixRelationCatalogV1 {
     let mut schema = test_scores_catalog().relation_schema;
@@ -128,12 +129,12 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog()}),
+        public_relation_registration(&append_only_scores_catalog()),
         StatusCode::CREATED,
     )
     .await;
     let input = (0..257)
-        .map(|i| json!({"user_id":format!("item-{i:04}"),"score":i,"delta":1}))
+        .map(|i| json!({"user_id":format!("item-{i:04}"),"score":i}))
         .collect::<Vec<_>>();
     ingest(&router, 0, json!(input)).await;
     declare(
@@ -423,8 +424,8 @@ async fn historical_derived_pages_pause_restart_and_resume_the_captured_cut() {
         &router,
         257,
         json!([
-            {"user_id":"item-0000","score":9000,"delta":1},
-            {"user_id":"later","score":7000,"delta":1}
+            {"user_id":"item-0000","score":9000},
+            {"user_id":"later","score":7000}
         ]),
     )
     .await;
@@ -543,11 +544,11 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog()}),
+        public_relation_registration(&append_only_scores_catalog()),
         StatusCode::CREATED,
     )
     .await;
-    ingest(&router, 0, json!([{"user_id":"one","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"one","score":7}])).await;
     declare(
         &router,
         "baseline_source",
@@ -694,7 +695,7 @@ async fn legacy_derived_checkpoint_upgrade_case(late_catchup: bool) {
     .await
     .unwrap();
     if late_catchup {
-        ingest(&router, 1, json!([{"user_id":"later","score":9,"delta":1}])).await;
+        ingest(&router, 1, json!([{"user_id":"later","score":9}])).await;
         post(
             &router,
             "/v1/views/baseline_source/backfill",
@@ -851,7 +852,7 @@ async fn empty_root_global_aggregate_chain_bootstraps_and_updates_automatically(
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog()}),
+        public_relation_registration(&append_only_scores_catalog()),
         StatusCode::CREATED,
     )
     .await;
@@ -910,7 +911,7 @@ async fn empty_root_global_aggregate_chain_bootstraps_and_updates_automatically(
             vec![json!({"result":empty})]
         );
     }
-    ingest(&router, 0, json!([{"user_id":"first","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"first","score":7}])).await;
     for (family, expected) in [("count", 1), ("sum", 7)] {
         for stage in ["total", "copy", "leaf"] {
             assert_eq!(
@@ -919,7 +920,7 @@ async fn empty_root_global_aggregate_chain_bootstraps_and_updates_automatically(
             );
         }
     }
-    ingest(&router, 1, json!([{"user_id":"first","score":5,"delta":1}])).await;
+    ingest(&router, 1, json!([{"user_id":"first","score":5}])).await;
     for (family, expected) in [("count", 2), ("sum", 12)] {
         for stage in ["total", "copy", "leaf"] {
             assert_eq!(
@@ -952,11 +953,11 @@ async fn shared_root_history_case(authoritative: bool) {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":append_only_scores_catalog()}),
+        public_relation_registration(&append_only_scores_catalog()),
         StatusCode::CREATED,
     )
     .await;
-    ingest(&router, 0, json!([{"user_id":"a","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
     for name in ["branch_one", "branch_two"] {
         declare(
             &router,
@@ -1013,7 +1014,7 @@ async fn shared_root_history_case(authoritative: bool) {
     )
     .await;
     assert!(query_rows(&router, "empty_union").await.is_empty());
-    ingest(&router, 1, json!([{"user_id":"b","score":-2,"delta":1}])).await;
+    ingest(&router, 1, json!([{"user_id":"b","score":-2}])).await;
     assert_eq!(
         query_rows(&router, "empty_union").await,
         vec![

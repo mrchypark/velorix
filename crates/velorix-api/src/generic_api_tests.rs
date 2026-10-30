@@ -1,5 +1,6 @@
 use super::*;
 use crate::example_fixtures::default_scores_relation_catalog;
+use crate::example_fixtures::public_relation_registration;
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 
 #[tokio::test]
@@ -75,7 +76,7 @@ async fn global_aggregates_publish_empty_and_append_results() {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":catalog}),
+        public_relation_registration(&catalog),
         StatusCode::CREATED,
     )
     .await;
@@ -109,8 +110,7 @@ async fn global_aggregates_publish_empty_and_append_results() {
         .await;
         assert_eq!(before["rows"], after["rows"]);
     }
-    for (offset, weight, expected_sum, expected_count) in
-        [(None, 0, Value::Null, 0), (Some(0), 1, json!(2.5), 1)]
+    for (offset, expected_sum, expected_count) in [(None, Value::Null, 0), (Some(0), json!(2.5), 1)]
     {
         if let Some(offset) = offset {
             post(
@@ -118,7 +118,7 @@ async fn global_aggregates_publish_empty_and_append_results() {
                 "/v1/relations/samples/ingest",
                 json!({"relation_version":"v1",
                 "stream_id":"samples-stream","partition_id":0,"start_offset_inclusive":offset,
-                "rows":[{"reading":2.5,"delta":weight}]}),
+                "rows":[{"reading":2.5}]}),
                 StatusCode::CREATED,
             )
             .await;
@@ -286,7 +286,7 @@ async fn typed_join_chain_preserves_nonunique_values_and_null_key_semantics() {
         post(
             &router,
             "/v1/relations",
-            json!({"catalog":catalog}),
+            public_relation_registration(&catalog),
             StatusCode::CREATED,
         )
         .await;
@@ -322,11 +322,11 @@ async fn typed_join_chain_preserves_nonunique_values_and_null_key_semantics() {
     for (relation, rows) in [
         (
             "grove_left",
-            json!([{"seed":7,"reading":11,"delta":1},{"seed":7,"reading":11,"delta":1},{"seed":7,"reading":null,"delta":1},{"seed":null,"reading":31,"delta":1}]),
+            json!([{"seed":7,"reading":11},{"seed":7,"reading":11},{"seed":7,"reading":null},{"seed":null,"reading":31}]),
         ),
         (
             "grove_right",
-            json!([{"seed":7,"reading":21,"delta":1},{"seed":7,"reading":22,"delta":1},{"seed":null,"reading":41,"delta":1}]),
+            json!([{"seed":7,"reading":21},{"seed":7,"reading":22},{"seed":null,"reading":41}]),
         ),
     ] {
         post(
@@ -374,7 +374,7 @@ async fn typed_join_chain_preserves_nonunique_values_and_null_key_semantics() {
         "/v1/relations/grove_right/ingest",
         json!({"relation_version":"v1",
         "stream_id":"grove_right","partition_id":0,"start_offset_inclusive":3,
-        "rows":[{"seed":7,"reading":23,"delta":1}]}),
+        "rows":[{"seed":7,"reading":23}]}),
         StatusCode::CREATED,
     )
     .await;
@@ -476,7 +476,7 @@ async fn typed_map_chain_preserves_live_bags_and_aggregate_updates() {
     post(
         &router,
         "/v1/relations",
-        json!({"catalog": catalog}),
+        public_relation_registration(&catalog),
         StatusCode::CREATED,
     )
     .await;
@@ -514,8 +514,8 @@ async fn typed_map_chain_preserves_live_bags_and_aggregate_updates() {
     assert!(records(&router).await.is_empty());
     let insert = json!({"relation_version":"v1","stream_id":"orchard-stream","partition_id":0,
     "start_offset_inclusive":0,"rows":[
-        {"seed":7,"reading":11,"delta":1}, {"seed":7,"reading":11,"delta":1},
-        {"seed":7,"reading":19,"delta":1}, {"seed":null,"reading":99,"delta":1}
+        {"seed":7,"reading":11}, {"seed":7,"reading":11},
+        {"seed":7,"reading":19}, {"seed":null,"reading":99}
     ]});
     post(
         &router,
@@ -586,7 +586,7 @@ async fn typed_map_chain_preserves_live_bags_and_aggregate_updates() {
         "/v1/relations/orchard_raw/ingest",
         json!({"relation_version":"v1",
         "stream_id":"orchard-stream","partition_id":0,"start_offset_inclusive":4,
-        "rows":[{"seed":7,"reading":11,"delta":1}]}),
+        "rows":[{"seed":7,"reading":11}]}),
         StatusCode::CREATED,
     )
     .await;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::example_fixtures::public_relation_registration;
 use axum::http::Method;
 use tower::ServiceExt;
 use velorix_control::meta_admin::InMemoryMetaStore;
@@ -57,7 +58,11 @@ fn catalog(name: &str) -> VelorixRelationCatalogV1 {
                 .collect(),
             primary_key_column_ids: Vec::new(),
             weight_column_id: "delta".into(),
-            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            allowed_operations: vec![
+                RelationOperationV1::Insert,
+                RelationOperationV1::Update,
+                RelationOperationV1::Delete,
+            ],
             event_time_column_id: None,
         },
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
@@ -152,7 +157,7 @@ async fn active_view_read_snapshot_reuses_validated_records_and_refreshes_per_op
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":catalog("snapshot_source")}),
+        public_relation_registration(&catalog("snapshot_source")),
         StatusCode::CREATED,
     )
     .await;
@@ -172,7 +177,7 @@ async fn active_view_read_snapshot_reuses_validated_records_and_refreshes_per_op
     post(
         &router,
         "/v1/relations",
-        json!({"catalog":catalog("unrelated_source")}),
+        public_relation_registration(&catalog("unrelated_source")),
         StatusCode::CREATED,
     )
     .await;
@@ -415,7 +420,7 @@ async fn two_producer_dag(join: bool) {
         post(
             &router,
             "/v1/relations",
-            json!({"catalog":catalog(source)}),
+            public_relation_registration(&catalog(source)),
             StatusCode::CREATED,
         )
         .await;
@@ -427,7 +432,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "left_source",
         0,
-        json!([{"item":1,"reading":10,"delta":1}]),
+        json!([{"item":1,"reading":10}]),
         StatusCode::CREATED,
     )
     .await;
@@ -435,7 +440,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "left_source",
         1,
-        json!([{"item":1,"reading":10,"delta":-1},{"item":1,"reading":11,"delta":1}]),
+        json!([{"operation":"update","before":{"item":1,"reading":10},"after":{"item":1,"reading":11}}]),
         StatusCode::CREATED,
     )
     .await;
@@ -443,7 +448,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "left_source",
         3,
-        json!([{"item":1,"reading":11,"delta":-1},{"item":1,"reading":12,"delta":1}]),
+        json!([{"operation":"update","before":{"item":1,"reading":11},"after":{"item":1,"reading":12}}]),
         StatusCode::CREATED,
     )
     .await;
@@ -451,7 +456,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "right_source",
         0,
-        json!([{"item":1,"reading":20,"delta":1}]),
+        json!([{"item":1,"reading":20}]),
         StatusCode::CREATED,
     )
     .await;
@@ -550,7 +555,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "left_source",
         5,
-        json!([{"item":1,"reading":12,"delta":-1},{"item":1,"reading":13,"delta":1}]),
+        json!([{"operation":"update","before":{"item":1,"reading":12},"after":{"item":1,"reading":13}}]),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -559,7 +564,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "left_source",
         7,
-        json!([{"item":1,"reading":13,"delta":-1},{"item":1,"reading":14,"delta":1}]),
+        json!([{"operation":"update","before":{"item":1,"reading":13},"after":{"item":1,"reading":14}}]),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -634,7 +639,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "right_source",
         1,
-        json!([{"item":1,"reading":21,"delta":1}]),
+        json!([{"item":1,"reading":21}]),
         StatusCode::CREATED,
     )
     .await;
@@ -678,7 +683,7 @@ async fn two_producer_dag(join: bool) {
         &router,
         "right_source",
         2,
-        json!([{"item":1,"reading":20,"delta":-1}]),
+        json!([{"operation":"update","before":{"item":1,"reading":20},"after":{"item":1,"reading":22}}]),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -736,7 +741,7 @@ async fn two_producer_dag(join: bool) {
         3
     );
     let restored_router = app(restarted.clone());
-    assert_rows(&restored_router, rows(join, 14, &[21])).await;
+    assert_rows(&restored_router, rows(join, 14, &[21, 22])).await;
     let (restored_active, restored_checkpoint) = checkpoint(&restarted, "combined").await;
     assert_eq!(
         consumer_direct_view_inputs(&restored_active, &restored_checkpoint)
@@ -755,11 +760,11 @@ async fn two_producer_dag(join: bool) {
         &restored_router,
         "left_source",
         9,
-        json!([{"item":1,"reading":14,"delta":-1},{"item":1,"reading":15,"delta":1}]),
+        json!([{"operation":"update","before":{"item":1,"reading":14},"after":{"item":1,"reading":15}}]),
         StatusCode::CREATED,
     )
     .await;
-    assert_rows(&restored_router, rows(join, 15, &[21])).await;
+    assert_rows(&restored_router, rows(join, 15, &[21, 22])).await;
 }
 
 #[tokio::test]

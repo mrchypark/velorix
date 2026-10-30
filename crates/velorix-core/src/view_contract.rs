@@ -269,20 +269,16 @@ pub fn catalog_input_relation_schema(
             .relation_schema
             .columns
             .iter()
-            .filter(|column| {
-                // The internal weight column of a published-view-output
-                // descriptor is an encoding artifact, not part of the public
-                // relation schema.
-                !(matches!(
-                    catalog.relation_source,
-                    VelorixRelationSourceV1::PublishedViewOutput { .. }
-                ) && column.column_id == catalog.relation_schema.weight_column_id)
-            })
+            // Differential weight is an engine encoding detail for every
+            // relation kind. Keep it in the persisted catalog/runtime schema,
+            // but never in the logical SQL/view schema.
+            .filter(|column| column.column_id != catalog.relation_schema.weight_column_id)
             .map(catalog_column_schema)
             .collect::<Result<Vec<_>, _>>()?,
         primary_key: catalog_primary_key_columns(catalog)?,
     })
 }
+
 pub fn view_spec_hash(spec: &StandingViewSpec) -> Result<String, ViewContractError> {
     validate_materialized_standing_view_spec(spec)?;
     let canonical_json =
@@ -1633,6 +1629,36 @@ mod tests {
         );
         assert_eq!(weight_column.logical_type, VelorixLogicalTypeV1::Int64);
         assert!(!weight_column.nullable);
+    }
+
+    #[test]
+    fn source_relation_logical_schema_hides_the_physical_weight_field() {
+        let published = catalog_from_published_relation_binding(&sample_binding()).unwrap();
+        let catalog = VelorixRelationCatalogV1::from_relation_schema(
+            published.relation_schema,
+            CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+        )
+        .unwrap();
+
+        let logical = catalog_input_relation_schema(&catalog).unwrap();
+        let weight_name = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .find(|column| column.column_id == catalog.relation_schema.weight_column_id)
+            .unwrap()
+            .name
+            .as_str();
+        assert_eq!(logical.columns.len(), 2);
+        assert!(logical
+            .columns
+            .iter()
+            .all(|column| column.name != weight_name));
+        assert_eq!(catalog.relation_schema.columns.len(), 3);
+        assert_eq!(
+            logical.schema_fingerprint,
+            catalog.schema_fingerprint.as_str()
+        );
     }
     #[test]
     fn published_relation_descriptor_catalog_rejects_reserved_weight_column_in_public_schema() {

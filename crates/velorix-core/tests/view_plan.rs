@@ -3301,7 +3301,7 @@ fn non_primary_scalar_join_admits_duplicate_key_state_and_rejects_unsafe_keys() 
         &[scores, accounts],
     )
     .unwrap_err();
-    assert!(error.to_string().contains("weight column"));
+    assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
 
     let mut nested_scores = scores_with_category_catalog();
     let category = nested_scores
@@ -4791,18 +4791,62 @@ fn filter_project_sql_accepts_predicate_on_unprojected_catalog_column() {
 
 #[test]
 fn filter_project_sql_rejects_predicate_on_weight_column() {
-    let catalog = scores_with_adjustment_catalog();
+    let mut catalog = scores_with_adjustment_catalog();
+    let old_weight_id = catalog.relation_schema.weight_column_id.clone();
+    let weight = catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == old_weight_id)
+        .unwrap();
+    weight.column_id = "__velorix_internal_weight".into();
+    weight.name = "__velorix_internal_weight".into();
+    catalog.relation_schema.weight_column_id = "__velorix_internal_weight".into();
+    refresh_catalog_fingerprint(&mut catalog);
     let error = validate_supported_filter_project_sql(
-        "select user_id, score from scores where delta = 1",
+        "select user_id, score from scores where __velorix_internal_weight = 1",
         &catalog,
     )
     .unwrap_err();
 
-    assert!(matches!(
-        error,
-        ViewPlanError::UnsupportedShape { reason }
-            if reason == "filter/project WHERE must not reference the weight column"
-    ));
+    assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
+}
+
+#[test]
+fn public_sql_resolution_hides_weight_from_wildcards_projection_and_predicates() {
+    let mut catalog = scores_catalog();
+    let old_weight_id = catalog.relation_schema.weight_column_id.clone();
+    let weight = catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == old_weight_id)
+        .unwrap();
+    weight.column_id = "__velorix_internal_weight".into();
+    weight.name = "__velorix_internal_weight".into();
+    catalog.relation_schema.weight_column_id = "__velorix_internal_weight".into();
+    refresh_catalog_fingerprint(&mut catalog);
+
+    let wildcard = validate_supported_filter_project_sql("select * from scores", &catalog)
+        .expect("wildcard should expand to business fields");
+    assert_eq!(
+        wildcard
+            .value_columns
+            .iter()
+            .map(|column| column.output_column_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["score"]
+    );
+    assert!(validate_supported_filter_project_sql(
+        "select user_id, __velorix_internal_weight from scores",
+        &catalog
+    )
+    .is_err());
+    assert!(validate_supported_filter_project_sql(
+        "select user_id, score from scores where __velorix_internal_weight > 0",
+        &catalog
+    )
+    .is_err());
 }
 
 #[test]
@@ -10561,9 +10605,6 @@ fn single_key_sum_count_fixture_sql_rejects_filter_on_weight_column() {
     .unwrap_err();
 
     assert!(matches!(error, ViewPlanError::UnsupportedShape { .. }));
-    assert!(error
-        .to_string()
-        .contains("WHERE column must be the primary key or value column"));
 }
 
 #[test]
@@ -10622,7 +10663,7 @@ fn single_key_aggregate_sql_accepts_explicit_identity_projection_cte() {
     let output_schema = scores_output_schema();
 
     let plan = lower_supported_sql_to_logical_plan(
-        "with base as (select user_id, score, delta from scores) select user_id, sum(score) as sum, count(*) as count from base group by user_id",
+        "with base as (select user_id, score from scores) select user_id, sum(score) as sum, count(*) as count from base group by user_id",
         std::slice::from_ref(&catalog),
         &output_schema,
     )

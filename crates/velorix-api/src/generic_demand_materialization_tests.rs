@@ -1,4 +1,5 @@
 use super::*;
+use crate::example_fixtures::public_relation_registration;
 
 #[path = "worker_capacity_http_tests.rs"]
 mod worker_capacity_http_tests;
@@ -116,7 +117,7 @@ fn assert_pending(response: &(StatusCode, Value), row_budget: usize) {
 #[tokio::test]
 async fn demand_reuses_verified_publication_bytes_for_checkpoint_coverage() {
     let (state, router, store, _meta, counts) = fixture().await;
-    ingest(&router, 0, json!([{"user_id":"a","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
     declare(
         &router,
         "single_source_publication",
@@ -191,7 +192,7 @@ async fn demand_caches_verified_immutable_source_and_batches_fenced_progress() {
         ingest(
             &app(state.clone()),
             offset,
-            json!([{"user_id":"a","score":offset,"delta":1}]),
+            json!([{"user_id":"a","score":offset}]),
         )
         .await;
     }
@@ -329,7 +330,7 @@ async fn output_manifest_for(
 async fn published_positive_pages_batch_once_and_keep_signed_boundary() {
     let (state, router, store, _meta, _counts) = fixture().await;
     let source_rows = (0..257)
-        .map(|i| json!({"user_id":format!("page-{i:04}"),"score":i,"delta":1}))
+        .map(|i| json!({"user_id":format!("page-{i:04}"),"score":i}))
         .collect::<Vec<_>>();
     ingest(&router, 0, json!(source_rows)).await;
     declare(
@@ -361,7 +362,7 @@ async fn published_positive_pages_batch_once_and_keep_signed_boundary() {
     ingest(
         &router,
         257,
-        json!([{"user_id":"after-baseline","score":9000,"delta":1}]),
+        json!([{"user_id":"after-baseline","score":9000}]),
     )
     .await;
     expected = demand(&router, "paged_positive_producer", None, 1024).await;
@@ -383,7 +384,7 @@ async fn published_positive_pages_batch_once_and_keep_signed_boundary() {
 async fn published_positive_page_budget_resumes_without_duplicate_or_missing_rows() {
     let (state, router, store, _meta, _counts) = fixture().await;
     let source_rows = (0..257)
-        .map(|i| json!({"user_id":format!("resume-{i:04}"),"score":i,"delta":1}))
+        .map(|i| json!({"user_id":format!("resume-{i:04}"),"score":i}))
         .collect::<Vec<_>>();
     ingest(&router, 0, json!(source_rows)).await;
     declare(
@@ -424,7 +425,7 @@ async fn published_positive_page_budget_resumes_without_duplicate_or_missing_row
 async fn published_page_byte_budget_commits_fitting_prefix_then_resumes() {
     let (state, router, store, _meta, _counts) = fixture().await;
     let source_rows = (0..257)
-        .map(|i| json!({"user_id":format!("bytes-{i:04}"),"score":i,"delta":1}))
+        .map(|i| json!({"user_id":format!("bytes-{i:04}"),"score":i}))
         .collect::<Vec<_>>();
     ingest(&router, 0, json!(source_rows)).await;
     declare(
@@ -635,7 +636,12 @@ async fn fixture_with_meta(
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    let response = post(&router, "/v1/relations", json!({"catalog":catalog})).await;
+    let response = post(
+        &router,
+        "/v1/relations",
+        public_relation_registration(&catalog),
+    )
+    .await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
     (state, router, store, meta, counts)
 }
@@ -650,7 +656,7 @@ async fn demand_continuation_keeps_the_certified_scope() {
         &router,
         0,
         json!((0..8)
-            .map(|i| json!({"user_id":format!("k{i}"),"score":i,"delta":1}))
+            .map(|i| json!({"user_id":format!("k{i}"),"score":i}))
             .collect::<Vec<_>>()),
     )
     .await;
@@ -702,9 +708,9 @@ async fn demand_scopes_survive_restart_without_skipping_gaps_or_recomputing() {
         &router,
         0,
         json!([
-            {"user_id":"a","score":1,"delta":1}, {"user_id":"b","score":2,"delta":1},
-            {"user_id":"a","score":3,"delta":1}, {"user_id":"b","score":4,"delta":1},
-            {"user_id":"a","score":5,"delta":1}, {"user_id":"b","score":6,"delta":1}
+            {"user_id":"a","score":1}, {"user_id":"b","score":2},
+            {"user_id":"a","score":3}, {"user_id":"b","score":4},
+            {"user_id":"a","score":5}, {"user_id":"b","score":6}
         ]),
     )
     .await;
@@ -845,7 +851,7 @@ async fn demand_scopes_survive_restart_without_skipping_gaps_or_recomputing() {
     let mut pinned = first_page.1["rows"].as_array().unwrap().clone();
     let mut token = first_page.1["next_page_token"].as_str().map(str::to_owned);
     assert!(token.is_some(), "fixture must cross a page boundary");
-    ingest(&router, 6, json!([{"user_id":"b","score":7,"delta":1}])).await;
+    ingest(&router, 6, json!([{"user_id":"b","score":7}])).await;
     for _ in 0..8 {
         let Some(current) = token.take() else { break };
         let page = post(
@@ -873,7 +879,7 @@ async fn paused_explicit_backfill_allows_query_demand_and_enforces_shared_budget
         &router,
         0,
         json!((0..8)
-            .map(|i| json!({"user_id":format!("k{i}"),"score":i,"delta":1}))
+            .map(|i| json!({"user_id":format!("k{i}"),"score":i}))
             .collect::<Vec<_>>()),
     )
     .await;
@@ -1033,8 +1039,8 @@ async fn scoped_join_lag_closure_repairs_derived_replacements_from_positive_appe
         &router,
         0,
         json!([
-            {"user_id":"a","score":10,"delta":1}, {"user_id":"b","score":20,"delta":1},
-            {"user_id":"c","score":30,"delta":1}
+            {"user_id":"a","score":10}, {"user_id":"b","score":20},
+            {"user_id":"c","score":30}
         ]),
     )
     .await;
@@ -1066,7 +1072,7 @@ async fn scoped_join_lag_closure_repairs_derived_replacements_from_positive_appe
     );
     // Positive source append moves A between B and C; C's LAG changes even
     // though the appended source row lies outside the requested output scope.
-    ingest(&router, 3, json!([{"user_id":"a","score":15,"delta":1}])).await;
+    ingest(&router, 3, json!([{"user_id":"a","score":15}])).await;
     let mut insufficient = post(
         &router,
         "/v1/views/joined/query",
@@ -1141,8 +1147,8 @@ async fn empty_scope_cannot_certify_by_ignoring_scanned_byte_budget() {
         &router,
         0,
         json!([
-            {"user_id":"outside-a","score":11,"delta":1},
-            {"user_id":"outside-b","score":13,"delta":1}
+            {"user_id":"outside-a","score":11},
+            {"user_id":"outside-b","score":13}
         ]),
     )
     .await;
@@ -1264,8 +1270,8 @@ async fn cancelled_demand_before_pointer_cas_retries_exactly_once() {
         &router,
         0,
         json!([
-            {"user_id":"a","score":3,"delta":1},
-            {"user_id":"a","score":5,"delta":1}
+            {"user_id":"a","score":3},
+            {"user_id":"a","score":5}
         ]),
     )
     .await;
@@ -1419,8 +1425,8 @@ async fn cancelled_demand_during_blocking_apply_retains_lock_and_retries_once() 
         &router,
         0,
         json!([
-            {"user_id":"a","score":3,"delta":1},
-            {"user_id":"a","score":5,"delta":1}
+            {"user_id":"a","score":3},
+            {"user_id":"a","score":5}
         ]),
     )
     .await;
@@ -1514,7 +1520,7 @@ async fn cancelled_demand_during_blocking_apply_retains_lock_and_retries_once() 
 #[tokio::test]
 async fn late_bounded_producer_publishes_delta_from_last_complete_output() {
     let (state, router, store, meta, _counts) = fixture().await;
-    ingest(&router, 0, json!([{"user_id":"a","score":3,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":3}])).await;
     declare(
         &router,
         "bounded_totals",
@@ -1549,8 +1555,8 @@ async fn late_bounded_producer_publishes_delta_from_last_complete_output() {
     // Separate immutable source publications. Both change the same aggregate,
     // so publishing only the final unit's delta would leave total 3 resident
     // or attempt to retract total 8, which the consumer has never received.
-    ingest(&router, 1, json!([{"user_id":"a","score":5,"delta":1}])).await;
-    ingest(&router, 2, json!([{"user_id":"a","score":7,"delta":1}])).await;
+    ingest(&router, 1, json!([{"user_id":"a","score":5}])).await;
+    ingest(&router, 2, json!([{"user_id":"a","score":7}])).await;
     let first = post(
         &router,
         "/v1/views/bounded_totals/query",
@@ -1670,7 +1676,7 @@ async fn late_bounded_producer_publishes_delta_from_last_complete_output() {
 #[tokio::test]
 async fn reverse_derived_backfill_preserves_baseline_and_atomic_replacement_order() {
     let (state, router, _store, _meta, _counts) = fixture().await;
-    ingest(&router, 0, json!([{"user_id":"a","score":3,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":3}])).await;
     declare(
         &router,
         "signed_producer",
@@ -1691,12 +1697,7 @@ async fn reverse_derived_backfill_preserves_baseline_and_atomic_replacement_orde
     )
     .await;
     for (offset, amount, total) in [(1, 5, 8), (2, 7, 15)] {
-        ingest(
-            &router,
-            offset,
-            json!([{"user_id":"a","score":amount,"delta":1}]),
-        )
-        .await;
+        ingest(&router, offset, json!([{"user_id":"a","score":amount}])).await;
         assert_eq!(
             demand(&router, "signed_producer", None, 64).await,
             vec![json!({"user_id":"a","total":total})]
@@ -1777,7 +1778,7 @@ async fn reverse_derived_backfill_preserves_baseline_and_atomic_replacement_orde
 #[tokio::test]
 async fn invalid_query_selector_is_rejected_before_demand_writes() {
     let (state, router, store, _meta, _counts) = fixture().await;
-    ingest(&router, 0, json!([{"user_id":"a","score":3,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":3}])).await;
     declare(
         &router,
         "validated_first",
@@ -1834,10 +1835,10 @@ async fn ordinary_query_where_drives_scoped_demand_and_reuses_bound_coverage() {
         &router,
         0,
         json!([
-            {"user_id":"a","score":3,"delta":1},
-            {"user_id":"b","score":5,"delta":1},
-            {"user_id":"a","score":7,"delta":1},
-            {"user_id":"b","score":11,"delta":1}
+            {"user_id":"a","score":3},
+            {"user_id":"b","score":5},
+            {"user_id":"a","score":7},
+            {"user_id":"b","score":11}
         ]),
     )
     .await;
@@ -1946,8 +1947,16 @@ async fn reverse_sparse_source_defers_watermark_until_full_closure_after_restart
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    let registered = post(&router, "/v1/relations", json!({"catalog":catalog})).await;
+    let registered = post(
+        &router,
+        "/v1/relations",
+        public_relation_registration(&catalog),
+    )
+    .await;
     assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
+    let catalog = read_relation_catalog(&state, "measurements", "2026-05-24.v1")
+        .await
+        .unwrap();
     let watermark = 120_000_000_000i64;
     let batch = |offset, rows| {
         json!({
@@ -1963,8 +1972,8 @@ async fn reverse_sparse_source_defers_watermark_until_full_closure_after_restart
         batch(
             0,
             json!([
-                {"user_id":"a","amount":3,"event_time":10_000_000_000i64,"delta":1},
-                {"user_id":"b","amount":7,"event_time":70_000_000_000i64,"delta":1}
+                {"user_id":"a","amount":3,"event_time":10_000_000_000i64},
+                {"user_id":"b","amount":7,"event_time":70_000_000_000i64}
             ]),
         ),
     )
@@ -2124,7 +2133,7 @@ async fn reverse_sparse_source_defers_watermark_until_full_closure_after_restart
         batch(
             2,
             json!([
-                {"user_id":"a","amount":5,"event_time":20_000_000_000i64,"delta":1}
+                {"user_id":"a","amount":5,"event_time":20_000_000_000i64}
             ]),
         ),
     )
@@ -2159,7 +2168,12 @@ async fn window_replay_preserves_commit_order_across_source_partitions() {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    let registered = post(&router, "/v1/relations", json!({"catalog":catalog})).await;
+    let registered = post(
+        &router,
+        "/v1/relations",
+        public_relation_registration(&catalog),
+    )
+    .await;
     assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
     // The earlier commit deliberately has the larger partition ID. Sorting by
     // partition would replay the high watermark before the older, valid row.
@@ -2175,7 +2189,7 @@ async fn window_replay_preserves_commit_order_across_source_partitions() {
                 "relation_version":"2026-05-24.v1",
                 "stream_id":"partitioned-stream","partition_id":partition,
                 "start_offset_inclusive":0,
-                "rows":[{"user_id":user,"amount":amount,"event_time":event_time,"delta":1}],
+                "rows":[{"user_id":user,"amount":amount,"event_time":event_time}],
                 "event_time_watermark":{"event_time_column_id":"event_time",
                     "max_observed_event_time_ns":watermark,"watermark_ns":watermark}
             }),
@@ -2265,7 +2279,7 @@ async fn source_appends_leave_declared_views_unbuilt_until_requested() {
     for historical in [false, true] {
         let (state, router, _store, _meta, _counts) = fixture().await;
         if historical {
-            ingest(&router, 0, json!([{"user_id":"a","score":3,"delta":1}])).await;
+            ingest(&router, 0, json!([{"user_id":"a","score":3}])).await;
         }
         declare(
             &router,
@@ -2281,7 +2295,7 @@ async fn source_appends_leave_declared_views_unbuilt_until_requested() {
         ingest(
             &router,
             if historical { 1 } else { 0 },
-            json!([{"user_id":"a","score":5,"delta":1}]),
+            json!([{"user_id":"a","score":5}]),
         )
         .await;
         assert!(
@@ -2323,9 +2337,7 @@ async fn fixed_tumbling_scopes_are_available_before_full_coverage_and_survive_re
     let registered = post(
         &router,
         "/v1/relations",
-        json!({
-            "catalog":catalog
-        }),
+        public_relation_registration(&catalog),
     )
     .await;
     assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
@@ -2343,10 +2355,10 @@ async fn fixed_tumbling_scopes_are_available_before_full_coverage_and_survive_re
         batch(
             0,
             json!([
-                {"user_id":"x","amount":3,"event_time":10_000_000_000i64,"delta":1},
-                {"user_id":"x","amount":7,"event_time":70_000_000_000i64,"delta":1},
-                {"user_id":"x","amount":5,"event_time":20_000_000_000i64,"delta":1},
-                {"user_id":"x","amount":11,"event_time":80_000_000_000i64,"delta":1}
+                {"user_id":"x","amount":3,"event_time":10_000_000_000i64},
+                {"user_id":"x","amount":7,"event_time":70_000_000_000i64},
+                {"user_id":"x","amount":5,"event_time":20_000_000_000i64},
+                {"user_id":"x","amount":11,"event_time":80_000_000_000i64}
             ]),
         ),
     )
@@ -2384,7 +2396,7 @@ async fn fixed_tumbling_scopes_are_available_before_full_coverage_and_survive_re
         batch(
             4,
             json!([
-                {"user_id":"x","amount":13,"event_time":90_000_000_000i64,"delta":1}
+                {"user_id":"x","amount":13,"event_time":90_000_000_000i64}
             ]),
         ),
     )
@@ -2498,7 +2510,7 @@ async fn fixed_tumbling_scopes_are_available_before_full_coverage_and_survive_re
         batch(
             5,
             json!([
-                {"user_id":"x","amount":13,"event_time":90_000_000_000i64,"delta":1}
+                {"user_id":"x","amount":13,"event_time":90_000_000_000i64}
             ]),
         ),
     )

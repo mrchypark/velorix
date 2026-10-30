@@ -1,5 +1,6 @@
 //! Synthetic correctness and I/O checks for schema-bound materialized pages.
 use super::*;
+use crate::example_fixtures::public_relation_registration;
 use crate::materialized_output_pages as pages;
 use velorix_core::delta::{DeltaKey, DeltaRecord, DeltaValue};
 
@@ -129,8 +130,13 @@ async fn request_rows(router: &Router, view: &str, sql: &str) -> Vec<Value> {
 }
 
 async fn register(router: &Router, relation: &str, columns: &[(&str, VelorixLogicalTypeV1, bool)]) {
-    let result = call_json(router, Method::POST, "/v1/relations",
-        json!({"catalog":test_relation_catalog_for_e2e(relation, columns),(concat!("default_", "orde", "rs_sum_count")):false})).await;
+    let result = call_json(
+        router,
+        Method::POST,
+        "/v1/relations",
+        public_relation_registration(&test_relation_catalog_for_e2e(relation, columns)),
+    )
+    .await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
 }
 
@@ -204,9 +210,9 @@ async fn materialized_public_runtime_normalizes_filter_projection_group_and_two_
     create(&router, "joined_output", "select i.key_col, sum(o.amount) as sum, count(*) as count from left_table o join right_table i on o.key_col = i.key_col group by i.key_col", true).await;
     let result = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[
         {"relation_id":"left_table","relation_version":"2026-08-14.v1","stream_id":"left_table-stream","partition_id":0,"start_offset_inclusive":0,
-         "rows":[{"key_col":"k1","amount":10,"delta":1},{"key_col":"k1","amount":6,"delta":1},{"key_col":"k2","amount":2,"delta":1}]},
+         "rows":[{"key_col":"k1","amount":10},{"key_col":"k1","amount":6},{"key_col":"k2","amount":2}]},
         {"relation_id":"right_table","relation_version":"2026-08-14.v1","stream_id":"right_table-stream","partition_id":0,"start_offset_inclusive":0,
-         "rows":[{"key_col":"k1","value_col":3,"delta":1}]}
+         "rows":[{"key_col":"k1","value_col":3}]}
     ]})).await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     for view in ["projected_output", "grouped_output", "joined_output"] {
@@ -267,7 +273,7 @@ async fn materialized_public_large_snapshot_prunes_and_keeps_count_cte_null_and_
     let rows = (0..10017)
         .map(|i| {
             json!({"key_col":format!("k{i:05}"),
-        "amount":if i==0 {Value::Null} else {json!(i)},"delta":1})
+        "amount":if i==0 {Value::Null} else {json!(i)}})
         })
         .collect::<Vec<_>>();
     for (index, chunk) in rows.chunks(5000).enumerate() {
@@ -568,9 +574,9 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
         ingest(
             0,
             json!([
-        {"key_col":"k1","amount":10,"delta":1},
-        {"key_col":"k1_other","amount":10,"delta":1},
-        {"key_col":"k2","amount":20,"delta":1}]),
+        {"key_col":"k1","amount":10},
+        {"key_col":"k1_other","amount":10},
+        {"key_col":"k2","amount":20}]),
         ),
     )
     .await;
@@ -593,8 +599,7 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
         "/v1/ingest",
         ingest(
             3,
-            json!([
-        {"key_col":"k1","amount":10,"delta":-1}]),
+        json!([{"operation":"update","before":{"key_col":"k1","amount":10},"after":{"key_col":"k1","amount":12}}]),
         ),
     )
     .await;
@@ -606,7 +611,7 @@ async fn materialized_public_cursor_preserves_rows_and_rejects_old_epoch_after_s
             "SELECT count(*) AS count, sum(amount) AS sum FROM copied_output"
         )
         .await,
-        vec![json!({"count":2,"sum":30})]
+        vec![json!({"count":3,"sum":42})]
     );
     let stale = call_json(&router, Method::POST, uri, request).await;
     assert_eq!(stale.0, StatusCode::BAD_REQUEST, "{}", stale.1);
@@ -1196,7 +1201,11 @@ fn publication_catalog(
             ],
             primary_key_column_ids: vec!["k".into()],
             weight_column_id: "weight".into(),
-            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+            allowed_operations: vec![
+                RelationOperationV1::Insert,
+                RelationOperationV1::Update,
+                RelationOperationV1::Delete,
+            ],
             event_time_column_id: None,
         },
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
@@ -1267,19 +1276,24 @@ async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let state = publication_state(store.clone(), meta.clone()).await;
         let router = app(state.clone());
-        let registered = call_json(&router, Method::POST, "/v1/relations",
-            json!({"catalog":publication_catalog(logical,physical),(concat!("default_", "orde", "rs_sum_count")):false})).await;
+        let catalog = publication_catalog(logical, physical);
+        let registered = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations",
+            public_relation_registration(&catalog),
+        )
+        .await;
         assert_eq!(registered.0, StatusCode::CREATED, "{}", registered.1);
-        // A retained cancelling batch supplies the bootstrap frontier with empty output.
+        // The filter leaves the seeded business row out of the initial output
+        // while retaining a real source frontier for bootstrap recovery.
         let seeded = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
             "relation_id":"synthetic_input","relation_version":"synthetic-v1","stream_id":"synthetic_stream",
-            "partition_id":0,"start_offset_inclusive":0,"rows":[
-                {"k":value,"v":17,"weight":1}, {"k":value,"v":17,"weight":-1}
-            ]
+            "partition_id":0,"start_offset_inclusive":0,"rows":[{"k":value,"v":0}]
         }]})).await;
         assert_eq!(seeded.0, StatusCode::CREATED, "{}", seeded.1);
         let created = call_json(&router, Method::POST, "/v1/views", json!({
-            "view_id":"synthetic_output", "sql":"select k,v from synthetic_input",
+            "view_id":"synthetic_output", "sql":"select k,v from synthetic_input where v > 0",
             "input_relation_id":"synthetic_input", "input_relation_version":"synthetic-v1", "response_formats":["json"]
         })).await;
         if timezone_key {
@@ -1323,18 +1337,18 @@ async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
         )
         .await;
         assert_eq!(activated.0, StatusCode::OK, "{}", activated.1);
-        let empty = call_json(
+        let initial = call_json(
             &router,
             Method::POST,
             "/v1/views/synthetic_output/query",
             json!({"sql":"select * from synthetic_output"}),
         )
         .await;
-        assert_eq!(empty.0, StatusCode::OK, "{}", empty.1);
-        assert_eq!(empty.1["rows"], json!([]));
+        assert_eq!(initial.0, StatusCode::OK, "{}", initial.1);
+        assert_eq!(initial.1["rows"], json!([]));
         let ingested = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
             "relation_id":"synthetic_input","relation_version":"synthetic-v1","stream_id":"synthetic_stream",
-            "partition_id":0,"start_offset_inclusive":2,"rows":[{"k":value,"v":17,"weight":1}]
+            "partition_id":0,"start_offset_inclusive":1,"rows":[{"k":value,"v":17},{"operation":"update","before":{"k":value,"v":17},"after":{"k":value,"v":18}}]
         }]})).await;
         assert_eq!(ingested.0, StatusCode::CREATED, "{}", ingested.1);
         let rows = call_json(
@@ -1345,7 +1359,7 @@ async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
         )
         .await;
         assert_eq!(rows.0, StatusCode::OK, "{}", rows.1);
-        assert_eq!(rows.1["rows"], json!([{"k":value,"v":17}]));
+        assert_eq!(rows.1["rows"], json!([{"k":value,"v":18}]));
         let restarted = publication_state(store, meta).await;
         restarted
             .restore_standing_program_runtimes_from_active_views()
@@ -1359,7 +1373,7 @@ async fn publication_primitive_keys_admit_ingest_publish_and_restore() {
         )
         .await;
         assert_eq!(rows.0, StatusCode::OK, "{}", rows.1);
-        assert_eq!(rows.1["rows"], json!([{"k":value,"v":17}]));
+        assert_eq!(rows.1["rows"], json!([{"k":value,"v":18}]));
     }
 }
 

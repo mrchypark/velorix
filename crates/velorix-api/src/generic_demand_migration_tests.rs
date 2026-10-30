@@ -1,5 +1,6 @@
 //! Register as a child of tests.rs; integration owner runs these tests.
 use super::*;
+use crate::example_fixtures::public_relation_registration;
 
 #[tokio::test]
 async fn checkpoint_body_and_fragment_reads_share_cache_and_preserve_disabled_path() {
@@ -204,7 +205,7 @@ async fn append(router: &Router, offset: u64, score: i64) {
         json!({
             "relation_version":"2026-05-24.v1","stream_id":"migration-stream",
             "partition_id":0,"start_offset_inclusive":offset,
-            "rows":[{"user_id":"one","score":score,"delta":1}]
+            "rows":[{"user_id":"one","score":score}]
         }),
     )
     .await;
@@ -260,7 +261,12 @@ async fn run_case(derived: bool) {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    request(&router, "/v1/relations", json!({"catalog":catalog})).await;
+    request(
+        &router,
+        "/v1/relations",
+        public_relation_registration(&catalog),
+    )
+    .await;
     declare(&router, "migration_source", "scores", "2026-05-24.v1").await;
     seed_legacy_eager_checkpoint_for_compatibility(&state, "migration_source").await;
     append(&router, 0, 7).await;
@@ -412,7 +418,12 @@ async fn derived_pause_resume_preserves_cursors_without_physical_source_cut() {
         CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
     )
     .unwrap();
-    request(&router, "/v1/relations", json!({"catalog":catalog})).await;
+    request(
+        &router,
+        "/v1/relations",
+        public_relation_registration(&catalog),
+    )
+    .await;
     append(&router, 0, 9).await;
     declare(&router, "control_source", "scores", "2026-05-24.v1").await;
     finish(&state, "control_source").await;

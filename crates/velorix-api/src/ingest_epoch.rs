@@ -279,6 +279,7 @@ pub(super) async fn ingest_relation_rows(
                 partition_id: request.partition_id,
                 start_offset_inclusive: request.start_offset_inclusive,
                 event_time_watermark: request.event_time_watermark,
+                row_format: request.row_format,
                 rows: request.rows,
             }],
         }),
@@ -1014,7 +1015,8 @@ pub(super) fn prepare_ingest_batch_with_catalog(
     if let Some(timer) = timer.as_mut() {
         timer.mark("prepare_catalog");
     }
-    request.rows = normalize_ingest_operation_envelopes(&catalog, &request.rows)?;
+    request.rows =
+        normalize_ingest_operation_envelopes(&catalog, &request.rows, request.row_format)?;
     if let Some(timer) = timer.as_mut() {
         timer.mark("prepare_normalize");
     }

@@ -11,7 +11,6 @@ rhiza_service_recovery_write_relation_payload() {
     cat >"$1/relation.json" <<'RHIZA_RELATION_JSON'
 {
   "catalog": {
-    "schema_version": 1,
     "relation_schema": {
       "relation_id": "samples",
       "relation_name": "samples",
@@ -23,37 +22,14 @@ rhiza_service_recovery_write_relation_payload() {
           "logical_type": {"kind": "float64"},
           "physical_arrow_type": {"kind": "float64"},
           "nullable": false,
-          "ordinal": 0,
-          "semantic_role": "value"
-        },
-        {
-          "column_id": "delta",
-          "name": "delta",
-          "logical_type": {"kind": "int64"},
-          "physical_arrow_type": {"kind": "int64"},
-          "nullable": false,
-          "ordinal": 1,
-          "semantic_role": "weight"
+          "ordinal": 0
         }
       ],
       "primary_key_column_ids": [],
-      "weight_column_id": "delta",
       "allowed_operations": ["insert"],
       "event_time_column_id": null
     },
-    "schema_fingerprint": "sha256:268ecf9d783fd3f994cbc290753a0949584aba557abdd78e4387252adc159f46",
-    "datafusion_registration": {
-      "name": "samples",
-      "mode": "table"
-    },
-    "incremental_relation": {
-      "relation_id": "samples",
-      "schema_fingerprint": "sha256:268ecf9d783fd3f994cbc290753a0949584aba557abdd78e4387252adc159f46"
-    },
-    "incremental_adapter": {
-      "adapter_id": "incremental-adapter-generic-v1"
-    },
-    "relation_source": {"kind": "source_relation"}
+    "adapter_id": "incremental-adapter-generic-v1"
   }
 }
 RHIZA_RELATION_JSON
@@ -106,7 +82,7 @@ rhiza_service_recovery_write_ingest_payload() {
   "partition_id": 0,
   "start_offset_inclusive": 0,
   "rows": [
-    {"reading": 2.5, "delta": 1}
+    {"reading": 2.5}
   ]
 }
 RHIZA_INGEST_JSON

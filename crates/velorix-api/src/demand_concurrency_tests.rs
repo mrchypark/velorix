@@ -26,8 +26,8 @@ async fn blocked_cold_owner_allows_warm_scope_and_other_view_to_complete() {
         &router,
         0,
         json!([
-            {"user_id":"a","score":3,"delta":1},
-            {"user_id":"b","score":5,"delta":1}
+            {"user_id":"a","score":3},
+            {"user_id":"b","score":5}
         ]),
     )
     .await;
@@ -92,7 +92,7 @@ async fn duplicate_scope_prepares_once_and_short_wait_returns_pending() {
         DurableCapabilityMetaStore::new(InMemoryMetaStore::default()).with_guard_race(gate.clone()),
     );
     let (_state, router, _store, _meta, counts) = fixture_with_meta(meta).await;
-    ingest(&router, 0, json!([{"user_id":"a","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
     declare(
         &router,
         "bounded_output",
@@ -154,8 +154,8 @@ async fn api_role_reads_completed_scope_without_a_worker_or_local_runtime() {
         &router,
         0,
         json!([
-            {"user_id":"a","score":3,"delta":1},
-            {"user_id":"b","score":5,"delta":1}
+            {"user_id":"a","score":3},
+            {"user_id":"b","score":5}
         ]),
     )
     .await;
@@ -217,7 +217,7 @@ async fn cancelled_demand_and_control_keep_worker_slot_through_atomic_commit() {
                 .with_guard_race(gate.clone()),
         );
         let (state, router, _store, _meta, _counts) = fixture_with_meta(meta).await;
-        ingest(&router, 0, json!([{"user_id":"a","score":7,"delta":1}])).await;
+        ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
         declare(
             &router,
             "atomic_output",

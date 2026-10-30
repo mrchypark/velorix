@@ -242,7 +242,7 @@ After it finishes, call the REST API through the local port-forward:
   curl "$VELORIX_API_URL/healthz"
   curl -X POST "$VELORIX_API_URL/v1/relations/scores-default" -H "$VELORIX_API_AUTH_HEADER"
   curl -X POST "$VELORIX_API_URL/v1/views" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"view_id":"positive_scores_by_user","urlPath":"/scores/positive","input_relation_id":"scores","input_relation_version":"2026-05-24.v1","sql":"select user_id, sum(score) as sum, count(*) as count from scores where score > 0 group by user_id","response_formats":["json"]}'
-  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'
+  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H 'content-type: application/json' -d '{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5},{"user_id":"u1","score":7},{"user_id":"u2","score":-1}]}'
   curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H 'Accept: application/json' -H "$VELORIX_API_AUTH_HEADER"
 
 Main overrides:
@@ -5095,7 +5095,7 @@ PY
     owner_ingest_status="$(curl_api_status "${output_dir}/multi-replica-owner-ingest.json" \
       -X POST "http://127.0.0.1:${port_a}/v1/relations/scores/ingest" \
       -H 'content-type: application/json' \
-      -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":5,\"delta\":1}]}")"
+      -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":5}]}")"
     case "$owner_ingest_status" in
       200 | 201) break ;;
       409) sleep 1 ;;
@@ -5126,7 +5126,7 @@ PY
   fenced_ingest_status="$(curl_api_status "${output_dir}/multi-replica-fenced-ingest.json" \
     -X POST "http://127.0.0.1:${port_b}/v1/relations/scores/ingest" \
     -H 'content-type: application/json' \
-    -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9,\"delta\":1}]}")"
+    -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9}]}")"
   if [ "$fenced_ingest_status" != "409" ]; then
     echo "expected non-owner replica ingest to be fenced with 409, got ${fenced_ingest_status}" >&2
     cat "${output_dir}/multi-replica-fenced-ingest.json" >&2 || true
@@ -5136,7 +5136,7 @@ PY
   owner_retry_status="$(curl_api_status "${output_dir}/multi-replica-owner-retry-ingest.json" \
     -X POST "http://127.0.0.1:${port_a}/v1/relations/scores/ingest" \
     -H 'content-type: application/json' \
-    -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9,\"delta\":1}]}")"
+    -d "{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"${data_stream_id}\",\"partition_id\":0,\"start_offset_inclusive\":1,\"rows\":[{\"user_id\":\"${user_id}\",\"score\":9}]}")"
   case "$owner_retry_status" in
     200 | 201) ;;
     *)
@@ -7466,7 +7466,7 @@ PY
   start_api_writer_owner_port_forward_for_smoke
   curl_api -X POST "http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest" \
     -H 'content-type: application/json' \
-    -d '{"relation_version":"2026-05-24.v1","stream_id":"product-smoke-'"${run_id}"'","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1},{"user_id":"u3","score":0,"delta":1}]}' \
+    -d '{"relation_version":"2026-05-24.v1","stream_id":"product-smoke-'"${run_id}"'","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5},{"user_id":"u1","score":7},{"user_id":"u2","score":-1},{"user_id":"u3","score":0}]}' \
     | tee "${output_dir}/scores-ingest.json" >/dev/null
   curl_api "http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query" \
     | tee "${output_dir}/positive-scores-query.json" >/dev/null
@@ -7661,7 +7661,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/healthz"'
   # shellcheck disable=SC2016
-  echo '  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H '\''content-type: application/json'\'' -d '\''{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5,"delta":1},{"user_id":"u1","score":7,"delta":1},{"user_id":"u2","score":-1,"delta":1}]}'\'''
+  echo '  curl -X POST "$VELORIX_API_URL/v1/relations/scores/ingest" -H "$VELORIX_API_AUTH_HEADER" -H '\''content-type: application/json'\'' -d '\''{"relation_version":"2026-05-24.v1","stream_id":"scores","partition_id":0,"start_offset_inclusive":0,"rows":[{"user_id":"u1","score":5},{"user_id":"u1","score":7},{"user_id":"u2","score":-1}]}'\'''
   # shellcheck disable=SC2016
   echo '  curl "$VELORIX_API_URL/v1/views/positive_scores_by_user/query" -H "Accept: application/json" -H "$VELORIX_API_AUTH_HEADER"'
   # shellcheck disable=SC2016
@@ -7672,7 +7672,7 @@ if [ "$api_auth_mode" = "bearer-token" ]; then
   echo "  VELORIX_VIND_PRODUCT_DIR=${output_dir} scripts/report-vind-product-completion.sh"
 else
   echo "  curl http://127.0.0.1:${api_local_port}/healthz"
-  echo "  curl -X POST http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest -H 'content-type: application/json' -d '{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"scores\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"u1\",\"score\":5,\"delta\":1},{\"user_id\":\"u1\",\"score\":7,\"delta\":1},{\"user_id\":\"u2\",\"score\":-1,\"delta\":1}]}'"
+  echo "  curl -X POST http://127.0.0.1:${api_local_port}/v1/relations/scores/ingest -H 'content-type: application/json' -d '{\"relation_version\":\"2026-05-24.v1\",\"stream_id\":\"scores\",\"partition_id\":0,\"start_offset_inclusive\":0,\"rows\":[{\"user_id\":\"u1\",\"score\":5},{\"user_id\":\"u1\",\"score\":7},{\"user_id\":\"u2\",\"score\":-1}]}'"
   echo "  curl -H 'Accept: application/json' http://127.0.0.1:${api_local_port}/v1/views/positive_scores_by_user/query"
   echo "  curl -H 'Accept: application/json' http://127.0.0.1:${api_local_port}/v1/api/scores/positive"
 fi
