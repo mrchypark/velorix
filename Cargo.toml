@@ -10,6 +10,11 @@ members = [
   "crates/velorix-api",
   "crates/velorix-meta",
 ]
+exclude = [
+  "third_party/arrow-ipc-59.3.0",
+  "third_party/parquet-59.3.0",
+  "third_party/foyer-storage-0.22.6",
+]
 resolver = "2"
 
 [workspace.package]
@@ -57,3 +62,8 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 url = "2"
 uuid = { version = "1", features = ["v7", "serde"] }
+
+[patch.crates-io]
+arrow-ipc = { path = "third_party/arrow-ipc-59.3.0" }
+foyer-storage = { path = "third_party/foyer-storage-0.22.6" }
+parquet = { path = "third_party/parquet-59.3.0" }
