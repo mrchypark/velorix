@@ -146,6 +146,12 @@ jobs:
           # this repository has no Go module/sum path for setup-go to cache.
           cache: false
 
+      - name: Check S3 benchmark process runner
+        run: |
+          sh -n scripts/run-s3-release-benchmark.sh
+          sh -n scripts/run-process-group.sh
+          (cd scripts/run-process-group-src && GOWORK=off go test ./...)
+
       - name: Install pinned offline manifest validators
         run: |
           GOBIN="$RUNNER_TEMP/bin" go install sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
