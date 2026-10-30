@@ -185,8 +185,13 @@ support.
 
 `scripts/run-s3-release-benchmark.sh` is the local producer for the release
 S3-compatible workload. It runs `cargo bench -p velorix-runtime --bench
-local_incremental` against a per-run bucket and prefix on a loopback-only,
-isolated Docker network containing the digest-pinned Versity Gateway fixture.
+local_incremental` against a per-run bucket and prefix on a dedicated,
+run-specific Docker bridge network (non-internal) with the digest-pinned
+Versity Gateway fixture and one-shot AWS CLI helpers. The ephemeral published
+port binds only to `127.0.0.1`; readiness checks require both an S3 response
+inside the run network and an HTTP response through the host mapping. The
+benchmark SDK uses the explicit loopback endpoint and generated test
+credentials.
 The AWS CLI helper image is pinned to its multiarch manifest-index digest;
 Docker selects the host-native architecture without forcing emulation.
 The runner rejects dirty tracked checkouts, derives the candidate commit from

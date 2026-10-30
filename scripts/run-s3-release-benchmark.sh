@@ -222,6 +222,8 @@ run_self_tests() {
   require_command jq
   require_command cargo
   require_command go
+  require_command grep
+  require_command sed
   (cd "$script_dir/run-process-group-src" && go test ./...)
   selftest_dir=$(mktemp -d "${TMPDIR:-/tmp}/velorix-s3-release-benchmark.XXXXXX")
   trap 'rm -rf "$selftest_dir"' EXIT HUP INT TERM
@@ -260,6 +262,15 @@ run_self_tests() {
 
   head_commit=$(git rev-parse HEAD)
   selftest_baseline_path=$default_baseline_path
+  network_create_line=$(sed -n '/^docker network create /p' "$script_path")
+  [ -n "$network_create_line" ] || die 'self-test failed: fixture network creation is missing'
+  case "$network_create_line" in
+    *--internal*) die 'self-test failed: fixture network suppresses published ports' ;;
+  esac
+  grep -F '127.0.0.1::9000' "$script_path" >/dev/null ||
+    die 'self-test failed: fixture port is not explicitly loopback-bound'
+  grep -F 'curl --connect-timeout' "$script_path" >/dev/null ||
+    die 'self-test failed: fixture has no host-published port readiness probe'
   jq --arg commit "$head_commit" '
     .commit = $commit |
     .gate_level = "release" |
@@ -386,6 +397,7 @@ run_self_tests() {
     '  ignored target evidence allowed' \
     '  checkout HEAD changes rejected' \
     '  SIGTERM reaped an owned process-group stub descendant' \
+    '  fixture uses loopback-only published port without Docker internal-network suppression' \
     '  custom calibrated baseline requires and matches a provenance companion' \
     '  baseline JSON and companion hashes detect changed inputs' \
     '  baseline companion workload and harness fingerprints checked' \
@@ -556,6 +568,7 @@ require_command openssl
 require_command awk
 require_command grep
 require_command date
+require_command curl
 case "$versitygw_image" in
   versity/versitygw:v1.8.0@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499) ;;
   *) die 'internal Versity Gateway image pin mismatch' ;;
@@ -643,6 +656,7 @@ jq -n \
     artifacts:{gate_log:$gate_log,fixture_log:$fixture_log,validation_log:$validation_log,
       benchmark_stderr:$benchmark_stderr,runner_log:$runner_log},
     measurement_complete:false,result_pair_complete:false,result_validated:false,
+    docker_network_mode:"dedicated per-run bridge (non-internal); published endpoint loopback-only",
     gate_evaluated:false,gate_status:"not_run",phase:$phase,
     checkout_clean_at_start:($checkout_clean == 1),credentials_redacted:true,
     cleanup_status:"pending"}' >"$run_report_tmp"
@@ -679,7 +693,7 @@ printf '%s\n' "run_id=$run_id" "commit=$head_commit" "docker_host=$runner_archit
   "result=$result_path" >"$runner_log_tmp"
 mv "$runner_log_tmp" "$runner_log_path"
 
-docker network create --internal \
+docker network create \
   --label "velorix.s3-release-benchmark.run=$resource_label" \
   "$network_name" >/dev/null
 created_network=1
@@ -738,6 +752,20 @@ while [ "$attempt" -lt 90 ]; do
   sleep 1
 done
 [ "$ready" -eq 1 ] || die 'pinned local Versity Gateway did not become ready on the isolated Docker network'
+host_port_ready=0
+attempt=0
+while [ "$attempt" -lt 30 ]; do
+  host_http_status=$(curl --connect-timeout 1 --max-time 2 -sS -o /dev/null -w '%{http_code}' "$endpoint" 2>/dev/null || true)
+  case "$host_http_status" in
+    2?? | 3?? | 4??)
+      host_port_ready=1
+      break
+      ;;
+  esac
+  attempt=$((attempt + 1))
+  sleep 1
+done
+[ "$host_port_ready" -eq 1 ] || die "loopback-published Versity Gateway port did not return HTTP: $endpoint"
 if ! aws_cli s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
   aws_cli s3api create-bucket --bucket "$bucket" >/dev/null
 fi
