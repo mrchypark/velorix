@@ -643,6 +643,7 @@ fi
   die 'calibration measurements require one GitHub Actions Linux runner'
 [ -f "$historical_baseline" ] || die "historical baseline does not exist: $historical_baseline"
 historical_baseline_sha256=$(sha256_file "$historical_baseline")
+mkdir -p "$cargo_target_dir"
 [ -d "$cargo_target_dir" ] || die "shared Cargo target directory does not exist: $cargo_target_dir"
 
 head_commit=$(git rev-parse HEAD)
