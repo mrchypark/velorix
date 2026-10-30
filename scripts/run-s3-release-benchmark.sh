@@ -907,6 +907,14 @@ run_phase=measurement_validated
 collection_data_valid=1
 
 if [ "$collect_only" -eq 1 ]; then
+  jq --arg host "$runner_architecture" \
+    --arg image "$versitygw_image" \
+    --arg digest "$actual_image_digest" \
+    --arg platform "$actual_image_platform" \
+    '.docker_host=$host | .versitygw_image=$image |
+      .versitygw_image_digest=$digest | .versitygw_image_platform=$platform' \
+    "$run_report_path" >"$run_report_tmp"
+  mv "$run_report_tmp" "$run_report_path"
   run_phase=collection_pending_cleanup
   exit 0
 fi
