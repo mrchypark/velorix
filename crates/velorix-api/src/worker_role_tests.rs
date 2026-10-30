@@ -243,7 +243,10 @@ async fn eager_fixture() -> (
     let (status, _) = create_relation(
         State(state.clone()),
         Json(CreateRelationRequest {
-            catalog: catalog.clone(),
+            catalog: serde_json::from_value(
+                crate::example_fixtures::public_relation_registration(&catalog)["catalog"].clone(),
+            )
+            .unwrap(),
         }),
     )
     .await
@@ -276,7 +279,8 @@ fn ingest_request(catalog: &VelorixRelationCatalogV1, offset: u64) -> IngestEpoc
             partition_id: 0,
             start_offset_inclusive: offset,
             event_time_watermark: None,
-            rows: vec![json!({"user_id":"item","score":7,"delta":1})],
+            row_format: None,
+            rows: vec![json!({"user_id":"item","score":7})],
         }],
     }
 }

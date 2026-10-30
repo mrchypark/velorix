@@ -7070,7 +7070,12 @@ fn cte_projection_is_identity(
     if matches!(projection, [SelectItem::Wildcard(_)]) {
         return true;
     }
-    let columns = &catalog.relation_schema.columns;
+    let columns: Vec<_> = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .filter(|column| column.column_id != catalog.relation_schema.weight_column_id)
+        .collect();
     if projection.len() != columns.len() {
         return false;
     }
@@ -7945,7 +7950,10 @@ fn catalog_column_by_identifier<'a>(
         .relation_schema
         .columns
         .iter()
-        .find(|column| column_identifier_eq(column, column_name))
+        .find(|column| {
+            column.column_id != catalog.relation_schema.weight_column_id
+                && column_identifier_eq(column, column_name)
+        })
         .ok_or_else(|| ViewPlanError::UnsupportedShape {
             reason: "JOIN USING column must exist in both input relations".to_string(),
         })
@@ -8181,7 +8189,10 @@ fn qualified_ref_catalog_column<'a>(
         .relation_schema
         .columns
         .iter()
-        .find(|column| column_identifier_eq(column, reference.column.as_str()))
+        .find(|column| {
+            column.column_id != catalog.relation_schema.weight_column_id
+                && column_identifier_eq(column, reference.column.as_str())
+        })
         .ok_or_else(|| ViewPlanError::UnsupportedShape {
             reason: "qualified column must reference a registered relation column".to_string(),
         })
@@ -11119,11 +11130,10 @@ fn expression_catalog_column<'a>(
     catalog: &'a VelorixRelationCatalogV1,
     relation_alias: Option<&str>,
 ) -> Option<&'a RelationColumnV1> {
-    catalog
-        .relation_schema
-        .columns
-        .iter()
-        .find(|column| expression_references_catalog_column(expr, catalog, column, relation_alias))
+    catalog.relation_schema.columns.iter().find(|column| {
+        column.column_id != catalog.relation_schema.weight_column_id
+            && expression_references_catalog_column(expr, catalog, column, relation_alias)
+    })
 }
 
 fn expression_filter_project_column<'a>(
@@ -15967,11 +15977,10 @@ fn expression_references_unambiguous_output_alias(
     if !identifier_eq(ident.value.as_str(), output_column_id) {
         return false;
     }
-    !catalog
-        .relation_schema
-        .columns
-        .iter()
-        .any(|column| column_identifier_eq(column, output_column_id))
+    !catalog.relation_schema.columns.iter().any(|column| {
+        column.column_id != catalog.relation_schema.weight_column_id
+            && column_identifier_eq(column, output_column_id)
+    })
 }
 
 fn expression_references_catalog_column(
@@ -15980,6 +15989,9 @@ fn expression_references_catalog_column(
     column: &RelationColumnV1,
     relation_alias: Option<&str>,
 ) -> bool {
+    if column.column_id == catalog.relation_schema.weight_column_id {
+        return false;
+    }
     if expression_references_column(expr, column, relation_alias) {
         return true;
     }
@@ -16028,11 +16040,10 @@ fn expression_column<'a>(
     catalog: &'a VelorixRelationCatalogV1,
     relation_alias: Option<&str>,
 ) -> Option<&'a RelationColumnV1> {
-    catalog
-        .relation_schema
-        .columns
-        .iter()
-        .find(|column| expression_references_catalog_column(expr, catalog, column, relation_alias))
+    catalog.relation_schema.columns.iter().find(|column| {
+        column.column_id != catalog.relation_schema.weight_column_id
+            && expression_references_catalog_column(expr, catalog, column, relation_alias)
+    })
 }
 
 fn source_projection_expression_column<'a>(

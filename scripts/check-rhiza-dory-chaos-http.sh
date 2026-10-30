@@ -18,7 +18,6 @@ die() { echo "rhiza Dory chaos HTTP probe: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
 need curl
 need jq
-need shasum
 need mktemp
 need stat
 need id
@@ -50,22 +49,13 @@ echo "Evidence: $evidence"
 mkdir "$evidence/payloads"
 . "$repo_root/scripts/rhiza-service-recovery-payloads.sh"
 rhiza_service_recovery_write_payloads "$evidence/payloads"
-# Use a fresh relation identity when requested. Compute the schema fingerprint
-# with the same domain-separated canonical JSON contract as SchemaFingerprintV1.
+# Use a fresh relation identity when requested. The server derives its internal
+# schema fingerprint from this public business schema.
 jq --arg relation "$relation_id" '
   .catalog.relation_schema.relation_id = $relation |
-  .catalog.relation_schema.relation_name = $relation |
-  .catalog.datafusion_registration.name = $relation |
-  .catalog.incremental_relation.relation_id = $relation
+  .catalog.relation_schema.relation_name = $relation
 ' "$evidence/payloads/relation.json" >"$evidence/payloads/relation-schema.tmp"
 mv "$evidence/payloads/relation-schema.tmp" "$evidence/payloads/relation.json"
-schema=$(jq -c '.catalog.relation_schema' "$evidence/payloads/relation.json")
-fingerprint=$(printf 'velorix-relation-schema-v1\000%s' "$schema" | shasum -a 256 | awk '{print $1}')
-jq --arg fingerprint "sha256:$fingerprint" '
-  .catalog.schema_fingerprint = $fingerprint |
-  .catalog.incremental_relation.schema_fingerprint = $fingerprint
-' "$evidence/payloads/relation.json" >"$evidence/payloads/relation.tmp"
-mv "$evidence/payloads/relation.tmp" "$evidence/payloads/relation.json"
 # The public CreateViewRequest is explicitly standing_view; split roles use
 # authoritative demand ingest and never fall back to all-role legacy execution.
 for view_payload in "$evidence/payloads/view-sum.json" "$evidence/payloads/view-count.json"; do
@@ -146,7 +136,7 @@ if [ "$mode" = baseline ]; then
 fi
 
 if [ "$mode" = during-s3 ]; then
-  jq --arg stream "$stream_id" '.stream_id=$stream | .start_offset_inclusive=4 | .rows=[{"reading":9,"delta":1}]' \
+  jq --arg stream "$stream_id" '.stream_id=$stream | .start_offset_inclusive=4 | .rows=[{"reading":9}]' \
     "$evidence/payloads/ingest.json" >"$evidence/payloads/ingest-offset-4.json"
   set +e
   code=$(curl --silent --show-error --max-time 8 -o "$evidence/during-s3-response.json" \
@@ -194,7 +184,7 @@ case "$sum/$count" in
 esac
 
 jq --arg stream "$stream_id" --argjson offset "$offset" --argjson reading "$reading" \
-  '.stream_id=$stream | .start_offset_inclusive=$offset | .rows=[{"reading":$reading,"delta":1}]' \
+  '.stream_id=$stream | .start_offset_inclusive=$offset | .rows=[{"reading":$reading}]' \
   "$evidence/payloads/ingest.json" >"$evidence/payloads/ingest-next.json"
 request POST "/v1/relations/$relation_id/ingest" "$evidence/payloads/ingest-next.json" "$evidence/ingest-next-first.json"
 outcome=$(jq -r '.outcome // empty' "$evidence/ingest-next-first.json")

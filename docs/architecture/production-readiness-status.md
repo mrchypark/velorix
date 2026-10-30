@@ -1,5 +1,18 @@
 # Production Readiness Status
 
+Current CI baseline (2026-10-30): [run 41020731224](https://github.com/mrchypark/velorix/actions/runs/41020731224)
+completed all eight reported jobs: formatting, script contracts, MSRV,
+clippy, workspace tests, Rhiza backend, dependency deny, and PR benchmark smoke.
+This is CI evidence for baseline `c6222abd054858109c90a63a061db698fa9fc9e8`
+only. It does not establish complete SQL-family coverage, production readiness,
+or the representative S3 release benchmark gate. No release-readiness report
+or live release evidence is asserted by this document.
+
+The current machine-generated readiness contract is implemented by
+`crates/velorix-cli/src/main.rs` (`readiness-report`) and
+`.github/workflows/release-gate.yml`; local CI success does not satisfy those
+artifact gates. Canonical product requirements: [specification.md](../specification.md).
+
 This document does not certify release readiness. It exists to point readers at
 the evidence-bound release gate.
 

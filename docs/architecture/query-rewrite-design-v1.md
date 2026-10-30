@@ -6,6 +6,16 @@ to already proven operators.
 
 ## Current State
 
+**Status at baseline `c6222ab`:** this list is a partial snapshot. In addition
+to the listed identity/filter CTE and narrow PK-correlated EXISTS forms, the
+planner contains narrowly admitted aggregate CTE normalization, IN/NOT IN
+decorrelation, a scalar aggregate-filter family, and recursive fixpoint
+admission. These are separate execution shapes with their own limits; they do
+not imply general subquery or CTE support. See
+[`view_plan`](../../crates/velorix-core/src/view_plan/mod.rs) and
+[supported SQL](supported-sql.md). The sections below remain broader proposals
+unless current validators establish the shape.
+
 ### Supported CTEs
 - Identity CTEs: `WITH cte AS (SELECT * FROM t) SELECT * FROM cte`
 - Simple filter/project CTEs: `WITH cte AS (SELECT col1, col2 FROM t WHERE ...) SELECT * FROM cte`

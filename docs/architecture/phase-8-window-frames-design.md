@@ -1,6 +1,14 @@
 # Phase 8 — Window Frames and Navigation Functions (Design)
 
-Status: DESIGN — implementation gated on this document.
+Status: Bounded ROWS navigation-frame runtime support is present at baseline
+`c6222ab`. Admission is narrow (one relation, one partition column, one
+non-null order column, bounded constant ROWS frame, supported navigation
+functions); RANGE/GROUPS and broader analytic SQL are rejected. Runtime
+coverage exists, but public API end-to-end qualification is not established by
+the runtime tests cited here. The constraints and budgets below are design
+proposals except where the validator/runtime code proves them. Evidence:
+[`validate_supported_analytic_window_frame_sql`](../../crates/velorix-core/src/view_plan/mod.rs)
+and [`AnalyticWindowFrameRuntime`](../../crates/velorix-runtime/src/materialized_view_runtime/analytic_window_frame.rs).
 
 ## 1. Semantic design
 

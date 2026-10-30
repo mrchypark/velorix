@@ -35,7 +35,7 @@ impl Drop for HttpServer {
 
 async fn capacity_fixture() -> (ApiState, ApiState, HttpServer, HttpServer, String, u64) {
     let (_state, router, store, meta, _counts) = fixture().await;
-    ingest(&router, 0, json!([{"user_id":"a","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
     let view = "capacity_output";
     declare(
         &router,
@@ -235,7 +235,7 @@ async fn assert_public_worker_error(worker_status: StatusCode, expected_status: 
 async fn restarted_endpoint_waits_for_foreign_lease_without_self_rpc_then_takes_over() {
     let durable = Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
     let (old, router, store, meta, counts) = fixture_with_meta(durable.clone()).await;
-    ingest(&router, 0, json!([{"user_id":"a","score":7,"delta":1}])).await;
+    ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
     let view = "restart_output";
     declare(
         &router,

@@ -2942,7 +2942,7 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -2981,7 +2981,7 @@ async fn standing_runtime_output_compaction_publishes_checkpoint_bound_snapshot_
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1}
+                {"user_id": "alice", "score": 10}
             ]
         }),
     )
@@ -4482,7 +4482,7 @@ async fn rest_latest_by_key_cte_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog()
+            "catalog": public_catalog_fixture(&test_item_status_catalog())
         }),
     )
     .await;
@@ -4528,9 +4528,9 @@ async fn rest_latest_by_key_cte_view_materializes_outputs() {
                     "watermark_ns": 100
                 },
                 "rows": [
-                    {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                    {"key": "item-a", "flag": false, "ts": 110, "delta": 1},
-                    {"key": "item-b", "flag": true, "ts": 90, "delta": 1}
+                    {"key": "item-a", "flag": true, "ts": 100},
+                    {"key": "item-a", "flag": false, "ts": 110},
+                    {"key": "item-b", "flag": true, "ts": 90}
                 ]
             }]
         }),
@@ -4588,7 +4588,7 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog
+            "catalog": public_catalog_fixture(&catalog)
         }),
     )
     .await;
@@ -4625,9 +4625,9 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                    {"key": "item-a", "flag": null, "ts": 110, "delta": 1},
-                    {"key": "item-b", "flag": false, "ts": 120, "delta": 1}
+                    {"key": "item-a", "flag": true, "ts": 100},
+                    {"key": "item-a", "flag": null, "ts": 110},
+                    {"key": "item-b", "flag": false, "ts": 120}
                 ]
             }]
         }),
@@ -4697,7 +4697,7 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
                 "partition_id": 0,
                 "start_offset_inclusive": 3,
                 "rows": [
-                    {"key": "item-a", "flag": false, "ts": 120, "delta": 1}
+                    {"key": "item-a", "flag": false, "ts": 120}
                 ]
             }]
         }),
@@ -4740,9 +4740,10 @@ async fn rest_latest_by_key_nullable_value_survives_query_and_restart() {
                 "stream_id": "nullable-item-status-stream",
                 "partition_id": 0,
                 "start_offset_inclusive": 4,
-                "rows": [
-                    {"key": "item-a", "flag": false, "ts": 120, "delta": -1}
-                ]
+                "rows": [{"operation":"update",
+                    "before":{"key":"item-a","flag":false,"ts":120},
+                    "after":{"key":"item-a","flag":null,"ts":120}
+                }]
             }]
         }),
     )
@@ -4788,7 +4789,7 @@ async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_re
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog()
+            "catalog": public_catalog_fixture(&test_item_status_catalog())
         }),
     )
     .await;
@@ -4840,9 +4841,9 @@ async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_re
                 "watermark_ns": 100
             },
             "rows": [
-                {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                {"key": "item-a", "flag": false, "ts": 110, "delta": 1},
-                {"key": "item-b", "flag": true, "ts": 90, "delta": 1}
+                {"key": "item-a", "flag": true, "ts": 100},
+                {"key": "item-a", "flag": false, "ts": 110},
+                {"key": "item-b", "flag": true, "ts": 90}
             ]
         }),
     )
@@ -4899,11 +4900,11 @@ async fn rest_latest_bool_view_materialized_output_replays_later_ingest_after_re
                 max_observed_event_time_ns: 120,
                 watermark_ns: 115,
             }),
+            row_format: None,
             rows: vec![json!({
                 "key": "item-b",
                 "flag": false,
                 "ts": 120,
-                "delta": 1
             })],
         },
     )
@@ -4945,7 +4946,7 @@ async fn rest_latest_by_key_order_by_limit_top_k_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog()
+            "catalog": public_catalog_fixture(&test_item_status_catalog())
         }),
     )
     .await;
@@ -4995,8 +4996,8 @@ async fn rest_latest_by_key_order_by_limit_top_k_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                    {"key": "item-b", "flag": false, "ts": 110, "delta": 1}
+                    {"key": "item-a", "flag": true, "ts": 100},
+                    {"key": "item-b", "flag": false, "ts": 110}
                 ]
             }]
         }),
@@ -5037,7 +5038,7 @@ async fn rest_latest_by_key_order_by_limit_offset_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog()
+            "catalog": public_catalog_fixture(&test_item_status_catalog())
         }),
     )
     .await;
@@ -5077,9 +5078,9 @@ async fn rest_latest_by_key_order_by_limit_offset_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                    {"key": "item-b", "flag": false, "ts": 110, "delta": 1},
-                    {"key": "item-c", "flag": true, "ts": 120, "delta": 1}
+                    {"key": "item-a", "flag": true, "ts": 100},
+                    {"key": "item-b", "flag": false, "ts": 110},
+                    {"key": "item-c", "flag": true, "ts": 120}
                 ]
             }]
         }),
@@ -5115,7 +5116,7 @@ async fn rest_ingest_event_time_watermark_requires_declared_event_time_column() 
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -5137,7 +5138,7 @@ async fn rest_ingest_event_time_watermark_requires_declared_event_time_column() 
                 "watermark_ns": 90
             },
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1}
+                {"user_id": "alice", "score": 10}
             ]
         }),
     )
@@ -5164,7 +5165,7 @@ async fn rest_ingest_event_time_watermark_rejects_max_below_batch_event_time() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog()
+            "catalog": public_catalog_fixture(&test_item_status_catalog())
         }),
     )
     .await;
@@ -5186,8 +5187,8 @@ async fn rest_ingest_event_time_watermark_rejects_max_below_batch_event_time() {
                 "watermark_ns": 100
             },
             "rows": [
-                {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                {"key": "item-b", "flag": false, "ts": 110, "delta": 1}
+                {"key": "item-a", "flag": true, "ts": 100},
+                {"key": "item-b", "flag": false, "ts": 110}
             ]
         }),
     )
@@ -5222,7 +5223,7 @@ async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_afte
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -5280,10 +5281,10 @@ async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_afte
                 "watermark_ns": 60_000_000_000i64
             },
             "rows": [
-                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1},
-                {"user_id": "bob", "amount": -50, "event_time": 35_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 7, "event_time": 70_000_000_000i64, "delta": 1}
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64},
+                {"user_id": "bob", "amount": -50, "event_time": 35_000_000_000i64},
+                {"user_id": "alice", "amount": 7, "event_time": 70_000_000_000i64}
             ]
         }),
     )
@@ -5325,11 +5326,11 @@ async fn rest_tumbling_window_view_materialized_output_replays_later_ingest_afte
                 max_observed_event_time_ns: 120_000_000_000,
                 watermark_ns: 120_000_000_000,
             }),
+            row_format: None,
             rows: vec![json!({
                 "user_id": "bob",
                 "amount": 11,
                 "event_time": 80_000_000_000i64,
-                "delta": 1
             })],
         },
     )
@@ -5384,7 +5385,7 @@ async fn rest_tumbling_window_cte_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -5430,9 +5431,9 @@ async fn rest_tumbling_window_cte_view_materializes_outputs() {
                     "watermark_ns": 60_000_000_000i64
                 },
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                    {"user_id": "bob", "amount": 8, "event_time": 20_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 4, "event_time": 30_000_000_000i64, "delta": 1}
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "bob", "amount": 8, "event_time": 20_000_000_000i64},
+                    {"user_id": "alice", "amount": 4, "event_time": 30_000_000_000i64}
                 ]
             }]
         }),
@@ -5477,7 +5478,7 @@ async fn rest_tumbling_window_order_by_limit_top_k_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -5522,9 +5523,9 @@ async fn rest_tumbling_window_order_by_limit_top_k_view_materializes_outputs() {
                     "watermark_ns": 60_000_000_000i64
                 },
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                    {"user_id": "bob", "amount": 12, "event_time": 30_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 50, "event_time": 70_000_000_000i64, "delta": 1}
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "bob", "amount": 12, "event_time": 30_000_000_000i64},
+                    {"user_id": "alice", "amount": 50, "event_time": 70_000_000_000i64}
                 ]
             }]
         }),
@@ -5568,7 +5569,7 @@ async fn rest_tumbling_window_order_by_sum_function_top_k_view_materializes_outp
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -5613,9 +5614,9 @@ async fn rest_tumbling_window_order_by_sum_function_top_k_view_materializes_outp
                     "watermark_ns": 60_000_000_000i64
                 },
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                    {"user_id": "bob", "amount": 12, "event_time": 30_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 50, "event_time": 70_000_000_000i64, "delta": 1}
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "bob", "amount": 12, "event_time": 30_000_000_000i64},
+                    {"user_id": "alice", "amount": 50, "event_time": 70_000_000_000i64}
                 ]
             }]
         }),
@@ -5667,7 +5668,7 @@ async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -5712,10 +5713,10 @@ async fn rest_tumbling_window_count_distinct_view_materializes_outputs() {
                     "watermark_ns": 60_000_000_000i64
                 },
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 10, "event_time": 20_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
-                    {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1}
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "alice", "amount": 10, "event_time": 20_000_000_000i64},
+                    {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64},
+                    {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64}
                 ]
             }]
         }),
@@ -5794,7 +5795,7 @@ async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs(
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -5839,10 +5840,10 @@ async fn rest_tumbling_window_filtered_count_distinct_view_materializes_outputs(
                     "watermark_ns": 60_000_000_000i64
                 },
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 10, "event_time": 20_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
-                    {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1}
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "alice", "amount": 10, "event_time": 20_000_000_000i64},
+                    {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64},
+                    {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64}
                 ]
             }]
         }),
@@ -5933,7 +5934,7 @@ async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() 
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog
+            "catalog": public_catalog_fixture(&catalog)
         }),
     )
     .await;
@@ -5962,31 +5963,31 @@ async fn rest_tumbling_window_nullable_column_count_view_materializes_outputs() 
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
 
     let ingest_response = call_json(
-            &router,
-            Method::POST,
-            "/v1/relations/ingest",
-            json!({
-                "batches": [{
-                    "relation_id": "purchases",
-                    "relation_version": "2026-05-24.v1",
-                    "stream_id": "purchases-nullable-window-stream",
-                    "partition_id": 0,
-                    "start_offset_inclusive": 0,
-                    "event_time_watermark": {
-                        "event_time_column_id": "event_time",
-                        "max_observed_event_time_ns": 70_000_000_000i64,
-                        "watermark_ns": 60_000_000_000i64
-                    },
-                    "rows": [
-                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                        {"user_id": "alice", "amount": null, "event_time": 20_000_000_000i64, "delta": 1},
-                        {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
-                        {"user_id": "bob", "amount": null, "event_time": 30_000_000_000i64, "delta": 1}
-                    ]
-                }]
-            }),
-        )
-        .await;
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [{
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "purchases-nullable-window-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 70_000_000_000i64,
+                    "watermark_ns": 60_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "alice", "amount": null, "event_time": 20_000_000_000i64},
+                    {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64},
+                    {"user_id": "bob", "amount": null, "event_time": 30_000_000_000i64}
+                ]
+            }]
+        }),
+    )
+    .await;
     assert_eq!(
         ingest_response.0,
         StatusCode::CREATED,
@@ -6071,7 +6072,7 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog
+            "catalog": public_catalog_fixture(&catalog)
         }),
     )
     .await;
@@ -6100,31 +6101,31 @@ async fn rest_tumbling_window_filtered_nullable_column_count_view_materializes_o
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
 
     let ingest_response = call_json(
-            &router,
-            Method::POST,
-            "/v1/relations/ingest",
-            json!({
-                "batches": [{
-                    "relation_id": "purchases",
-                    "relation_version": "2026-05-24.v1",
-                    "stream_id": "purchases-filtered-nullable-window-stream",
-                    "partition_id": 0,
-                    "start_offset_inclusive": 0,
-                    "event_time_watermark": {
-                        "event_time_column_id": "event_time",
-                        "max_observed_event_time_ns": 70_000_000_000i64,
-                        "watermark_ns": 60_000_000_000i64
-                    },
-                    "rows": [
-                        {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                        {"user_id": "alice", "amount": null, "event_time": 20_000_000_000i64, "delta": 1},
-                        {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64, "delta": 1},
-                        {"user_id": "bob", "amount": null, "event_time": 30_000_000_000i64, "delta": 1}
-                    ]
-                }]
-            }),
-        )
-        .await;
+        &router,
+        Method::POST,
+        "/v1/relations/ingest",
+        json!({
+            "batches": [{
+                "relation_id": "purchases",
+                "relation_version": "2026-05-24.v1",
+                "stream_id": "purchases-filtered-nullable-window-stream",
+                "partition_id": 0,
+                "start_offset_inclusive": 0,
+                "event_time_watermark": {
+                    "event_time_column_id": "event_time",
+                    "max_observed_event_time_ns": 70_000_000_000i64,
+                    "watermark_ns": 60_000_000_000i64
+                },
+                "rows": [
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "alice", "amount": null, "event_time": 20_000_000_000i64},
+                    {"user_id": "alice", "amount": 7, "event_time": 30_000_000_000i64},
+                    {"user_id": "bob", "amount": null, "event_time": 30_000_000_000i64}
+                ]
+            }]
+        }),
+    )
+    .await;
     assert_eq!(
         ingest_response.0,
         StatusCode::CREATED,
@@ -6197,7 +6198,7 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -6215,15 +6216,15 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
             "view_id": "filtered_score_groups",
             "input_relation_id": "scores",
             "input_relation_version": "2026-05-24.v1",
-            "sql": "select user_id, sum(score) filter (where score = 0) as filtered_sum, count(*) filter (where score = 0) as filtered_count from scores group by user_id"
+            "sql": "select user_id, sum(score) filter (where score = 0) as filtered_sum, count(*) filter (where score = 0) as filtered_count from scores where score >= 0 group by user_id"
         }),
     )
     .await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
 
     let rows = json!([
-        {"user_id": "zero", "score": 0, "delta": 1},
-        {"user_id": "filtered_out", "score": 1, "delta": 1}
+        {"user_id": "zero", "score": 0},
+        {"user_id": "filtered_out", "score": 1}
     ]);
     let ingest_response = call_json(
         &router,
@@ -6300,8 +6301,8 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
             "partition_id": 0,
             "start_offset_inclusive": 2,
             "rows": [
-                {"user_id": "zero", "score": 0, "delta": -1},
-                {"user_id": "filtered_out", "score": 1, "delta": -1}
+                {"operation":"update","before":{"user_id":"zero","score":0},"after":{"user_id":"zero","score":-1}},
+                {"operation":"update","before":{"user_id":"filtered_out","score":1},"after":{"user_id":"filtered_out","score":-1}}
             ]
         }),
     )
@@ -6330,8 +6331,11 @@ async fn rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_res
             "relation_version": "2026-05-24.v1",
             "stream_id": "filtered-group-survival-stream",
             "partition_id": 0,
-            "start_offset_inclusive": 4,
-            "rows": rows
+            "start_offset_inclusive": 6,
+            "rows": [
+                {"operation":"update","before":{"user_id":"zero","score":-1},"after":{"user_id":"zero","score":0}},
+                {"operation":"update","before":{"user_id":"filtered_out","score":-1},"after":{"user_id":"filtered_out","score":1}}
+            ]
         }),
     )
     .await;
@@ -6378,7 +6382,7 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score()
+            "catalog": public_catalog_fixture(&test_scores_catalog_with_nullable_score())
         }),
     )
     .await;
@@ -6396,17 +6400,17 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
             "view_id": "nullable_score_aggregate_groups",
             "input_relation_id": "scores",
             "input_relation_version": "2026-05-24.v1",
-            "sql": "select user_id, sum(score) as score_sum, avg(score) as score_avg, min(score) as score_min, max(score) as score_max, count(score) as score_count from scores group by user_id"
+            "sql": "select user_id, sum(score) as score_sum, avg(score) as score_avg, min(score) as score_min, max(score) as score_max, count(score) as score_count from scores where score is null or score = 0 group by user_id"
         }),
     )
     .await;
     assert_eq!(view_response.0, StatusCode::CREATED, "{view_response:?}");
 
     let rows = json!([
-        {"user_id": "empty", "score": null, "delta": 1},
-        {"user_id": "mixed", "score": 0, "delta": 1},
-        {"user_id": "mixed", "score": null, "delta": 1},
-        {"user_id": "zero", "score": 0, "delta": 1}
+        {"user_id": "empty", "score": null},
+        {"user_id": "mixed", "score": 0},
+        {"user_id": "mixed", "score": null},
+        {"user_id": "zero", "score": 0}
     ]);
     let ingest_response = call_json(
         &router,
@@ -6505,10 +6509,10 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
             "partition_id": 0,
             "start_offset_inclusive": 4,
             "rows": [
-                {"user_id": "empty", "score": null, "delta": -1},
-                {"user_id": "mixed", "score": 0, "delta": -1},
-                {"user_id": "mixed", "score": null, "delta": -1},
-                {"user_id": "zero", "score": 0, "delta": -1}
+                {"operation":"update","before":{"user_id":"empty","score":null},"after":{"user_id":"empty","score":1}},
+                {"operation":"update","before":{"user_id":"mixed","score":0},"after":{"user_id":"mixed","score":1}},
+                {"operation":"update","before":{"user_id":"mixed","score":null},"after":{"user_id":"mixed","score":1}},
+                {"operation":"update","before":{"user_id":"zero","score":0},"after":{"user_id":"zero","score":1}}
             ]
         }),
     )
@@ -6536,8 +6540,13 @@ async fn rest_nullable_numeric_aggregates_preserve_nulls_and_retractions_across_
             "relation_version": "2026-05-24.v1",
             "stream_id": "nullable-aggregate-survival-stream",
             "partition_id": 0,
-            "start_offset_inclusive": 8,
-            "rows": rows
+            "start_offset_inclusive": 12,
+            "rows": [
+                {"operation":"update","before":{"user_id":"empty","score":1},"after":{"user_id":"empty","score":null}},
+                {"operation":"update","before":{"user_id":"mixed","score":1},"after":{"user_id":"mixed","score":0}},
+                {"operation":"update","before":{"user_id":"mixed","score":1},"after":{"user_id":"mixed","score":null}},
+                {"operation":"update","before":{"user_id":"zero","score":1},"after":{"user_id":"zero","score":0}}
+            ]
         }),
     )
     .await;
@@ -6579,7 +6588,7 @@ async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -6626,9 +6635,9 @@ async fn rest_hopping_window_advanced_aggregate_view_survives_api_restart() {
                     "watermark_ns": 90_000_000_000i64
                 },
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 14, "event_time": 20_000_000_000i64, "delta": 1},
-                    {"user_id": "alice", "amount": 10, "event_time": 40_000_000_000i64, "delta": 1}
+                    {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                    {"user_id": "alice", "amount": 14, "event_time": 20_000_000_000i64},
+                    {"user_id": "alice", "amount": 10, "event_time": 40_000_000_000i64}
                 ]
             }]
         }),
@@ -6702,7 +6711,7 @@ async fn rest_hopping_and_session_window_views_materialize_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -6766,9 +6775,9 @@ async fn rest_hopping_and_session_window_views_materialize_outputs() {
                 "watermark_ns": 120_000_000_000i64
             },
             "rows": [
-                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64},
+                {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64}
             ]
         }),
     )
@@ -6837,7 +6846,7 @@ async fn rest_session_window_view_materialized_output_survives_api_restart() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -6880,9 +6889,9 @@ async fn rest_session_window_view_materialized_output_survives_api_restart() {
                 "watermark_ns": 120_000_000_000i64
             },
             "rows": [
-                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64},
+                {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64}
             ]
         }),
     )
@@ -6947,7 +6956,7 @@ async fn rest_late_tumbling_window_view_reports_materialization_lag_on_first_que
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -6974,9 +6983,9 @@ async fn rest_late_tumbling_window_view_reports_materialization_lag_on_first_que
                 "watermark_ns": 60_000_000_000i64
             },
             "rows": [
-                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 7, "event_time": 80_000_000_000i64, "delta": 1}
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                {"user_id": "bob", "amount": 5, "event_time": 30_000_000_000i64},
+                {"user_id": "alice", "amount": 7, "event_time": 80_000_000_000i64}
             ]
         }),
     )
@@ -7034,7 +7043,7 @@ async fn rest_late_tumbling_window_view_reports_materialization_lag_on_first_que
                 "watermark_ns": 120_000_000_000i64
             },
             "rows": [
-                {"user_id": "bob", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                {"user_id": "bob", "amount": 11, "event_time": 80_000_000_000i64}
             ]
         }),
     )
@@ -7116,7 +7125,7 @@ async fn rest_late_hopping_and_session_window_views_report_materialization_lag_o
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -7138,9 +7147,9 @@ async fn rest_late_hopping_and_session_window_views_report_materialization_lag_o
                 "watermark_ns": 120_000_000_000i64
             },
             "rows": [
-                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64, "delta": 1}
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                {"user_id": "alice", "amount": 7, "event_time": 25_000_000_000i64},
+                {"user_id": "alice", "amount": 11, "event_time": 80_000_000_000i64}
             ]
         }),
     )
@@ -7262,7 +7271,7 @@ async fn rest_unsupported_single_input_sql_admission_fails_closed_without_creati
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -7333,7 +7342,7 @@ async fn rest_unsupported_join_sql_admission_fails_closed_without_creating_view(
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -7414,7 +7423,7 @@ async fn rest_unsupported_three_table_join_admission_fails_closed_without_active
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -7510,7 +7519,7 @@ async fn rest_sql_admission_corpus_fails_closed_without_metadata_or_runtime_bind
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -7712,7 +7721,7 @@ fn ingest_epoch_request_rejects_ack_mode_negotiation_field() {
             "stream_id": "scores",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 1, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 1}]
         }]
     }))
     .unwrap_err();
@@ -7759,7 +7768,7 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -7796,7 +7805,8 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
             partition_id: 0,
             start_offset_inclusive: 0,
             event_time_watermark: None,
-            rows: vec![json!({"user_id": "alice", "score": 10, "delta": 1})],
+            row_format: None,
+            rows: vec![json!({"user_id": "alice", "score": 10})],
         },
         None,
     )
@@ -7831,7 +7841,8 @@ async fn direct_apply_uses_prepared_current_batch_without_replaying_ingest_objec
             partition_id: 0,
             start_offset_inclusive: 1,
             event_time_watermark: None,
-            rows: vec![json!({"user_id": "alice", "score": 5, "delta": 1})],
+            row_format: None,
+            rows: vec![json!({"user_id": "alice", "score": 5})],
         },
         None,
     )
@@ -7896,7 +7907,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -7911,7 +7922,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
             "stream_id": "rest-direct-apply-baseline-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -7944,7 +7955,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -7982,7 +7993,7 @@ async fn rest_relation_scoped_materialized_ingest_uses_prepared_current_batch_wi
             "stream_id": "rest-direct-apply-scores-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -8040,13 +8051,17 @@ async fn rest_ingest_commits_metadata_source_cut_only_after_durable_append() {
     .await;
     let router = app(state.clone());
     let catalog = test_scores_catalog();
-    let schema_fingerprint = catalog.schema_fingerprint.to_string();
+    let schema_fingerprint = public_catalog_fixture(&catalog)
+        .into_internal()
+        .unwrap()
+        .schema_fingerprint
+        .to_string();
     let relation_response = call_json(
         &router,
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog
+            "catalog": public_catalog_fixture(&catalog)
         }),
     )
     .await;
@@ -8062,7 +8077,7 @@ async fn rest_ingest_commits_metadata_source_cut_only_after_durable_append() {
             "stream_id": "source-cut-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -8104,13 +8119,17 @@ async fn rest_ingest_does_not_commit_source_cut_when_durable_append_fails() {
     .await;
     let router = app(state);
     let catalog = test_scores_catalog();
-    let schema_fingerprint = catalog.schema_fingerprint.to_string();
+    let schema_fingerprint = public_catalog_fixture(&catalog)
+        .into_internal()
+        .unwrap()
+        .schema_fingerprint
+        .to_string();
     let relation_response = call_json(
         &router,
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": catalog
+            "catalog": public_catalog_fixture(&catalog)
         }),
     )
     .await;
@@ -8122,7 +8141,7 @@ async fn rest_ingest_does_not_commit_source_cut_when_durable_append_fails() {
         "stream_id": "source-cut-failure-stream",
         "partition_id": 0,
         "start_offset_inclusive": 0,
-        "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+        "rows": [{"user_id": "alice", "score": 10}]
     });
     failing_store.arm("v1/ingest/");
     let failed = call_json(&router, Method::POST, "/v1/ingest", ingest.clone()).await;
@@ -8171,7 +8190,7 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -8186,7 +8205,7 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
             "stream_id": "view-bootstrap-source-cut-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -8329,7 +8348,7 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
             "stream_id": "view-bootstrap-source-cut-stream",
             "partition_id": 0,
             "start_offset_inclusive": 1,
-            "rows": [{"user_id": "bob", "score": 20, "delta": 1}]
+            "rows": [{"user_id": "bob", "score": 20}]
         }),
     )
     .await;
@@ -8344,7 +8363,7 @@ async fn rest_view_admission_persists_plan_spec_and_source_cut_in_metadata() {
             "stream_id": "view-bootstrap-source-cut-stream",
             "partition_id": 1,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "carol", "score": 30, "delta": 1}]
+            "rows": [{"user_id": "carol", "score": 30}]
         }),
     )
     .await;
@@ -8473,7 +8492,7 @@ async fn rest_relation_scoped_ingest_materializes_views_automatically() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -8511,9 +8530,9 @@ async fn rest_relation_scoped_ingest_materializes_views_automatically() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": -4, "delta": 1},
-                {"user_id": "bob", "score": 7, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": -4},
+                {"user_id": "bob", "score": 7}
             ]
         }),
     )
@@ -8570,7 +8589,7 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_order_facts_catalog()
+            "catalog": public_catalog_fixture(&test_order_facts_catalog())
         }),
     )
     .await;
@@ -8580,45 +8599,10 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
         "{relation_response:?}"
     );
 
-    for request in [
-        json!({
-            "view_id": "order_totals_by_user_category",
-            "input_relation_id": "order_facts",
-            "input_relation_version": "2026-08-10.v1",
-            "sql": "select user_id, category, sum(amount) as sum, count(*) as count from order_facts group by user_id, category"
-        }),
-        json!({
-            "view_id": "order_fact_count",
-            "input_relation_id": "order_facts",
-            "input_relation_version": "2026-08-10.v1",
-            "sql": "select count(*) as count from order_facts"
-        }),
-    ] {
-        let response = call_json(&router, Method::POST, "/v1/views", request).await;
-        assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
-    }
-
-    let empty_global = call_json(
-        &router,
-        Method::POST,
-        "/v1/views/order_fact_count/query",
-        json!({}),
-    )
-    .await;
-    assert_eq!(
-        empty_global.0,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "{empty_global:?}"
-    );
-    assert!(empty_global.1["error"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("MATERIALIZATION_LAG"));
-
     let rows = json!([
-        {"order_id": "o1", "user_id": "u1", "category": "a", "amount": 5, "delta": 1},
-        {"order_id": "o2", "user_id": "u1", "category": "a", "amount": 7, "delta": 1},
-        {"order_id": "o3", "user_id": "u1", "category": null, "amount": 15, "delta": 1}
+        {"order_id": "o1", "user_id": "u1", "category": "a", "amount": 5},
+        {"order_id": "o2", "user_id": "u1", "category": "a", "amount": 7},
+        {"order_id": "o3", "user_id": "u1", "category": null, "amount": 15}
     ]);
     let ingest_response = call_json(
         &router,
@@ -8638,7 +8622,75 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
         StatusCode::CREATED,
         "{ingest_response:?}"
     );
-    assert_eq!(ingest_response.1["materialization"]["active_views"], 2);
+    assert_eq!(ingest_response.1["materialization"]["active_views"], 0);
+
+    let parent_view = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id":"positive_order_facts",
+            "input_relation_id":"order_facts",
+            "input_relation_version":"2026-08-10.v1",
+            "sql":"select order_id, user_id, category, amount from order_facts where amount > 0"
+        }),
+    )
+    .await;
+    assert_eq!(parent_view.0, StatusCode::CREATED, "{parent_view:?}");
+    let parent_backfill = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/positive_order_facts/backfill",
+        json!({}),
+    )
+    .await;
+    assert_eq!(parent_backfill.0, StatusCode::OK, "{parent_backfill:?}");
+    let composite_view = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id":"order_totals_by_user_category",
+            "input_relation_id":"positive_order_facts",
+            "input_relation_version":"v1",
+            "sql":"select user_id, category, sum(amount) as sum, count(*) as count from positive_order_facts group by user_id, category"
+        }),
+    )
+    .await;
+    assert_eq!(composite_view.0, StatusCode::CREATED, "{composite_view:?}");
+    let composite_backfill = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/order_totals_by_user_category/backfill",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        composite_backfill.0,
+        StatusCode::OK,
+        "{composite_backfill:?}"
+    );
+    let count_view = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id":"order_fact_count",
+            "input_relation_id":"positive_order_facts",
+            "input_relation_version":"v1",
+            "sql":"select count(*) as count from positive_order_facts"
+        }),
+    )
+    .await;
+    assert_eq!(count_view.0, StatusCode::CREATED, "{count_view:?}");
+    let count_backfill = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/order_fact_count/backfill",
+        json!({}),
+    )
+    .await;
+    assert_eq!(count_backfill.0, StatusCode::OK, "{count_backfill:?}");
 
     let composite = call_json(
         &router,
@@ -8655,6 +8707,7 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
             {"user_id": "u1", "category": null, "sum": 15, "count": 1}
         ])
     );
+
     let global = call_json(
         &router,
         Method::POST,
@@ -8678,7 +8731,7 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
             .restore_standing_program_runtimes_from_active_views()
             .await
             .unwrap(),
-        2
+        3
     );
     let restarted_router = app(restarted_state);
     for (view_id, expected_rows) in [
@@ -8697,9 +8750,9 @@ async fn rest_composite_and_global_aggregates_survive_restart_and_final_retracti
     }
 
     let retract_rows = json!([
-        {"order_id": "o1", "user_id": "u1", "category": "a", "amount": 5, "delta": -1},
-        {"order_id": "o2", "user_id": "u1", "category": "a", "amount": 7, "delta": -1},
-        {"order_id": "o3", "user_id": "u1", "category": null, "amount": 15, "delta": -1}
+        {"operation":"update","before":{"order_id":"o1","user_id":"u1","category":"a","amount":5},"after":{"order_id":"o1","user_id":"u1","category":"a","amount":0}},
+        {"operation":"update","before":{"order_id":"o2","user_id":"u1","category":"a","amount":7},"after":{"order_id":"o2","user_id":"u1","category":"a","amount":0}},
+        {"operation":"update","before":{"order_id":"o3","user_id":"u1","category":null,"amount":15},"after":{"order_id":"o3","user_id":"u1","category":null,"amount":0}}
     ]);
     let retraction = call_json(
         &restarted_router,
@@ -8755,7 +8808,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -8773,7 +8826,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
                     "stream_id": "relation-batch-baseline-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+                    "rows": [{"user_id": "alice", "score": 10}]
                 },
                 {
                     "relation_id": "scores",
@@ -8781,7 +8834,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
                     "stream_id": "relation-batch-baseline-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 1,
-                    "rows": [{"user_id": "bob", "score": 7, "delta": 1}]
+                    "rows": [{"user_id": "bob", "score": 7}]
                 }
             ]
         }),
@@ -8817,7 +8870,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -8858,7 +8911,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
                     "stream_id": "relation-batch-direct-apply-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+                    "rows": [{"user_id": "alice", "score": 10}]
                 },
                 {
                     "relation_id": "scores",
@@ -8866,7 +8919,7 @@ async fn rest_relation_batch_ingest_materializes_multiple_batches_without_ingest
                     "stream_id": "relation-batch-direct-apply-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 1,
-                    "rows": [{"user_id": "bob", "score": 7, "delta": 1}]
+                    "rows": [{"user_id": "bob", "score": 7}]
                 }
             ]
         }),
@@ -8952,7 +9005,7 @@ async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_r
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_accounts_catalog()
+            "catalog": public_catalog_fixture(&test_accounts_catalog())
         }),
     )
     .await;
@@ -8991,10 +9044,10 @@ async fn rest_row_number_view_materializes_relation_scoped_ingest_and_survives_r
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                {"account_id": "aaron", "limit": 100, "tier": "gold", "delta": 1},
-                {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
-                {"account_id": "carol", "limit": 80, "tier": "silver", "delta": 1}
+                {"account_id": "alice", "limit": 100, "tier": "gold"},
+                {"account_id": "aaron", "limit": 100, "tier": "gold"},
+                {"account_id": "bob", "limit": 50, "tier": "gold"},
+                {"account_id": "carol", "limit": 80, "tier": "silver"}
             ]
         }),
     )
@@ -9062,7 +9115,7 @@ async fn rest_late_filter_project_view_reports_materialization_lag_on_first_quer
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -9078,9 +9131,9 @@ async fn rest_late_filter_project_view_reports_materialization_lag_on_first_quer
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": -2, "delta": 1},
-                {"user_id": "carol", "score": 7, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": -2},
+                {"user_id": "carol", "score": 7}
             ]
         }),
     )
@@ -9144,7 +9197,7 @@ async fn rest_between_predicate_aggregate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_catalog())
         }),
     )
     .await;
@@ -9182,10 +9235,10 @@ async fn rest_between_predicate_aggregate_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "amount": 10, "delta": 1},
-                {"user_id": "bob", "amount": 5, "delta": 1},
-                {"user_id": "alice", "amount": 7, "delta": 1},
-                {"user_id": "carol", "amount": 21, "delta": 1}
+                {"user_id": "alice", "amount": 10},
+                {"user_id": "bob", "amount": 5},
+                {"user_id": "alice", "amount": 7},
+                {"user_id": "carol", "amount": 21}
             ]
         }),
     )
@@ -9227,7 +9280,7 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -9262,7 +9315,8 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
         partition_id: 0,
         start_offset_inclusive: 0,
         event_time_watermark: None,
-        rows: vec![json!({"user_id": "alice", "score": 10, "delta": 1})],
+        row_format: None,
+        rows: vec![json!({"user_id": "alice", "score": 10})],
     };
     let prepared = prepare_ingest_batch(&state, ingest_request.clone(), None)
         .await
@@ -9323,7 +9377,7 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
             "stream_id": "retry-scores-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -9366,7 +9420,7 @@ async fn rest_ingest_retry_converges_after_runtime_failure_after_durable_append(
             "stream_id": "retry-scores-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -9460,7 +9514,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -9494,7 +9548,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
         "stream_id": "optimized-scores-stream",
         "partition_id": 0,
         "start_offset_inclusive": 0,
-        "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+        "rows": [{"user_id": "alice", "score": 10}]
     });
     let first_ingest = call_json(
         &router,
@@ -9657,7 +9711,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
                     "stream_id": "optimized-scores-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 1,
-                    "rows": [{"user_id": "alice", "score": 1, "delta": 1}]
+                    "rows": [{"user_id": "alice", "score": 1}]
                 },
                 {
                     "relation_id": "scores",
@@ -9665,7 +9719,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
                     "stream_id": "optimized-scores-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 2,
-                    "rows": [{"user_id": "bob", "score": 2, "delta": 1}]
+                    "rows": [{"user_id": "bob", "score": 2}]
                 }
             ]
         }),
@@ -9728,7 +9782,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
                     "stream_id": "optimized-scores-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 3,
-                    "rows": [{"user_id": "alice", "score": 3, "delta": 1}]
+                    "rows": [{"user_id": "alice", "score": 3}]
                 },
                 {
                     "relation_id": "scores",
@@ -9736,7 +9790,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
                     "stream_id": "optimized-scores-stream",
                     "partition_id": 0,
                     "start_offset_inclusive": 4,
-                    "rows": [{"user_id": "bob", "score": 4, "delta": 1}]
+                    "rows": [{"user_id": "bob", "score": 4}]
                 }
             ]
         }),
@@ -9767,7 +9821,7 @@ async fn rest_ingest_optimization_modes_report_timings_and_materialize_correctly
                 "partition_id": 0,
                 "start_offset_inclusive": 3,
                 "ack_mode": "append_committed",
-                "rows": [{"user_id": "alice", "score": 3, "delta": 1}]
+                "rows": [{"user_id": "alice", "score": 3}]
             }]
         }),
     )
@@ -9795,7 +9849,7 @@ async fn rest_materialization_rejects_output_delta_over_runtime_budget() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -9833,8 +9887,8 @@ async fn rest_materialization_rejects_output_delta_over_runtime_budget() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 20, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 20}
             ]
         }),
     )
@@ -9886,7 +9940,7 @@ async fn rest_epoch_ingest_appends_batches_concurrently() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -9905,7 +9959,7 @@ async fn rest_epoch_ingest_appends_batches_concurrently() {
                     "stream_id": "parallel-append-a",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "alice", "score": 1, "delta": 1}]
+                    "rows": [{"user_id": "alice", "score": 1}]
                 },
                 {
                     "relation_id": "scores",
@@ -9913,7 +9967,7 @@ async fn rest_epoch_ingest_appends_batches_concurrently() {
                     "stream_id": "parallel-append-b",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "bob", "score": 2, "delta": 1}]
+                    "rows": [{"user_id": "bob", "score": 2}]
                 },
                 {
                     "relation_id": "scores",
@@ -9921,7 +9975,7 @@ async fn rest_epoch_ingest_appends_batches_concurrently() {
                     "stream_id": "parallel-append-c",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "carol", "score": 3, "delta": 1}]
+                    "rows": [{"user_id": "carol", "score": 3}]
                 },
                 {
                     "relation_id": "scores",
@@ -9929,7 +9983,7 @@ async fn rest_epoch_ingest_appends_batches_concurrently() {
                     "stream_id": "parallel-append-d",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "dave", "score": 4, "delta": 1}]
+                    "rows": [{"user_id": "dave", "score": 4}]
                 }
             ]
         }),
@@ -9954,14 +10008,14 @@ async fn rest_sum_arithmetic_expression_view_materializes_outputs() {
         false,
     )
     .await;
-    let router = app(state);
+    let router = app(state.clone());
 
     let relation_response = call_json(
         &router,
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10001,9 +10055,9 @@ async fn rest_sum_arithmetic_expression_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": 5}
                 ]
             }]
         }),
@@ -10052,7 +10106,7 @@ async fn rest_cast_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10090,9 +10144,9 @@ async fn rest_cast_int64_aggregate_expression_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5}
             ]
         }),
     )
@@ -10137,7 +10191,7 @@ async fn rest_nested_double_colon_cast_int64_aggregate_expression_view_materiali
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10175,9 +10229,9 @@ async fn rest_nested_double_colon_cast_int64_aggregate_expression_view_materiali
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5}
             ]
         }),
     )
@@ -10225,7 +10279,7 @@ async fn rest_try_and_safe_cast_int64_aggregate_expression_view_materializes_out
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10263,9 +10317,9 @@ async fn rest_try_and_safe_cast_int64_aggregate_expression_view_materializes_out
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5}
             ]
         }),
     )
@@ -10313,7 +10367,7 @@ async fn rest_abs_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10353,9 +10407,9 @@ async fn rest_abs_int64_aggregate_expression_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": -10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": -5, "delta": 1}
+                    {"user_id": "alice", "score": -10},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": -5}
                 ]
             }]
         }),
@@ -10403,7 +10457,7 @@ async fn rest_greatest_least_int64_aggregate_expression_view_materializes_output
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10443,9 +10497,9 @@ async fn rest_greatest_least_int64_aggregate_expression_view_materializes_output
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": -10, "delta": 1},
-                    {"user_id": "alice", "score": 17, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1}
+                    {"user_id": "alice", "score": -10},
+                    {"user_id": "alice", "score": 17},
+                    {"user_id": "bob", "score": 5}
                 ]
             }]
         }),
@@ -10494,7 +10548,7 @@ async fn rest_coalesce_nullable_int64_aggregate_expression_view_materializes_out
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score()
+            "catalog": public_catalog_fixture(&test_scores_catalog_with_nullable_score())
         }),
     )
     .await;
@@ -10534,10 +10588,10 @@ async fn rest_coalesce_nullable_int64_aggregate_expression_view_materializes_out
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": null, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": null, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": null},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": null}
                 ]
             }]
         }),
@@ -10585,7 +10639,7 @@ async fn rest_is_not_distinct_from_null_predicate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score()
+            "catalog": public_catalog_fixture(&test_scores_catalog_with_nullable_score())
         }),
     )
     .await;
@@ -10623,10 +10677,10 @@ async fn rest_is_not_distinct_from_null_predicate_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": null, "delta": 1},
-                {"user_id": "bob", "score": null, "delta": 1},
-                {"user_id": "carol", "score": 3, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": null},
+                {"user_id": "bob", "score": null},
+                {"user_id": "carol", "score": 3}
             ]
         }),
     )
@@ -10673,7 +10727,7 @@ async fn rest_case_when_distinct_from_null_predicate_view_materializes_outputs()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score()
+            "catalog": public_catalog_fixture(&test_scores_catalog_with_nullable_score())
         }),
     )
     .await;
@@ -10711,10 +10765,10 @@ async fn rest_case_when_distinct_from_null_predicate_view_materializes_outputs()
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": null, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": null, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": null},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": null}
             ]
         }),
     )
@@ -10763,7 +10817,7 @@ async fn rest_case_when_is_null_predicate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score()
+            "catalog": public_catalog_fixture(&test_scores_catalog_with_nullable_score())
         }),
     )
     .await;
@@ -10801,10 +10855,10 @@ async fn rest_case_when_is_null_predicate_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": null, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": null, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": null},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": null}
             ]
         }),
     )
@@ -10853,7 +10907,7 @@ async fn rest_case_when_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10893,9 +10947,9 @@ async fn rest_case_when_int64_aggregate_expression_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": -7, "delta": 1},
-                    {"user_id": "bob", "score": -5, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": -7},
+                    {"user_id": "bob", "score": -5}
                 ]
             }]
         }),
@@ -10944,7 +10998,7 @@ async fn rest_case_when_between_and_in_predicate_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -10982,10 +11036,10 @@ async fn rest_case_when_between_and_in_predicate_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1},
-                {"user_id": "carol", "score": 12, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5},
+                {"user_id": "carol", "score": 12}
             ]
         }),
     )
@@ -11036,7 +11090,7 @@ async fn rest_if_int64_aggregate_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11076,9 +11130,9 @@ async fn rest_if_int64_aggregate_expression_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": -7, "delta": 1},
-                    {"user_id": "bob", "score": -5, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": -7},
+                    {"user_id": "bob", "score": -5}
                 ]
             }]
         }),
@@ -11127,7 +11181,7 @@ async fn rest_multi_branch_case_when_int64_aggregate_expression_view_materialize
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11167,9 +11221,9 @@ async fn rest_multi_branch_case_when_int64_aggregate_expression_view_materialize
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 20, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": -5, "delta": 1}
+                    {"user_id": "alice", "score": 20},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": -5}
                 ]
             }]
         }),
@@ -11217,7 +11271,7 @@ async fn rest_simple_case_when_int64_aggregate_expression_view_materializes_outp
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11257,9 +11311,9 @@ async fn rest_simple_case_when_int64_aggregate_expression_view_materializes_outp
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 1, "delta": 1},
-                    {"user_id": "alice", "score": 2, "delta": 1},
-                    {"user_id": "bob", "score": 9, "delta": 1}
+                    {"user_id": "alice", "score": 1},
+                    {"user_id": "alice", "score": 2},
+                    {"user_id": "bob", "score": 9}
                 ]
             }]
         }),
@@ -11307,7 +11361,7 @@ async fn rest_min_max_arithmetic_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11347,9 +11401,9 @@ async fn rest_min_max_arithmetic_expression_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": 5}
                 ]
             }]
         }),
@@ -11398,7 +11452,7 @@ async fn rest_avg_arithmetic_expression_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11438,9 +11492,9 @@ async fn rest_avg_arithmetic_expression_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": 5}
                 ]
             }]
         }),
@@ -11486,7 +11540,7 @@ async fn rest_filter_project_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11527,8 +11581,8 @@ async fn rest_filter_project_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "bob", "score": -3, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "bob", "score": -3}
                 ]
             }]
         }),
@@ -11563,7 +11617,7 @@ async fn rest_filter_project_union_distinct_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11602,9 +11656,9 @@ async fn rest_filter_project_union_distinct_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": -3, "delta": 1},
-                {"user_id": "carol", "score": 7, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": -3},
+                {"user_id": "carol", "score": 7}
             ]
         }),
     )
@@ -11644,7 +11698,7 @@ async fn rest_filter_project_order_by_limit_view_materializes_top_k_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11684,9 +11738,9 @@ async fn rest_filter_project_order_by_limit_view_materializes_top_k_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 8, "delta": 1},
-                {"user_id": "carol", "score": 6, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 8},
+                {"user_id": "carol", "score": 6}
             ]
         }),
     )
@@ -11719,9 +11773,10 @@ async fn rest_filter_project_order_by_limit_view_materializes_top_k_outputs() {
             "stream_id": "filter-project-top-k-scores-stream",
             "partition_id": 0,
             "start_offset_inclusive": 3,
-            "rows": [
-                {"user_id": "alice", "score": 10, "delta": -1}
-            ]
+            "rows": [{"operation":"update",
+                "before":{"user_id":"alice","score":10},
+                "after":{"user_id":"alice","score":0}
+            }]
         }),
     )
     .await;
@@ -11760,7 +11815,7 @@ async fn rest_filter_project_case_over_bool_predicate_materializes_relation_scop
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_item_status_catalog()
+            "catalog": public_catalog_fixture(&test_item_status_catalog())
         }),
     )
     .await;
@@ -11800,8 +11855,8 @@ async fn rest_filter_project_case_over_bool_predicate_materializes_relation_scop
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"key": "item-a", "flag": true, "ts": 100, "delta": 1},
-                {"key": "item-b", "flag": false, "ts": 101, "delta": 1}
+                {"key": "item-a", "flag": true, "ts": 100},
+                {"key": "item-b", "flag": false, "ts": 101}
             ]
         }),
     )
@@ -11841,7 +11896,7 @@ async fn rest_filter_project_cte_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11882,9 +11937,9 @@ async fn rest_filter_project_cte_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "bob", "score": 8, "delta": 1},
-                    {"user_id": "carol", "score": -2, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "bob", "score": 8},
+                    {"user_id": "carol", "score": -2}
                 ]
             }]
         }),
@@ -11919,7 +11974,7 @@ async fn rest_filter_project_derived_table_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -11960,9 +12015,9 @@ async fn rest_filter_project_derived_table_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "bob", "score": 8, "delta": 1},
-                    {"user_id": "carol", "score": -2, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "bob", "score": 8},
+                    {"user_id": "carol", "score": -2}
                 ]
             }]
         }),
@@ -11997,7 +12052,7 @@ async fn rest_filter_project_view_materializes_nullable_value_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog_with_nullable_score()
+            "catalog": public_catalog_fixture(&test_scores_catalog_with_nullable_score())
         }),
     )
     .await;
@@ -12038,8 +12093,8 @@ async fn rest_filter_project_view_materializes_nullable_value_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "bob", "score": null, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "bob", "score": null}
                 ]
             }]
         }),
@@ -12080,7 +12135,7 @@ async fn rest_computed_filter_project_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -12122,8 +12177,8 @@ async fn rest_computed_filter_project_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "bob", "score": -3, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "bob", "score": -3}
                 ]
             }]
         }),
@@ -12157,7 +12212,7 @@ async fn rest_aggregate_having_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -12195,9 +12250,9 @@ async fn rest_aggregate_having_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "alice", "score": 5, "delta": 1},
-                {"user_id": "bob", "score": 3, "delta": 1}
+                {"user_id": "alice", "score": 7},
+                {"user_id": "alice", "score": 5},
+                {"user_id": "bob", "score": 3}
             ]
         }),
     )
@@ -12234,7 +12289,7 @@ async fn rest_count_distinct_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -12275,10 +12330,10 @@ async fn rest_count_distinct_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "alice", "score": 5, "delta": 1},
-                    {"user_id": "bob", "score": 3, "delta": 1}
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "alice", "score": 5},
+                    {"user_id": "bob", "score": 3}
                 ]
             }]
         }),
@@ -12348,7 +12403,7 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -12548,9 +12603,9 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 100, "delta": 1},
-                        {"user_id": "bob", "score": 140, "delta": 1},
-                        {"user_id": "carol", "score": 190, "delta": 1}
+                        {"user_id": "alice", "score": 100},
+                        {"user_id": "bob", "score": 140},
+                        {"user_id": "carol", "score": 190}
                     ]
                 },
                 {
@@ -12560,9 +12615,9 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "a1", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "a2", "limit": 50, "tier": "silver", "delta": 1},
-                        {"account_id": "a3", "limit": 80, "tier": "gold", "delta": 1}
+                        {"account_id": "a1", "limit": 50, "tier": "gold"},
+                        {"account_id": "a2", "limit": 50, "tier": "silver"},
+                        {"account_id": "a3", "limit": 80, "tier": "gold"}
                     ]
                 },
                 {
@@ -12572,9 +12627,9 @@ async fn rest_scalar_aggregate_modifier_admission_and_plain_matrix() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "na1", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "na2", "limit": null, "tier": "silver", "delta": 1},
-                        {"account_id": "na3", "limit": 80, "tier": "gold", "delta": 1}
+                        {"account_id": "na1", "limit": 50, "tier": "gold"},
+                        {"account_id": "na2", "limit": null, "tier": "silver"},
+                        {"account_id": "na3", "limit": 80, "tier": "gold"}
                     ]
                 }
             ]
@@ -13014,7 +13069,7 @@ async fn rest_scalar_decimal_aggregate_admission_rejects_nullable_and_nonnullabl
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(&catalog)}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -13090,7 +13145,7 @@ async fn rest_having_count_distinct_function_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -13128,11 +13183,11 @@ async fn rest_having_count_distinct_function_view_materializes_outputs() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5},
+                {"user_id": "bob", "score": 5}
             ]
         }),
     )
@@ -13169,7 +13224,7 @@ async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -13209,10 +13264,10 @@ async fn rest_filtered_count_distinct_mixed_filter_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": 5}
                 ]
             }]
         }),
@@ -13248,7 +13303,7 @@ async fn rest_order_by_limit_top_k_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_catalog())
         }),
     )
     .await;
@@ -13298,9 +13353,9 @@ async fn rest_order_by_limit_top_k_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "delta": 1},
-                    {"user_id": "alice", "amount": 7, "delta": 1},
-                    {"user_id": "bob", "amount": 5, "delta": 1}
+                    {"user_id": "alice", "amount": 10},
+                    {"user_id": "alice", "amount": 7},
+                    {"user_id": "bob", "amount": 5}
                 ]
             }]
         }),
@@ -13331,7 +13386,7 @@ async fn rest_order_by_limit_top_k_view_materializes_outputs() {
                 "stream_id": "top-purchaser-stream",
                 "partition_id": 0,
                 "start_offset_inclusive": 3,
-                "rows": [{"user_id": "bob", "amount": 20, "delta": 1}]
+                "rows": [{"user_id": "bob", "amount": 20}]
             }]
         }),
     )
@@ -13360,7 +13415,7 @@ async fn rest_order_by_limit_offset_view_materializes_outputs() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_catalog())
         }),
     )
     .await;
@@ -13400,9 +13455,9 @@ async fn rest_order_by_limit_offset_view_materializes_outputs() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "amount": 10, "delta": 1},
-                    {"user_id": "alice", "amount": 7, "delta": 1},
-                    {"user_id": "bob", "amount": 5, "delta": 1}
+                    {"user_id": "alice", "amount": 10},
+                    {"user_id": "alice", "amount": 7},
+                    {"user_id": "bob", "amount": 5}
                 ]
             }]
         }),
@@ -13439,7 +13494,7 @@ async fn rest_order_by_function_top_k_view_materializes_relation_scoped_ingest()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -13477,10 +13532,10 @@ async fn rest_order_by_function_top_k_view_materializes_relation_scoped_ingest()
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1},
-                {"user_id": "carol", "score": 20, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5},
+                {"user_id": "carol", "score": 20}
             ]
         }),
     )
@@ -13513,7 +13568,7 @@ async fn rest_concurrent_ingest_replays_from_fresh_checkpoint_per_view() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -13545,8 +13600,7 @@ async fn rest_concurrent_ingest_replays_from_fresh_checkpoint_per_view() {
                     "rows": [
                         {
                             "user_id": format!("concurrent-user-{stream_index}"),
-                            "score": stream_index + 1,
-                            "delta": 1
+                            "score": stream_index + 1
                         }
                     ]
                 }),
@@ -14051,7 +14105,8 @@ async fn authoritative_publisher_reacquires_same_owner_token_on_new_api_startup(
         partition_id: 0,
         start_offset_inclusive: 1,
         event_time_watermark: None,
-        rows: vec![json!({"user_id":"oak","score":7,"delta":1})],
+        row_format: None,
+        rows: vec![json!({"user_id":"oak","score":7})],
     };
 
     let first_state = test_authoritative_api_state_with_store(
@@ -14100,7 +14155,8 @@ async fn concurrent_first_authoritative_publisher_requests_share_one_startup() {
         partition_id: 0,
         start_offset_inclusive: 1,
         event_time_watermark: None,
-        rows: vec![json!({"user_id":"oak","score":7,"delta":1})],
+        row_format: None,
+        rows: vec![json!({"user_id":"oak","score":7})],
     };
 
     let (first, second) = tokio::join!(
@@ -14159,7 +14215,7 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":test_scores_catalog()}),
+        json!({"catalog":public_catalog_fixture(&test_scores_catalog())}),
     )
     .await;
     assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -14169,7 +14225,7 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
             Method::POST,
             "/v1/relations/scores/ingest",
             json!({"relation_version":"2026-05-24.v1","stream_id":stream,"partition_id":0,
-                "start_offset_inclusive":0,"rows":[{"user_id":"oak","score":score,"delta":1}]}),
+                "start_offset_inclusive":0,"rows":[{"user_id":"oak","score":score}]}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -14256,7 +14312,8 @@ async fn authoritative_source_first_backfill_discovers_partitions_without_runtim
                     partition_id: 0,
                     start_offset_inclusive: 1,
                     event_time_watermark: None,
-                    rows: vec![json!({"user_id":"oak","score":7,"delta":1})],
+                    row_format: None,
+                    rows: vec![json!({"user_id":"oak","score":7})],
                 },
             )
             .await
@@ -14387,7 +14444,7 @@ async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_scores_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -14415,7 +14472,7 @@ async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta
             "stream_id": "authoritative-scores-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -14430,7 +14487,7 @@ async fn authoritative_relation_ingest_materializes_query_and_recovers_from_meta
             "stream_id": "authoritative-scores-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -14496,7 +14553,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_scores_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -14525,7 +14582,7 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
             "stream_id": "legacy-rebuild-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         }),
     )
     .await;
@@ -14695,8 +14752,9 @@ async fn authoritative_legacy_single_key_rebuild_replays_source_and_preserves_ol
         stream_id: "legacy-rebuild-stream".to_string(),
         partition_id: 0,
         start_offset_inclusive: 1,
-        rows: vec![json!({"user_id": "bob", "score": 7, "delta": 1})],
+        rows: vec![json!({"user_id": "bob", "score": 7})],
         event_time_watermark: None,
+        row_format: None,
     };
     let source_catalog = read_relation_catalog(
         &source_state,
@@ -14831,8 +14889,8 @@ async fn authoritative_multi_batch_request_rejects_before_publication() {
         "/v1/relations/ingest",
         json!({
             "batches": [
-                {"relation_id": "scores", "relation_version": "v1", "stream_id": "s0", "partition_id": 0, "start_offset_inclusive": 0, "rows": [{"user_id": "a", "score": 1, "delta": 1}]},
-                {"relation_id": "scores", "relation_version": "v1", "stream_id": "s1", "partition_id": 0, "start_offset_inclusive": 0, "rows": [{"user_id": "b", "score": 2, "delta": 1}]}
+                {"relation_id": "scores", "relation_version": "v1", "stream_id": "s0", "partition_id": 0, "start_offset_inclusive": 0, "rows": [{"user_id": "a", "score": 1}]},
+                {"relation_id": "scores", "relation_version": "v1", "stream_id": "s1", "partition_id": 0, "start_offset_inclusive": 0, "rows": [{"user_id": "b", "score": 2}]}
             ]
         }),
     )
@@ -14862,7 +14920,7 @@ async fn authoritative_concurrent_same_scope_ingest_reuses_registry_publisher() 
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_scores_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -14873,7 +14931,7 @@ async fn authoritative_concurrent_same_scope_ingest_reuses_registry_publisher() 
             "stream_id": "concurrent-authoritative-stream",
             "partition_id": 0,
             "start_offset_inclusive": 0,
-            "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+            "rows": [{"user_id": "alice", "score": 10}]
         })
     };
     let (first, second) = tokio::join!(
@@ -14935,7 +14993,7 @@ async fn rest_late_view_query_reports_materialization_lag_without_blocking_later
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -14952,9 +15010,9 @@ async fn rest_late_view_query_reports_materialization_lag_without_blocking_later
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 3, "delta": 1},
-                {"user_id": "bob", "score": 4, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 3},
+                {"user_id": "bob", "score": 4}
             ]
         }),
     )
@@ -15012,7 +15070,7 @@ async fn rest_late_view_query_reports_materialization_lag_without_blocking_later
             "partition_id": 0,
             "start_offset_inclusive": 3,
             "rows": [
-                {"user_id": "alice", "score": 2, "delta": 1}
+                {"user_id": "alice", "score": 2}
             ]
         }),
     )
@@ -15404,20 +15462,23 @@ async fn backfill_progress_counts_weighted_batches_across_packed_epochs_without_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
     assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
-    // Three submitted epochs contain twelve physical batches and 24 BAG copies.
+    // Three submitted epochs contain twelve physical batches and 24 public rows.
     for epoch in 0..3_u64 {
         let batches = (0..4_u64)
             .map(|index| {
                 json!({
                     "relation_id": "scores", "relation_version": "2026-05-24.v1",
                     "stream_id": "weighted-progress", "partition_id": 0,
-                    "start_offset_inclusive": epoch * 4 + index,
-                    "rows": [{"user_id": "alice", "score": 10, "delta": 2}]
+                    "start_offset_inclusive": epoch * 8 + index * 2,
+                    "rows": [
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 10}
+                    ]
                 })
             })
             .collect::<Vec<_>>();
@@ -15517,7 +15578,7 @@ async fn rest_late_view_backfill_api_reports_coverage_and_runs_limited_steps() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -15527,14 +15588,14 @@ async fn rest_late_view_backfill_api_reports_coverage_and_runs_limited_steps() {
         (
             0,
             json!([
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 4, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 4}
             ]),
         ),
         (
             2,
             json!([
-                {"user_id": "alice", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 5}
             ]),
         ),
     ] {
@@ -15675,7 +15736,7 @@ async fn rest_late_single_relation_stats_having_top_k_backfill_api_runs_limited_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -15685,14 +15746,14 @@ async fn rest_late_single_relation_stats_having_top_k_backfill_api_runs_limited_
         (
             0,
             json!([
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 12, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 12}
             ]),
         ),
         (
             2,
             json!([
-                {"user_id": "alice", "score": 8, "delta": 1}
+                {"user_id": "alice", "score": 8}
             ]),
         ),
     ] {
@@ -15815,7 +15876,7 @@ async fn rest_late_view_backfill_rejects_offset_range_scope() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -15825,14 +15886,14 @@ async fn rest_late_view_backfill_rejects_offset_range_scope() {
         (
             0,
             json!([
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 4, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 4}
             ]),
         ),
         (
             2,
             json!([
-                {"user_id": "alice", "score": 2, "delta": 1}
+                {"user_id": "alice", "score": 2}
             ]),
         ),
     ] {
@@ -15940,7 +16001,7 @@ async fn rest_late_view_backfill_rejects_predicate_request_scope() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -15950,14 +16011,14 @@ async fn rest_late_view_backfill_rejects_predicate_request_scope() {
         (
             0,
             json!([
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 4, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 4}
             ]),
         ),
         (
             2,
             json!([
-                {"user_id": "alice", "score": 2, "delta": 1}
+                {"user_id": "alice", "score": 2}
             ]),
         ),
     ] {
@@ -16060,7 +16121,7 @@ async fn rest_late_view_background_backfill_request_fails_closed() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -16070,13 +16131,13 @@ async fn rest_late_view_background_backfill_request_fails_closed() {
         (
             0,
             json!([
-                {"user_id": "alice", "score": 10, "delta": 1}
+                {"user_id": "alice", "score": 10}
             ]),
         ),
         (
             1,
             json!([
-                {"user_id": "bob", "score": 4, "delta": 1}
+                {"user_id": "bob", "score": 4}
             ]),
         ),
     ] {
@@ -16172,7 +16233,7 @@ async fn rest_view_query_fails_closed_without_published_checkpoint_output() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -16245,7 +16306,7 @@ async fn rest_select_star_backfill_activates_authoritative_bootstrap_when_ingest
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -16283,9 +16344,9 @@ async fn rest_select_star_backfill_activates_authoritative_bootstrap_when_ingest
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 9, "delta": 1},
-                {"user_id": "carol", "score": 42, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 9},
+                {"user_id": "carol", "score": 42}
             ]
         }),
     )
@@ -16365,7 +16426,7 @@ async fn rest_standing_runtime_output_query_without_sql_reads_materialized_rows_
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -16410,8 +16471,8 @@ async fn rest_standing_runtime_output_query_without_sql_reads_materialized_rows_
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 5}
             ]
         }),
     )
@@ -16455,7 +16516,7 @@ async fn rest_view_compaction_and_openapi_paths_are_available_after_materializat
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -16495,9 +16556,9 @@ async fn rest_view_compaction_and_openapi_paths_are_available_after_materializat
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 15, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 15},
+                {"user_id": "bob", "score": 5}
             ]
         }),
     )
@@ -16570,7 +16631,7 @@ async fn raw_sql_count_and_sum_use_complete_materialized_input_despite_page_caps
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -16643,10 +16704,10 @@ async fn raw_sql_count_and_sum_use_complete_materialized_input_despite_page_caps
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "bob", "score": 20, "delta": 1},
-                {"user_id": "carol", "score": 30, "delta": 1},
-                {"user_id": "dave", "score": 40, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "bob", "score": 20},
+                {"user_id": "carol", "score": 30},
+                {"user_id": "dave", "score": 40}
             ]
         }),
     )
@@ -16734,7 +16795,7 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(&catalog)}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -16796,8 +16857,8 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -16807,7 +16868,7 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"}
                     ]
                 }
             ]
@@ -16864,8 +16925,8 @@ async fn rest_exists_and_not_exists_views_survive_restart_and_match_transitions(
             "partition_id": 0,
             "start_offset_inclusive": 1,
             "rows": [
-                {"account_id": "alice", "limit": 100, "tier": "gold", "delta": -1},
-                {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                {"operation":"update","before":{"account_id":"alice","limit":100,"tier":"gold"},"after":{"account_id":"archived-alice","limit":100,"tier":"silver"}},
+                {"account_id": "bob", "limit": 50, "tier": "gold"}
             ]
         }),
     )
@@ -16913,7 +16974,7 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -16976,9 +17037,9 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -16988,8 +17049,8 @@ async fn rest_two_relation_join_view_materialized_output_survives_api_restart() 
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -17067,7 +17128,7 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(catalog)}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -17222,8 +17283,9 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "tenant_id": "t1", "delta": 2},
-                        {"user_id": "bob", "score": 5, "tenant_id": "t1", "delta": 1}
+                        {"user_id": "alice", "score": 10, "tenant_id": "t1"},
+                        {"user_id": "alice", "score": 10, "tenant_id": "t1"},
+                        {"user_id": "bob", "score": 5, "tenant_id": "t1"}
                     ]
                 },
                 {
@@ -17233,8 +17295,10 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "account_tenant_id": "t1", "delta": 3},
-                        {"account_id": "bob", "limit": 50, "tier": "silver", "account_tenant_id": "t1", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold", "account_tenant_id": "t1"},
+                        {"account_id": "alice", "limit": 100, "tier": "gold", "account_tenant_id": "t1"},
+                        {"account_id": "alice", "limit": 100, "tier": "gold", "account_tenant_id": "t1"},
+                        {"account_id": "bob", "limit": 50, "tier": "silver", "account_tenant_id": "t1"}
                     ]
                 },
                 {
@@ -17244,7 +17308,10 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 0, "tier": "profile", "account_tenant_id": "t1", "delta": 4}
+                        {"account_id": "alice", "limit": 0, "tier": "profile", "account_tenant_id": "t1"},
+                        {"account_id": "alice", "limit": 0, "tier": "profile", "account_tenant_id": "t1"},
+                        {"account_id": "alice", "limit": 0, "tier": "profile", "account_tenant_id": "t1"},
+                        {"account_id": "alice", "limit": 0, "tier": "profile", "account_tenant_id": "t1"}
                     ]
                 }
             ]
@@ -17366,10 +17433,12 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
         "relation_version": "2026-05-24.v1",
         "stream_id": "three-input-profiles",
         "partition_id": 0,
-        "start_offset_inclusive": 1,
-        "rows": [
-            {"account_id": "alice", "limit": 0, "tier": "profile", "account_tenant_id": "t1", "delta": -1}
-        ]
+        "start_offset_inclusive": 4,
+        "rows": (0..4).map(|_| json!({
+            "operation":"update",
+            "before":{"account_id":"alice","limit":0,"tier":"profile","account_tenant_id":"t1"},
+            "after":{"account_id":"inactive","limit":0,"tier":"profile","account_tenant_id":"t1"}
+        })).collect::<Vec<_>>()
     });
     let retracted = call_json(
         &restarted_router,
@@ -17386,10 +17455,7 @@ async fn rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart
         json!({}),
     )
     .await;
-    assert_eq!(
-        after_retract.1["rows"],
-        json!([{"tenant_id": "t1", "user_id": "alice", "count": 18}])
-    );
+    assert_eq!(after_retract.1["rows"], json!([]));
     let replay = call_json(
         &restarted_router,
         Method::POST,
@@ -17433,7 +17499,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": scores}),
+        json!({"catalog": public_catalog_fixture(&scores)}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -17502,9 +17568,10 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "left-a", "score": 10, "delta": 2},
-                {"user_id": "left-b", "score": 10, "delta": 1},
-                {"user_id": "left-c", "score": 5, "delta": 1}
+                {"user_id": "left-a", "score": 10},
+                {"user_id": "left-a", "score": 10},
+                {"user_id": "left-b", "score": 10},
+                {"user_id": "left-c", "score": 5}
             ]
         }),
     )
@@ -17578,8 +17645,11 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
         "relation_version": "2026-05-24.v1",
         "stream_id": "self-join-scores-stream",
         "partition_id": 0,
-        "start_offset_inclusive": 3,
-        "rows": [{"user_id": "left-a", "score": 10, "delta": -1}]
+        "start_offset_inclusive": 4,
+        "rows": [{"operation":"update",
+            "before":{"user_id":"left-a","score":10},
+            "after":{"user_id":"left-a","score":11}
+        }]
     });
     store.arm("v1/standing-runtime-output-deltas/");
     let failed_partial = call_json(
@@ -17635,7 +17705,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
         json!({}),
     )
     .await;
-    assert_eq!(count_five.1["rows"], json!([{"count": 5}]));
+    assert_eq!(count_five.1["rows"], json!([{"count": 6}]));
 
     let replay = call_json(
         &recovered_router,
@@ -17652,7 +17722,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
         json!({}),
     )
     .await;
-    assert_eq!(after_replay.1["rows"], json!([{"count": 5}]));
+    assert_eq!(after_replay.1["rows"], json!([{"count": 6}]));
 
     let final_retract = call_json(
         &recovered_router,
@@ -17662,11 +17732,11 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
             "relation_version": "2026-05-24.v1",
             "stream_id": "self-join-scores-stream",
             "partition_id": 0,
-            "start_offset_inclusive": 4,
+            "start_offset_inclusive": 6,
             "rows": [
-                {"user_id": "left-a", "score": 10, "delta": -1},
-                {"user_id": "left-b", "score": 10, "delta": -1},
-                {"user_id": "left-c", "score": 5, "delta": -1}
+                {"operation":"update","before":{"user_id":"left-a","score":10},"after":{"user_id":"left-a","score":12}},
+                {"operation":"update","before":{"user_id":"left-b","score":10},"after":{"user_id":"left-b","score":15}},
+                {"operation":"update","before":{"user_id":"left-c","score":5},"after":{"user_id":"left-c","score":20}}
             ]
         }),
     )
@@ -17680,7 +17750,7 @@ async fn rest_self_join_atomic_fanout_survives_restart_replay_and_final_retract(
     )
     .await;
     assert_eq!(zero.0, StatusCode::OK, "{zero:?}");
-    assert_eq!(zero.1["rows"], json!([{"count": 0}]));
+    assert_eq!(zero.1["rows"], json!([{"count": 4}]));
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -17756,7 +17826,7 @@ async fn run_join_differential_api_trace(
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(&catalog)}),
         )
         .await;
         assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -17790,10 +17860,10 @@ async fn run_join_differential_api_trace(
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 10, "delta": 1},
-                    {"user_id": "alice", "score": 7, "delta": 1},
-                    {"user_id": "bob", "score": 5, "delta": 1},
-                    {"user_id": "charlie", "score": 30, "delta": 1}
+                    {"user_id": "alice", "score": 10},
+                    {"user_id": "alice", "score": 7},
+                    {"user_id": "bob", "score": 5},
+                    {"user_id": "charlie", "score": 30}
                 ]
             },
             {
@@ -17803,8 +17873,8 @@ async fn run_join_differential_api_trace(
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                    {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                    {"account_id": "alice", "limit": 100, "tier": "gold"},
+                    {"account_id": "bob", "limit": 50, "tier": "gold"}
                 ]
             }
         ]}),
@@ -17872,9 +17942,8 @@ async fn run_join_differential_api_trace(
             "partition_id": 0,
             "start_offset_inclusive": 4,
             "rows": [
-                {"user_id": "alice", "score": 7, "delta": -1},
-                {"user_id": "bob", "score": 5, "delta": -1},
-                {"user_id": "bob", "score": 8, "delta": 1}
+                {"operation":"update","before":{"user_id":"alice","score":7},"after":{"user_id":"alice","score":9}},
+                {"operation":"update","before":{"user_id":"bob","score":5},"after":{"user_id":"bob","score":8}}
             ]
         },
         {
@@ -17884,9 +17953,8 @@ async fn run_join_differential_api_trace(
             "partition_id": 0,
             "start_offset_inclusive": 2,
             "rows": [
-                {"account_id": "alice", "limit": 100, "tier": "gold", "delta": -1},
-                {"account_id": "alice", "limit": 80, "tier": "silver", "delta": 1},
-                {"account_id": "charlie", "limit": 90, "tier": "silver", "delta": 1}
+                {"operation":"update","before":{"account_id":"alice","limit":100,"tier":"gold"},"after":{"account_id":"alice","limit":80,"tier":"silver"}},
+                {"account_id": "charlie", "limit": 90, "tier": "silver"}
             ]
         }
     ]});
@@ -18013,7 +18081,7 @@ async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(&catalog)}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -18059,11 +18127,11 @@ async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"sample_id": "a-1", "bucket": "alpha", "value": 2, "delta": 1},
-                    {"sample_id": "a-2", "bucket": "alpha", "value": 10, "delta": 1},
-                    {"sample_id": "b-1", "bucket": "beta", "value": 4, "delta": 1},
-                    {"sample_id": "b-2", "bucket": "beta", "value": 8, "delta": 1},
-                    {"sample_id": "b-3", "bucket": "beta", "value": 12, "delta": 1}
+                    {"sample_id": "a-1", "bucket": "alpha", "value": 2},
+                    {"sample_id": "a-2", "bucket": "alpha", "value": 10},
+                    {"sample_id": "b-1", "bucket": "beta", "value": 4},
+                    {"sample_id": "b-2", "bucket": "beta", "value": 8},
+                    {"sample_id": "b-3", "bucket": "beta", "value": 12}
                 ]
             },
             {
@@ -18073,11 +18141,11 @@ async fn rest_grouped_median_and_percentiles_materialize_and_survive_api_restart
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"observation_id": "c-1", "segment": "critical", "latency": 20, "delta": 1},
-                    {"observation_id": "c-2", "segment": "critical", "latency": 50, "delta": 1},
-                    {"observation_id": "c-3", "segment": "critical", "latency": 100, "delta": 1},
-                    {"observation_id": "s-1", "segment": "standard", "latency": 10, "delta": 1},
-                    {"observation_id": "s-2", "segment": "standard", "latency": 20, "delta": 1}
+                    {"observation_id": "c-1", "segment": "critical", "latency": 20},
+                    {"observation_id": "c-2", "segment": "critical", "latency": 50},
+                    {"observation_id": "c-3", "segment": "critical", "latency": 100},
+                    {"observation_id": "s-1", "segment": "standard", "latency": 10},
+                    {"observation_id": "s-2", "segment": "standard", "latency": 20}
                 ]
             }
         ]}),
@@ -18155,7 +18223,7 @@ async fn rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_scores_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_scores_catalog())}),
     )
     .await;
     assert_eq!(relation_response.0, StatusCode::CREATED);
@@ -18187,7 +18255,7 @@ async fn rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": decimal_scores}),
+        json!({"catalog": public_catalog_fixture(&decimal_scores)}),
     )
     .await;
     assert_eq!(decimal_relation_response.0, StatusCode::CREATED);
@@ -18294,7 +18362,7 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -18353,9 +18421,9 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -18365,8 +18433,8 @@ async fn rest_two_relation_join_count_only_view_materialized_output_survives_api
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -18430,7 +18498,7 @@ async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -18481,10 +18549,10 @@ async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1},
-                        {"user_id": "charlie", "score": 30, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5},
+                        {"user_id": "charlie", "score": 30}
                     ]
                 },
                 {
@@ -18494,8 +18562,8 @@ async fn rest_left_join_left_group_key_view_materializes_unmatched_left_rows() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -18534,7 +18602,7 @@ async fn rest_right_join_swaps_operands_and_materializes_unmatched_right_rows() 
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(&catalog)}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED);
@@ -18588,7 +18656,7 @@ async fn rest_right_join_swaps_operands_and_materializes_unmatched_right_rows() 
                     "stream_id": "right-swap-scores",
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
-                    "rows": [{"user_id": "alice", "score": 10, "delta": 1}]
+                    "rows": [{"user_id": "alice", "score": 10}]
                 },
                 {
                     "relation_id": "accounts",
@@ -18597,8 +18665,8 @@ async fn rest_right_join_swaps_operands_and_materializes_unmatched_right_rows() 
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -18636,7 +18704,7 @@ async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -18688,9 +18756,9 @@ async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -18700,8 +18768,8 @@ async fn rest_two_relation_join_min_max_avg_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -18743,7 +18811,7 @@ async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -18794,9 +18862,9 @@ async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -18806,8 +18874,8 @@ async fn rest_two_relation_join_right_min_max_avg_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -18849,7 +18917,7 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -18869,9 +18937,9 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -18881,8 +18949,8 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -18935,7 +19003,7 @@ async fn rest_late_two_relation_join_having_top_k_reports_materialization_lag_on
                 "stream_id": "late-join-having-top-k-scores",
                 "partition_id": 0,
                 "start_offset_inclusive": 3,
-                "rows": [{"user_id": "bob", "score": 20, "delta": 1}]
+                "rows": [{"user_id": "bob", "score": 20}]
             }]
         }),
     )
@@ -18992,7 +19060,7 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19043,9 +19111,9 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19055,8 +19123,8 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19088,7 +19156,7 @@ async fn rest_two_relation_join_order_by_limit_top_k_view_materializes_outputs()
                 "stream_id": "join-top-k-scores",
                 "partition_id": 0,
                 "start_offset_inclusive": 3,
-                "rows": [{"user_id": "bob", "score": 20, "delta": 1}]
+                "rows": [{"user_id": "bob", "score": 20}]
             }]
         }),
     )
@@ -19120,7 +19188,7 @@ async fn rest_two_relation_join_having_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19172,9 +19240,9 @@ async fn rest_two_relation_join_having_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19184,8 +19252,8 @@ async fn rest_two_relation_join_having_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19227,7 +19295,7 @@ async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19279,9 +19347,9 @@ async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19291,8 +19359,8 @@ async fn rest_two_relation_join_mixed_aggregate_filter_view_materializes_outputs
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19334,7 +19402,7 @@ async fn rest_two_relation_join_filtered_count_distinct_view_materializes_output
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19386,10 +19454,10 @@ async fn rest_two_relation_join_filtered_count_distinct_view_materializes_output
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19399,8 +19467,8 @@ async fn rest_two_relation_join_filtered_count_distinct_view_materializes_output
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19445,7 +19513,7 @@ async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outp
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19497,10 +19565,10 @@ async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outp
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": null, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": null},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19510,8 +19578,8 @@ async fn rest_two_relation_join_nullable_left_value_count_view_materializes_outp
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19557,7 +19625,7 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19609,10 +19677,10 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19622,8 +19690,8 @@ async fn rest_two_relation_join_count_distinct_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19687,7 +19755,7 @@ async fn rest_two_relation_join_alias_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19739,9 +19807,9 @@ async fn rest_two_relation_join_alias_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5}
                     ]
                 },
                 {
@@ -19751,8 +19819,8 @@ async fn rest_two_relation_join_alias_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"}
                     ]
                 }
             ]
@@ -19787,7 +19855,7 @@ async fn rest_two_relation_join_where_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19839,12 +19907,12 @@ async fn rest_two_relation_join_where_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1},
-                        {"user_id": "alice", "score": 150, "delta": 1},
-                        {"user_id": "charlie", "score": 8, "delta": 1},
-                        {"user_id": "alice", "score": -3, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": 7},
+                        {"user_id": "bob", "score": 5},
+                        {"user_id": "alice", "score": 150},
+                        {"user_id": "charlie", "score": 8},
+                        {"user_id": "alice", "score": -3}
                     ]
                 },
                 {
@@ -19854,9 +19922,9 @@ async fn rest_two_relation_join_where_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"},
+                        {"account_id": "charlie", "limit": 100, "tier": "silver"}
                     ]
                 }
             ]
@@ -19891,7 +19959,7 @@ async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -19943,10 +20011,10 @@ async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": -3, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": -3},
+                        {"user_id": "bob", "score": 5},
+                        {"user_id": "alice", "score": 7}
                     ]
                 },
                 {
@@ -19956,9 +20024,9 @@ async fn rest_two_relation_join_cte_source_filter_view_materializes_outputs() {
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"},
+                        {"account_id": "charlie", "limit": 100, "tier": "silver"}
                     ]
                 }
             ]
@@ -19994,7 +20062,7 @@ async fn rest_two_relation_join_right_cte_source_filter_view_materializes_output
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -20046,10 +20114,10 @@ async fn rest_two_relation_join_right_cte_source_filter_view_materializes_output
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": -3, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": -3},
+                        {"user_id": "bob", "score": 5},
+                        {"user_id": "alice", "score": 7}
                     ]
                 },
                 {
@@ -20059,9 +20127,9 @@ async fn rest_two_relation_join_right_cte_source_filter_view_materializes_output
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"},
+                        {"account_id": "charlie", "limit": 100, "tier": "silver"}
                     ]
                 }
             ]
@@ -20096,7 +20164,7 @@ async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs(
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -20148,10 +20216,10 @@ async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs(
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": -3, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": -3},
+                        {"user_id": "bob", "score": 5},
+                        {"user_id": "alice", "score": 7}
                     ]
                 },
                 {
@@ -20161,9 +20229,9 @@ async fn rest_two_relation_join_two_cte_source_filter_view_materializes_outputs(
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"},
+                        {"account_id": "charlie", "limit": 100, "tier": "silver"}
                     ]
                 }
             ]
@@ -20202,7 +20270,7 @@ async fn rest_two_relation_join_derived_table_source_filter_view_materializes_ou
             Method::POST,
             "/v1/relations",
             json!({
-                "catalog": catalog
+                "catalog": public_catalog_fixture(&catalog)
             }),
         )
         .await;
@@ -20254,10 +20322,10 @@ async fn rest_two_relation_join_derived_table_source_filter_view_materializes_ou
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"user_id": "alice", "score": 10, "delta": 1},
-                        {"user_id": "alice", "score": -3, "delta": 1},
-                        {"user_id": "bob", "score": 5, "delta": 1},
-                        {"user_id": "alice", "score": 7, "delta": 1}
+                        {"user_id": "alice", "score": 10},
+                        {"user_id": "alice", "score": -3},
+                        {"user_id": "bob", "score": 5},
+                        {"user_id": "alice", "score": 7}
                     ]
                 },
                 {
@@ -20267,9 +20335,9 @@ async fn rest_two_relation_join_derived_table_source_filter_view_materializes_ou
                     "partition_id": 0,
                     "start_offset_inclusive": 0,
                     "rows": [
-                        {"account_id": "alice", "limit": 100, "tier": "gold", "delta": 1},
-                        {"account_id": "bob", "limit": 50, "tier": "gold", "delta": 1},
-                        {"account_id": "charlie", "limit": 100, "tier": "silver", "delta": 1}
+                        {"account_id": "alice", "limit": 100, "tier": "gold"},
+                        {"account_id": "bob", "limit": 50, "tier": "gold"},
+                        {"account_id": "charlie", "limit": 100, "tier": "silver"}
                     ]
                 }
             ]
@@ -20758,7 +20826,7 @@ async fn first_admission_initializes_empty_meta_active_registry() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":catalog}),
+        json!({"catalog":public_catalog_fixture(&catalog)}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -20804,7 +20872,7 @@ async fn first_admission_refuses_to_auto_import_nonempty_legacy_registry() {
         &seed_router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":catalog}),
+        json!({"catalog":public_catalog_fixture(&catalog)}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -20889,7 +20957,7 @@ async fn api_path_lookup_hydrates_only_the_matching_immutable_spec() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": catalog.clone()}),
+        json!({"catalog": public_catalog_fixture(&catalog)}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -21080,6 +21148,558 @@ async fn test_public_api_state_with_store(
     .unwrap()
     .with_view_bootstrap_meta_store(meta_store.clone());
     with_initialized_active_view_meta_store(state, meta_store).await
+}
+
+#[tokio::test]
+async fn public_ingest_rejects_delete_and_engine_weight_spoof_without_persisting_batch() {
+    use object_store::memory::InMemory;
+
+    let state =
+        test_public_api_state_with_store(Arc::new(InMemory::new()), "public-delete-policy", false)
+            .await;
+    let router = app(state);
+    let catalog = test_purchases_catalog();
+    let (status, _) = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog": public_catalog_fixture(&catalog)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let registered_catalog = public_catalog_fixture(&catalog)
+        .into_internal()
+        .expect("public registration derives a hidden engine weight column");
+    let engine_weight_name = relation_weight_column_name(&registered_catalog).unwrap();
+    let spoof_weight = |weight| {
+        let mut row = json!({"user_id":"a","amount":1});
+        row[engine_weight_name] = json!(weight);
+        row
+    };
+
+    for (stream, rejected_row, expected_error) in [
+        (
+            "delete-case",
+            json!({"operation":"delete","row":{"user_id":"a","amount":1}}),
+            "public input DELETE is unsupported",
+        ),
+        ("negative-case", spoof_weight(-1), "reserved engine field"),
+        (
+            "legacy-delta-name-case",
+            json!({"user_id":"a","amount":1,"delta":-1}),
+            "undeclared",
+        ),
+        (
+            "positive-weight-spoof-case",
+            spoof_weight(1),
+            "reserved engine field",
+        ),
+        (
+            "zero-weight-spoof-case",
+            spoof_weight(0),
+            "reserved engine field",
+        ),
+    ] {
+        let (status, error) = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/ingest",
+            json!({"batches":[
+                {"relation_id":"purchases","relation_version":"2026-05-24.v1","stream_id":stream,"partition_id":0,"start_offset_inclusive":0,"rows":public_insert_rows_fixture(&catalog, &[json!({"user_id":"a","amount":1,"delta":1})])},
+                {"relation_id":"purchases","relation_version":"2026-05-24.v1","stream_id":stream,"partition_id":0,"start_offset_inclusive":1,"rows":[rejected_row]}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let error_message = error["error"].as_str().unwrap();
+        assert!(error_message.contains(expected_error), "{error_message}");
+        assert!(
+            !error_message.contains(engine_weight_name),
+            "private engine field name leaked in error: {error_message}"
+        );
+
+        // The rejected multi-batch request did not consume its first range.
+        let (retry_status, _) = call_json(
+            &router,
+            Method::POST,
+            "/v1/relations/purchases/ingest",
+            json!({"relation_version":"2026-05-24.v1","stream_id":stream,"partition_id":0,"start_offset_inclusive":0,"rows":public_insert_rows_fixture(&catalog, &[json!({"user_id":"a","amount":1,"delta":1})])}),
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::CREATED);
+    }
+    assert_ne!(engine_weight_name, "delta");
+}
+
+#[test]
+fn update_and_upsert_normalization_keeps_generated_retractions() {
+    let mut catalog = test_purchases_catalog();
+    catalog.relation_schema.allowed_operations = vec![
+        RelationOperationV1::Insert,
+        RelationOperationV1::Update,
+        RelationOperationV1::Upsert,
+    ];
+    let normalized = normalize_ingest_operation_envelopes(
+        &catalog,
+        &[
+            json!({"operation":"update","before":{"user_id":"a","amount":1},"after":{"user_id":"a","amount":2}}),
+            json!({"operation":"upsert","before":{"user_id":"b","amount":3},"row":{"user_id":"b","amount":4}}),
+        ],
+        Some(IngestRowFormat::OperationEnvelopes),
+    )
+    .unwrap();
+    assert_eq!(normalized.len(), 4);
+    assert_eq!(normalized[0]["delta"], -1);
+    assert_eq!(normalized[1]["delta"], 1);
+    assert_eq!(normalized[2]["delta"], -1);
+    assert_eq!(normalized[3]["delta"], 1);
+}
+
+#[test]
+fn schema_columns_named_like_operation_envelopes_remain_raw_rows() {
+    let mut catalog = test_purchases_catalog();
+    catalog.relation_schema.allowed_operations = vec![
+        RelationOperationV1::Insert,
+        RelationOperationV1::Update,
+        RelationOperationV1::Upsert,
+    ];
+    let old_weight_id = catalog.relation_schema.weight_column_id.clone();
+    let weight_column = catalog
+        .relation_schema
+        .columns
+        .iter_mut()
+        .find(|column| column.column_id == old_weight_id)
+        .expect("engine fixture weight column");
+    weight_column.column_id = "fixture_engine_weight".into();
+    weight_column.name = "fixture_engine_weight".into();
+    catalog.relation_schema.weight_column_id = "fixture_engine_weight".into();
+    let first_new_ordinal = catalog.relation_schema.columns.len() as u32;
+    for (ordinal, name) in [
+        "operation",
+        "before",
+        "row",
+        "__velorix_internal_weight",
+        "delta",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (logical_type, physical_arrow_type) = if name == "delta" {
+            (VelorixLogicalTypeV1::Int64, ArrowPhysicalTypeV1::Int64)
+        } else {
+            (VelorixLogicalTypeV1::Utf8, ArrowPhysicalTypeV1::Utf8)
+        };
+        catalog.relation_schema.columns.push(RelationColumnV1 {
+            column_id: name.into(),
+            name: name.into(),
+            logical_type,
+            physical_arrow_type,
+            nullable: false,
+            ordinal: first_new_ordinal + ordinal as u32,
+            semantic_role: RelationSemanticRoleV1::Metadata,
+        });
+    }
+    let catalog = public_catalog_fixture(&catalog)
+        .into_internal()
+        .expect("collision schema must register through the public DTO");
+    let engine_weight_name = relation_weight_column_name(&catalog).unwrap();
+    assert_ne!(engine_weight_name, "__velorix_internal_weight");
+    // Public source rows have no engine weight. Even when every envelope key
+    // is also a business column, scalar values must keep this as a raw insert.
+    let raw_row = json!({"user_id":"a","amount":1,"operation":"update","before":"literal","row":"literal","__velorix_internal_weight":"business-value","delta":-5});
+    let normalized_raw =
+        normalize_ingest_operation_envelopes(&catalog, std::slice::from_ref(&raw_row), None)
+            .unwrap();
+    assert_eq!(normalized_raw.len(), 1);
+    assert_eq!(normalized_raw[0]["operation"], "update");
+    assert_eq!(normalized_raw[0]["before"], "literal");
+    assert_eq!(normalized_raw[0]["row"], "literal");
+    assert_eq!(
+        normalized_raw[0]["__velorix_internal_weight"],
+        "business-value"
+    );
+    assert_eq!(normalized_raw[0]["delta"], -5);
+    assert_eq!(normalized_raw[0][engine_weight_name], 1);
+
+    // The same business schema must still recognize actual nested envelopes;
+    // their payloads carry every business column, including collision names.
+    let update = json!({
+        "operation":"update",
+        "before":{"user_id":"a","amount":1,"operation":"update","before":"literal","row":"literal","__velorix_internal_weight":"business-value","delta":-5},
+        "after":{"user_id":"a","amount":2,"operation":"business","before":"new","row":"new","__velorix_internal_weight":"business-value","delta":-7}
+    });
+    let normalized_update = normalize_ingest_operation_envelopes(
+        &catalog,
+        &[update],
+        Some(IngestRowFormat::OperationEnvelopes),
+    )
+    .unwrap();
+    assert_eq!(normalized_update.len(), 2);
+    assert_eq!(normalized_update[0][engine_weight_name], -1);
+    assert_eq!(normalized_update[1][engine_weight_name], 1);
+    assert_eq!(normalized_update[1]["operation"], "business");
+
+    let upsert = json!({
+        "operation":"upsert",
+        "before":{"user_id":"a","amount":1,"operation":"business","before":"old","row":"old","__velorix_internal_weight":"business-value","delta":-5},
+        "row":{"user_id":"a","amount":2,"operation":"business","before":"new","row":"new","__velorix_internal_weight":"business-value","delta":-7}
+    });
+    let normalized = normalize_ingest_operation_envelopes(
+        &catalog,
+        &[upsert],
+        Some(IngestRowFormat::OperationEnvelopes),
+    )
+    .unwrap();
+    assert_eq!(normalized.len(), 2);
+    assert_eq!(normalized[0][engine_weight_name], -1);
+    assert_eq!(normalized[1][engine_weight_name], 1);
+    assert_eq!(normalized[1]["operation"], "business");
+    let mut negative_raw_row =
+        json!({"user_id":"a","amount":1,"operation":"delete","before":"literal","row":"literal"});
+    negative_raw_row[engine_weight_name] = json!(-1);
+    let error = normalize_ingest_operation_envelopes(
+        &catalog,
+        &[negative_raw_row.take()],
+        Some(IngestRowFormat::BusinessRows),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("reserved engine field"));
+}
+
+#[tokio::test]
+async fn ambiguous_business_columns_require_explicit_ingest_row_format() {
+    use object_store::memory::InMemory;
+
+    let state = test_public_api_state_with_store(
+        Arc::new(InMemory::new()),
+        "ambiguous-row-format-owner",
+        false,
+    )
+    .await;
+    let router = app(state.clone());
+    let catalog = PublicRelationCatalogV1 {
+        relation_schema: PublicRelationSchemaV1 {
+            relation_id: "ambiguous_rows".into(),
+            relation_name: "ambiguous_rows".into(),
+            relation_version: "v1".into(),
+            columns: vec![
+                PublicRelationColumnV1 {
+                    column_id: "operation".into(),
+                    name: "operation".into(),
+                    logical_type: VelorixLogicalTypeV1::Utf8,
+                    physical_arrow_type: ArrowPhysicalTypeV1::Utf8,
+                    nullable: false,
+                    ordinal: 0,
+                },
+                PublicRelationColumnV1 {
+                    column_id: "row".into(),
+                    name: "row".into(),
+                    logical_type: VelorixLogicalTypeV1::Json,
+                    physical_arrow_type: ArrowPhysicalTypeV1::JsonUtf8,
+                    nullable: false,
+                    ordinal: 1,
+                },
+            ],
+            primary_key_column_ids: Vec::new(),
+            allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Update],
+            event_time_column_id: None,
+        },
+        adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
+    };
+    let registration = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog":catalog}),
+    )
+    .await;
+    assert_eq!(registration.0, StatusCode::CREATED, "{registration:?}");
+    let internal_catalog = catalog
+        .clone()
+        .into_internal()
+        .expect("public fixture converts to the stored internal schema");
+    let engine_weight_name = relation_weight_column_name(&internal_catalog).unwrap();
+
+    let business_row = json!({"operation":"insert","row":{"operation":"literal","row":0}});
+    let ambiguous = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ambiguous_rows/ingest",
+        json!({
+            "relation_version":"v1",
+            "stream_id":"ambiguous-row-format",
+            "partition_id":0,
+            "start_offset_inclusive":0,
+            "rows":[business_row]
+        }),
+    )
+    .await;
+    assert_eq!(ambiguous.0, StatusCode::BAD_REQUEST, "{ambiguous:?}");
+    assert!(ambiguous.1["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("ambiguous"));
+    let business_insert_key = ObjectKey::ingest_batch("ambiguous-row-format", 0, 0, 1).unwrap();
+    assert!(state
+        .store
+        .get(&Path::from(business_insert_key.as_str()))
+        .await
+        .is_err());
+
+    let business_insert = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ambiguous_rows/ingest",
+        json!({
+            "relation_version":"v1",
+            "stream_id":"ambiguous-row-format",
+            "partition_id":0,
+            "start_offset_inclusive":0,
+            "row_format":"business_rows",
+            "rows":[business_row]
+        }),
+    )
+    .await;
+    assert_eq!(
+        business_insert.0,
+        StatusCode::CREATED,
+        "{business_insert:?}"
+    );
+    let business_bytes = state
+        .store
+        .get(&Path::from(business_insert_key.as_str()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let business_batches = IngestEnvelope::decode(business_bytes)
+        .unwrap()
+        .record_batches()
+        .unwrap();
+    let business_batch = &business_batches[0];
+    let stored_row = business_batch
+        .column_by_name("row")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(stored_row.value(0)).unwrap(),
+        json!({"operation":"literal","row":0})
+    );
+    let stored_weights = business_batch
+        .column_by_name(engine_weight_name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(stored_weights.value(0), 1);
+
+    let update = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/ambiguous_rows/ingest",
+        json!({
+            "relation_version":"v1",
+            "stream_id":"ambiguous-row-format",
+            "partition_id":0,
+            "start_offset_inclusive":1,
+            "row_format":"operation_envelopes",
+            "rows":[{
+                "operation":"update",
+                "before":{
+                    "operation":"insert","row":{"operation":"literal","row":0}
+                },
+                "after":{
+                    "operation":"updated","row":{"operation":"new","row":2}
+                }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(update.0, StatusCode::CREATED, "{update:?}");
+    let update_key = ObjectKey::ingest_batch("ambiguous-row-format", 0, 1, 3).unwrap();
+    let update_bytes = state
+        .store
+        .get(&Path::from(update_key.as_str()))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let update_batches = IngestEnvelope::decode(update_bytes)
+        .unwrap()
+        .record_batches()
+        .unwrap();
+    let update_batch = &update_batches[0];
+    let update_weights = update_batch
+        .column_by_name(engine_weight_name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(update_weights.values(), &[-1, 1]);
+    let updated_rows = update_batch
+        .column_by_name("row")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(updated_rows.value(0)).unwrap(),
+        json!({"operation":"literal","row":0})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(updated_rows.value(1)).unwrap(),
+        json!({"operation":"new","row":2})
+    );
+}
+
+#[tokio::test]
+async fn public_update_and_upsert_retractions_reach_view_and_restore_after_restart() {
+    use object_store::memory::InMemory;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state =
+        test_public_api_state_with_store(store.clone(), "public-replacement-restart-a", false)
+            .await;
+    let restart_meta = Arc::clone(state.meta_store.as_ref().unwrap());
+    let restart_owner_id = state.owner_id.clone();
+    let router = app(state);
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations",
+        json!({"catalog":public_catalog_fixture(&test_scores_catalog())}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response:?}");
+
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id":"scores_public_star",
+            "input_relation_id":"scores",
+            "input_relation_version":"2026-05-24.v1",
+            "sql":"select * from scores",
+            "source_kind":"standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response:?}");
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/views",
+        json!({
+            "view_id":"scores_after_replacements",
+            "input_relation_id":"scores",
+            "input_relation_version":"2026-05-24.v1",
+            "sql":"select user_id, sum(score) as total from scores group by user_id",
+            "source_kind":"standing_view"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response:?}");
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version":"2026-05-24.v1","stream_id":"replacement-restart",
+            "partition_id":0,"start_offset_inclusive":0,
+            "rows":[
+                {"user_id":"alice","score":10},
+                {"user_id":"bob","score":5}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response:?}");
+
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/relations/scores/ingest",
+        json!({
+            "relation_version":"2026-05-24.v1","stream_id":"replacement-restart",
+            "partition_id":0,"start_offset_inclusive":2,
+            "rows":[
+                {"operation":"update","before":{"user_id":"alice","score":10},"after":{"user_id":"alice","score":15}},
+                {"operation":"upsert","before":{"user_id":"bob","score":5},"row":{"user_id":"bob","score":8}}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response:?}");
+    let expected = json!([{"user_id":"alice","total":15},{"user_id":"bob","total":8}]);
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/scores_after_replacements/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["rows"], expected);
+
+    let (status, response) = call_json(
+        &router,
+        Method::POST,
+        "/v1/views/scores_public_star/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(
+        response["rows"],
+        json!([{"user_id":"alice","score":15},{"user_id":"bob","score":8}])
+    );
+    assert!(response["rows"][0]
+        .get("__velorix_internal_weight")
+        .is_none());
+
+    drop(router);
+    let restarted_state = restart_test_api_state_with_store(
+        restart_meta,
+        restart_owner_id,
+        store,
+        "public-replacement-restart-b",
+        true,
+    )
+    .await;
+    assert_eq!(
+        restarted_state
+            .restore_standing_program_runtimes_from_active_views()
+            .await
+            .unwrap(),
+        2
+    );
+    let restarted_router = app(restarted_state);
+    let (status, response) = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/scores_after_replacements/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(response["rows"], expected);
+    let (status, response) = call_json(
+        &restarted_router,
+        Method::POST,
+        "/v1/views/scores_public_star/query",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response:?}");
+    assert_eq!(
+        response["rows"],
+        json!([{"user_id":"alice","score":15},{"user_id":"bob","score":8}])
+    );
 }
 
 struct FailingApplyRuntimeFactory {
@@ -21386,7 +22006,7 @@ async fn public_1_0_rejects_experimental_view_surfaces_by_default() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -21551,7 +22171,12 @@ fn test_purchases_catalog() -> VelorixRelationCatalogV1 {
         ],
         primary_key_column_ids: vec!["user_id".to_string()],
         weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        allowed_operations: vec![
+            RelationOperationV1::Insert,
+            RelationOperationV1::Delete,
+            RelationOperationV1::Update,
+            RelationOperationV1::Upsert,
+        ],
         event_time_column_id: None,
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
@@ -21630,7 +22255,12 @@ fn test_order_facts_catalog() -> VelorixRelationCatalogV1 {
         ],
         primary_key_column_ids: vec!["order_id".to_string()],
         weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        allowed_operations: vec![
+            RelationOperationV1::Insert,
+            RelationOperationV1::Delete,
+            RelationOperationV1::Update,
+            RelationOperationV1::Upsert,
+        ],
         event_time_column_id: None,
     };
     VelorixRelationCatalogV1::from_relation_schema(
@@ -21680,7 +22310,7 @@ async fn public_1_0_admits_event_time_window_sql_by_default() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_purchases_event_time_catalog()
+            "catalog": public_catalog_fixture(&test_purchases_event_time_catalog())
         }),
     )
     .await;
@@ -21736,7 +22366,7 @@ async fn rest_http_two_writers_materialize_exact_aggregate_with_latency_diagnost
     for (path, body) in [
         (
             "/v1/relations",
-            json!({"catalog":test_order_facts_catalog()}),
+            json!({"catalog":public_catalog_fixture(&test_order_facts_catalog())}),
         ),
         (
             "/v1/views",
@@ -21769,7 +22399,7 @@ async fn rest_http_two_writers_materialize_exact_aggregate_with_latency_diagnost
                         json!({
                             "order_id":format!("{writer_id}-{batch}-{row}"),
                             "user_id":if row == 7 { "cold" } else { "hot" },
-                            "category":"load","amount":1,"delta":1
+                            "category":"load","amount":1
                         })
                     })
                     .collect();
@@ -21857,13 +22487,13 @@ async fn rest_join_families_materialize_retract_and_restart() {
                     ),
                 ],
                 "select r.ride_id, r.booking_start, r.booking_end_time from rides r join vehicles v on r.booking_start < v.capacity_end and v.capacity_start_time < r.booking_end_time",
-                json!([{"ride_id":"r1","booking_start":10,"booking_end_time":20,"delta":1}]),
+                json!([{"ride_id":"r1","booking_start":10,"booking_end_time":20}]),
                 json!([
-                    {"vehicle_id":"v1","capacity_start_time":15,"capacity_end":25,"delta":1},
-                    {"vehicle_id":"v2","capacity_start_time":18,"capacity_end":22,"delta":1},
-                    {"vehicle_id":"touch_right","capacity_start_time":20,"capacity_end":30,"delta":1},
-                    {"vehicle_id":"touch_left","capacity_start_time":0,"capacity_end":10,"delta":1},
-                    {"vehicle_id":"disjoint","capacity_start_time":30,"capacity_end":40,"delta":1}
+                    {"vehicle_id":"v1","capacity_start_time":15,"capacity_end":25},
+                    {"vehicle_id":"v2","capacity_start_time":18,"capacity_end":22},
+                    {"vehicle_id":"touch_right","capacity_start_time":20,"capacity_end":30},
+                    {"vehicle_id":"touch_left","capacity_start_time":0,"capacity_end":10},
+                    {"vehicle_id":"disjoint","capacity_start_time":30,"capacity_end":40}
                 ]),
                 json!([
                     {"ride_id":"r1","booking_start":10,"booking_end_time":20,"vehicle_id":"v1"},
@@ -21878,8 +22508,8 @@ async fn rest_join_families_materialize_retract_and_restart() {
                     generic_adapter_catalog(test_accounts_catalog()),
                 ],
                 "select s.user_id, a.account_id, s.score, a.tier from scores s cross join accounts a",
-                json!([{"user_id":"alice","score":10,"delta":1},{"user_id":"bob","score":5,"delta":1}]),
-                json!([{"account_id":"a1","limit":100,"tier":"gold","delta":1},{"account_id":"a2","limit":50,"tier":"silver","delta":1}]),
+                json!([{"user_id":"alice","score":10},{"user_id":"bob","score":5}]),
+                json!([{"account_id":"a1","limit":100,"tier":"gold"},{"account_id":"a2","limit":50,"tier":"silver"}]),
                 json!([
                     {"user_id":"alice","account_id":"a1","score":10,"tier":"gold"},
                     {"user_id":"alice","account_id":"a2","score":10,"tier":"silver"},
@@ -21887,6 +22517,8 @@ async fn rest_join_families_materialize_retract_and_restart() {
                     {"user_id":"bob","account_id":"a2","score":5,"tier":"silver"}
                 ]),
                 json!([
+                    {"user_id":"alice","account_id":"a3","score":10,"tier":"bronze"},
+                    {"user_id":"bob","account_id":"a3","score":5,"tier":"bronze"},
                     {"user_id":"alice","account_id":"a2","score":10,"tier":"silver"},
                     {"user_id":"bob","account_id":"a2","score":5,"tier":"silver"}
                 ]),
@@ -21906,7 +22538,7 @@ async fn rest_join_families_materialize_retract_and_restart() {
                 &router,
                 Method::POST,
                 "/v1/relations",
-                json!({"catalog":catalog}),
+                json!({"catalog":public_catalog_fixture(&catalog)}),
             )
             .await;
             assert_eq!(
@@ -21976,11 +22608,21 @@ async fn rest_join_families_materialize_retract_and_restart() {
             expected.sort_by_key(Value::to_string);
             assert_eq!(actual, expected, "interval={interval}");
         }
-        let mut retracted = right_rows[0].clone();
-        retracted["delta"] = json!(-1);
+        let mut before = right_rows[0].clone();
+        before.as_object_mut().unwrap().remove("delta");
+        let after = if interval {
+            json!({
+                "vehicle_id": "v1",
+                "capacity_start_time": 30,
+                "capacity_end": 40
+            })
+        } else {
+            json!({"account_id": "a3", "limit": 75, "tier": "bronze"})
+        };
         let response = call_json(&restarted_router, Method::POST, "/v1/relations/ingest", json!({"batches":[{
             "relation_id":refs[1]["relation_id"],"relation_version":refs[1]["relation_version"],
-            "stream_id":"join-stream-1","partition_id":0,"start_offset_inclusive":right_rows.as_array().unwrap().len(),"rows":[retracted]
+            "stream_id":"join-stream-1","partition_id":0,"start_offset_inclusive":right_rows.as_array().unwrap().len(),
+            "rows":[{"operation":"update","before":before,"after":after}]
         }]})).await;
         assert_eq!(
             response.0,
@@ -22026,7 +22668,7 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog": catalog}),
+            json!({"catalog": public_catalog_fixture(&catalog)}),
         )
         .await;
         assert_eq!(response.0, StatusCode::CREATED, "{response:?}");
@@ -22086,10 +22728,10 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"vehicle_id": "p1", "price": 1000, "event_time": 100, "delta": 1},
-            {"vehicle_id": "p1", "price": 2000, "event_time": 200, "delta": 1},
-            {"vehicle_id": "p1", "price": 3000, "event_time": 300, "delta": 1},
-            {"vehicle_id": "p2", "price": 999, "event_time": 240, "delta": 1}
+            {"vehicle_id": "p1", "price": 1000, "event_time": 100},
+            {"vehicle_id": "p1", "price": 2000, "event_time": 200},
+            {"vehicle_id": "p1", "price": 3000, "event_time": 300},
+            {"vehicle_id": "p2", "price": 999, "event_time": 240}
         ]
     });
     let ingest_prices = call_json(
@@ -22113,8 +22755,8 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"ride_id": "p1", "booking_start": 10, "event_time": 250, "delta": 1},
-                    {"ride_id": "missing", "booking_start": 20, "event_time": 250, "delta": 1}
+                    {"ride_id": "p1", "booking_start": 10, "event_time": 250},
+                    {"ride_id": "missing", "booking_start": 20, "event_time": 250}
                 ]
             }]
         }),
@@ -22179,7 +22821,11 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
                 "stream_id": "temporal-asof-prices",
                 "partition_id": 0,
                 "start_offset_inclusive": 4,
-                "rows": [{"vehicle_id": "p1", "price": 2000, "event_time": 200, "delta": -1}]
+                "rows": [{
+                    "operation": "update",
+                    "before": {"vehicle_id": "p1", "price": 2000, "event_time": 200},
+                    "after": {"vehicle_id": "p1", "price": 1500, "event_time": 50}
+                }]
             }]
         }),
     )
@@ -22214,27 +22860,23 @@ async fn rest_temporal_asof_join_materializes_retracts_and_restores() {
 async fn rest_relation_admission_rejects_internal_published_view_output_source_kind() {
     let state = test_api_state().await;
     let router = app(state);
-    let mut catalog = test_scores_catalog();
-    catalog.relation_source = VelorixRelationSourceV1::PublishedViewOutput {
-        producer_view_id: "producer".to_string(),
-        producer_view_generation: 1,
-        output_stream_id: "producer/v1".to_string(),
-    };
-    let rejected = call_json(
-        &router,
-        Method::POST,
-        "/v1/relations",
-        json!({
-            "catalog": catalog
-        }),
-    )
-    .await;
-    assert_eq!(rejected.0, StatusCode::BAD_REQUEST, "{rejected:?}");
+    let mut catalog_payload = json!({
+        "catalog": public_catalog_fixture(&test_scores_catalog())
+    });
+    catalog_payload["catalog"]["relation_source"] = json!({
+        "PublishedViewOutput": {
+            "producer_view_id": "producer",
+            "producer_view_generation": 1,
+            "output_stream_id": "producer/v1"
+        }
+    });
+    let rejected = call_json(&router, Method::POST, "/v1/relations", catalog_payload).await;
+    assert_eq!(rejected.0, StatusCode::UNPROCESSABLE_ENTITY, "{rejected:?}");
     assert!(
         rejected.1["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("PublishedViewOutput"),
+            .contains("unknown field"),
         "{rejected:?}"
     );
 }
@@ -22259,7 +22901,7 @@ async fn rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_resto
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": catalog}),
+        json!({"catalog": public_catalog_fixture(&catalog)}),
     )
     .await;
     assert_eq!(
@@ -22296,9 +22938,9 @@ async fn rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_resto
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"edge_id": "e1", "src": "a", "dst": "b", "delta": 1},
-                    {"edge_id": "e2", "src": "b", "dst": "c", "delta": 1},
-                    {"edge_id": "e3", "src": "isolated", "dst": "leaf", "delta": 1}
+                    {"edge_id": "e1", "src": "a", "dst": "b"},
+                    {"edge_id": "e2", "src": "b", "dst": "c"},
+                    {"edge_id": "e3", "src": "isolated", "dst": "leaf"}
                 ]
             }]
         }),
@@ -22546,7 +23188,12 @@ fn test_relation_catalog_for_e2e(
         columns: schema_columns,
         primary_key_column_ids: vec![columns[0].0.to_string()],
         weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        allowed_operations: vec![
+            RelationOperationV1::Insert,
+            RelationOperationV1::Delete,
+            RelationOperationV1::Update,
+            RelationOperationV1::Upsert,
+        ],
         event_time_column_id: None,
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema).unwrap();
@@ -22567,6 +23214,64 @@ fn test_relation_catalog_for_e2e(
             adapter_id: CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.to_string(),
         },
     }
+}
+
+/// Explicitly converts an engine fixture catalog at a public registration
+/// declaration site. Engine weight metadata and semantic roles are omitted;
+/// public ordinals are contiguous across business columns.
+fn public_catalog_fixture(catalog: &VelorixRelationCatalogV1) -> PublicRelationCatalogV1 {
+    let weight_id = catalog.relation_schema.weight_column_id.as_str();
+    PublicRelationCatalogV1 {
+        relation_schema: PublicRelationSchemaV1 {
+            relation_id: catalog.relation_schema.relation_id.clone(),
+            relation_name: catalog.relation_schema.relation_name.clone(),
+            relation_version: catalog.relation_schema.relation_version.clone(),
+            columns: catalog
+                .relation_schema
+                .columns
+                .iter()
+                .filter(|column| column.column_id != weight_id)
+                .enumerate()
+                .map(|(ordinal, column)| PublicRelationColumnV1 {
+                    column_id: column.column_id.clone(),
+                    name: column.name.clone(),
+                    logical_type: column.logical_type.clone(),
+                    physical_arrow_type: column.physical_arrow_type.clone(),
+                    nullable: column.nullable,
+                    ordinal: ordinal as u32,
+                })
+                .collect(),
+            primary_key_column_ids: catalog.relation_schema.primary_key_column_ids.clone(),
+            allowed_operations: catalog.relation_schema.allowed_operations.clone(),
+            event_time_column_id: catalog.relation_schema.event_time_column_id.clone(),
+        },
+        adapter_id: catalog.incremental_adapter.adapter_id.clone(),
+    }
+}
+
+/// Explicitly converts positive engine-weighted insert fixture rows for a
+/// public ingest declaration. Only the ordinary +1 fixture weight is
+/// representable as a public insert; callers must handle all other weights
+/// explicitly so the conversion cannot erase multiplicity or spoof coverage.
+fn public_insert_rows_fixture(catalog: &VelorixRelationCatalogV1, rows: &[Value]) -> Vec<Value> {
+    let weight_column = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .find(|column| column.column_id == catalog.relation_schema.weight_column_id)
+        .map(|column| column.name.as_str())
+        .expect("internal fixture catalog has a weight column");
+    rows.iter()
+        .map(|row| {
+            let mut converted = row.clone();
+            if let Some(object) = converted.as_object_mut() {
+                if let Some(weight) = object.remove(weight_column) {
+                    assert_eq!(weight, 1, "only +1 fixture inserts convert publicly");
+                }
+            }
+            converted
+        })
+        .collect()
 }
 
 fn test_scores_catalog() -> VelorixRelationCatalogV1 {
@@ -22605,7 +23310,12 @@ fn test_scores_catalog() -> VelorixRelationCatalogV1 {
         ],
         primary_key_column_ids: vec!["user_id".to_string()],
         weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        allowed_operations: vec![
+            RelationOperationV1::Insert,
+            RelationOperationV1::Delete,
+            RelationOperationV1::Update,
+            RelationOperationV1::Upsert,
+        ],
         event_time_column_id: None,
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
@@ -22690,7 +23400,12 @@ fn test_accounts_catalog() -> VelorixRelationCatalogV1 {
         ],
         primary_key_column_ids: vec!["account_id".to_string()],
         weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        allowed_operations: vec![
+            RelationOperationV1::Insert,
+            RelationOperationV1::Delete,
+            RelationOperationV1::Update,
+            RelationOperationV1::Upsert,
+        ],
         event_time_column_id: None,
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
@@ -22821,7 +23536,12 @@ fn test_item_status_catalog() -> VelorixRelationCatalogV1 {
         ],
         primary_key_column_ids: vec!["key".to_string()],
         weight_column_id: "delta".to_string(),
-        allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+        allowed_operations: vec![
+            RelationOperationV1::Insert,
+            RelationOperationV1::Delete,
+            RelationOperationV1::Update,
+            RelationOperationV1::Upsert,
+        ],
         event_time_column_id: Some("ts".to_string()),
     };
     let schema_fingerprint = SchemaFingerprintV1::for_relation_schema(&relation_schema)
@@ -22863,7 +23583,7 @@ async fn scenario_relation_view_ingest_query_aggregate() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -22902,9 +23622,9 @@ async fn scenario_relation_view_ingest_query_aggregate() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 100, "delta": 1},
-                    {"user_id": "bob", "score": 200, "delta": 1},
-                    {"user_id": "alice", "score": 150, "delta": 1}
+                    {"user_id": "alice", "score": 100},
+                    {"user_id": "bob", "score": 200},
+                    {"user_id": "alice", "score": 150}
                 ]
             }]
         }),
@@ -22942,7 +23662,7 @@ async fn scenario_multi_epoch_incremental() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -22974,7 +23694,7 @@ async fn scenario_multi_epoch_incremental() {
                 "partition_id": 0,
                 "start_offset_inclusive": 0,
                 "rows": [
-                    {"user_id": "alice", "score": 100, "delta": 1}
+                    {"user_id": "alice", "score": 100}
                 ]
             }]
         }),
@@ -23009,8 +23729,8 @@ async fn scenario_multi_epoch_incremental() {
                 "partition_id": 0,
                 "start_offset_inclusive": 1,
                 "rows": [
-                    {"user_id": "alice", "score": 50, "delta": 1},
-                    {"user_id": "bob", "score": 200, "delta": 1}
+                    {"user_id": "alice", "score": 50},
+                    {"user_id": "bob", "score": 200}
                 ]
             }]
         }),
@@ -23053,7 +23773,7 @@ async fn scenario_list_views_empty_then_create() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -23092,12 +23812,13 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
     let restart_owner_id = state.owner_id.clone();
     let router = app(state);
 
+    let scores_catalog = test_scores_catalog();
     let relation_response = call_json(
         &router,
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&scores_catalog)
         }),
     )
     .await;
@@ -23136,10 +23857,10 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1},
-                {"user_id": "alice", "score": 7, "delta": 1},
-                {"user_id": "bob", "score": 5, "delta": 1},
-                {"user_id": "carol", "score": -3, "delta": 1}
+                {"user_id": "alice", "score": 10},
+                {"user_id": "alice", "score": 7},
+                {"user_id": "bob", "score": 5},
+                {"user_id": "carol", "score": -3}
             ]
         }),
     )
@@ -23269,9 +23990,13 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
             "partition_id": 0,
             "start_offset_inclusive": 4,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": -1},
-                {"user_id": "carol", "score": 8, "delta": 1},
-                {"user_id": "dave", "score": 3, "delta": 1}
+                {
+                    "operation": "update",
+                    "before": {"user_id": "alice", "score": 10},
+                    "after": {"user_id": "alice", "score": 0}
+                },
+                {"user_id": "carol", "score": 8},
+                {"user_id": "dave", "score": 3}
             ]
         }),
     )
@@ -23355,13 +24080,25 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
             relation_version: "2026-05-24.v1".to_string(),
             stream_id: "scores-chain-stream".to_string(),
             partition_id: 0,
-            start_offset_inclusive: 7,
+            start_offset_inclusive: 8,
             event_time_watermark: None,
+            row_format: None,
             rows: vec![
-                json!({"user_id": "bob", "score": 5, "delta": -1}),
-                json!({"user_id": "dave", "score": 3, "delta": -1}),
-                json!({"user_id": "alice", "score": 7, "delta": -1}),
-                json!({"user_id": "alice", "score": 6, "delta": 1}),
+                json!({
+                    "operation": "update",
+                    "before": {"user_id": "bob", "score": 5},
+                    "after": {"user_id": "bob", "score": -1}
+                }),
+                json!({
+                    "operation": "update",
+                    "before": {"user_id": "dave", "score": 3},
+                    "after": {"user_id": "dave", "score": -1}
+                }),
+                json!({
+                    "operation": "update",
+                    "before": {"user_id": "alice", "score": 7},
+                    "after": {"user_id": "alice", "score": 6}
+                }),
             ],
         },
     )
@@ -23440,9 +24177,9 @@ async fn rest_three_level_filter_aggregate_topk_chain_exact() {
             "relation_version": "2026-05-24.v1",
             "stream_id": "scores-chain-stream",
             "partition_id": 0,
-            "start_offset_inclusive": 11,
+            "start_offset_inclusive": 14,
             "rows": [
-                {"user_id": "eve", "score": 12, "delta": 1}
+                {"user_id": "eve", "score": 12}
             ]
         }),
     )
@@ -23477,7 +24214,7 @@ async fn view_on_view_admission_rejects_cycles_missing_producers_and_ambiguity()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -23570,7 +24307,7 @@ async fn view_on_view_admission_rejects_cycles_missing_producers_and_ambiguity()
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": competing_catalog
+            "catalog": public_catalog_fixture(&competing_catalog)
         }),
     )
     .await;
@@ -23610,7 +24347,7 @@ async fn view_on_view_chain_rejects_cycles_at_admission() {
         Method::POST,
         "/v1/relations",
         json!({
-            "catalog": test_scores_catalog()
+            "catalog": public_catalog_fixture(&test_scores_catalog())
         }),
     )
     .await;
@@ -23627,7 +24364,7 @@ async fn view_on_view_chain_rejects_cycles_at_admission() {
             "partition_id": 0,
             "start_offset_inclusive": 0,
             "rows": [
-                {"user_id": "alice", "score": 10, "delta": 1}
+                {"user_id": "alice", "score": 10}
             ]
         }),
     )
@@ -23965,7 +24702,7 @@ async fn rest_correction_configuration_rejects_invalid_horizons_and_shapes() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -24146,7 +24883,7 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED, "{relation:?}");
@@ -24166,9 +24903,9 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         batch(
             0,
             json!([
-                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1},
-                {"user_id": "alice", "amount": 4, "event_time": 20_000_000_000i64, "delta": 1},
-                {"user_id": "bob", "amount": 20, "event_time": 10_000_000_000i64, "delta": 1}
+                {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                {"user_id": "alice", "amount": 4, "event_time": 20_000_000_000i64},
+                {"user_id": "bob", "amount": 20, "event_time": 10_000_000_000i64}
             ]),
             60_000_000_000i64,
         ),
@@ -24182,7 +24919,7 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         batch(
             3,
             json!([
-                {"user_id": "charlie", "amount": 3, "event_time": 10_000_000_000_000i64, "delta": 1}
+                {"user_id": "charlie", "amount": 3, "event_time": 10_000_000_000_000i64}
             ]),
             10_080_000_000_000i64,
         ),
@@ -24270,7 +25007,11 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
     let router = app(restarted.clone());
     let late = batch(
         4,
-        json!([{"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": -1}]),
+        json!([{
+            "operation": "update",
+            "before": {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+            "after": {"user_id": "alice", "amount": 11, "event_time": 10_000_000_000i64}
+        }]),
         10_080_000_000_000i64,
     );
     let before_objects = store
@@ -24403,11 +25144,11 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
         .iter()
         .find(|row| row["user_id"] == "alice")
         .unwrap();
-    assert_eq!(alice["total"], 4);
-    assert_eq!(alice["count"], 1);
+    assert_eq!(alice["total"], 15);
+    assert_eq!(alice["count"], 2);
     assert_eq!(alice["minimum"], 4);
-    assert_eq!(alice["maximum"], 4);
-    assert_eq!(alice["average"].as_f64(), Some(4.0));
+    assert_eq!(alice["maximum"], 11);
+    assert_eq!(alice["average"].as_f64(), Some(7.5));
     assert_eq!(query.1["rows"].as_array().unwrap().len(), 3);
     if !migrate {
         let committed =
@@ -24424,9 +25165,9 @@ async fn far_late_window_regression(authoritative: bool, migrate: bool) {
             .unwrap();
         failing.arm("v1/state/materialized-view-runtime/");
         let failing_ingest = batch(
-            5,
+            6,
             json!([
-                {"user_id": "bob", "amount": 5, "event_time": 20_000_000_000i64, "delta": 1}
+                {"user_id": "bob", "amount": 5, "event_time": 20_000_000_000i64}
             ]),
             10_080_000_000_000i64,
         );
@@ -24544,14 +25285,14 @@ async fn rest_default_session_accepts_late_input_after_closure() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
     let created = call_json(&router, Method::POST, "/v1/views", json!({"view_id": "late_session", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total from session(purchases, event_time, interval '30 seconds') group by user_id, window_start, window_end"})).await;
     assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
     for (offset, amount) in [(0, 10), (1, 7)] {
-        let ingested = call_json(&router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "session-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 1_000_000_000_000i64, "watermark_ns": 1_000_000_000_000i64}, "rows": [{"user_id": "alice", "amount": amount, "event_time": 10_000_000_000i64, "delta": 1}]})).await;
+        let ingested = call_json(&router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "session-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 1_000_000_000_000i64, "watermark_ns": 1_000_000_000_000i64}, "rows": [{"user_id": "alice", "amount": amount, "event_time": 10_000_000_000i64}]})).await;
         assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
     }
     let query = call_json(
@@ -24574,13 +25315,13 @@ async fn rest_window_archival_drains_multiple_bounded_export_chunks() {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
     let created = call_json(&router, Method::POST, "/v1/views", json!({"view_id": "archive_chunks", "input_relation_id": "purchases", "input_relation_version": "2026-05-24.v1", "sql": "select user_id, window_start, window_end, sum(amount) as total from tumble(purchases, event_time, interval '60 seconds') group by user_id, window_start, window_end"})).await;
     assert_eq!(created.0, StatusCode::CREATED, "{created:?}");
-    let rows = (0..130).map(|key| json!({"user_id": format!("user-{key}"), "amount": key, "event_time": 10_000_000_000i64, "delta": 1})).collect::<Vec<_>>();
+    let rows = (0..130).map(|key| json!({"user_id": format!("user-{key}"), "amount": key, "event_time": 10_000_000_000i64})).collect::<Vec<_>>();
     let ingested = call_json(&router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "archive-chunks-stream", "partition_id": 0, "start_offset_inclusive": 0, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 10_080_000_000_000i64, "watermark_ns": 10_080_000_000_000i64}, "rows": rows})).await;
     assert_eq!(ingested.0, StatusCode::CREATED, "{ingested:?}");
     let active = read_test_active_view(&state, "archive_chunks")
@@ -24665,7 +25406,7 @@ async fn correction_restart_regression(authoritative: bool) {
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -24703,12 +25444,12 @@ async fn correction_restart_regression(authoritative: bool) {
     different["correction_horizon_ns"] = json!(121_000_000_000i64);
     let conflict = call_json(&router, Method::POST, "/v1/views", different).await;
     assert_eq!(conflict.0, StatusCode::CONFLICT, "{conflict:?}");
-    let batch = |offset, amount, time, delta, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "correction-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": [{"user_id": "alice", "amount": amount, "event_time": time, "delta": delta}]});
+    let batch = |offset, amount, time, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "correction-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": [{"user_id": "alice", "amount": amount, "event_time": time}]});
     let initial = call_json(
         &router,
         Method::POST,
         "/v1/ingest",
-        batch(0, 10, 10_000_000_000i64, 1, 60_000_000_000i64),
+        batch(0, 10, 10_000_000_000i64, 60_000_000_000i64),
     )
     .await;
     assert_eq!(initial.0, StatusCode::CREATED, "{initial:?}");
@@ -24728,7 +25469,7 @@ async fn correction_restart_regression(authoritative: bool) {
         &router,
         Method::POST,
         "/v1/ingest",
-        batch(1, 7, 20_000_000_000i64, 1, 60_000_000_000i64),
+        batch(1, 7, 20_000_000_000i64, 60_000_000_000i64),
     )
     .await;
     assert_eq!(correction.0, StatusCode::CREATED, "{correction:?}");
@@ -24785,14 +25526,34 @@ async fn correction_restart_regression(authoritative: bool) {
     )
     .await;
     assert_eq!(restored_query.1["rows"], corrected.1["rows"]);
-    let retraction = call_json(
+    let correction_update = call_json(
         &router,
         Method::POST,
         "/v1/ingest",
-        batch(2, 10, 10_000_000_000i64, -1, 60_000_000_000i64),
+        json!({
+            "relation_id": "purchases",
+            "relation_version": "2026-05-24.v1",
+            "stream_id": "correction-stream",
+            "partition_id": 0,
+            "start_offset_inclusive": 2,
+            "event_time_watermark": {
+                "event_time_column_id": "event_time",
+                "max_observed_event_time_ns": 60_000_000_000i64,
+                "watermark_ns": 60_000_000_000i64
+            },
+            "rows": [{
+                "operation": "update",
+                "before": {"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64},
+                "after": {"user_id": "alice", "amount": 1, "event_time": 10_000_000_000i64}
+            }]
+        }),
     )
     .await;
-    assert_eq!(retraction.0, StatusCode::CREATED, "{retraction:?}");
+    assert_eq!(
+        correction_update.0,
+        StatusCode::CREATED,
+        "{correction_update:?}"
+    );
     let retracted = call_json(
         &router,
         Method::POST,
@@ -24800,13 +25561,13 @@ async fn correction_restart_regression(authoritative: bool) {
         json!({}),
     )
     .await;
-    assert_eq!(retracted.1["rows"][0]["total"], 7);
-    assert_eq!(retracted.1["rows"][0]["count"], 1);
+    assert_eq!(retracted.1["rows"][0]["total"], 8);
+    assert_eq!(retracted.1["rows"][0]["count"], 2);
     let advance = call_json(
         &router,
         Method::POST,
         "/v1/ingest",
-        batch(3, 5, 130_000_000_000i64, 1, 180_000_000_000i64),
+        batch(4, 5, 130_000_000_000i64, 180_000_000_000i64),
     )
     .await;
     assert_eq!(advance.0, StatusCode::CREATED, "{advance:?}");
@@ -24819,7 +25580,7 @@ async fn correction_restart_regression(authoritative: bool) {
     .await;
     assert_eq!(retained.0, StatusCode::OK, "{retained:?}");
     assert_eq!(retained.1["rows"].as_array().unwrap().len(), 2);
-    assert_eq!(retained.1["rows"][0]["total"], 7);
+    assert_eq!(retained.1["rows"][0]["total"], 8);
     let before = read_latest_standing_runtime_checkpoint(
         &restarted,
         &binding.standing_program_identity,
@@ -24828,11 +25589,11 @@ async fn correction_restart_regression(authoritative: bool) {
     .await
     .unwrap()
     .unwrap();
-    let mut mixed_epoch = batch(4, 2, 20_000_000_000i64, 1, 180_000_000_000i64);
+    let mut mixed_epoch = batch(5, 2, 20_000_000_000i64, 180_000_000_000i64);
     mixed_epoch["rows"].as_array_mut().unwrap().insert(
         0,
         json!({
-            "user_id": "alice", "amount": 3, "event_time": 140_000_000_000i64, "delta": 1,
+            "user_id": "alice", "amount": 3, "event_time": 140_000_000_000i64,
         }),
     );
     let objects_before_rejection = store
@@ -24874,7 +25635,7 @@ async fn correction_restart_regression(authoritative: bool) {
         after.checkpoint.state_payload,
         before.checkpoint.state_payload
     );
-    let mut lower_partition_watermark = batch(0, 3, 150_000_000_000i64, 1, 180_000_000_000i64);
+    let mut lower_partition_watermark = batch(0, 3, 150_000_000_000i64, 180_000_000_000i64);
     lower_partition_watermark["partition_id"] = json!(1);
     lower_partition_watermark["event_time_watermark"]["watermark_ns"] = json!(60_000_000_000i64);
     let regressed = call_json(
@@ -24905,7 +25666,7 @@ async fn correction_restart_regression(authoritative: bool) {
         &router,
         Method::POST,
         "/v1/ingest",
-        batch(0, 10, 10_000_000_000i64, 1, 60_000_000_000i64),
+        batch(0, 10, 10_000_000_000i64, 60_000_000_000i64),
     )
     .await;
     assert_eq!(
@@ -24929,10 +25690,11 @@ async fn correction_restart_regression(authoritative: bool) {
         1
     );
     let router = app(after_rejection.clone());
-    let mut replacement = batch(6, 4, 150_000_000_000i64, 1, 180_000_000_000i64);
-    replacement["rows"].as_array_mut().unwrap().push(
-        json!({"user_id": "alice", "amount": 6, "event_time": 160_000_000_000i64, "delta": 1}),
-    );
+    let mut replacement = batch(7, 4, 150_000_000_000i64, 180_000_000_000i64);
+    replacement["rows"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"user_id": "alice", "amount": 6, "event_time": 160_000_000_000i64}));
     let valid = call_json(&router, Method::POST, "/v1/ingest", replacement).await;
     assert_eq!(
         valid.0,
@@ -24943,11 +25705,11 @@ async fn correction_restart_regression(authoritative: bool) {
         &router,
         Method::POST,
         "/v1/ingest",
-        batch(8, 2, 170_000_000_000i64, 1, 180_000_000_000i64),
+        batch(9, 2, 170_000_000_000i64, 180_000_000_000i64),
     )
     .await;
     assert_eq!(next.0, StatusCode::CREATED, "next valid ingest: {next:?}");
-    let mut partition_replacement = batch(0, 3, 150_000_000_000i64, 1, 180_000_000_000i64);
+    let mut partition_replacement = batch(0, 3, 150_000_000_000i64, 180_000_000_000i64);
     partition_replacement["partition_id"] = json!(1);
     let partition_valid =
         call_json(&router, Method::POST, "/v1/ingest", partition_replacement).await;
@@ -24982,7 +25744,7 @@ async fn correction_restart_regression(authoritative: bool) {
     assert_eq!(
         query.1["rows"],
         json!([
-            {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total": 9, "count": 2},
+            {"user_id": "alice", "window_start": 0, "window_end": 60_000_000_000i64, "total": 10, "count": 3},
             {"user_id": "alice", "window_start": 120_000_000_000i64, "window_end": 180_000_000_000i64, "total": 23, "count": 6},
         ])
     );
@@ -25010,7 +25772,7 @@ async fn correction_source_commit_fences_concurrent_view_creation_and_backfill()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
@@ -25021,7 +25783,7 @@ async fn correction_source_commit_fences_concurrent_view_creation_and_backfill()
     hook.fire_once.store(true, Ordering::SeqCst);
     let ingest_router = router.clone();
     let ingest = tokio::spawn(async move {
-        call_json(&ingest_router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "correction-race-stream", "partition_id": 0, "start_offset_inclusive": 0, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 60_000_000_000i64, "watermark_ns": 60_000_000_000i64}, "rows": [{"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64, "delta": 1}]})).await
+        call_json(&ingest_router, Method::POST, "/v1/ingest", json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "correction-race-stream", "partition_id": 0, "start_offset_inclusive": 0, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": 60_000_000_000i64, "watermark_ns": 60_000_000_000i64}, "rows": [{"user_id": "alice", "amount": 10, "event_time": 10_000_000_000i64}]})).await
     });
     tokio::time::timeout(Duration::from_secs(5), hook.reached.notified())
         .await
@@ -25093,11 +25855,11 @@ async fn deploying_correction_view_accepts_far_late_input_after_partial_backfill
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog": test_purchases_event_time_catalog()}),
+        json!({"catalog": public_catalog_fixture(&test_purchases_event_time_catalog())}),
     )
     .await;
     assert_eq!(relation.0, StatusCode::CREATED);
-    let batch = |offset, amount, time, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "partial-correction-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": [{"user_id": "alice", "amount": amount, "event_time": time, "delta": 1}]});
+    let batch = |offset, amount, time, watermark| json!({"relation_id": "purchases", "relation_version": "2026-05-24.v1", "stream_id": "partial-correction-stream", "partition_id": 0, "start_offset_inclusive": offset, "event_time_watermark": {"event_time_column_id": "event_time", "max_observed_event_time_ns": watermark, "watermark_ns": watermark}, "rows": [{"user_id": "alice", "amount": amount, "event_time": time}]});
     for input in [
         batch(0, 10, 10_000_000_000i64, 180_000_000_000i64),
         batch(1, 5, 190_000_000_000i64, 240_000_000_000i64),
@@ -25268,7 +26030,10 @@ async fn explicit_http_scope_migrates_an_existing_eager_checkpoint() {
         .with_experimental_advanced_view_features(true);
     let router = app(state.clone());
     for (path, body) in [
-        ("/v1/relations", json!({"catalog":test_scores_catalog()})),
+        (
+            "/v1/relations",
+            json!({"catalog":public_catalog_fixture(&test_scores_catalog())}),
+        ),
         (
             "/v1/views",
             json!({"view_id":"http_scope","input_relation_id":"scores",
@@ -25287,8 +26052,8 @@ async fn explicit_http_scope_migrates_an_existing_eager_checkpoint() {
         json!({
             "relation_version":"2026-05-24.v1","stream_id":"http-scope-stream","partition_id":0,
             "start_offset_inclusive":0,"rows":[
-                {"user_id":"a","score":3,"delta":1},
-                {"user_id":"b","score":7,"delta":1}
+                {"user_id":"a","score":3},
+                {"user_id":"b","score":7}
             ]
         }),
     )

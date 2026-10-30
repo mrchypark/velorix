@@ -1,10 +1,9 @@
 # Supported materialized-view SQL
 
-**Status: 2026-09-05; contract verified against committed code/tests through
-`677c125` (not a moving-HEAD claim).** The verification range includes the
-latest authoritative, no-PVC product deployment gate in
-`scripts/run-vind-product.sh`. This is the canonical contract for
-`POST /v1/views`.
+**Status at baseline `c6222ab` (2026-10-30).** This is the canonical SQL
+admission contract for `POST /v1/views`; the capability matrix below is
+reconciled against the baseline source and named tests, with per-family test
+execution and deployment validation not performed in this documentation pass.
 It is deliberately narrower than parser acceptance and than SQL accepted by a
 read-only query over an already materialized output. A view is admitted only
 when registered input catalogs resolve, output-schema derivation succeeds, a
@@ -12,16 +11,38 @@ typed `VelorixLogicalViewPlanV1` is built, the native runtime accepts it, and
 public-policy checks pass. Unsupported SQL or view shapes fail closed with a
 clear 4xx admission error; there is no source-recomputation fallback.
 
+The SQL matrix describes public admission in configured server mode. Configured
+startup defaults authoritative relation ingest on, which makes new views
+demand-managed; the `StandingRuntime` execution-mode label does not mean eager
+materialization. Low-level `ApiState` construction is Legacy until explicitly
+configured. Event-time windows are enabled by default; analytic `OVER` families
+are experimental by default. `VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true`
+enables both policies, subject to each family's validated SQL subset. The rows
+identify the exact admission boundary; they do not imply general SQL,
+full dependency-DAG, or benchmark qualification. Read-time DataFusion remains a
+separate, policy-bounded query over published output and is not a general
+source-query or view-admission path.
+
 ## Product flow
 
 1. `POST /v1/relations` registers an explicit relation schema and key.
 2. An ingest endpoint validates schema-bound rows and commits an ingest epoch.
 3. `POST /v1/views` resolves registered schemas and admits a typed native plan.
-4. The standing runtime applies committed deltas and persists materialized output.
-5. The view query endpoint reads that published output, never source batches.
+4. In configured authoritative mode, new-view materialization is deferred;
+   queries and explicit backfill advance bounded demand work. Legacy mode
+   retains eligible eager ingest updates. Existing eager checkpoints keep their
+   behavior.
+5. The view query endpoint reads published output, never source batches. A
+   demand query may return `202 Accepted` while required work remains or is
+   paused/yielded; `200 OK` means the requested step/scope is complete at its
+   declared cut, not necessarily that the whole view is complete.
 
-A late-created view is `backfill_required` until its backfill completes. That
-state is materialization progress, not an alternate query implementation.
+New authoritative declarations carry a deferred `backfill_required` lifecycle
+reason even for empty input, but a query can advance demand materialization
+without an explicit backfill request. For Legacy declarations, historical
+backfill requirements follow the existing lifecycle path. `backfill_required`
+is progress/lifecycle metadata, not a statement that explicit backfill is the
+only way to materialize the view.
 
 ## Authoritative relation-ingest operational mode
 
@@ -44,7 +65,11 @@ current live K8s deployment.
 
 ## Admission matrix
 
-“Default public” means reachable through the default public API configuration.
+"Default public" means the SQL family is admitted through the configured
+public API with its default feature policy; it does not specify eager versus
+demand materialization. Configured server startup defaults authoritative ingest
+and demand-managed new views. Low-level test/state constructors can remain in
+Legacy mode unless configured.
 “Experimental-gated” requires `experimental_advanced_view_features=true`.
 “Internal but publicly unreachable” means a runtime test exists but public
 schema derivation/admission does not expose it; it is not a product capability.
@@ -53,8 +78,9 @@ API can reach the validator and runtime, but an API
 admission-to-materialization-to-restart test has not yet supplied end-to-end
 evidence for that family.
 
-`VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true` enables analytic-window SQL;
-with the default `false` setting, analytic-window families remain gated. The
+`VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true` enables analytic-window
+admission and also enables event-time-window policy (already enabled by default).
+With the default feature policy, analytic-window families remain gated. The
 typed two-input join projection family below uses the default admission path
 and does not require this flag.
 
@@ -84,7 +110,7 @@ and does not require this flag.
 | Percentile and median | Default public | Grouped `median`, `percentile_disc`, and `percentile_cont` use direct Int64 input columns and validated numeric literal percentiles in `[0, 1]`; global median, string/Decimal128 inputs, and invalid percentile shapes/types fail closed during admission. They are not supported in join output-schema construction. Public factory evidence: `rest_grouped_median_and_percentiles_materialize_and_survive_api_restart`; rejection evidence: `rest_percentile_admission_rejects_global_invalid_and_non_int64_inputs`; runtime evidence: `percentile_aggregates_are_exact_across_retract_and_restart`. |
 | `ROW_NUMBER`, `RANK`, `DENSE_RANK` | Experimental-gated | One relation with validated partition/order/tie-breaker and bounded rank-filter form. Default admission returns an explicit experimental-disabled error; `public_1_0_rejects_experimental_view_surfaces_by_default`. |
 | Scalar aggregate subquery filter | Default public | Narrow two-input outer comparison against one unfiltered inner global `SUM`, `COUNT`, `MIN`, `MAX`, or `AVG` (including `COUNT(*)`), not arbitrary subqueries. The public factory dispatches `ScalarAggregateFilter`; API evidence: `rest_scalar_aggregate_modifier_admission_and_plain_matrix`. This does not broaden standalone global aggregate views beyond `COUNT(*)`. |
-| Analytic navigation frames | Internal but publicly unreachable | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE` runtime coverage exists (`analytic_window_frames_navigation_materializes_and_restores`), but public schema derivation does not expose it. |
+| Analytic navigation frames | Experimental-gated; API end-to-end evidence pending | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE` with the bounded ROWS grammar are admitted when `VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true`; default admission rejects `OVER`. Runtime coverage: `analytic_window_frames_navigation_materializes_and_restores`. The flag also enables event-time admission, which is enabled by default. |
 
 <a id="event-time-windows-and-bounded-corrections"></a>
 
@@ -97,7 +123,8 @@ not a live deployment claim. See the example requests in
 Both the existing table-function form and the projected window-alias form use
 the same native admission/runtime path. For a registered `purchases` relation
 with primary key `user_id`, declared Int64 nanosecond event time `event_time`,
-Int64 value `amount`, and signed weight `delta`, the alias form is:
+and Int64 business value `amount`, use this alias form. Signed multiplicity is
+maintained internally and is not a public relation column:
 
 ```sql
 SELECT TUMBLE(INTERVAL '60 seconds') AS window, user_id,
@@ -169,9 +196,14 @@ from a tracked partition can pin closure/expiry; this does not make the
 required watermark field optional on window input batches.
 There is no automatic wall-clock/idle-partition advance promised here.
 
-The current public ingest API uses synchronous materialized acknowledgement:
-success follows runtime application, checkpoint publication, and dependency
-draining. There is no public asynchronous acknowledgement mode in this path.
+In configured authoritative demand mode, ingest acknowledgement covers
+authoritative source publication; it does not mean demand-managed view output
+has been materialized. Queries/backfill advance that work and may report
+`202 Accepted` while it remains incomplete. The synchronous materialized
+acknowledgement described by the correction path applies to the eager runtime
+path that performs those runtime/checkpoint/dependency steps during ingest; do
+not generalize it to the configured demand default. There is no separate public
+asynchronous ingest-acknowledgement switch established here.
 
 Correction preflight reads live plans and previously committed frontiers under
 per-view guards, without cloning historical state. View creation, ingest, and

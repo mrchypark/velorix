@@ -1,5 +1,14 @@
 # Incremental SQL Gap-Closure Plan
 
+**Status note at baseline `c6222ab`:** this remains a dated execution ledger,
+not a complete current capability matrix. Some rows labeled pending or future
+have since acquired narrow admission/runtime support, including view-on-view
+dependencies, event-time windows, query rewrites, and selected Phase 8
+families. Source presence does not complete the plan's public, restart, or
+benchmark exit gates. Use [supported SQL](supported-sql.md) for admission
+status and the exact scope, and retain the historical checkboxes and progress
+entries below as dated evidence rather than silently advancing them.
+
 This document is the executable checklist for closing the gap between
 Velorix's native materialized-view runtime and broader incremental systems such
 as RisingWave, Materialize, and Feldera. GreptimeDB Flow is the comparison point
@@ -125,8 +134,9 @@ Required work:
   delta replay, including concurrent ingest. Evidence: the View Bootstrap
   Frontier section of `incremental-processing-semantics-v1.md`, including the
   distinction between committed-set cuts and in-flight range reservations;
-  implementation of the persisted barrier and race tests remains required by
-  the exit gate.
+    implementation of the persisted barrier and race tests was still required
+    at this ledger entry's original baseline; later checklist entries below
+    record completion evidence and supersede that sentence.
   - [x] Persist the bootstrapping view generation and committed-set cut through
     the same multi-writer metadata authority that serializes ingest admission.
     Evidence: `BeginViewBootstrapRequest` writes the versioned control record,

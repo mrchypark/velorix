@@ -1,5 +1,11 @@
 # Vind Product Development
 
+Current implementation and operational guide, not a release certification.
+The scripts and source links below describe available paths; only evidence
+artifacts bound to the same commit and image digests can establish a release
+claim. The 2026-10-30 CI baseline is recorded in
+[production-readiness-status.md](../architecture/production-readiness-status.md).
+
 Vind is the local product exercise path for Velorix.
 
 The product flow starts from an empty service:
@@ -22,6 +28,25 @@ product must not use fake fallback recomputation to pretend support.
 The standing runtime is internal and jarless. Product operation does not start
 external compiler services, build runtime packages at view creation time, load
 third-party manager images, or rely on PVC state.
+
+### Container roles
+
+The API and worker images are separate BuildKit targets from the same
+`velorix-api` executable. `VELORIX_SERVICE_ROLE=api` and `worker` select logical
+roles at runtime: the API role delegates compute to configured workers, while
+the worker role serves authenticated internal compute RPCs and rejects public
+ingest. Meta and ingest-writer are separate executables and images. The
+all-in-one image packages all three executables; its default `all` mode starts
+Meta and API, while `api`, `meta`, and `ingest-writer` are explicit entrypoint
+modes. See [`Dockerfile.api`](../../Dockerfile.api),
+[`Dockerfile.meta`](../../Dockerfile.meta),
+[`Dockerfile.ingest-writer`](../../Dockerfile.ingest-writer),
+[`Dockerfile.all-in-one`](../../Dockerfile.all-in-one),
+[`worker_role.rs`](../../crates/velorix-api/src/worker_role.rs),
+[`velorix-all-in-one-entrypoint.sh`](../../scripts/velorix-all-in-one-entrypoint.sh),
+and [the GHCR image workflow](../../.github/workflows/velorix-ghcr-images.yml).
+These build definitions do not establish that a corresponding image was
+qualified or deployed.
 
 ## Local Smoke
 
@@ -137,6 +162,13 @@ separately as one node-keyed shared map: the harness passes
 `VELORIX_RHIZA_PEER_TOKEN_FILE`. It is greenfield: it provisions a fresh
 namespace, object-store prefix, cluster identity, and empty node directories,
 and it has no migration path from a pre-0.19.0 membership document.
+
+The 0.19.0 version label above is historical; current dependency governance
+pins Rhiza 0.21.2. The current isolated Kubernetes gate still validates the
+same four-field member records, separately supplied node-keyed peer-token map,
+and rejection of per-member tokens in
+[`run-rhiza-kv-k8s-gate.sh`](../../scripts/run-rhiza-kv-k8s-gate.sh). This
+source-level contract does not establish runtime or deployment qualification.
 
 Refresh deployed image digest evidence with:
 

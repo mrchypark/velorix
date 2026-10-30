@@ -1,5 +1,14 @@
 # Issue #29: recursive CTE reachability
 
+Issue-level implementation/evidence note, not issue closure or a claim of
+general multi-CTE semantics. Test outcomes below are recorded historical
+results, not tests run during this reconciliation. Current implementation is
+in [`recursive_fixpoint.rs`](../crates/velorix-runtime/src/materialized_view_runtime/recursive_fixpoint.rs)
+and admission is in [`view_plan/mod.rs`](../crates/velorix-core/src/view_plan/mod.rs).
+The named API regression is in [`tests.rs`](../crates/velorix-api/src/tests.rs);
+runtime regressions are in
+[`materialized_view_runtime.rs`](../crates/velorix-runtime/tests/materialized_view_runtime.rs).
+
 The admitted recursive grammar validates one or two CTE definitions, but the
 current SQL surface exposes only the first CTE: its recursive term is
 self-referential and the outer query selects the first CTE. The second CTE is

@@ -5414,7 +5414,7 @@ fn runtime_materializes_identity_cte_single_relation_aggregate() {
     let catalog = purchases_catalog_without_value_role();
     let input_schema = catalog_input_relation_schema(&catalog).unwrap();
     let output_schema = purchases_output_schema();
-    let sql = "with purchase_source as (select user_id, amount, delta from purchases) select user_id, sum(amount) as sum, count(*) as count from purchase_source group by user_id";
+    let sql = "with purchase_source as (select user_id, amount from purchases) select user_id, sum(amount) as sum, count(*) as count from purchase_source group by user_id";
     let identity = standing_identity_with_view(sql, "purchases_by_user_cte");
     let mut runtime = create_standing_runtime_with_sql_and_catalogs(
         &identity,
@@ -25002,7 +25002,7 @@ fn phase8_admission_fails_closed_on_unsafe_shapes() {
             "with recursive reach as (select src, delta from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.src) select src, dst from reach",
             vec![edges.clone()],
             output.clone(),
-            "weight column",
+            "direct base relation columns",
         ),
         (
             "with recursive reach as (select src, dst from edges union distinct select r.src, e.dst from reach r join edges e on r.dst = e.missing_col) select src, dst from reach",

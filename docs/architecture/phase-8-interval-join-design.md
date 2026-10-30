@@ -1,6 +1,15 @@
 # Phase 8 — Interval Joins (Non-Equi) (Design)
 
-Status: DESIGN — implementation gated on this document.
+Status: Narrow runtime implementation present at baseline `c6222ab` —
+`SupportedIntervalJoinPlanV1` + `IntervalJoinRuntime`; public admission reaches
+the strict overlap INNER JOIN family. The implemented contract does not require
+watermarks, maximum interval duration, eviction, or an append-only result.
+Inputs are generic signed-weight relations and the runtime maintains/reconciles
+materialized output with retractions. The broader temporal/eviction proposal
+below remains unimplemented. See
+[`validate_supported_interval_join_sql`](../../crates/velorix-core/src/view_plan/mod.rs)
+and [`interval_join_materializes_overlap_retraction_and_restart`]
+(../../crates/velorix-runtime/src/materialized_view_runtime/interval_join.rs).
 
 ## 1. Semantic design
 

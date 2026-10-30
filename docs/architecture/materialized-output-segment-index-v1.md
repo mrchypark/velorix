@@ -1,6 +1,6 @@
 # Materialized Output Segment Index V1
 
-Status: Proposed
+Status: Design target; partially implemented
 Applies to: materialized output serving and object-store cost control.
 
 Velorix queries must read published materialized output, not source relation
@@ -75,3 +75,22 @@ Pass criteria:
 
 Recent-K is not general Top-K. It is valid only when page sort bounds prove
 coverage for the requested `ORDER BY event_time DESC LIMIT K` shape.
+
+## Current implementation boundary
+
+`velorix-api` currently publishes Arrow output pages with an index containing
+the output schema and, when available, per-page null counts and typed min/max
+statistics. Filtered materialized reads use those statistics only for
+conservative page exclusion, then evaluate residual SQL over the complete
+selected weighted input. The persisted index does not currently have the
+proposed `segment_id`, explicit row-count field, or recent-K sort-bound proof.
+The `materialized_output_recent_k` benchmark uses a synthetic page fixture and
+checks its local indexed reader against a full-read oracle; it is not evidence
+that the public query API implements general recent-K pruning. General
+recent-K coverage and a broader segment-index format remain design targets.
+
+Implementation references: [`materialized_output_pages.rs`](../../crates/velorix-api/src/materialized_output_pages.rs), including
+`PageIndex`, `ColumnStats`, `query_bound_selected_policy_at_pointer`, and the
+`native_filtered_reads_prune_and_run_complete_weighted_residual_sql` test;
+the synthetic benchmark is in
+[`materialized_output_workloads.rs`](../../crates/velorix-runtime/benches/materialized_output_workloads.rs).

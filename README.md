@@ -1,7 +1,7 @@
 # Velorix
 
-Velorix is an ultra-lightweight, object-storage-first streaming database for
-schema-bound relations and materialized views.
+Velorix is an object-storage-first streaming database for schema-bound
+relations and materialized views.
 
 The first-completion product target is a jarless runtime:
 
@@ -9,19 +9,23 @@ The first-completion product target is a jarless runtime:
 - register relations with explicit schemas
 - ingest JSON rows through REST
 - define supported views over registered relations
-- update materialized output tables as ingest epochs commit
-- query relation data and materialized view output through REST
+- update materialized output tables through the selected eager or demand
+  materialization mode
+- query materialized view output and promoted view APIs through REST
 - recover after restart from metadata plus object/local storage checkpoints
 
-The product execution path does not use external compiler services, runtime
-build/deploy jobs, package-loading, official third-party manager images, or PVC
-state.
+The runtime does not compile or package-load user view code. PVC-free
+replacement-pod recovery is a product validation target and must be backed by
+deployment evidence; this README does not claim that the target has passed.
 
 ## Architecture
 
 Velorix treats object storage as the durable system of record. Compute nodes are
 replaceable: input, metadata-derived identities, view state checkpoints, and
-published progress live outside the process.
+published progress live outside the process. The API binary supports `all`,
+`api`, and `worker` service roles. Configured authoritative relation ingest is
+the default and uses demand materialization for new views; legacy/eager mode
+remains selectable, and existing eager checkpoints retain their behavior.
 
 Main components:
 
@@ -34,6 +38,11 @@ Main components:
 - `velorix-meta`: metadata service backends, including in-memory, object-store,
   and Rhiza KV modes.
 - `velorix-k8s`: Kubernetes startup validation and operator-facing contracts.
+
+The public router has no arbitrary relation-source scan endpoint. Query-time
+DataFusion applies bounded, policy-checked SQL to published materialized view
+output; view declaration uses Velorix's typed admission and native runtime. See
+[the API serving boundary](docs/architecture/api-serving-scope-v1.md).
 
 ## Query and View Model
 

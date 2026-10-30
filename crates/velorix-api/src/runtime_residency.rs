@@ -107,6 +107,7 @@ impl ApiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::example_fixtures::public_relation_registration;
     use tower::ServiceExt;
     use velorix_core::relation::*;
 
@@ -184,7 +185,11 @@ mod tests {
                     .collect(),
                 primary_key_column_ids: vec![],
                 weight_column_id: "delta".into(),
-                allowed_operations: vec![RelationOperationV1::Insert, RelationOperationV1::Delete],
+                allowed_operations: vec![
+                    RelationOperationV1::Insert,
+                    RelationOperationV1::Update,
+                    RelationOperationV1::Delete,
+                ],
                 event_time_column_id: None,
             },
             CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
@@ -193,7 +198,7 @@ mod tests {
         post(
             &router,
             "/v1/relations",
-            json!({"catalog":catalog}),
+            public_relation_registration(&catalog),
             StatusCode::CREATED,
         )
         .await;
@@ -212,7 +217,12 @@ mod tests {
             )
             .await;
         }
-        ingest(&router, 0, json!([{"item":1,"reading":10,"delta":2}])).await;
+        ingest(
+            &router,
+            0,
+            json!([{"item":1,"reading":10},{"item":1,"reading":10}]),
+        )
+        .await;
         (state, router, store, meta)
     }
 
@@ -265,7 +275,12 @@ mod tests {
             .unwrap()
             .with_meta_store(meta.clone());
         let b_router = app(b_state.clone());
-        ingest(&b_router, 1, json!([{"item":2,"reading":20,"delta":2}])).await;
+        ingest(
+            &b_router,
+            2,
+            json!([{"item":2,"reading":20},{"item":2,"reading":20}]),
+        )
+        .await;
         let latest = read_latest_standing_runtime_checkpoint(&b_state, identity, view_id)
             .await
             .unwrap()
@@ -600,12 +615,12 @@ mod tests {
             .unwrap()
             .contains_key(&standing_runtime_key(identity, "a_stage")));
         drop((consumer, last));
-        ingest(&router, 1, json!([{"item":2,"reading":20,"delta":1}])).await;
+        ingest(&router, 2, json!([{"item":2,"reading":20}])).await;
         // A late replacement retracts one old duplicate, preserving the other.
         ingest(
             &router,
-            2,
-            json!([{"item":1,"reading":10,"delta":-1},{"item":1,"reading":11,"delta":1}]),
+            3,
+            json!([{"operation":"update","before":{"item":1,"reading":10},"after":{"item":1,"reading":11}}]),
         )
         .await;
         let expected = vec![

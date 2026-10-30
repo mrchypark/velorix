@@ -1,4 +1,5 @@
 use super::*;
+use crate::example_fixtures::public_relation_registration;
 use arrow::ipc::reader::StreamReader;
 use std::io::Cursor;
 
@@ -108,7 +109,7 @@ async fn generic_fixture() -> (ApiState, Router, ObjectStoreAccessCounts) {
             &router,
             Method::POST,
             "/v1/relations",
-            json!({"catalog":catalog,(concat!("default_", "orde", "rs_sum_count")):false}),
+            public_relation_registration(&catalog),
         )
         .await;
         assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
@@ -142,12 +143,12 @@ async fn generic_fixture() -> (ApiState, Router, ObjectStoreAccessCounts) {
     let result = call_json(&router, Method::POST, "/v1/relations/ingest", json!({"batches":[
         {"relation_id":"left_table","relation_version":"2026-08-14.v1","stream_id":"format-left_table",
          "partition_id":0,"start_offset_inclusive":0,"rows":[
-             {"key_col":"k1","amount":10,"delta":1},{"key_col":"k1","amount":7,"delta":1},
-             {"key_col":"k2","amount":5,"delta":1},{"key_col":"k3","amount":2,"delta":1}]},
+             {"key_col":"k1","amount":10},{"key_col":"k1","amount":7},
+             {"key_col":"k2","amount":5},{"key_col":"k3","amount":2}]},
         {"relation_id":"right_table","relation_version":"2026-08-14.v1","stream_id":"format-right_table",
          "partition_id":0,"start_offset_inclusive":0,"rows":[
-             {"key_col":"k1","value_col":100,"category":"cat_a","delta":1},
-             {"key_col":"k2","value_col":50,"category":"cat_b","delta":1}]}
+             {"key_col":"k1","value_col":100,"category":"cat_a"},
+             {"key_col":"k2","value_col":50,"category":"cat_b"}]}
     ]})).await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
     for view in [
@@ -538,7 +539,7 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
         &router,
         Method::POST,
         "/v1/relations",
-        json!({"catalog":catalog,(concat!("default_", "orde", "rs_sum_count")):false}),
+        public_relation_registration(&catalog),
     )
     .await;
     assert_eq!(result.0, StatusCode::CREATED, "{}", result.1);
@@ -557,7 +558,7 @@ async fn generic_sql_count_and_cte_read_all_materialized_rows_above_output_cap()
     let rows = (0..10017)
         .map(|index| {
             json!({
-                "key_col":format!("k{index:05}"),"amount":1,"delta":1,
+                "key_col":format!("k{index:05}"),"amount":1,
             })
         })
         .collect::<Vec<_>>();

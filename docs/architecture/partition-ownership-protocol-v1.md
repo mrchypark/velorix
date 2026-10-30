@@ -13,6 +13,13 @@ defines a pure production ownership backend gate that rejects in-memory/dev
 leases and rejects backends without durable epoch record support. It does not
 implement a Kubernetes adapter, operator, CRDs, or reconciliation.
 
+The object-key record and validation type are implemented in
+[ownership.rs](../../crates/velorix-storage/src/ownership.rs), and storage-side
+owner-claim checks are implemented with checkpoint publication. The claim
+protocol described here remains an admission design: code presence does not
+show that a deployed Kubernetes writer acquires the Lease, writes the epoch
+record, and supplies it to every authoritative commit.
+
 ## Durable Epoch Record
 
 After acquiring a Kubernetes Lease, a production worker creates a durable epoch

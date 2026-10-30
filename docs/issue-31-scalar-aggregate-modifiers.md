@@ -1,5 +1,15 @@
 # Scalar aggregate subquery admission
 
+Issue-level admission note. Its narrow shape and historical focused-test
+results do not establish arbitrary scalar aggregate support or release
+qualification. Current implementation is in
+[`view_plan/mod.rs`](../crates/velorix-core/src/view_plan/mod.rs) and
+[`scalar_aggregate_filter.rs`](../crates/velorix-runtime/src/materialized_view_runtime/scalar_aggregate_filter.rs);
+canonical status belongs in [specification.md](specification.md).
+Focused planner coverage is in
+[`view_plan.rs`](../crates/velorix-core/tests/view_plan.rs), and public-path
+coverage is in [`tests.rs`](../crates/velorix-api/src/tests.rs).
+
 Scalar aggregate subqueries admit only plain `COUNT`, `SUM`, `MIN`, `MAX`,
 and `AVG` calls with the existing simple argument forms. Function-level
 metadata (`FILTER`, `OVER`, `WITHIN GROUP`, null treatment, parameters, and

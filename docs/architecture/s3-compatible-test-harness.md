@@ -179,7 +179,7 @@ sharing the S3-compatible gate.
 ## Out Of Scope
 
 The current slice intentionally does not validate Foyer, Kubernetes
-coordination, or release-quality S3-compatible baselines. DataFusion 54 uses
-`object_store` 0.13 while Velorix storage uses `object_store` 0.14; the runtime
-query harness and benchmark keep those clients explicit instead of adding an
-adapter between the versions.
+coordination, or release-quality S3-compatible baselines. The workspace pins
+DataFusion 55.1.0, which resolves `object_store` 0.13.2; Velorix storage
+resolves `object_store` 0.14.2. The runtime query harness and benchmark keep
+those clients explicit instead of adding an adapter between the versions.

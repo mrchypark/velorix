@@ -44,7 +44,7 @@ Setting
 `max_concurrent_queries` without a compatible runtime limiter still fails query
 execution.
 
-Current DataFusion 54 wiring:
+Current DataFusion 55.1.0 wiring (workspace-pinned in `Cargo.toml`):
 
 - `batch_size` maps to `SessionConfig::with_batch_size`.
 - `target_partitions` maps to `SessionConfig::with_target_partitions`.
@@ -70,10 +70,10 @@ successful `get_ranges` results and wraps `get_opts` response streams so
 opened. Local filesystem payloads are converted through the same stream path
 before metering.
 
-DataFusion 54 memory exhaustion now has version-specific runtime evidence for
-a grouped aggregate over the public object-backed Parquet query path.
-Object-backed scan preflight timeout evidence also proves that cancellation
-drops the stalled list stream and releases the shared query limiter permit.
+The documented DataFusion 54 memory-exhaustion result is historical and does
+not establish behavior for the currently pinned DataFusion 55.1.0. Object-backed
+scan preflight timeout evidence proves that cancellation drops the stalled list
+stream and releases the shared query limiter permit.
 `ProductionQueryRuntime` now owns the shared concurrency limiter derived from a
 `QueryPolicy` and exposes compatible limiter handles to production query
 wrappers. Local evidence shows one runtime can let an object-backed query hold
@@ -95,8 +95,9 @@ error shape is DataFusion-version-dependent.
 - Large joins, sorts, high-cardinality aggregations, many-file scans, and large
   Parquet scans are bounded by policy where the current DataFusion version
   honors the configured memory and spill limits.
-- DataFusion 54 returns `ResourcesExhausted` for an object-backed grouped
-  aggregate that exceeds `memory_limit_bytes`.
+- DataFusion 55.1.0-specific memory-exhaustion behavior remains unverified here;
+  the older DataFusion 54 `ResourcesExhausted` result is not current-version
+  evidence.
 - `LIMIT 1` does not bypass scan byte or object request limits.
 - Concurrent queries cannot exceed the runtime-owned local concurrency pool for
   the covered production query wrappers; broader tenant/global shared runtime

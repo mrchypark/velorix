@@ -262,12 +262,14 @@ produces the same consolidated bag and checkpoint-bound frontier vector. Public
 multi-relation ingest remains a sequence of per-relation frontier advances, not
 an atomic cross-relation transaction.
 
-The current `standing_runtime_create_requires_backfill` boolean log scan does
-not implement this barrier: it can race between scanning committed input and
-making the view visible, and completion of a later backfill can race with new
-ingest. It remains compatibility scaffolding until admission persists `F` and
-the snapshot/tail race tests pass. Existing late-view and crash-window tests are
-useful replay evidence but are not proof of this stronger contract.
+The original boolean-scan limitation above has been superseded at baseline
+`c6222ab`: admission persists a bootstrap source cut and lifecycle generation
+through `BeginViewBootstrapRequest`, and promotion is fenced by an activation
+cut and checkpoint coverage. API regression coverage includes
+[`rest_view_admission_persists_plan_spec_and_source_cut_in_metadata`](../../crates/velorix-api/src/tests.rs).
+This evidence establishes the implemented bootstrap protocol in the tested
+path; it does not establish every backend's production availability or a
+whole-DAG performance guarantee.
 
 ## Evidence
 

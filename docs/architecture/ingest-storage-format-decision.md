@@ -123,9 +123,26 @@ This decision intentionally breaks current bootstrap assumptions:
 - Local object-store fixtures created before this decision are disposable and
   should be regenerated, not migrated.
 
+## Current Implementation Status
+
+The checked-in storage codec and ingest/replay callers now use the Arrow IPC
+envelope. The envelope carries relation identity, schema fingerprint, range,
+digest, compression, and optional event-time watermark; JSON request rows are
+still accepted at the HTTP boundary and converted before durable storage. The
+codec currently uses `none` compression and has no explicit header/body size
+caps. These source facts do not establish production benchmark or provider-wide
+qualification. See [ingest-envelope-v1.md](ingest-envelope-v1.md),
+[ingest_envelope.rs](../../crates/velorix-storage/src/ingest_envelope.rs), and
+[ingest_epoch.rs](../../crates/velorix-api/src/ingest_epoch.rs).
+
 ## Implementation Requirements
 
-The implementation should land as a single coherent breaking slice:
+The following list records the original breaking-slice requirements. The
+envelope and typed append/replay implementation are present in current source;
+source presence does not close deployment, performance, or provider coverage
+gates.
+
+Original implementation plan:
 
 1. Add an ingest envelope module with typed encode/decode, digest calculation,
    schema fingerprinting, and fail-closed version/format validation.

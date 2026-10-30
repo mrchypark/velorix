@@ -86,9 +86,10 @@ sum/count `2.5/1`; after a new input it became `4/2`, and the same-offset
 duplicate retry left it unchanged. The second empty-directory restore retained
 `4/2`. The run also recorded eight checkpoint bodies with the Arrow IPC ZSTD
 codec, zero old-source batch GETs during first-restore boot, and one GET for the
-new source batch. See the [run result](../../target/rhiza-service-recovery-evidence/20261028t132247z-28327/result.json),
-[cleanup record](../../target/rhiza-service-recovery-evidence/20261028t132247z-28327/cleanup.txt),
-and [first-restore query audit](../../target/rhiza-service-recovery-evidence/20261028t132247z-28327/s3-first-restore-boot-query-audit.log).
+new source batch. The run-local result, cleanup record, and query audit are not
+checked-in artifacts and are not public proof. The source path is implemented
+in [rhiza_recovery.rs](../../crates/velorix-meta/tests/rhiza_recovery.rs); this
+historical local run does not qualify a Kubernetes deployment or live cloud.
 
 This proves the tested local service path only. The API and worker in that run
 used local-development mode and logical fencing; the evidence explicitly says
@@ -502,14 +503,10 @@ The service run exercised `init-local` before all three meta starts, a real
 missing-bucket SDK open failure with no listener, HTTP materialized-view
 recovery across two empty-directory restores, duplicate ingest handling, and
 SIGTERM close of all three meta processes with exit status 0 and the database
-close diagnostic. The full Local service result is
-[target/rhiza-service-recovery-evidence/20261028t151124z-45170/result.json](../../target/rhiza-service-recovery-evidence/20261028t151124z-45170/result.json);
-the standalone native probe result is
-[target/rhiza-recovery-evidence/20261028T145528Z-24843/rhiza-recovery.json](../../target/rhiza-recovery-evidence/20261028T145528Z-24843/rhiza-recovery.json).
-The `velorix-meta` Rhiza-feature suite completed with 196 passed, 0 failed, and
-4 ignored in
-[`target/rhiza-0.21.1-contract-evidence/meta-feature-tests-rerun1.log`](../../target/rhiza-0.21.1-contract-evidence/meta-feature-tests-rerun1.log)
-(exit status 0).
+close diagnostic. Detailed run results and test logs are run-local ignored
+artifacts, not public proof. The `velorix-meta` Rhiza-feature suite was
+historically recorded with 196 passed, 0 failed, and 4 ignored (exit status 0);
+this reconciliation did not rerun it.
 
 The service harness had four earlier failed attempts, all classified as
 harness/build issues rather than Rhiza failures: `20261028t145657z-24836` used
@@ -532,12 +529,11 @@ Meta start, a missing-bucket open failed closed, SIGTERM closed each Meta
 process cleanly, and two empty-directory restores retained the materialized
 sum/count before a new input advanced them from `(2.5, 1)` to `(4, 2)`. A
 same-offset retry was reported as a duplicate with an unchanged descriptor.
-Evidence is in
-[`target/rhiza-recovery-evidence/20261029T111251Z-89574/rhiza-recovery.json`](../../target/rhiza-recovery-evidence/20261029T111251Z-89574/rhiza-recovery.json)
-and
-[`target/rhiza-service-recovery-evidence/20261029t111346z-89570/result.json`](../../target/rhiza-service-recovery-evidence/20261029t111346z-89570/result.json).
-This is native local-fixture evidence; no Kubernetes deployment or live-cloud
-qualification was performed.
+Detailed results are run-local ignored artifacts, not public proof. This is
+native local-fixture evidence; no Kubernetes deployment or live-cloud
+qualification was performed. The implementation/test entry points are
+[rhiza.rs](../../crates/velorix-meta/src/rhiza.rs) and
+[rhiza_recovery.rs](../../crates/velorix-meta/tests/rhiza_recovery.rs).
 
 This is a graceful cold-restart test, not a SIGKILL or power-loss test. The gateway
 remains available throughout the retained-WAL restart. Neither this drill nor

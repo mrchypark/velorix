@@ -1,6 +1,15 @@
 # Phase 8 — Exact Percentile and Median Aggregates (Design)
 
-Status: DESIGN — implementation gated on this document.
+Status: Narrow exact implementation present at baseline `c6222ab` — grouped
+`percentile_disc` and `percentile_cont` over direct Int64 inputs with a numeric
+literal percentile in `[0, 1]` are admitted on the public view path and survive
+retraction/restart. Global percentile, string/Decimal128 input, and unsupported
+aggregate shapes fail admission. `median(Int64-column)` is also admitted as
+`percentile_cont(..., 0.5)`. Decimal128 semantics and ordered-set syntax are not
+established by this implementation.
+Evidence: [`percentile_value`](../../crates/velorix-runtime/src/materialized_view_runtime.rs)
+and [`rest_grouped_median_and_percentiles_materialize_and_survive_api_restart`]
+(../../crates/velorix-api/src/tests.rs).
 
 ## 1. Semantic design
 

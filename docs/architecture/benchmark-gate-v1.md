@@ -103,6 +103,12 @@ and restores that runtime, and verifies its materialized output after replay.
 `IngestAdmissionCoordinator` admission, so these labels must not be cited as
 full HTTP relation-ingest evidence. Product-path HTTP evidence should use a
 separate workload label once it measures the public API boundary end to end.
+The current harness reports top-level `scan_bytes=0` and `spill_bytes=0` as
+fixed fields; those values are not instrumented totals. Its `peak_rss_bytes`
+field is a terminal RSS sample, not a measured high-water peak. Per-workload
+object request counts apply to that harness fixture and phase only. They are
+not universal S3 operation counts for deployed query, ingest, or checkpoint
+flows.
 
 `gc_execution_denied` must not be presented as deletion, retention, or
 production-GC evidence. The live `gc-execute-s3-compatible` CLI is unavailable
@@ -174,3 +180,7 @@ support.
 - S3-compatible benchmark gates consume an explicitly supplied benchmark
   result. The removed source-scan benchmark is not accepted as standing-runtime
   performance evidence.
+
+Current implementation references: [`local_incremental.rs`](../../crates/velorix-runtime/benches/local_incremental.rs),
+[`materialized_output_workloads.rs`](../../crates/velorix-runtime/benches/materialized_output_workloads.rs),
+and [`benchmark_gate.rs`](../../crates/velorix-runtime/tests/benchmark_gate.rs).

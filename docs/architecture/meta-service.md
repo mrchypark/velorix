@@ -1,5 +1,36 @@
 # Meta Service
 
+## Current Source Contract (2026-10-30)
+
+Meta is not one checkpoint snapshot. `MetaStore` exposes separate relation
+catalog, ingest reservation/publication, active-view registry/bootstrap,
+standing-runtime owner/checkpoint pointer, and partition-authority APIs. The
+gRPC methods and request shapes are defined in
+[meta.proto](../../crates/velorix-meta/proto/velorix/meta/v1/meta.proto); the
+backend implementations are in
+[lib.rs](../../crates/velorix-meta/src/lib.rs) and
+[rhiza_meta.rs](../../crates/velorix-meta/src/rhiza_meta.rs). Rhiza's KV
+implementation stores Velorix metadata through a bounded snapshot-root/page
+protocol with CAS; the separate Rhiza Local archive is database recovery
+storage, not the runtime checkpoint body store.
+
+`VELORIX_META_MODE` and `VELORIX_META_BACKEND` are explicit configuration
+inputs. Development permits memory, OSS, or Rhiza KV. Production rejects
+memory; OSS requires durable object storage, and Rhiza KV requires exactly
+three voters, explicit S3/GCS/Azure object storage, and `before-ack` archive
+durability. Rhiza `local` mode is a separate single-writer mode and is not a
+consensus cluster or multiwriter claim. Config admission is in
+[main.rs](../../crates/velorix-meta/src/main.rs); the `production_rhiza_requires_three_voters_before_ack_and_object_storage`
+and production-config tests exercise these gates. This source inspection is
+not a live provider or deployment qualification.
+
+Standing-runtime and partition-authority state have distinct capability
+reports. Current Rhiza KV metadata uses proposer-sampled root-CAS logical
+ticks, not authoritative elapsed wall-clock time; source presence or successful
+local recovery does not establish bounded failover or production
+multiwriter safety. Runtime checkpoint object bodies remain in the object-store
+state/output namespaces; metadata stores pointer/identity/reference fields.
+
 The metadata service owns hot control-plane metadata. Object storage owns large
 artifacts and checkpoint payloads; Rhiza Local's own archive is a distinct
 durability path with its own bucket/prefix configuration. API/worker checkpoint

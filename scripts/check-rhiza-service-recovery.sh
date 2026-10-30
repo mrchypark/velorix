@@ -627,7 +627,7 @@ object_inventory s3-after-recovery
 # Append a unique post-restore input exactly once, then repeat the same request
 # to exercise the public offset/idempotency path before a second cold restart.
 # The relation has no event-time column, so this is not a late-event test.
-jq '.start_offset_inclusive=1 | .rows=[{"reading":1.5,"delta":1}]' "$evidence_dir/payloads/ingest.json" >"$evidence_dir/payloads/ingest-post-restore.json"
+jq '.start_offset_inclusive=1 | .rows=[{"reading":1.5}]' "$evidence_dir/payloads/ingest.json" >"$evidence_dir/payloads/ingest-post-restore.json"
 api_post /v1/relations/samples/ingest "$evidence_dir/payloads/ingest-post-restore.json" "$evidence_dir/ingest-post-restore-response.json"
 gateway_lines_before_incremental_query=$(wc -l <"$evidence_dir/gateway.log" | tr -d ' ')
 api_query sample_sum "$evidence_dir/query-incremental-sum.json"

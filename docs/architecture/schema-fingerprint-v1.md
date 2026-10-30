@@ -53,3 +53,8 @@ activation, query execution, or checkpoint publication.
 - View validation rejects input relation fingerprint mismatch.
 - DataFusion registration uses the cataloged relation schema, not ad hoc payload
   inference.
+
+Current fingerprint implementation and tests: [relation.rs](../../crates/velorix-core/src/relation.rs)
+and [relation tests](../../crates/velorix-core/tests/relation.rs). The V1 hash
+serializes the validated `VelorixRelationSchemaV1` with Serde and prefixes the
+domain string; it does not hash an Arrow schema or its metadata map directly.

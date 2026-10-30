@@ -1,5 +1,14 @@
 # September 2026 dependency refresh
 
+> Historical refresh record; versions and migration assessment below are a
+> September snapshot, not current dependency state. The current workspace pins
+> Rhiza 0.21.2 and no longer includes Hiqlite; inspect
+> [Cargo.toml](../../Cargo.toml), [Cargo.lock](../../Cargo.lock), and
+> [dependency-governance.json](../../dependency-governance.json) for current
+> facts. The 2026-10-30 CI run is recorded in
+> [production-readiness-status.md](../architecture/production-readiness-status.md)
+> and is not release qualification.
+
 Status: local verification passed as of 2026-09-21; PR CI remains pending.
 Compatibility holds below mean this is not an all-latest or deployed-migration
 claim. Rust remains pinned to 1.98.1; OS-installed packages are outside scope.

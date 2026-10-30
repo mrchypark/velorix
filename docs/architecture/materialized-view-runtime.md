@@ -58,9 +58,21 @@ maintains key indexes for participating relations. An aggregate maintains
 group-level accumulators. A latest-by-key operator keeps the current selected
 row by key and ordering rule.
 
-When an ingest epoch is committed, affected views are advanced to that epoch and
-publish changed materialized output. Query serving reads the materialized output
-state for the view rather than scanning all source relation data.
+In legacy/eager mode, eligible active views advance with committed ingest and
+publish changed materialized output. In the configured authoritative relation
+ingest mode, the default is demand materialization: new views defer historical
+work and source ingest does not eagerly apply those views; a query or explicit
+backfill performs bounded materialization work. Existing checkpoints without
+demand metadata retain eager behavior. A query can return HTTP 202 while its
+bounded work is incomplete; HTTP 200 indicates that the requested
+materialization step completed and the response is pinned to published output.
+Neither mode uses a source recomputation query fallback. See
+[`view_admission`](../../crates/velorix-api/src/view_admission.rs),
+[`ingest_epoch`](../../crates/velorix-api/src/ingest_epoch.rs), and
+[`query_serving`](../../crates/velorix-api/src/query_serving.rs).
+
+Query serving reads the materialized output state for the view rather than
+scanning all source relation data.
 
 Two-relation joins publish checkpoint-bound per-relation frontier vectors.
 Sequential relation ingests may expose sequential intermediate results; each

@@ -128,7 +128,6 @@ python3 - \
   "$relation_version" \
   "$stream_id" \
   "$api_path" <<'PY'
-import hashlib
 import json
 import sys
 
@@ -144,7 +143,7 @@ import sys
 ) = sys.argv[1:]
 
 
-def column(column_id, kind, ordinal, role):
+def column(column_id, kind, ordinal):
     return {
         "column_id": column_id,
         "name": column_id,
@@ -152,7 +151,6 @@ def column(column_id, kind, ordinal, role):
         "physical_arrow_type": {"kind": "utf8" if kind == "utf8" else kind},
         "nullable": False,
         "ordinal": ordinal,
-        "semantic_role": role,
     }
 
 
@@ -161,32 +159,17 @@ relation_schema = {
     "relation_name": relation_id,
     "relation_version": relation_version,
     "columns": [
-        column("account_id", "utf8", 0, "primary_key"),
-        column("tier", "utf8", 1, "metadata"),
-        column("score", "int64", 2, "value"),
-        column("delta", "int64", 3, "weight"),
+        column("account_id", "utf8", 0),
+        column("tier", "utf8", 1),
+        column("score", "int64", 2),
     ],
     "primary_key_column_ids": ["account_id"],
-    "weight_column_id": "delta",
     "allowed_operations": ["insert", "delete"],
     "event_time_column_id": None,
 }
-canonical = json.dumps(relation_schema, separators=(",", ":"), ensure_ascii=False).encode()
-schema_fingerprint = "sha256:" + hashlib.sha256(
-    b"velorix-relation-schema-v1\0" + canonical
-).hexdigest()
 catalog = {
-    "schema_version": 1,
     "relation_schema": relation_schema,
-    "schema_fingerprint": schema_fingerprint,
-    "datafusion_registration": {"name": relation_id, "mode": "table"},
-    "incremental_relation": {
-        "relation_id": relation_id,
-        "schema_fingerprint": schema_fingerprint,
-    },
-    "incremental_adapter": {
-        "adapter_id": "incremental-adapter-single-key-sum-count-v1",
-    },
+    "adapter_id": "incremental-adapter-single-key-sum-count-v1",
 }
 sql = (
     f"select account_id, row_number() over "
@@ -196,7 +179,6 @@ sql = (
 files = {
     relation_request_path: {
         "catalog": catalog,
-        "default_orders_sum_count": False,
     },
     view_request_path: {
         "view_id": view_id,
@@ -214,11 +196,11 @@ files = {
         "partition_id": 0,
         "start_offset_inclusive": 0,
         "rows": [
-            {"account_id": "acct-a", "tier": "gold", "score": 120, "delta": 1},
-            {"account_id": "acct-b", "tier": "gold", "score": 120, "delta": 1},
-            {"account_id": "acct-c", "tier": "gold", "score": 90, "delta": 1},
-            {"account_id": "acct-d", "tier": "silver", "score": 70, "delta": 1},
-            {"account_id": "acct-e", "tier": "gold", "score": -1, "delta": 1},
+            {"account_id": "acct-a", "tier": "gold", "score": 120},
+            {"account_id": "acct-b", "tier": "gold", "score": 120},
+            {"account_id": "acct-c", "tier": "gold", "score": 90},
+            {"account_id": "acct-d", "tier": "silver", "score": 70},
+            {"account_id": "acct-e", "tier": "gold", "score": -1},
         ],
     },
 }

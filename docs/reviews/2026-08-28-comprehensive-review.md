@@ -1,5 +1,10 @@
 # Velorix Comprehensive Code Review — 2026-08-28
 
+> Historical review at the SHA below. Preserve its findings and completion
+> marks as review-time evidence only; they are not current implementation or
+> performance qualification. See [specification.md](../specification.md) for
+> current product contracts.
+
 Review SHA: `c86c5299e5f0a158f68c29fd1daaecb18442623e`
 
 ## 핵심 발견

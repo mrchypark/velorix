@@ -8,8 +8,27 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         "/v1/relations".to_string(),
         json!({
             "post": {
-                "summary": "Create a relation catalog",
-                "responses": { "201": { "description": "Relation created" } }
+                "summary": "Register a relation schema",
+                "description": "Registers the caller-visible relation schema. Velorix derives its internal multiplicity column and catalog metadata; the returned schema_fingerprint is a server-assigned opaque catalog identity.",
+                "requestBody": { "required": true, "content": { "application/json": {
+                    "schema": openapi_create_relation_request_schema(),
+                    "examples": { "generic_relation": { "value": {
+                        "catalog": { "relation_schema": {
+                            "relation_id": "orders", "relation_name": "orders", "relation_version": "v1",
+                            "columns": [
+                                {"column_id":"order_id","name":"order_id","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0},
+                                {"column_id":"amount","name":"amount","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1}
+                            ],
+                            "primary_key_column_ids": ["order_id"], "allowed_operations": ["insert", "update", "upsert"], "event_time_column_id": null
+                        } }
+                    } } }
+                } } },
+                "responses": {
+                    "201": { "description": "Relation registered", "content": { "application/json": { "schema": openapi_relation_response_schema() } } },
+                    "200": { "description": "Relation already registered with the same catalog", "content": { "application/json": { "schema": openapi_relation_response_schema() } } },
+                    "400": { "description": "Relation catalog fails semantic validation", "content": { "application/json": { "schema": openapi_error_response_schema() } } },
+                    "422": { "description": "Request body does not match the public relation request shape", "content": { "application/json": { "schema": openapi_error_response_schema() } } }
+                }
             }
         }),
     );
@@ -18,7 +37,7 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         json!({
             "post": {
                 "summary": "Ingest rows into one relation and update active views",
-                "description": "Preferred product ingest path. The relation is selected by the URL path; successful materialized ack updates all active materialized views that depend on the relation before returning.",
+                "description": "Preferred product ingest path. Optional row_format applies to every row in this request: business_rows forces rows to be interpreted as business records; operation_envelopes requires valid operation envelopes. When omitted, Velorix detects unambiguous rows and rejects only rows valid as both shapes. Setting the format matters only for ambiguous rows. DELETE envelopes are rejected. The relation is selected by the URL path.",
                 "parameters": [{
                     "name": "relation_id",
                     "in": "path",
@@ -29,7 +48,11 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                     "required": true,
                     "content": {
                         "application/json": {
-                            "schema": openapi_ingest_relation_rows_request_schema()
+                            "schema": openapi_ingest_relation_rows_request_schema(),
+                            "examples": {
+                                "plain_insert": { "value": { "relation_version":"v1", "stream_id":"orders-stream", "partition_id":0, "start_offset_inclusive":0, "row_format":"business_rows", "rows":[{"order_id":"o-1","amount":12}] } },
+                                "update": { "value": { "relation_version":"v1", "stream_id":"orders-stream", "partition_id":0, "start_offset_inclusive":1, "row_format":"operation_envelopes", "rows":[{"operation":"update","before":{"order_id":"o-1","amount":12},"after":{"order_id":"o-1","amount":15}}] } }
+                            }
                         }
                     }
                 },
@@ -41,7 +64,9 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                                 "schema": openapi_ingest_epoch_response_schema()
                             }
                         }
-                    }
+                    },
+                    "400": { "description": "Relation, row, or operation fails semantic validation", "content": { "application/json": { "schema": openapi_error_response_schema() } } },
+                    "422": { "description": "Request body shape or row_format enum is invalid", "content": { "application/json": { "schema": openapi_error_response_schema() } } }
                 }
             }
         }),
@@ -51,14 +76,18 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
         json!({
             "post": {
                 "summary": "Ingest ordered batches for one or more relations",
-                "description": "Public multi-relation ingest convenience path. It applies the submitted relation batches in request order and publishes materialized views at the resulting per-relation frontier vector; it is not an atomic multi-relation transaction API. A successful materialized ack durably appends every batch and updates every active dependent materialized view before returning.",
+                "description": "Public multi-relation ingest convenience path. Each batch may set row_format, which applies to every row in that batch: business_rows forces business-record interpretation; operation_envelopes requires valid operation envelopes. When omitted, Velorix detects unambiguous rows and rejects only rows valid as both shapes. Setting the format matters only for ambiguous rows. DELETE envelopes are rejected. Batches are applied in request order; this is not an atomic multi-relation transaction API.",
                 "requestBody": {
                     "required": true,
                     "content": {
                         "application/json": {
                             "schema": openapi_ingest_relations_request_schema(
                                 state.authoritative_relation_ingest_enabled()
-                            )
+                            ),
+                            "examples": {
+                                "plain_insert": { "value": { "batches": [ { "relation_id":"orders", "relation_version":"v1", "stream_id":"orders-stream", "partition_id":0, "start_offset_inclusive":0, "row_format":"business_rows", "rows":[{"order_id":"o-1","amount":12}] } ] } },
+                                "update": { "value": { "batches": [ { "relation_id":"orders", "relation_version":"v1", "stream_id":"orders-stream", "partition_id":0, "start_offset_inclusive":1, "row_format":"operation_envelopes", "rows":[{"operation":"update","before":{"order_id":"o-1","amount":12},"after":{"order_id":"o-1","amount":15}}] } ] } }
+                            }
                         }
                     }
                 },
@@ -70,7 +99,9 @@ pub(super) async fn openapi_json(State(state): State<ApiState>) -> Result<Json<V
                                 "schema": openapi_ingest_epoch_response_schema()
                             }
                         }
-                    }
+                    },
+                    "400": { "description": "Relation, row, or operation fails semantic validation", "content": { "application/json": { "schema": openapi_error_response_schema() } } },
+                    "422": { "description": "Request body shape or row_format enum is invalid", "content": { "application/json": { "schema": openapi_error_response_schema() } } }
                 }
             }
         }),
@@ -538,6 +569,7 @@ fn openapi_view_query_parameters(
 fn openapi_ingest_relation_rows_request_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "required": [
             "relation_version",
             "stream_id",
@@ -553,15 +585,18 @@ fn openapi_ingest_relation_rows_request_schema() -> Value {
             "start_offset_inclusive": { "type": "integer", "minimum": 0 },
             "event_time_watermark": {
                 "type": "object",
+                "required": ["event_time_column_id", "max_observed_event_time_ns", "watermark_ns"],
                 "properties": {
                     "event_time_column_id": { "type": "string" },
                     "max_observed_event_time_ns": { "type": "integer", "format": "int64" },
                     "watermark_ns": { "type": "integer", "format": "int64" }
                 }
             },
+            "row_format": { "type": "string", "enum": ["business_rows", "operation_envelopes"], "description": "Optional interpretation for all rows in this request. Selection changes behavior only when a row is valid as both a business record and an operation envelope; omission auto-detects unambiguous rows." },
             "rows": {
                 "type": "array",
-                "items": { "type": "object" }
+                "description": "Rows are business records or operation envelopes: insert uses row (or after), update uses before and after, and upsert uses row (or after), each with a business-record object. Plain business records are inserts. DELETE input is rejected, even if declared in relation metadata. Envelope payloads contain business columns only; engine multiplicity is generated internally. Without row_format, only rows valid as both shapes fail as ambiguous.",
+                "items": { "type": "object", "additionalProperties": true }
             }
         }
     })
@@ -571,12 +606,14 @@ fn openapi_ingest_relations_request_schema(authoritative: bool) -> Value {
     let mut schema = json!({
         "type": "object",
         "required": ["batches"],
+        "additionalProperties": false,
         "properties": {
             "batches": {
                 "type": "array",
                 "minItems": 1,
                 "items": {
                     "type": "object",
+                    "additionalProperties": false,
                     "required": [
                         "relation_id",
                         "relation_version",
@@ -593,15 +630,18 @@ fn openapi_ingest_relations_request_schema(authoritative: bool) -> Value {
                         "start_offset_inclusive": { "type": "integer", "minimum": 0 },
                         "event_time_watermark": {
                             "type": "object",
+                            "required": ["event_time_column_id", "max_observed_event_time_ns", "watermark_ns"],
                             "properties": {
                                 "event_time_column_id": { "type": "string" },
                                 "max_observed_event_time_ns": { "type": "integer", "format": "int64" },
                                 "watermark_ns": { "type": "integer", "format": "int64" }
                             }
                         },
+                        "row_format": { "type": "string", "enum": ["business_rows", "operation_envelopes"], "description": "Optional interpretation for every row in this batch. Selection changes behavior only for rows valid as both business records and operation envelopes; omission auto-detects unambiguous rows." },
                         "rows": {
                             "type": "array",
-                            "items": { "type": "object" }
+                            "description": "Rows are business records or insert/update/upsert operation envelopes. Plain business records are inserts. DELETE is rejected. Envelope payloads contain business columns only; engine multiplicity is generated internally. Without row_format, only rows valid as both shapes fail as ambiguous.",
+                            "items": { "type": "object", "additionalProperties": true }
                         }
                     }
                 }
@@ -614,6 +654,66 @@ fn openapi_ingest_relations_request_schema(authoritative: bool) -> Value {
             json!("Authoritative mode accepts exactly one relation batch per request");
     }
     schema
+}
+
+fn openapi_create_relation_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["catalog"],
+        "properties": {
+            "catalog": {
+                "type": "object",
+                "required": ["relation_schema"],
+                "additionalProperties": false,
+                "properties": {
+                    "adapter_id": { "type": "string", "default": "incremental-adapter-generic-v1" },
+                    "relation_schema": {
+                        "type": "object",
+                        "required": ["relation_id", "relation_name", "relation_version", "columns", "primary_key_column_ids", "allowed_operations"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "relation_id": { "type": "string" },
+                            "relation_name": { "type": "string" },
+                            "relation_version": { "type": "string" },
+                            "columns": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["column_id", "name", "logical_type", "physical_arrow_type", "nullable", "ordinal"],
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "column_id": { "type": "string" },
+                                        "name": { "type": "string" },
+                                        "logical_type": { "type": "object", "required": ["kind"], "description": "Serde-tagged Velorix logical type descriptor. Parameterized variants require their corresponding fields (for example decimal precision/scale, array element_type, struct fields, or map key_type/value_type).", "properties": { "kind": { "type": "string" } } },
+                                        "physical_arrow_type": { "type": "object", "required": ["kind"], "description": "Serde-tagged Arrow physical type descriptor. Parameterized variants require their corresponding fields (for example decimal precision/scale, timestamp timezone, list element_type, or map key_type/value_type).", "properties": { "kind": { "type": "string" } } },
+                                        "nullable": { "type": "boolean" },
+                                        "ordinal": { "type": "integer", "minimum": 0 }
+                                    }
+                                }
+                            },
+                            "primary_key_column_ids": { "type": "array", "items": { "type": "string" } },
+                            "allowed_operations": { "type": "array", "description": "Core relation operation metadata. Declaring delete does not enable public DELETE ingest; DELETE input remains unsupported.", "items": { "type": "string", "enum": ["insert", "update", "upsert", "delete"] } },
+                            "event_time_column_id": { "type": ["string", "null"] }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn openapi_relation_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["relation_id", "relation_version", "schema_fingerprint", "outcome"],
+        "properties": {
+            "relation_id": { "type": "string" },
+            "relation_version": { "type": "string" },
+            "schema_fingerprint": { "type": "string", "description": "Server-assigned opaque relation catalog identity. Clients should store and return it as supplied; its encoding is not a public schema hash contract." },
+            "outcome": { "type": "string", "enum": ["created", "duplicate"] }
+        }
+    })
 }
 
 fn openapi_ingest_materialization_schema() -> Value {
@@ -837,8 +937,38 @@ mod openapi_spec_verification {
         // Register one view so the spec also contains generated view query paths.
         let catalog = crate::example_fixtures::default_scores_relation_catalog().unwrap();
         let view = crate::example_fixtures::default_positive_scores_view_request(&catalog).unwrap();
+        let public_columns = catalog
+            .relation_schema
+            .columns
+            .iter()
+            .filter(|column| {
+                column.column_id.as_str() != catalog.relation_schema.weight_column_id.as_str()
+            })
+            .map(|column| {
+                json!({
+                    "column_id": column.column_id,
+                    "name": column.name,
+                    "logical_type": column.logical_type,
+                    "physical_arrow_type": column.physical_arrow_type,
+                    "nullable": column.nullable,
+                    "ordinal": column.ordinal,
+                })
+            })
+            .collect::<Vec<_>>();
+        let public_catalog = json!({
+            "relation_schema": {
+                "relation_id": catalog.relation_schema.relation_id,
+                "relation_name": catalog.relation_schema.relation_name,
+                "relation_version": catalog.relation_schema.relation_version,
+                "columns": public_columns,
+                "primary_key_column_ids": catalog.relation_schema.primary_key_column_ids,
+                "allowed_operations": catalog.relation_schema.allowed_operations,
+                "event_time_column_id": catalog.relation_schema.event_time_column_id,
+            },
+            "adapter_id": catalog.incremental_adapter.adapter_id,
+        });
         for (uri, body) in [
-            ("/v1/relations", json!({ "catalog": catalog })),
+            ("/v1/relations", json!({ "catalog": public_catalog })),
             ("/v1/views", json!(view)),
         ] {
             let response = router

@@ -3,6 +3,13 @@
 Status: Accepted
 Applies to: persisted table specs and DataFusion object-backed scans.
 
+This is an internal/production table-scan contract, not a statement that the
+public REST API currently exposes persisted-table registration or arbitrary
+source scans. At baseline `c6222ab`, the public router exposes query-policy
+catalog routes but no table-spec or generic source-query route; public
+view-query SQL runs over materialized output. Keep this contract scoped to the
+table-scan implementations and policy catalog that use it.
+
 Raw caller-provided Parquet URLs are phase-0/dev-only. They are not production
 authority and must not be exposed as a multi-tenant public surface.
 

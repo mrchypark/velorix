@@ -1,5 +1,10 @@
 # Reassessment of the 2026-09-03 main-branch review
 
+> Historical reassessment bounded to commit `677c125` as stated below. Its
+> statuses do not describe baseline `c6222abd054858109c90a63a061db698fa9fc9e8`.
+> Preserve the recorded assessment; use [specification.md](../specification.md)
+> for current status.
+
 **Reassessed 2026-09-05 against the validated code/test range through commit
 `677c125` (not a moving-HEAD claim).** The supplied review was a static
 assessment of `1ffbca70`. The range includes the latest authoritative,

@@ -7,11 +7,18 @@ semantics.
 Internal admission-layer acknowledgements cover durable input admission only.
 They do not claim that SQL processing, standing views, output publication, or
 checkpoint publication has completed. This durable-admission-only guarantee is
-an internal storage/runtime contract, not the public 1.0 relation ingest API
-contract. The public `/v1/relations/.../ingest` API exposes only the
-`materialized` acknowledgement: a successful response means the relation update
-and admitted materialized-view effects have both reached the durable
-materialized output contract, not merely append admission.
+an internal storage/runtime contract, not the complete public relation-ingest
+response contract. The public request currently emits the fixed wire label
+`ack_mode: materialized`; that label does not prove that every affected view
+output is current. In configured authoritative mode, new demand-managed views
+are skipped during ingest and advanced by query/backfill. Existing eager
+checkpoints may still be applied before response. The response's
+`materialization.status` is also mode/path-specific: `deferred` is returned
+when the API role delegates compute, while the local path can report
+`completed` after its ingest materialization pass even though demand-managed
+views were intentionally skipped. Callers must use per-view progress/coverage
+to establish freshness. See `materialize_prepared_ingest_epoch_for_ack_mode`
+and `is_demand_managed_view` in `crates/velorix-api/src/ingest_epoch.rs`.
 
 ## Admission Modes
 
@@ -44,11 +51,14 @@ as production evidence.
 ## Relation Ingest and Join Frontiers
 
 The public relation ingest contract is sequential. A relation ingest advances
-the frontier for the relation stream/partition named by that request, and active
-dependent views publish materialized output for the resulting frontier vector
-before returning the `materialized` acknowledgement. For joins, that vector may
-contain one advanced relation and one relation still at its previous frontier.
-Those intermediate vectors are valid published states.
+the frontier for the relation stream/partition named by that request. In
+Legacy/eager mode, eligible active dependent views publish output for the
+resulting frontier vector before the ingest materialization pass returns. In
+configured authoritative mode, new demand-managed views do not advance on
+ingest; their source frontier may be ahead of the view until query/backfill
+work. Existing eager checkpoints retain eager behavior. For eager join views,
+the vector may contain one advanced relation and one relation still at its
+previous frontier; those intermediate vectors are valid published states.
 
 Velorix does not expose a public atomic multi-relation transaction API for 1.0.
 `/v1/relations/ingest`, when used with multiple relation batches, is a
@@ -193,3 +203,17 @@ Conflict reasons must be explicit:
   other than `IngestAdmissionCoordinator`, including the runtime and
   persisted-query recovered-runtime fixtures plus catalog-backed runtime
   recovery fixtures.
+
+Current route evidence: public relation ingest is implemented in
+[ingest_epoch.rs](../../crates/velorix-api/src/ingest_epoch.rs) and its API
+tests in [tests.rs](../../crates/velorix-api/src/tests.rs). The storage
+admission/index implementation is in
+[log.rs](../../crates/velorix-storage/src/log.rs), with focused tests in
+[ingest_envelope.rs](../../crates/velorix-storage/tests/ingest_envelope.rs).
+`ack_mode: materialized` is the current API wire label, not a freshness
+certificate for every view. The storage append `201`/`200` outcomes remain
+internal admission stages. In authoritative demand mode, a successful source
+publication can precede demand-view output progress; the local pass's
+`materialization.status` label does not replace per-view checkpoint coverage.
+Neither a successful catalog append nor these source/tests alone prove
+whole-DAG production qualification.

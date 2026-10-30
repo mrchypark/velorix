@@ -1,6 +1,13 @@
 ## Verdict
 
-**Current status.** The original contract blockers for ingest acknowledgement, output-only query serving, metadata startup safety, and join frontier shape are resolved in the current docs/code contracts: public 1.0 ingest uses synchronous `materialized` acknowledgement, queries read published materialized output, production metadata startup fails closed, and joins use sequential per-relation frontier vectors. This critique still blocks release readiness where live evidence is missing, especially cross-store checkpoint fault injection, trusted disaster recovery, repair/GC/upgrade evidence, and adversarial scale/retention proof.
+> Historical architecture critique based on the supplied bundle and review
+> context; it is not the canonical current specification or a fresh audit of
+> baseline `c6222abd054858109c90a63a061db698fa9fc9e8`. Preserve its proposals
+> and findings as history. Current requirements and implementation status are
+> being reconciled in [specification.md](specification.md) and
+> [README.md](README.md).
+
+**Historical disposition only.** This paragraph in the original critique treated its then-current contract blockers as resolved. It is not a current statement that the fixed `ack_mode: materialized` wire label certifies demand-managed view freshness. The current API can defer demand work; see the mode-specific behavior in [Ingest Admission Contract](architecture/ingest-admission-contract.md) and [the current specification](specification.md). The critique's release-evidence concerns remain historical findings, not a fresh readiness report.
 
 This is an architecture/contract review of the supplied bundle, not a full implementation audit. Line references are to `attachments-bundle.txt`.
 
@@ -615,4 +622,4 @@ Verification:
 
 * **“Full workspace tests passed locally.”** Local command success on June 15, 2026 is development evidence, not release-scoped, image-bound or independently reproducible readiness evidence.
 
-[Attached review source](sandbox:/mnt/data/attachments-bundle.txt)
+The attached review source was `attachments-bundle.txt` in the original supplied bundle; that attachment is not included in this repository.

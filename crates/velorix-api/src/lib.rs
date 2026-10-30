@@ -153,6 +153,10 @@ use velorix_core::{
     },
 };
 
+pub use velorix_core::public_relation::{
+    PublicRelationCatalogV1, PublicRelationColumnV1, PublicRelationSchemaV1,
+};
+
 #[cfg(test)]
 use velorix_core::relation::{
     DataFusionRegistrationModeV1, DataFusionRegistrationV1, IncrementalAdapterBindingV1,
@@ -2549,8 +2553,9 @@ mod api_shutdown_tests {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRelationRequest {
-    pub catalog: VelorixRelationCatalogV1,
+    pub catalog: PublicRelationCatalogV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2563,7 +2568,16 @@ pub struct IngestRowsRequest {
     pub start_offset_inclusive: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_time_watermark: Option<IngestEventTimeWatermarkRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_format: Option<IngestRowFormat>,
     pub rows: Vec<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestRowFormat {
+    BusinessRows,
+    OperationEnvelopes,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2577,6 +2591,8 @@ pub struct IngestRelationRowsRequest {
     pub start_offset_inclusive: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_time_watermark: Option<IngestEventTimeWatermarkRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_format: Option<IngestRowFormat>,
     pub rows: Vec<Value>,
 }
 
@@ -3142,7 +3158,11 @@ async fn create_relation(
     State(state): State<ApiState>,
     Json(request): Json<CreateRelationRequest>,
 ) -> Result<(StatusCode, Json<RelationResponse>), ApiError> {
-    create_relation_catalog(state, request.catalog).await
+    let catalog = request
+        .catalog
+        .into_internal()
+        .map_err(ApiError::bad_request)?;
+    create_relation_catalog(state, catalog).await
 }
 
 async fn create_relation_catalog(
@@ -7814,8 +7834,19 @@ fn sql_type_from_logical_type(
 fn normalize_ingest_operation_envelopes(
     catalog: &VelorixRelationCatalogV1,
     rows: &[Value],
+    row_format: Option<IngestRowFormat>,
 ) -> Result<Vec<Value>, ApiError> {
     let weight_column = relation_weight_column_name(catalog)?;
+    let business_columns: Vec<_> = catalog
+        .relation_schema
+        .columns
+        .iter()
+        .filter(|column| column.column_id != catalog.relation_schema.weight_column_id)
+        .collect();
+    let business_names: std::collections::BTreeSet<&str> = business_columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
     let mut normalized = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let Some(object) = row.as_object() else {
@@ -7823,52 +7854,133 @@ fn normalize_ingest_operation_envelopes(
                 "each ingest row must be a JSON object",
             ));
         };
-        let is_operation_envelope = object.contains_key("operation")
-            && (object.contains_key("row")
-                || object.contains_key("before")
-                || object.contains_key("after"));
-        if !is_operation_envelope {
-            normalized.push(row.clone());
+        // The engine weight is a private field. Reject every explicit attempt,
+        // including positive and zero values, before interpreting envelopes.
+        if object.contains_key(weight_column) {
+            return Err(ApiError::bad_request(format!(
+                "public ingest row {index} must not include the reserved engine field"
+            )));
+        }
+        if row_format == Some(IngestRowFormat::BusinessRows) {
+            normalized.push(row_with_signed_weight(
+                catalog,
+                &business_names,
+                row,
+                1,
+                index,
+            )?);
             continue;
         }
-
         let operation = object
             .get("operation")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "ingest operation envelope at row {index} requires string operation"
-                ))
-            })?
-            .to_ascii_lowercase();
-        match operation.as_str() {
+            .map(|operation| operation.to_ascii_lowercase());
+        let envelope_shape_valid = operation
+            .as_deref()
+            .is_some_and(|operation| operation_envelope_shape_valid(object, operation));
+        if row_format == Some(IngestRowFormat::OperationEnvelopes) && !envelope_shape_valid {
+            return Err(ApiError::bad_request(format!(
+                "ingest row {index} is not a valid operation envelope"
+            )));
+        }
+        let is_operation_envelope = if row_format == Some(IngestRowFormat::OperationEnvelopes) {
+            true
+        } else if !envelope_shape_valid {
+            false
+        } else if public_business_row_shape_matches(&business_columns, object) {
+            let valid_business_row = public_business_row_matches(&business_columns, row);
+            let valid_envelope = operation.as_deref().is_some_and(|operation| {
+                operation_envelope_payloads_match(&business_columns, object, operation)
+            });
+            if valid_business_row && valid_envelope {
+                return Err(ApiError::bad_request(format!(
+                    "ingest row {index} is ambiguous between a business row and an operation envelope; set row_format to business_rows or operation_envelopes"
+                )));
+            }
+            valid_envelope
+        } else {
+            true
+        };
+        if !is_operation_envelope {
+            validate_public_row_fields(&business_names, object, index)?;
+            normalized.push(row_with_signed_weight(
+                catalog,
+                &business_names,
+                row,
+                1,
+                index,
+            )?);
+            continue;
+        }
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "operation" | "row" | "before" | "after"))
+        {
+            return Err(ApiError::bad_request(format!(
+                "ingest operation envelope at row {index} contains an undeclared field"
+            )));
+        }
+
+        match operation
+            .as_deref()
+            .expect("envelope discriminator was checked")
+        {
             "insert" => {
                 require_relation_operation(catalog, RelationOperationV1::Insert, index)?;
                 let payload = envelope_payload(object, "row", index)
                     .or_else(|_| envelope_payload(object, "after", index))?;
-                normalized.push(row_with_signed_weight(payload, weight_column, 1, index)?);
+                normalized.push(row_with_signed_weight(
+                    catalog,
+                    &business_names,
+                    payload,
+                    1,
+                    index,
+                )?);
             }
             "delete" => {
-                require_relation_operation(catalog, RelationOperationV1::Delete, index)?;
-                let payload = envelope_payload(object, "row", index)
-                    .or_else(|_| envelope_payload(object, "before", index))?;
-                normalized.push(row_with_signed_weight(payload, weight_column, -1, index)?);
+                return Err(ApiError::bad_request(format!(
+                    "public input DELETE is unsupported at row {index}; use update or upsert to replace a row"
+                )));
             }
             "update" => {
                 require_relation_operation(catalog, RelationOperationV1::Update, index)?;
                 let before = envelope_payload(object, "before", index)?;
                 let after = envelope_payload(object, "after", index)?;
-                normalized.push(row_with_signed_weight(before, weight_column, -1, index)?);
-                normalized.push(row_with_signed_weight(after, weight_column, 1, index)?);
+                normalized.push(row_with_signed_weight(
+                    catalog,
+                    &business_names,
+                    before,
+                    -1,
+                    index,
+                )?);
+                normalized.push(row_with_signed_weight(
+                    catalog,
+                    &business_names,
+                    after,
+                    1,
+                    index,
+                )?);
             }
             "upsert" => {
                 require_relation_operation(catalog, RelationOperationV1::Upsert, index)?;
                 if let Some(before) = object.get("before") {
-                    normalized.push(row_with_signed_weight(before, weight_column, -1, index)?);
+                    normalized.push(row_with_signed_weight(
+                        catalog,
+                        &business_names,
+                        before,
+                        -1,
+                        index,
+                    )?);
                 }
                 let payload = envelope_payload(object, "row", index)
                     .or_else(|_| envelope_payload(object, "after", index))?;
-                normalized.push(row_with_signed_weight(payload, weight_column, 1, index)?);
+                normalized.push(row_with_signed_weight(
+                    catalog,
+                    &business_names,
+                    payload,
+                    1,
+                    index,
+                )?);
             }
             other => {
                 return Err(ApiError::bad_request(format!(
@@ -7880,6 +7992,94 @@ fn normalize_ingest_operation_envelopes(
     Ok(normalized)
 }
 
+/// Potential envelopes are rare, so only those rows pay for per-column
+/// completeness and Arrow-type validation. Ambiguous shapes fail closed.
+fn public_business_row_shape_matches(
+    business_columns: &[&RelationColumnV1],
+    object: &serde_json::Map<String, Value>,
+) -> bool {
+    object.len() == business_columns.len()
+        && business_columns
+            .iter()
+            .all(|column| object.contains_key(&column.name))
+}
+
+fn public_business_row_matches(business_columns: &[&RelationColumnV1], row: &Value) -> bool {
+    let Some(object) = row.as_object() else {
+        return false;
+    };
+    if !public_business_row_shape_matches(business_columns, object) {
+        return false;
+    }
+    business_columns.iter().all(|column| {
+        relation_json_column_to_arrow_array(column, std::slice::from_ref(row)).is_ok()
+    })
+}
+
+fn operation_envelope_shape_valid(
+    envelope: &serde_json::Map<String, Value>,
+    operation: &str,
+) -> bool {
+    if envelope
+        .keys()
+        .any(|key| !matches!(key.as_str(), "operation" | "row" | "before" | "after"))
+    {
+        return false;
+    }
+    let has_exact_keys = |keys: &[&str]| {
+        envelope.len() == keys.len() && keys.iter().all(|key| envelope.contains_key(*key))
+    };
+    let is_object = |field: &str| envelope.get(field).is_some_and(Value::is_object);
+    match operation {
+        "insert" => {
+            (has_exact_keys(&["operation", "row"]) && is_object("row"))
+                || (has_exact_keys(&["operation", "after"]) && is_object("after"))
+        }
+        "update" => {
+            has_exact_keys(&["operation", "before", "after"])
+                && is_object("before")
+                && is_object("after")
+        }
+        "upsert" => {
+            (has_exact_keys(&["operation", "row"]) && is_object("row"))
+                || (has_exact_keys(&["operation", "after"]) && is_object("after"))
+                || (has_exact_keys(&["operation", "before", "row"])
+                    && is_object("before")
+                    && is_object("row"))
+                || (has_exact_keys(&["operation", "before", "after"])
+                    && is_object("before")
+                    && is_object("after"))
+        }
+        "delete" => {
+            (has_exact_keys(&["operation", "row"]) && is_object("row"))
+                || (has_exact_keys(&["operation", "before"]) && is_object("before"))
+        }
+        _ => false,
+    }
+}
+
+fn operation_envelope_payloads_match(
+    business_columns: &[&RelationColumnV1],
+    envelope: &serde_json::Map<String, Value>,
+    operation: &str,
+) -> bool {
+    let matches_payload = |field: &str| {
+        envelope
+            .get(field)
+            .is_some_and(|payload| public_business_row_matches(business_columns, payload))
+    };
+    match operation {
+        "insert" => matches_payload("row") || matches_payload("after"),
+        "update" => matches_payload("before") && matches_payload("after"),
+        "upsert" => {
+            (matches_payload("row") || matches_payload("after"))
+                && (envelope.get("before").is_none() || matches_payload("before"))
+        }
+        "delete" => matches_payload("row") || matches_payload("before"),
+        _ => false,
+    }
+}
+
 fn relation_weight_column_name(catalog: &VelorixRelationCatalogV1) -> Result<&str, ApiError> {
     catalog
         .relation_schema
@@ -7888,10 +8088,7 @@ fn relation_weight_column_name(catalog: &VelorixRelationCatalogV1) -> Result<&st
         .find(|column| column.column_id == catalog.relation_schema.weight_column_id)
         .map(|column| column.name.as_str())
         .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "relation `{}` weight column `{}` is missing",
-                catalog.relation_schema.relation_id, catalog.relation_schema.weight_column_id
-            ))
+            ApiError::bad_request("relation catalog is missing its reserved engine field")
         })
 }
 
@@ -7928,8 +8125,9 @@ fn envelope_payload<'a>(
 }
 
 fn row_with_signed_weight(
+    catalog: &VelorixRelationCatalogV1,
+    business_names: &std::collections::BTreeSet<&str>,
     payload: &Value,
-    weight_column: &str,
     weight: i64,
     row_index: usize,
 ) -> Result<Value, ApiError> {
@@ -7938,13 +8136,23 @@ fn row_with_signed_weight(
             "ingest operation envelope payload at row {row_index} must be a JSON object"
         ))
     })?;
-    if object.contains_key(weight_column) {
-        return Err(ApiError::bad_request(format!(
-            "ingest operation envelope payload at row {row_index} must not include weight column `{weight_column}`"
-        )));
-    }
+    validate_public_row_fields(business_names, &object, row_index)?;
+    let weight_column = relation_weight_column_name(catalog)?;
     object.insert(weight_column.to_string(), json!(weight));
     Ok(Value::Object(object))
+}
+
+fn validate_public_row_fields(
+    declared: &std::collections::BTreeSet<&str>,
+    object: &serde_json::Map<String, Value>,
+    row_index: usize,
+) -> Result<(), ApiError> {
+    if object.keys().any(|key| !declared.contains(key.as_str())) {
+        return Err(ApiError::bad_request(format!(
+            "public ingest row {row_index} contains an undeclared field"
+        )));
+    }
+    Ok(())
 }
 
 fn rows_to_record_batch(

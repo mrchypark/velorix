@@ -1,9 +1,12 @@
 # Type Inventory V1
 
-This document inventories the scalar and aggregate state requirements by type
-for Velorix's materialized-view runtime. It defines type-specific overflow,
-NaN, and handling rules, type promotion and coercion rules, and version
-expression encoding in checkpoint state.
+This document is a historical design inventory, not a verified statement of
+current runtime support. Its per-type availability, null, promotion, aggregate,
+and checkpoint-encoding claims have not been reconciled against current runtime
+operators and tests in this metadata/ingest documentation pass. Do not use its
+“Fully Implemented” labels as public admission or production support evidence;
+the canonical writer should reconcile it against the runtime source and
+focused tests before treating the table as current.
 
 ## Supported Types
 

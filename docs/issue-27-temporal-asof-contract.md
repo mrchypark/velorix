@@ -1,5 +1,9 @@
 # Temporal ASOF join contract
 
+Issue-level contract note. Source presence and focused tests establish only the
+admitted shape described here, not general temporal SQL or production
+qualification. Canonical status belongs in [specification.md](specification.md).
+
 Velorix admits only a deliberately narrow temporal join shape:
 
 ```sql
@@ -37,3 +41,10 @@ no automatic migration is claimed.
 
 This syntax follows the explicit `ASOF JOIN ... MATCH_CONDITION` form described
 by [Snowflake's ASOF JOIN documentation](https://docs.snowflake.com/en/sql-reference/constructs/asof-join).
+The current admission implementation is in
+[`view_plan/mod.rs`](../crates/velorix-core/src/view_plan/mod.rs), and the
+runtime is in
+[`temporal_join.rs`](../crates/velorix-runtime/src/materialized_view_runtime/temporal_join.rs).
+Focused public-path coverage is in
+[`tests.rs`](../crates/velorix-api/src/tests.rs), including
+`rest_temporal_asof_join_materializes_retracts_and_restores`.

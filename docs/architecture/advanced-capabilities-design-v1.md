@@ -1,7 +1,13 @@
 # Advanced Capabilities Design V1
 
-This document outlines the design for Phase 8: Deferred Advanced Capabilities.
-Each capability requires separate design decisions and pre-implementation artifacts.
+This document preserves the Phase 8 design proposals. It is not a description of
+the current admission or runtime contract. At baseline `c6222ab`, narrow
+implementations exist for bounded ROWS navigation frames, exact percentile
+aggregates, CROSS JOIN, strict interval-overlap INNER JOIN, compiled-in scalar
+UDFs, and positive recursive fixpoints. Their supported shapes and resource
+contracts are narrower than several proposals below; see the individual Phase 8
+designs and [supported SQL](supported-sql.md). Proposal details below remain
+targets unless a current implementation note explicitly says otherwise.
 
 ## Pre-Implementation Requirements
 

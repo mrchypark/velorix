@@ -1,6 +1,40 @@
 use super::*;
 pub(crate) use velorix_core::example_fixtures::orders_sum_count_relation_catalog;
 
+/// Convert a trusted engine fixture into the caller-facing relation registration
+/// payload. This deliberately drops the engine weight column and its bindings.
+pub(crate) fn public_relation_registration(catalog: &VelorixRelationCatalogV1) -> Value {
+    let schema = &catalog.relation_schema;
+    let columns = schema
+        .columns
+        .iter()
+        .filter(|column| column.column_id != schema.weight_column_id)
+        .enumerate()
+        .map(|(ordinal, column)| {
+            json!({
+                "column_id": column.column_id,
+                "name": column.name,
+                "logical_type": column.logical_type,
+                "physical_arrow_type": column.physical_arrow_type,
+                "nullable": column.nullable,
+                "ordinal": ordinal as u32,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"catalog": {
+        "relation_schema": {
+            "relation_id": schema.relation_id,
+            "relation_name": schema.relation_name,
+            "relation_version": schema.relation_version,
+            "columns": columns,
+            "primary_key_column_ids": schema.primary_key_column_ids,
+            "allowed_operations": schema.allowed_operations,
+            "event_time_column_id": schema.event_time_column_id,
+        },
+        "adapter_id": catalog.incremental_adapter.adapter_id,
+    }})
+}
+
 const DEFAULT_SCORES_RELATION_ID: &str = "scores";
 const DEFAULT_SCORES_RELATION_VERSION: &str = "2026-05-24.v1";
 const DEFAULT_POSITIVE_SCORES_VIEW_ID: &str = "positive_scores_by_user";

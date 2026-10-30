@@ -1,6 +1,12 @@
 # Phase 8 — Deterministic Built-in UDF Registry (Design)
 
-Status: DESIGN — implementation gated on this document.
+Status: A compiled-in deterministic scalar UDF registry is implemented in the
+typed expression path at baseline `c6222ab`. It is not user-supplied code
+execution or dynamic registration. The current registry's named functions,
+type signatures, and call contexts are the implementation boundary; the
+proposed identity/digest and admission/restore guarantees below must not be
+assumed without matching code. Evidence:
+[`BuiltinUdfIdentityV1` and `builtin_udf_spec`](../../crates/velorix-core/src/view_plan/typed_expr.rs).
 
 ## 1. Semantic design
 

@@ -29,9 +29,13 @@ manifest publication.
 | `v1/relations` | Create-only relation catalog writes. | Read-after-create. |
 | `v1/ownership` | Create-only epoch records, when enabled. | Read-after-create and documented listing semantics. |
 
-Production startup must reject unsupported conditional create or CAS behavior.
-Overwrite-based emulation is forbidden in production. Local filesystem or fake
-object-store emulation is dev/test only and must require an explicit local mode.
+The shared startup durability profile requires conditional create, atomic
+visibility, read-after-write, and list-after-write for each authoritative
+namespace. Conditional update/CAS is additionally required by specific callers
+such as active view lifecycle publication; it is not a field in the generic
+durability profile. Overwrite-based emulation is forbidden in production.
+Local filesystem or fake object-store emulation is dev/test only and must
+require an explicit local mode.
 Active view lifecycle records additionally require conditional update support
 (`PutMode::Update` / ETag CAS) in product `velorix-api` startup, because view
 activation must not fall back to last-writer-wins on shared Versity Gateway/S3-compatible
@@ -68,6 +72,15 @@ range-read behavior, and startup capabilities for every authoritative namespace
 when explicitly enabled.
 Capability diagnostics expose the backend name, namespace, and missing
 durability capabilities for every authoritative namespace.
+
+Range-read behavior is checked by the S3 harness; it is not represented in
+`ObjectStoreCapabilityProfile` or the shared startup durability profile.
+The namespace table's range/list/metadata-or-ETag entries are caller-level
+requirements; the shared profile does not prove each of those per-namespace
+semantics. The harness's direct range-read check is a backend operation check,
+not evidence that every namespace has a distinct range-read contract.
+Per-operation harness results do not establish a universal request-count
+contract for production query, ingest, or checkpoint phases.
 
 ## Current Verification
 

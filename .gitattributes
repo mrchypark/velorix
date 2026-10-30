@@ -1,2 +1,6 @@
 # Preserve the published help snapshot verbatim; vendor integrity is checked in CI.
 third_party/parquet-59.3.0/src/bin/parquet-fromcsv-help.txt -whitespace
+
+# Frozen EGM review targets retain their original Markdown hard breaks and hashes.
+docs/reviews/egm-2026-10-30/specification-before-review.md whitespace=-blank-at-eol
+docs/reviews/egm-2026-10-30/specification-reviewed.md whitespace=-blank-at-eol
