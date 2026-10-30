@@ -120,6 +120,10 @@ The key semantics identity must participate in the logical plan hash and the
 standing-program/checkpoint identity. Restore must fail closed if the expected
 identity differs, even when state bytes happen to deserialize.
 
-Binding this identity into every plan and checkpoint is tracked separately in
-Foundation 0A so this document does not claim restore compatibility before the
-code enforces it.
+At baseline `c6222ab`, logical-plan validation checks the key and bag
+semantics version, and plan hashing includes those fields. This confirms the
+plan-level binding described above; it does not by itself establish every
+checkpoint migration or per-type encoding claim in this proposal. See
+[`validate_logical_view_plan`](../../crates/velorix-core/src/view_plan/mod.rs)
+and `plan_hash` in the same module. Any broader restore-compatibility claim
+still requires the corresponding checkpoint identity and migration evidence.

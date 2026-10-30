@@ -1,6 +1,15 @@
 # Phase 8 — Recursive CTEs (Design)
 
-Status: DESIGN — implementation gated on this document.
+Status: Narrow positive recursive-fixpoint implementation present at baseline
+`c6222ab`; the public admission/runtime/restart path is covered. Admission
+supports validated `UNION DISTINCT` fixpoints with explicit resource bounds;
+arbitrary recursive SQL is rejected. Two-CTE definitions are validated, but
+the current outer-query contract selects only the first CTE, so this is not
+general mutually recursive execution. The section below is a broader proposal,
+not the complete current grammar. Evidence:
+[`validate_supported_recursive_cte_sql`](../../crates/velorix-core/src/view_plan/mod.rs)
+and [`rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_restore`]
+(../../crates/velorix-api/src/tests.rs).
 
 ## 1. Semantic design
 

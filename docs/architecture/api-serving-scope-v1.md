@@ -38,3 +38,23 @@ Contract mapping:
   evidence profiles.
 - `Kubernetes operator` keeps serving replicas stateless and coordinated by
   external authority records.
+
+## Current route boundary at baseline `c6222ab`
+
+The registered public routes are relation creation/ingest, view declaration,
+view and output queries, promoted `/v1/api/{path}` queries, query-policy
+catalog operations, backfill, and OpenAPI metadata
+([route table](../../crates/velorix-api/src/lib.rs)). There is no public
+persisted-table registration or arbitrary source-scan route in that table.
+Query-policy catalog endpoints therefore do not by themselves expose a public
+DataFusion table-scan API. Query-time SQL is validated and run over the selected
+published view output under policy; it is distinct from view SQL admission and
+from internal/dev object-backed DataFusion scans.
+
+Admission remains bounded by the internal typed-plan validators and public
+feature policy: event-time windows are enabled by default, analytic `OVER`
+families are experimental by default, and
+`VELORIX_EXPERIMENTAL_ADVANCED_VIEW_FEATURES=true` enables both. An enabled
+runtime family is still only its validated SQL subset. See
+[`validate_public_view_feature_admission`](../../crates/velorix-api/src/view_admission.rs)
+and [`validate_public_runtime_plan_admission`](../../crates/velorix-api/src/view_admission.rs).

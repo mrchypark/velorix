@@ -3009,46 +3009,49 @@ old_atomic_join_claims = [
     "join_transaction_contract",
     "relations_ingest_transaction",
 ]
-checks["public join contract is sequential frontier vectors, not atomic epochs"] = (
-    "Public 1.0 join consistency is a per-relation frontier-vector contract"
-    in materialized_view_roadmap
-    and "`/v1/relations/ingest` must not be described as an atomic multi-relation transaction API"
-    in materialized_view_roadmap.replace("\n", " ")
-    and "Every published runtime checkpoint for a join must carry the complete"
-    in materialized_view_roadmap
-    and "Output manifests must either record that vector directly or remain selected only through the checkpoint/pointer"
-    in ingest_admission_contract.replace("\n", " ")
-    and "does not add an atomic\nmulti-relation transaction boundary for joins"
-    in storage_contract
-    and "input_frontiers: Vec<RelationFrontier>" in (repo_root / "crates" / "velorix-core" / "src" / "standing_program.rs").read_text(encoding="utf-8")
-    and "runtime_tracks_input_frontiers_by_relation_stream_and_partition"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "runtime_materializes_two_relation_join_and_restores_epoch_consistent_state"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "let initial_frontiers = vec!["
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "assert_eq!(first_commit.input_frontiers, initial_frontiers);"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "assert_eq!(checkpoint.input_frontiers, initial_frontiers);"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "restored.checkpoint().unwrap().input_frontiers"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "committed_offset_exclusive: 4"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "committed_offset_exclusive: 2"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "let advanced_frontiers = vec!["
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "assert_eq!(second_commit.input_frontiers, advanced_frontiers);"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "committed_offset_exclusive: 5"
-    in (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
-    and "Ingest ordered batches for one or more relations" in api
-    and "it is not an atomic multi-relation transaction API" in api
-    and not any(claim in materialized_view_roadmap for claim in old_atomic_join_claims)
-    and not any(claim in api for claim in old_atomic_join_claims)
-    and not any(claim in rest_join_smoke for claim in old_atomic_join_claims)
+def normalized_contract_text(text):
+    return " ".join(text.replace("`", "").split()).lower()
+
+
+join_contract = normalized_contract_text(ingest_admission_contract)
+join_api_description = normalized_contract_text(
+    api.split('"/v1/relations/ingest"', 1)[1].split('"/v1/', 1)[0]
+    if '"/v1/relations/ingest"' in api
+    else ""
 )
+join_runtime_source = (repo_root / "crates" / "velorix-core" / "src" / "standing_program.rs").read_text(encoding="utf-8")
+join_runtime_tests = (repo_root / "crates" / "velorix-runtime" / "tests" / "materialized_view_runtime.rs").read_text(encoding="utf-8")
+join_frontier_assertions = {
+    "normalized contract describes sequential relation ingest": "the public relation ingest contract is sequential" in join_contract,
+    "contract advances only the named relation frontier": "advances the frontier for the relation stream/partition named by that request" in join_contract,
+    "legacy/eager active views publish before pass returns": "legacy/eager mode, eligible active dependent views publish output" in join_contract,
+    "authoritative demand views may lag their source frontier": (
+        "configured authoritative mode, new demand-managed views do not advance on ingest" in join_contract
+        and "their source frontier may be ahead of the view until query/backfill work" in join_contract
+    ),
+    "existing eager checkpoint behavior is preserved": "existing eager checkpoints retain eager behavior" in join_contract,
+    "intermediate per-relation vectors are valid": "those intermediate vectors are valid published states" in join_contract,
+    "contract denies public atomic multi-relation transactions": (
+        "does not expose a public atomic multi-relation transaction api for 1.0" in join_contract
+        and "deterministic convenience wrapper over relation ingest sequencing" in join_contract
+    ),
+    "OpenAPI describes request ordering and non-atomicity": (
+        "batches are applied in request order" in normalized_contract_text(api)
+        and "not an atomic multi-relation transaction api" in normalized_contract_text(api)
+    ),
+    "runtime checkpoint stores a vector of relation frontiers": "input_frontiers: Vec<RelationFrontier>" in join_runtime_source,
+    "runtime test tracks frontiers per relation/stream/partition": "runtime_tracks_input_frontiers_by_relation_stream_and_partition" in join_runtime_tests,
+    "runtime test verifies both initial and advanced vectors": (
+        "assert_eq!(first_commit.input_frontiers, initial_frontiers);" in join_runtime_tests
+        and "assert_eq!(second_commit.input_frontiers, advanced_frontiers);" in join_runtime_tests
+    ),
+    "legacy public atomic transaction claims are absent": (
+        not any(claim in materialized_view_roadmap for claim in old_atomic_join_claims)
+        and not any(claim in api for claim in old_atomic_join_claims)
+        and not any(claim in rest_join_smoke for claim in old_atomic_join_claims)
+    ),
+}
+checks["public join contract preserves sequential relation frontiers"] = all(join_frontier_assertions.values())
 
 checks["standalone REST SQL-family smokes avoid old external runtime help text"] = (
     all(path.is_file() and os.access(path, os.X_OK) for path in rest_sql_family_smoke_paths)
@@ -3766,31 +3769,41 @@ checks["NetworkPolicy and probe names reject uppercase and concurrent residuals"
     and "run_scope_suffix" in script
 )
 
-checks["public 1.0 exposes only materialized ingest acknowledgement"] = (
-    "pub enum IngestAckMode" in api
-    and "Materialized" in api.split("pub enum IngestAckMode", 1)[1].split("}", 1)[0]
-    and "AppendCommitted" not in api.split("pub enum IngestAckMode", 1)[1].split("}", 1)[0]
-    and '"enum": ["materialized"]' in api
-    and '"readOnly": true' in api
-    and '"append_committed_background_materialization"' not in readyz_source
-    and "pub ack_mode:" not in api.split("pub struct IngestRowsRequest", 1)[1].split("pub struct IngestEventTimeWatermarkRequest", 1)[0]
-    and "pub ack_mode:" not in api.split("pub struct IngestRelationRowsRequest", 1)[1].split("pub struct IngestEventTimeWatermarkRequest", 1)[0]
-    and "pub ack_mode:" not in api.split("pub struct IngestEpochRequest", 1)[1].split("pub enum IngestAckMode", 1)[0]
-    and "public 1.0 ingest API does not expose an async append-only acknowledgement"
-    in materialized_view_roadmap
-    and "does not expose acknowledgement negotiation to clients" in materialized_view_roadmap
-    and "## Storage-Layer Ingest Acknowledgement Semantics" in storage_contract
-    and "This section describes the storage-layer append/admission contract, not the\npublic relation ingest API."
-    in storage_contract
-    and "The public 1.0 relation ingest API uses the higher-level synchronous\n`materialized` acknowledgement"
-    in storage_contract
-    and "Ingest acknowledgement is scoped to durable input admission only"
-    not in storage_contract
-    and "## Storage-Layer Append Semantics" in ingest_storage_format_decision
-    and "This is not the public 1.0 relation ingest contract" in ingest_storage_format_decision
-    and "Public\n`/v1/relations/{relation_id}/ingest` and `/v1/relations/ingest` expose only the\nsynchronous `materialized` acknowledgement"
-    in ingest_storage_format_decision
-)
+ingest_epoch_source = (repo_root / "crates" / "velorix-api" / "src" / "ingest_epoch.rs").read_text(encoding="utf-8")
+ack_contract = normalized_contract_text(ingest_admission_contract)
+acknowledgement_assertions = {
+    "public acknowledgement enum exposes materialized only": (
+        "pub enum IngestAckMode" in api
+        and "Materialized" in api.split("pub enum IngestAckMode", 1)[1].split("}", 1)[0]
+        and "AppendCommitted" not in api.split("pub enum IngestAckMode", 1)[1].split("}", 1)[0]
+        and '"enum": ["materialized"]' in api
+        and '"readOnly": true' in api
+    ),
+    "public ingest requests do not negotiate acknowledgement mode": (
+        "pub ack_mode:" not in api.split("pub struct IngestRowsRequest", 1)[1].split("pub struct IngestEventTimeWatermarkRequest", 1)[0]
+        and "pub ack_mode:" not in api.split("pub struct IngestRelationRowsRequest", 1)[1].split("pub struct IngestEventTimeWatermarkRequest", 1)[0]
+        and "pub ack_mode:" not in api.split("pub struct IngestEpochRequest", 1)[1].split("pub enum IngestAckMode", 1)[0]
+    ),
+    "ack label is explicitly not a universal view freshness certificate": (
+        "ack_mode: materialized is the current api wire label, not a freshness certificate for every view" in ack_contract
+        and "successful source publication can precede demand-view output progress" in ack_contract
+        and "callers must use per-view progress/coverage to establish freshness" in ack_contract
+    ),
+    "authoritative demand and legacy eager behaviors are documented": (
+        "existing eager checkpoints retain eager behavior" in ack_contract
+        and "materialization.status label does not replace per-view checkpoint coverage" in ack_contract
+        and "legacy/eager mode, eligible active dependent views publish output" in ack_contract
+        and "configured authoritative mode, new demand-managed views do not advance on ingest" in ack_contract
+    ),
+    "materialization source selects demand/eager behavior and drains dependencies": (
+        "IngestAckMode::Materialized" in ingest_epoch_source
+        and "is_demand_managed_view(state, active)" in ingest_epoch_source
+        and "drain_published_view_dependencies_from_snapshot" in ingest_epoch_source
+        and '"deferred"' in ingest_epoch_source
+        and '"completed"' in ingest_epoch_source
+    ),
+}
+checks["public materialized acknowledgement label does not claim universal view freshness"] = all(acknowledgement_assertions.values())
 
 checks["public 1.0 publishes only enforced materialization runtime budgets"] = (
     '"enforced_public_1_0_limits"' in readyz_source
@@ -3981,6 +3994,13 @@ checks["product ingress apply helper creates no-PVC Kubernetes ingress"] = (
 failed = [name for name, ok in checks.items() if not ok]
 failed = [name for name in failed if name not in external_object_store_optional_checks]
 if failed:
+    for name, assertions in (
+        ("public join contract preserves sequential relation frontiers", join_frontier_assertions),
+        ("public materialized acknowledgement label does not claim universal view freshness", acknowledgement_assertions),
+    ):
+        if name in failed:
+            details = [detail for detail, ok in assertions.items() if not ok]
+            print(f"failed assertions for {name}: " + "; ".join(details), file=sys.stderr)
     raise SystemExit(
         "vind product contract check failed:\n- " + "\n- ".join(failed)
     )

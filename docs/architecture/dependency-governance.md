@@ -1,5 +1,15 @@
 # Dependency Governance
 
+This file combines current policy with a dated 2026-10-08 dependency-graph
+review. The graph counts and cargo-deny diagnostic totals below are that
+review's recorded results, not a fresh scan of the current checkout. The
+2026-10-30 [CI baseline](https://github.com/mrchypark/velorix/actions/runs/41020731224)
+reports its dependency-deny job successful for baseline
+`c6222abd054858109c90a63a061db698fa9fc9e8`; it does not replace the recorded
+JSON diagnostics or constitute release readiness. The current machine policy
+is [dependency-governance.json](../../dependency-governance.json),
+[deny.toml](../../deny.toml), and [CI](../../.github/workflows/ci.yml).
+
 Velorix runs `cargo-deny 0.20.2` with `cargo deny check -W unmaintained` in CI.
 The declared MSRV remains Rust `1.98.0`; CI installs that version and runs
 `cargo check --workspace --all-targets --locked` to enforce the declared MSRV

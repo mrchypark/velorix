@@ -42,3 +42,14 @@ snapshot compatibility are covered by the storage and metadata test suites.
 Checkpoint lineage, object visibility, and retention evidence are described in
 [Checkpoint Recovery Index V1](checkpoint-recovery-index-v1.md) and
 [Storage Contract](storage-contract.md).
+
+Current implementation entry points are
+[state.rs](../../crates/velorix-storage/src/state.rs) for manifest publication,
+inspection and recovery validation, and
+[checkpoint_publication.rs](../../crates/velorix-api/src/checkpoint_publication.rs)
+for standing-runtime checkpoint publication. Runtime checkpoint pointer fields
+are separately defined by the Meta RPC in
+[meta.proto](../../crates/velorix-meta/proto/velorix/meta/v1/meta.proto);
+metadata references object keys, hashes and manifest refs rather than owning
+the large runtime state body. Source and local test coverage do not qualify
+provider-wide durability or whole-DAG recovery.

@@ -1,5 +1,14 @@
 # Rhiza KV MetaStore Upgrade and Local-init guidance
 
+Current source configuration is parsed in
+[main.rs](../../crates/velorix-meta/src/main.rs); KV metadata snapshot/root-CAS
+behavior is in [rhiza_meta.rs](../../crates/velorix-meta/src/rhiza_meta.rs),
+[rhiza_kv_snapshot.rs](../../crates/velorix-meta/src/rhiza_kv_snapshot.rs),
+and [rhiza_snapshot.rs](../../crates/velorix-meta/src/rhiza_snapshot.rs).
+Historical release and test records below remain historical and are not
+re-verified by this source reconciliation. Run-local `target/` evidence is not
+a public repository artifact or provider/deployment qualification.
+
 ## Current upstream maintenance-release assessment: v0.21.2
 
 The official v0.21.2 tag resolves to the exact source commit

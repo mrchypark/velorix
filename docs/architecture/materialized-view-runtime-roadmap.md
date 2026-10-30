@@ -1,9 +1,13 @@
 # Materialized View Runtime Roadmap
 
-Status: First local-development materialized-view runtime milestone implemented
-and locally verified. This is local development evidence only, not
-release/product-complete evidence. Window, analytic, scoped backfill, and
-background scheduling work remains internal or experimental.
+Status: The roadmap's first local-development milestone is implemented, and
+later code now includes additional narrow SQL families, view dependencies,
+event-time handling, and authoritative demand materialization. This document
+contains dated design and verification history; individual source presence
+does not establish current public admission, complete dependency-DAG behavior,
+benchmark qualification, or product/release completion. For the current
+admission boundary use [supported SQL](supported-sql.md); for configured
+runtime modes see [the generic pipeline guide](../development/generic-view-pipeline.md).
 Applies to: view admission, logical planning, incremental operators,
 materialized output serving, checkpoint/recovery, and experimental window SQL.
 
@@ -686,10 +690,13 @@ relation schema, key descriptor, schema/key hashes, output stream, signed-delta
 codec, and producer-commit frontier kind. Public relation schemas never acquire
 a hidden delta-weight column.
 
-This metadata is only the first verified slice; it does not yet make view output
-consumable. The remaining dependency path must use direct typed signed deltas,
-consumer cursors, and one authoritative `CausalCutV1` over direct source and view
-inputs. Durable producer commit records are now implemented: every new published
+The binding metadata is consumed by the implemented dependency path: durable
+producer commits carry signed output deltas, consumers advance persisted cursors,
+and checkpoints bind source frontiers and view cursors in a `CausalCutV1`.
+Focused API coverage proves a three-level filter → aggregate → Top-K chain across
+insert, retract, restart, and replay; it does not qualify arbitrary DAG shapes,
+all mixed-input interleavings, or production-scale performance. Durable producer
+commit records are implemented: every new published
 epoch, including an empty delta, seals the binding identity, checkpoint/state,
 direct-source coverage, consolidated delta, and a canonical commit digest behind
 the authoritative checkpoint pointer. Legacy delta records remain readable. The
@@ -703,14 +710,12 @@ the recovery authority; `input_coverage` is only a bootstrap-compatibility
 mirror.
 
 The commit object is never authority by existence alone. Publication authority
-is the single metadata-pointer chain through its checkpoint reference, so an
-orphan written before a failed pointer CAS must be ignored. A follow-up strict
-review accepted this producer-commit slice on that bounded basis and retained
-canonical mixed source/view `CausalCutV1` plus fail-closed orphan recovery as the
-next correctness boundary. That implementation and its local recovery evidence
-now pass, and a strict follow-up review returned bounded `GO` with no P0/P1 for
-the cut replacement itself. Production cursor resolution/consumption is still
-unimplemented and remains the next fail-closed boundary.
+is the metadata-pointer chain through its checkpoint reference, so an orphan
+written before a failed pointer CAS is ignored. The historical review notes
+above apply only to their dated slice; current producer/consumer cursor handling
+is present in `view_dependencies.rs` and is exercised by the chain test cited
+above. Do not infer complete SQL composition or benchmark qualification from
+that test.
 
 A tenant DAG revision must bind edges to immutable generations. Producer deltas
 may be garbage-collected only after every live dependent's durable cursor, and a

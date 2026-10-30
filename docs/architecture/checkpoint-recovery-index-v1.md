@@ -12,15 +12,28 @@ v1/checkpoints/{checkpoint_version:020}.manifest
 
 Latest indexes are advisory acceleration only.
 
-## CheckpointManifestV1 Invariants
+## Storage checkpoint manifest invariants
 
-Each `CheckpointManifestV1` binds the admitted plan hash, owner fencing
-token/epoch, input frontier vector, operator state objects, materialized output
-objects/pages/deltas, output schema/fingerprint, previous checkpoint
-pointer/hash, and query-visible version. Query serving and recovery both start
-from the same authoritative checkpoint pointer and then validate the immutable
-manifest it names. Index and latest-cache objects may accelerate lookup, but
-they are advisory only and never replace the pointer or manifest as authority.
+The storage type is `velorix_storage::manifest::CheckpointManifest`; it binds
+checkpoint version, input ranges, state/output object references, optional
+parent checkpoint, and optional relation identity/schema fingerprint. Its
+owner claims are attached to state/output references where applicable. It does
+not itself carry an admitted plan hash, output schema, query-visible version,
+or a content-addressed parent hash. See the separate API `RuntimeCheckpoint`
+contract below for runtime identity, input frontiers, state root, output
+manifest references, owner epoch, input coverage, and causal cut.
+
+The storage latest-candidate marker accelerates lookup of a storage
+`CheckpointManifest`; it does not replace that manifest or its object refs as
+authority. The API's standing-runtime checkpoint pointer selects an immutable
+Arrow checkpoint record and validates that record separately. Do not treat
+these two checkpoint layouts or pointer paths as one interchangeable wire
+format.
+
+Implementation references: [`manifest.rs`](../../crates/velorix-storage/src/manifest.rs),
+[`standing_program.rs`](../../crates/velorix-core/src/standing_program.rs),
+[`checkpoint_index.rs`](../../crates/velorix-storage/src/checkpoint_index.rs),
+and [`checkpoint_publication.rs`](../../crates/velorix-api/src/checkpoint_publication.rs).
 
 ## Latest Candidate
 
@@ -41,12 +54,14 @@ visibility fail closed; they are not treated as advisory marker corruption. A
 corrupt future manifest must be visible to admin inspection so it does not
 permanently hide the last known good checkpoint.
 
-## Modes
+## Lookup and recovery behavior
 
-- `strict`: fail closed on invalid lineage.
-- `admin_inspect`: report invalid manifests and last known good checkpoint.
-- `last_known_good_read_only`: allow read-only recovery from an admin-selected
-  valid checkpoint.
+`CheckpointRecoveryMode` currently distinguishes `latest_candidate` and
+`selected_checkpoint` recovery-transition evidence. `strict`, `admin_inspect`,
+and `last_known_good_read_only` are descriptive behaviors in this document, not
+variants of that Rust enum. Latest lookup fails closed on storage errors and
+invalid lineage; admin inspection reports visible manifests and the latest
+valid checkpoint. Do not infer that admin inspection itself restores a runtime.
 
 The public CLI no longer starts engine recovery directly. It exposes local
 inspection and admin metadata repair commands only; runtime recovery must happen

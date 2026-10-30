@@ -1,6 +1,15 @@
 # Phase 8 — CROSS JOIN (Design)
 
-Status: IMPLEMENTED — `SupportedCrossJoinPlanV1` + `CrossJoinRuntime`.
+Status: Narrow runtime implementation present at baseline `c6222ab` —
+`SupportedCrossJoinPlanV1` + `CrossJoinRuntime`; public view admission reaches
+this family. This is not generic CROSS JOIN composition or unbounded-scale
+qualification. The SQL validator restricts inputs, projection, and shape, and
+the plan carries row/pair resource bounds. See
+[`validate_supported_cross_join_sql`](../../crates/velorix-core/src/view_plan/mod.rs)
+and [`cross_join_materializes_all_pairs_exactly_across_retract_and_restart`]
+(../../crates/velorix-runtime/tests/materialized_view_runtime.rs). Public API
+restart and retraction coverage is also present in
+[`rest_join_families_materialize_retract_and_restart`](../../crates/velorix-api/src/tests.rs).
 
 ## 1. Semantic design
 

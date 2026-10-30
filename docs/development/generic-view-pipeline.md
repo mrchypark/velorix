@@ -224,10 +224,14 @@ are alternatives and branches, not one required linear recipe.
 For new authoritative views, declaring a view and processing input are separate
 operations. A declaration, including one over empty input, is admitted in
 `Deploying` status with a `backfill_required` reason. The current
-demand-mode source allows a query to request materialization or an explicit
-backfill API (`POST /v1/views/{view_id}/backfill`) call to advance it. Declaration
-must not silently replay the entire source. This behavior remains unverified as
-described below.
+demand-mode source allows a query to request bounded materialization or an
+explicit backfill API (`POST /v1/views/{view_id}/backfill`) call to advance it.
+Declaration must not silently replay the entire source. API regression coverage
+includes [`source_appends_leave_declared_views_unbuilt_until_requested`]
+(../../crates/velorix-api/src/generic_demand_materialization_tests.rs) and
+[`demand_scopes_survive_restart_without_skipping_gaps_or_recomputing`]
+(../../crates/velorix-api/src/generic_demand_materialization_tests.rs). These
+tests are source evidence; they were not run during this reconciliation.
 
 Default startup leaves runtime hydration and historical processing deferred; it
 does not restore or catch up the entire active DAG. Durable registry and progress
@@ -283,13 +287,13 @@ does not guarantee a row count, byte size, or small amount of work. Do not assum
 all new operator outputs use native 512-row pages. An exhausted work budget skips
 fallback hydration.
 
-### Demand-driven materialization — validation pending
+### Demand-driven materialization — bounded, source-backed behavior
 
 The demand routes, explicit controls, ordinary-query scope inference, physical
-tumbling-window scope fix (including range B before A), sparse private frontiers,
-and authoritative readiness checks are present in source. This document describes
-the intended current contract; final integration validation remains pending.
-Earlier test results above do not validate these changes.
+tumbling-window scope handling, sparse private frontiers, and authoritative
+readiness checks are present in source with focused API regression tests. This
+reconciliation did not execute those tests. External real-data, whole-DAG
+performance, and deployment qualification remain separate evidence gaps.
 
 The current `POST /v1/views/{view_id}/query` JSON envelope accepts optional
 `materialization.scope.where` (an output-column predicate) and
@@ -343,7 +347,10 @@ The backfill request accepts `scope` (with `where`), `budget`, `action`, and
 `batch_limit` remains a compatibility alias for `budget.batch_limit`; conflicting
 values are rejected. Pause/resume acknowledge control changes with HTTP 200 but
 do not assert completion or start a background worker. A step returns 202 while
-incomplete, paused, or yielded to foreground demand, and 200 when complete.
+incomplete, paused, or yielded to foreground demand, and 200 when the requested
+step or scope is complete at its declared cut. A scoped 200 is not proof that
+the whole view or unrelated scopes are complete; only full-closure progress
+certifies full-view completion.
 
 Declaration records the view without automatically backfilling historical input.
 Startup restores durable progress without starting background historical
@@ -380,9 +387,11 @@ The implemented DAG path conservatively materializes ancestor stages through
 full dependency closure. A narrow predicate on the requested view does not imply
 that the same range is pushed through its ancestors or that ancestor work is small.
 
-The intended response distinction is `202 Accepted` while required work remains
-and `200 OK` only when the requested result is complete at its declared cut. A
-completed subrange may be served while unrelated ranges remain unfinished only
+The response distinction is `202 Accepted` while required work remains and
+`200 OK` when the requested result is complete at its declared cut. This does
+not promise that ingest has already been reflected in every view: authoritative
+demand-managed views can be behind the committed source frontier until a query
+or backfill advances them. A completed subrange may be served while unrelated ranges remain unfinished only
 when its dependency closure and coverage are proven. Advancing the entire
 baseline is not evidence that unfinished requested ranges receive priority;
 request ordering and prioritization need their own integration tests.

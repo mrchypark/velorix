@@ -20,6 +20,7 @@ Each committed ingest object body contains:
 - `relation_id`.
 - `relation_version`.
 - `schema_fingerprint`.
+- optional `event_time_watermark`, bound to the same stream and partition.
 - `payload_digest`.
 - `compression`.
 - `body`: Arrow IPC payload bytes.
@@ -54,10 +55,19 @@ range mutation, or digest-field mutation must fail decode with a typed error.
 
 ## Framing Requirements
 
-The implementation must define a deterministic binary framing before production
-use. The framing must specify magic bytes, header length, header canonical
-serialization, maximum header size, maximum body size, compression enum,
-unknown-field behavior, and typed errors for truncation or unsupported versions.
+The current implementation frames bytes as magic, little-endian `u32` JSON
+header length, JSON header, and Arrow IPC stream body. The digest uses a
+deterministically constructed JSON header without `payload_digest`, followed by
+the stored body. Compression currently accepts only `none`. The decoder
+rejects invalid magic, malformed/truncated headers, unsupported versions,
+formats and compression, digest mismatches, invalid header identity/range, and
+malformed or empty Arrow IPC payloads. No explicit maximum header/body byte
+limits or unknown-header-field rejection are implemented; do not claim those
+bounds from the current V1 codec.
+
+The durable relation weight column is selected by the catalog. The envelope
+codec itself validates the IPC stream and descriptor but does not require a
+literal column named `weight` or require that column to be Int64.
 
 ## Verification
 
@@ -65,5 +75,9 @@ unknown-field behavior, and typed errors for truncation or unsupported versions.
 - Changing only `payload_digest` fails decode.
 - Changing range, relation, schema fingerprint, compression, or body bytes fails
   digest verification.
-- Truncated header/body, oversized header/body, unsupported format, unsupported
-  compression, and malformed Arrow IPC return typed errors.
+- Truncated header, unsupported format/compression, and malformed Arrow IPC
+  return typed errors. Oversized header and body rejection remains
+  unimplemented and unverified.
+
+Current implementation: [ingest_envelope.rs](../../crates/velorix-storage/src/ingest_envelope.rs);
+codec and catalog-append tests: [ingest_envelope.rs tests](../../crates/velorix-storage/tests/ingest_envelope.rs).

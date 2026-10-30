@@ -1,5 +1,11 @@
 # Velorix open-issue priority ledger (2026-09-12)
 
+> Historical triage snapshot at base SHA `350105f`, not a current issue
+> inventory, priority order, CI status, or baseline-code assessment. Preserve
+> its dated evidence as history; verify current issue state and source before
+> acting on an item. Canonical implementation status belongs in
+> [specification.md](specification.md).
+
 Scope is `main` at `350105f` (base SHA for all anchors below). The GitHub inventory contains 30 open issues;
 this ledger covers every one returned by `gh issue list`. Current
 CI and GHCR checks for this SHA are successful. This is a read-only triage;

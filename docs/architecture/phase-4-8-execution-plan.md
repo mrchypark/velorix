@@ -1,5 +1,14 @@
 # Phase 4-8 Execution Plan
 
+**Historical ledger notice:** the status table and suite counts below are dated
+to 2026-08-12 and are not current-head test results. Later dated entries record
+additional narrow implementations, including several Phase 8 families. Keep
+those entries as historical evidence; do not infer public SQL qualification,
+whole-DAG coverage, or benchmark completion from an implementation row. The
+current public admission boundary is summarized in
+[supported SQL](supported-sql.md), with exact test scope retained in the cited
+source.
+
 This document defines the execution plan for completing Phases 4 through 8 of the
 [Incremental SQL Gap-Closure Plan](incremental-sql-gap-plan.md). It provides a
 structured roadmap for advancing Velorix from its current verified baseline to a
@@ -131,15 +140,14 @@ processes.
 These boundaries are deliberate product decisions confirmed by the ChatGPT Pro
 design review; they are enforced by tests, not just documentation.
 
-1. **Phase 5–8 remain gated / future scope.** TUMBLE/HOP/SESSION and
-   ROW_NUMBER/RANK/DENSE_RANK are implemented but rejected on the public 1.0
-   admission path unless `experimental_advanced_view_features` is enabled.
-   Evidence: `public_1_0_rejects_experimental_view_surfaces_by_default`
-   (tests.rs:16244) — all window/ranking SQL returns `BAD_REQUEST` with an
-   "experimental" error on the default public path. Phase 8 items additionally
-   require per-item design documents, state-boundedness specs, retraction
-   algorithms, replay determinism proofs, checkpoint compatibility proofs, and
-   benchmark budgets before implementation (see Phase 8.6).
+1. **Phase 5–8 boundary (2026-08-12 statement; superseded in part).** The
+   default public policy enables event-time windows and gates analytic `OVER`
+   families unless the experimental feature flag is enabled. Since this entry
+   was written, selected Phase 8 families also gained narrow public admission
+   and API restart coverage. This does not make the broader proposals below
+   complete, and an implementation/test row is not benchmark or whole-DAG
+   qualification. See the current per-family boundaries in
+   [supported SQL](supported-sql.md).
 
 2. **Catalog namespace authority boundary.** The meta store is the
    authoritative source-catalog namespace for view admission: a meta-store
@@ -569,17 +577,17 @@ closed at admission and restore (`builtin_udf_typed_projection_materializes_and_
 - [x] **Implement recursive CTE admission and validation**
 - [x] **Add checkpoint codec for fixpoint state**
 - [x] **Define retraction semantics for recursive results**
-- [x] **Implement mutually recursive CTEs (two CTEs referencing each other)**
+- [ ] **Implement mutually recursive CTE execution (two CTEs referencing each other)**
 
-**Current state**: Single and mutually recursive CTEs fully implemented.
-`WITH RECURSIVE` (UNION DISTINCT only, positive anchor/recursive term over
-one registered relation, optional conjunctive base-column predicates) admitted
-through `SupportedRecursiveFixpointPlanV1` with optional `SecondCTEConfigV1`
-for mutual recursion. Runtime maintains a merged derived set from both CTEs'
-anchor rows and evaluates both recursive terms in a single fixpoint loop.
-Evidence:
-`recursive_cte_materializes_closure_exactly_across_retract_restart_and_fail_closed`,
-`mutually_recursive_cte_materializes_bidirectional_closure`.
+**Current state**: The planner validates a narrow `UNION DISTINCT` positive
+fixpoint grammar and can validate a second CTE, but the runtime deliberately
+executes only the first CTE. A second mutually recursive CTE is not evaluated;
+do not report mutual-recursion execution as implemented. Evidence:
+`recursive_fixpoint.rs` documents this boundary, and
+`recursive_cte_ignores_unreachable_second_cte` plus
+`rest_recursive_cte_outer_first_ignores_disjoint_second_cte_across_restore`
+prove the currently selected behavior. The two-CTE execution target remains
+open.
 
 ### 8.6 Pre-Implementation Requirements
 

@@ -1,14 +1,16 @@
 # Storage Contract
 
-Velorix treats object storage as the durable database. Local compute, Foyer
-cache directories, process memory, and worker-local files are disposable. A
-worker has made durable progress only after it publishes a valid checkpoint
-manifest in object storage.
+Object storage is the durable authority for ingest batches and storage
+checkpoint state/manifests. Meta owns separate scoped control records and
+standing-runtime pointers. Local compute, Foyer cache directories, process
+memory, and worker-local files are disposable. Within this storage checkpoint
+contract, a worker has made durable progress only after it publishes a valid
+checkpoint manifest in object storage.
 
-This document describes the current prototype contract. It is readiness
-documentation for the bootstrap implementation, not a claim that production
-layout, compaction, lifecycle management, or multi-worker coordination are
-finished.
+This document combines current storage contracts with readiness requirements.
+Source support for an operation does not by itself establish production
+deployment, whole-DAG recovery, or benchmark qualification; deployment-specific
+gates remain explicit below.
 
 ## Object Key Layout
 
@@ -51,11 +53,11 @@ For v1 read compatibility, manifests whose output refs omit
 the missing metadata as authority. Legacy output refs that point at `v1/ingest`
 are rejected as output key mismatches under the new contract.
 
-The ingest object key layout remains stable. Current bootstrap code paths that
-replay JSON `DeltaBatch` ingest payloads are known violations of the accepted
-ingest contract and must be removed by the Arrow IPC envelope breaking slice.
-No new durable ingest, recovery, query, or standing-view code may depend on JSON
-`DeltaBatch` as an accepted storage format. See
+The ingest object key layout remains stable. Durable ingest/replay now uses the
+Arrow IPC envelope. HTTP request rows and internal runtime/output records may
+still use JSON representations; that does not make JSON `DeltaBatch` an accepted
+`v1/ingest` payload. Raw JSON bytes at that key fail validated replay with a
+typed malformed-envelope error. See
 [Ingest Storage Format Decision](ingest-storage-format-decision.md),
 [Ingest Envelope V1](ingest-envelope-v1.md), and
 [Legacy JSON DeltaBatch Removal](legacy-json-deltabatch-removal.md).
@@ -68,12 +70,19 @@ to durable input admission only. It must not claim that SQL processing,
 materialized view updates, output publication, or checkpoint publication has
 completed.
 
-The public 1.0 relation ingest API uses the higher-level synchronous
-`materialized` acknowledgement described in
-[Materialized View Runtime Roadmap](materialized-view-runtime-roadmap.md) and
-[Ingest Admission Contract](ingest-admission-contract.md). That public
-acknowledgement is still sequential per relation and does not add an atomic
-multi-relation transaction boundary for joins.
+The public relation ingest request currently emits the fixed wire field
+`ack_mode: materialized`, but that label is not a per-view freshness
+certificate. In configured authoritative mode, new demand-managed views are
+skipped during ingest and advanced by query/backfill; existing eager
+checkpoints may still advance. The API-only role can return
+`materialization.status: deferred` while delegating compute. The local path can
+report `completed` after its ingest pass even when demand-managed views were
+intentionally skipped, so callers must inspect per-view progress/coverage.
+Legacy/eager mode applies eligible active views before its materialization pass
+returns. This relation-level sequence does not add an atomic multi-relation
+transaction boundary for joins. See [Ingest Admission Contract](ingest-admission-contract.md)
+and `materialize_prepared_ingest_epoch_for_ack_mode` in
+`crates/velorix-api/src/ingest_epoch.rs`.
 
 A synchronous ingest API should use these meanings:
 
@@ -103,9 +112,12 @@ Committed ingest ranges are half-open intervals. Adjacent ranges such as
 stream/partition are rejected only in modes where admission is serialized by a
 single writer, durable admission index, or write coordinator. Deterministic
 create-only object keys reject identical-key conflicts, but they do not
-atomically reject different-key overlapping ranges. Production multi-writer
-ingest must not advertise range-overlap `409 Conflict` until
-`RangeAdmissionIndexV1` or an equivalent write coordinator is implemented. See
+atomically reject different-key overlapping ranges. The checked
+catalog-aware `IngestAdmissionCoordinator` uses `RangeAdmissionIndexV1`
+transitions and durable admission records to reject overlaps. This source-level
+and harness capability does not establish a deployed multi-writer production
+guarantee: the deployed writer must use the checked path and satisfy the stated
+object-store and topology evidence gates. See
 [Ingest Admission Contract](ingest-admission-contract.md).
 
 Every successful ingest response should include an explicit status body rather
@@ -304,6 +316,13 @@ required capability set, startup must fail closed. Local filesystem emulation is
 dev/test-only and must not be used as evidence that an S3-compatible backend
 satisfies the contract. See
 [Object Store Capabilities V1](object-store-capabilities-v1.md).
+
+Current storage implementation and model definitions are in
+[state.rs](../../crates/velorix-storage/src/state.rs),
+[manifest.rs](../../crates/velorix-storage/src/manifest.rs), and
+[object_key.rs](../../crates/velorix-storage/src/object_key.rs). These establish
+the implemented object/pointer validation paths; they do not establish
+provider-wide or production deployment qualification.
 
 Kubernetes `Lease` acquisition, renewal, and `owner_epoch` assignment remain
 future control-plane work. Kubernetes and etcd are not treated as the durable

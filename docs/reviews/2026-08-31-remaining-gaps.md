@@ -1,5 +1,10 @@
 # Velorix Remaining Gaps Audit — 2026-08-31
 
+> Historical gap audit. The module-integration and issue-status tables are a
+> 2026-08-31 snapshot and must not be read as current findings. Preserve the
+> original assessment; use [specification.md](../specification.md) for current
+> contracts and implementation status.
+
 ## 1. 신규 모듈 미통합 (가장 큰 격차)
 
 **16개 신규 모듈이 모두 standalone 상태** — 실제 runtime/storage 코드에 통합되지 않음.

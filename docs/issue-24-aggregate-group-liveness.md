@@ -1,5 +1,17 @@
 # Issue 24: aggregate group liveness
 
+This is an issue-scoped implementation/evidence note, not issue closure or
+release acceptance. Its dated local test results remain historical; current
+source contracts are in
+[`single_key_aggregate.rs`](../crates/velorix-runtime/src/materialized_view_runtime/single_key_aggregate.rs),
+[`materialized_view_runtime.rs`](../crates/velorix-runtime/src/materialized_view_runtime.rs),
+and [`view_plan/mod.rs`](../crates/velorix-core/src/view_plan/mod.rs).
+The cited API regressions are in
+[`tests.rs`](../crates/velorix-api/src/tests.rs), including
+`rest_filtered_aggregate_retains_zero_and_all_filtered_groups_across_restart_retraction`.
+External-store fault injection and deployment recovery remain explicitly
+outside the cited local tests.
+
 Status: partial implementation and focused validation. This note does not
 close Issue 24 or claim production, cluster, or external-object-store proof.
 

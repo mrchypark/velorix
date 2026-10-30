@@ -1,5 +1,10 @@
 # OpenData Package Review
 
+> Dated architecture research and adoption proposal. This is not a current
+> dependency approval or implementation status report. The recommendation to
+> evaluate OpenData before adopting it remains a proposal; consult the current
+> [specification](../specification.md) and Cargo manifests for product facts.
+
 Reviewed source:
 [opendata-oss/opendata](https://github.com/opendata-oss/opendata) at
 `0961492a72bc5911f44f782f774ede233af8778e` (2026-04-30).

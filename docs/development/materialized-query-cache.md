@@ -120,12 +120,23 @@ There are no additional cache metrics knobs.
 
 ## Read-cache integration points
 
-The cache is consulted only where an immutable published byte range is read:
+The cache is consulted only for immutable objects selected by fresh authority:
 
 - bounded checkpoint fragment and descriptor reads,
 - published materialized output page reads, including their codec, hash and
   root-binding validation,
 - demand-view output reads that resolve an immutable page or manifest.
+- demand materialization's physical ingest-envelope inputs. Their keys bind the
+  configured authority store and namespace, relation identity, stream/partition,
+  object path/digest, and a hash of the validated demand-source artifact.
+
+Derived published-view inputs are resolved through producer checkpoint cursors
+and frozen published cuts; they are not reclassified as physical ingest source
+artifacts in the consumer's source-cut list. Admission separately walks
+published-view parents to validate physical history roots and their relation
+generation/schema identities. This establishes identity propagation through
+the dependency graph, but does not make a consumer cache key an authority for
+an upstream source or checkpoint.
 
 Mutable view heads, checkpoint selection metadata, and LIST-based discovery
 stay authoritative and are never served from cache. Reads that lack a fresh
@@ -144,7 +155,11 @@ generic SQL views. The variable name is retained for compatibility with
 existing deployments; only its value is unsupported.
 
 See [the cache implementation](../../crates/velorix-api/src/materialized_read_cache.rs)
-for its embedding interfaces and synthetic lifecycle tests.
+for its embedding interfaces and synthetic lifecycle tests. Physical demand
+source key construction and validation live in
+[`demand_source.rs`](../../crates/velorix-api/src/demand_source.rs), with
+integration coverage in
+[`generic_demand_materialization_tests.rs`](../../crates/velorix-api/src/generic_demand_materialization_tests.rs).
 
 ## Conservative page pruning
 
@@ -254,9 +269,11 @@ decoding; it is separate from the cache close/reopen test.
 For a small manual correctness check, register a `left_table` schema with UTF-8
 `key_col` and integer `amount` columns. Register a `right_table` schema with
 UTF-8 `key_col` and `category` columns and an integer `value_col` column.
-Use the API's configured weight column for generated ingest updates. Admit
-these view definitions through the normal view API before ingesting generated
-rows; give each view a distinct output relation identifier:
+Send business rows without an engine multiplicity field. Use an update or
+upsert operation envelope when replacing values; Velorix generates signed
+retractions internally. Admit these view definitions through the normal view
+API before ingesting generated rows; give each view a distinct output relation
+identifier:
 
 ```sql
 SELECT key_col, amount FROM left_table WHERE amount > 0;

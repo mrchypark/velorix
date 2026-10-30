@@ -1,5 +1,13 @@
 # Phase 4 Design Review Packet
 
+> Historical design-review packet. Its “Current Architecture” and gap lists
+> describe the packet's review-time snapshot, not baseline
+> `c6222abd054858109c90a63a061db698fa9fc9e8`: current code now contains
+> dependency-edge validation, cycle/topological graph validation, published
+> relation bindings, lineage cursors, and DAG-focused API tests. This does not
+> by itself establish complete DAG semantics or production qualification.
+> See [specification.md](../specification.md) for the canonical current status.
+
 ## Title
 [CODEX→PRO] Velorix — Phase 4: View-on-View Incremental Dependencies Design Review
 

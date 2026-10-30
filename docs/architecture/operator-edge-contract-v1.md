@@ -151,9 +151,13 @@ Join planning uses `lower_join_chain_to_binary_dag`. It folds an ordered list of
 join steps into a left-deep chain of ordinary `InnerEquiJoin` or `LeftEquiJoin`
 nodes, so adding a third or later input does not introduce an N-way logical or
 physical operator. The admitted two-input SQL path uses the same fold with one
-step. Public N-way SQL remains fail closed until the general-join phase supplies
-catalog binding, semantic join-order proofs, runtime construction, and end-to-end
-evidence; this Foundation item fixes the required lowering shape only.
+step. The current public path also admits one narrow three-input inner-join
+family with complete composite primary-key equalities and root-key grouped
+`COUNT(*)`; this does not establish general N-way SQL. Other wider join
+combinations remain fail closed. See
+[`validate_supported_three_input_inner_join_count_sql`](../../crates/velorix-core/src/view_plan/mod.rs)
+and [`rest_three_input_composite_pk_join_uses_binary_dag_and_survives_restart`]
+(../../crates/velorix-api/src/tests.rs).
 
 `RIGHT [OUTER] JOIN` does not have a logical node or runtime state machine.
 Admission swaps its SQL operands, aliases, source predicates, and key-column
@@ -161,9 +165,10 @@ bindings, then applies the narrow-left rules. Output bindings retain the SQL
 right-side column identities. Thus unmatched-row maintenance, checkpointing,
 and replay use the existing `LeftEquiJoin` path.
 
-There is likewise no subquery logical or physical operator. Identity, direct
-projection, and filter-only CTE/derived sources are admitted only after they
-have been inlined into the existing scan/filter/project graph. Scalar,
-correlated, aggregate-derived, and otherwise undecorrelated subqueries fail
-closed. A future decorrelator may broaden SQL only by producing the same typed
-relational nodes and passing the complete edge-capability validator.
+There is no general subquery logical or physical operator. Current admission
+inlines bounded identity/filter/project and selected aggregate CTE forms, and
+decorrelates narrow `IN`, `EXISTS`/`NOT EXISTS`, scalar-aggregate-filter, and
+recursive CTE shapes into existing typed plans or dedicated runtime families.
+Other correlated, scalar, aggregate-derived, or otherwise unsupported
+subqueries fail closed. These admitted rewrites do not establish arbitrary
+subquery support; each family has separate validators and runtime coverage.

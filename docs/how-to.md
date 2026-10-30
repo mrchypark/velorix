@@ -13,6 +13,12 @@ This setup is for local development only. It deliberately disables API
 authentication and multi-writer fencing. Do not use these settings for a
 shared or production deployment. Metadata lives in the development Meta process;
 this guide does not demonstrate recovery after that process restarts.
+The configured API defaults to authoritative relation ingest and demand
+materialization. New views defer historical work; ingest publishes source data
+without eagerly applying those views. A query advances bounded work and can
+return HTTP 202 while materialization is incomplete, or HTTP 200 when its
+requested work completes. Explicit backfill is also available. Legacy/eager
+behavior is a separate mode and is not what this guide configures.
 
 ## Prerequisites
 
@@ -108,6 +114,7 @@ export VELORIX_S3_BUCKET=velorix-local
 export VELORIX_S3_PREFIX=quickstart
 export VELORIX_META_GRPC_ENDPOINT=http://127.0.0.1:9090
 export VELORIX_META_BEARER_TOKEN=velorix-local-meta-token
+export VELORIX_RELATION_INGEST_OWNER_ID=velorix-local-ingest-owner
 export VELORIX_API_BIND=127.0.0.1:8080
 export VELORIX_API_ALLOW_UNAUTHENTICATED_DEV=1
 export VELORIX_STANDING_RUNTIME_FENCING=unsafe-dev-only
@@ -258,8 +265,7 @@ This quickstart registers a `scores` relation. It has these columns:
 | Column | Type | Role |
 | --- | --- | --- |
 | `user_id` | UTF-8 string | primary key |
-| `score` | signed 64-bit integer | value |
-| `delta` | signed 64-bit integer | row weight |
+| `score` | signed 64-bit integer | business value |
 
 Create the relation:
 
@@ -269,28 +275,19 @@ curl -fsS -X POST \
   -H 'content-type: application/json' \
   -d '{
     "catalog": {
-      "schema_version": 1,
+      "adapter_id": "incremental-adapter-single-key-sum-count-v1",
       "relation_schema": {
         "relation_id": "scores",
         "relation_name": "scores",
         "relation_version": "2026-05-24.v1",
         "columns": [
-          {"column_id":"user_id","name":"user_id","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0,"semantic_role":"primary_key"},
-          {"column_id":"score","name":"score","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1,"semantic_role":"value"},
-          {"column_id":"delta","name":"delta","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":2,"semantic_role":"weight"}
+          {"column_id":"user_id","name":"user_id","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0},
+          {"column_id":"score","name":"score","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1}
         ],
         "primary_key_column_ids": ["user_id"],
-        "weight_column_id": "delta",
-        "allowed_operations": ["insert", "delete"],
+        "allowed_operations": ["insert", "update", "upsert"],
         "event_time_column_id": null
-      },
-      "schema_fingerprint": "sha256:1e257147b96f379bbe4bfc98782f8cd1f019ed0bdd17532fb72901126000cc77",
-      "datafusion_registration": {"name":"scores","mode":"table"},
-      "incremental_relation": {
-        "relation_id": "scores",
-        "schema_fingerprint": "sha256:1e257147b96f379bbe4bfc98782f8cd1f019ed0bdd17532fb72901126000cc77"
-      },
-      "incremental_adapter": {"adapter_id":"incremental-adapter-single-key-sum-count-v1"}
+      }
     }
   }'
 ```
@@ -313,8 +310,11 @@ curl -fsS -X POST \
   }'
 ```
 
-Creating the view does not complete authoritative activation: ingest the first
-batch, then backfill before querying.
+Creating the view defers materialization. After ingest, the first query can
+perform a bounded demand step; if work remains, it returns HTTP 202 with
+materialization progress. Continue the request or use explicit backfill until
+the full view is materialized. The sequence below uses explicit backfill so its
+final query reads a complete result.
 
 The view response should contain:
 
@@ -322,7 +322,7 @@ The view response should contain:
 {
   "view_id": "positive_scores_by_user",
   "execution_mode": "standing_runtime",
-  "query_enabled": true,
+  "query_enabled": false,
   "outcome": "created"
 }
 ```
@@ -340,11 +340,12 @@ curl -fsS -X POST \
     "stream_id": "quickstart",
     "partition_id": 0,
     "start_offset_inclusive": 0,
+    "row_format": "business_rows",
     "rows": [
-      {"user_id": "ada", "score": 10, "delta": 1},
-      {"user_id": "ada", "score": 15, "delta": 1},
-      {"user_id": "ada", "score": -7, "delta": 1},
-      {"user_id": "grace", "score": 4, "delta": 1}
+      {"user_id": "ada", "score": 10},
+      {"user_id": "ada", "score": 15},
+      {"user_id": "ada", "score": -7},
+      {"user_id": "grace", "score": 4}
     ]
   }'
 ```
@@ -457,75 +458,79 @@ curl -sS -i -X POST \
 
 ## Custom Relations
 
-`POST /v1/relations` accepts an explicit relation catalog. Create only the
-canonical `VelorixRelationSchemaV1` input; the CLI computes the fingerprint,
-copies it into every required binding, constructs the table registration, and
-validates the selected ingest adapter.
+`POST /v1/relations` accepts the public catalog shape. List business columns
+and their key/operation metadata; Velorix derives internal catalog fields.
+`adapter_id` is optional and defaults to `incremental-adapter-generic-v1`.
 
-Save this example as `/tmp/src-table-schema.json`:
+```json
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations \
+  -H 'content-type: application/json' \
+  -d '{"catalog":{"adapter_id":"incremental-adapter-generic-v1","relation_schema":{"relation_id":"src_table","relation_name":"src_table","relation_version":"v1","columns":[{"column_id":"key_col","name":"key_col","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0},{"column_id":"value_col","name":"value_col","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1}],"primary_key_column_ids":["key_col"],"allowed_operations":["insert","update","upsert"],"event_time_column_id":null}}}'
+```
+
+Then submit business rows. A plain row is an insert; do not include any
+engine-maintained multiplicity field:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/src_table/ingest \
+  -H 'content-type: application/json' \
+  -d '{"relation_version":"v1","stream_id":"src-table-stream","partition_id":0,"start_offset_inclusive":0,"row_format":"business_rows","rows":[{"key_col":"a","value_col":7}]}'
+```
+
+To replace that row, submit an update envelope at the next input offset. The
+before and after payloads contain business fields only; Velorix generates the
+retraction and replacement weights internally:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/src_table/ingest \
+  -H 'content-type: application/json' \
+  -d '{"relation_version":"v1","stream_id":"src-table-stream","partition_id":0,"start_offset_inclusive":1,"row_format":"operation_envelopes","rows":[{"operation":"update","before":{"key_col":"a","value_col":7},"after":{"key_col":"a","value_col":9}}]}'
+```
+
+Column names such as `weight`, `delta`, and `operation` remain available as
+ordinary business columns when declared in the schema. Because `operation`
+also discriminates update envelopes, a complete business row that matches a
+recognized operation-envelope shape is rejected as ambiguous. `delete` may
+appear in relation operation metadata, but public DELETE ingest is unsupported.
+Set `row_format` to `business_rows` when the row is business data that also
+matches an envelope shape, or to `operation_envelopes` when it is an operation.
+For example, when a relation declares `operation` (UTF-8) and `before`/`after`
+(JSON) as business columns, send the raw values with an explicit format:
 
 ```json
 {
-  "relation_id": "src_table",
-  "relation_name": "src_table",
   "relation_version": "v1",
-  "columns": [
-    {
-      "column_id": "key_col",
-      "name": "key_col",
-      "logical_type": {"kind": "utf8"},
-      "physical_arrow_type": {"kind": "utf8"},
-      "nullable": false,
-      "ordinal": 0,
-      "semantic_role": "primary_key"
-    },
-    {
-      "column_id": "value_col",
-      "name": "value_col",
-      "logical_type": {"kind": "int64"},
-      "physical_arrow_type": {"kind": "int64"},
-      "nullable": false,
-      "ordinal": 1,
-      "semantic_role": "value"
-    },
-    {
-      "column_id": "weight",
-      "name": "weight",
-      "logical_type": {"kind": "int64"},
-      "physical_arrow_type": {"kind": "int64"},
-      "nullable": false,
-      "ordinal": 2,
-      "semantic_role": "weight"
-    }
-  ],
-  "primary_key_column_ids": ["key_col"],
-  "weight_column_id": "weight",
-  "allowed_operations": ["insert", "delete"],
-  "event_time_column_id": null
+  "stream_id": "src-table-stream",
+  "partition_id": 0,
+  "start_offset_inclusive": 2,
+  "row_format": "business_rows",
+  "rows": [{"operation":"update","before":{"key_col":"a","value_col":7},"after":{"key_col":"a","value_col":9}}]
 }
 ```
 
-Generate the exact API request body and register it:
+Omitting `row_format` auto-detects unambiguous rows and fails only when the
+same row is valid both as a complete business record and as an operation
+envelope. Choosing a format has observable effect only for those ambiguous
+rows. Neither format accepts an engine multiplicity value from the caller.
+
+The multi-relation endpoint puts `row_format` on each batch, so batches in one
+request may choose their interpretation independently:
 
 ```bash
-cargo run -q -p velorix-cli -- relation-catalog \
-  --schema /tmp/src-table-schema.json \
-  --adapter-id incremental-adapter-generic-v1 \
-  > /tmp/src-table-relation.json
-
-curl -fsS -X POST \
-  http://127.0.0.1:8080/v1/relations \
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/ingest \
   -H 'content-type: application/json' \
-  --data-binary @/tmp/src-table-relation.json
+  -d '{"batches":[{"relation_id":"src_table","relation_version":"v1","stream_id":"src-table-stream","partition_id":0,"start_offset_inclusive":1,"row_format":"operation_envelopes","rows":[{"operation":"update","before":{"key_col":"a","value_col":7},"after":{"key_col":"a","value_col":9}}]}]}'
 ```
 
-Use `--schema -` to read the schema explicitly from standard input. Both
-`--schema` and `--adapter-id` are required; Velorix does not guess an adapter.
-The general custom-relation adapter is
-`incremental-adapter-generic-v1`. The narrower built-in adapter IDs remain
-available only when their schema compatibility checks pass. Invalid JSON,
-unknown fields, unsupported adapters, and adapter/schema mismatches exit
-non-zero without producing a request body.
+Authoritative mode accepts one batch per request; this endpoint does not make
+multiple relation batches an atomic transaction.
+
+Request-shape errors return HTTP `422`: for example, an unknown/private field
+in relation registration or an invalid `row_format` enum value. A request that
+parses but fails relation-schema or row/operation validation returns HTTP `400`.
+For example, an ambiguous row without an explicit format or a malformed
+operation envelope is a semantic `400`, not a request-shape `422`.
 
 The complete materialized-view SQL contract, including every supported feature
 class and the fail-closed unsupported classes, is in
@@ -554,34 +559,32 @@ Save this canonical schema as `/tmp/purchases-event-time-schema.json`:
 
 ```json
 {
-  "relation_id": "purchases",
-  "relation_name": "purchases",
-  "relation_version": "v1",
-  "columns": [
-    {"column_id":"user_id","name":"user_id","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0,"semantic_role":"primary_key"},
-    {"column_id":"amount","name":"amount","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1,"semantic_role":"value"},
-    {"column_id":"event_time","name":"event_time","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":2,"semantic_role":"event_time"},
-    {"column_id":"delta","name":"delta","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":3,"semantic_role":"weight"}
-  ],
-  "primary_key_column_ids": ["user_id"],
-  "weight_column_id": "delta",
-  "allowed_operations": ["insert", "delete"],
-  "event_time_column_id": "event_time"
+  "catalog": {
+    "adapter_id": "incremental-adapter-generic-v1",
+    "relation_schema": {
+      "relation_id": "purchases",
+      "relation_name": "purchases",
+      "relation_version": "v1",
+      "columns": [
+        {"column_id":"user_id","name":"user_id","logical_type":{"kind":"utf8"},"physical_arrow_type":{"kind":"utf8"},"nullable":false,"ordinal":0},
+        {"column_id":"amount","name":"amount","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":1},
+        {"column_id":"event_time","name":"event_time","logical_type":{"kind":"int64"},"physical_arrow_type":{"kind":"int64"},"nullable":false,"ordinal":2}
+      ],
+      "primary_key_column_ids": ["user_id"],
+      "allowed_operations": ["insert", "update", "upsert"],
+      "event_time_column_id": "event_time"
+    }
+  }
 }
 ```
 
-The CLI computes the catalog bindings and fingerprint; the API does not infer
-the event-time schema from the SQL:
+Register the public schema directly; the event-time column is explicit and is
+not inferred from the SQL:
 
 ```sh
-cargo run -q -p velorix-cli -- relation-catalog \
-  --schema /tmp/purchases-event-time-schema.json \
-  --adapter-id incremental-adapter-generic-v1 \
-  > /tmp/purchases-event-time-relation.json
-
 curl -fsS -X POST http://127.0.0.1:8080/v1/relations \
   -H 'content-type: application/json' \
-  --data-binary @/tmp/purchases-event-time-relation.json
+  --data-binary @/tmp/purchases-event-time-schema.json
 
 curl -fsS -X POST http://127.0.0.1:8080/v1/views \
   -H 'content-type: application/json' --data-binary '{
@@ -613,14 +616,15 @@ retention durations remain admission errors.
 Ingest two rows and explicitly advance this partition's watermark to 60 seconds:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:8080/v1/ingest \
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/purchases/ingest \
   -H 'content-type: application/json' --data-binary '{
-    "relation_id":"purchases","relation_version":"v1",
+    "relation_version":"v1",
     "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":0,
+    "row_format":"business_rows",
     "event_time_watermark":{"event_time_column_id":"event_time","max_observed_event_time_ns":70000000000,"watermark_ns":60000000000},
     "rows":[
-      {"user_id":"alice","amount":10,"event_time":10000000000,"delta":1},
-      {"user_id":"alice","amount":7,"event_time":70000000000,"delta":1}
+      {"user_id":"alice","amount":10,"event_time":10000000000},
+      {"user_id":"alice","amount":7,"event_time":70000000000}
     ]
   }'
 
@@ -636,54 +640,60 @@ the `[60, 120 seconds)` window is still open. Send a late row at 30 seconds whil
 keeping the watermark at 60 seconds:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:8080/v1/ingest \
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/purchases/ingest \
   -H 'content-type: application/json' --data-binary '{
-    "relation_id":"purchases","relation_version":"v1",
+    "relation_version":"v1",
     "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":2,
+    "row_format":"business_rows",
     "event_time_watermark":{"event_time_column_id":"event_time","max_observed_event_time_ns":70000000000,"watermark_ns":60000000000},
-    "rows":[{"user_id":"alice","amount":5,"event_time":30000000000,"delta":1}]
+    "rows":[{"user_id":"alice","amount":5,"event_time":30000000000}]
   }'
 ```
 
 Query the same endpoint again: the already published row now has
-`total_amount=15` and `event_count=2`. Retract that exact row with signed weight
-`-1` at the next offset:
+`total_amount=15` and `event_count=2`. Public DELETE input is unsupported, and
+the request has no caller-supplied multiplicity field. Correct the row with an
+UPDATE envelope; Velorix creates the signed retraction internally:
 
 ```sh
-curl -fsS -X POST http://127.0.0.1:8080/v1/ingest \
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/purchases/ingest \
   -H 'content-type: application/json' --data-binary '{
-    "relation_id":"purchases","relation_version":"v1",
+    "relation_version":"v1",
     "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":3,
+    "row_format":"operation_envelopes",
     "event_time_watermark":{"event_time_column_id":"event_time","max_observed_event_time_ns":70000000000,"watermark_ns":60000000000},
-    "rows":[{"user_id":"alice","amount":5,"event_time":30000000000,"delta":-1}]
+    "rows":[{"operation":"update","before":{"user_id":"alice","amount":5,"event_time":30000000000},"after":{"user_id":"alice","amount":1,"event_time":30000000000}}]
   }'
 
-curl -fsS -X POST http://127.0.0.1:8080/v1/ingest \
+curl -fsS -X POST http://127.0.0.1:8080/v1/relations/purchases/ingest \
   -H 'content-type: application/json' --data-binary '{
-    "relation_id":"purchases","relation_version":"v1",
-    "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":4,
+    "relation_version":"v1",
+    "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":5,
+    "row_format":"business_rows",
     "event_time_watermark":{"event_time_column_id":"event_time","max_observed_event_time_ns":180000000000,"watermark_ns":180000000000},
-    "rows":[{"user_id":"alice","amount":1,"event_time":180000000000,"delta":1}]
+    "rows":[{"user_id":"alice","amount":1,"event_time":180000000000}]
   }'
 ```
 
-The retraction restores the first row to total 10/count 1. Advancing `W` to 180
+The update replaces the old row with the corrected value. Advancing `W` to 180
 seconds reaches its hot-retention boundary `end <= W - H`
 (`60 <= 180 - 120`); the runtime recovers durable cold state for later corrections while the
 published row remains queryable. The second window is published with total
-7/count 1. Send a far-late correction at event time 30 seconds with next offset
-5 and watermark 180 seconds. The required ingest result is HTTP 201 Created,
+7/count 1. Send a far-late UPDATE replacing the corrected event at 30 seconds
+with its revised amount, at offset 6 and watermark 180 seconds. The required
+ingest result is HTTP 201 Created,
 followed by a query returning HTTP 200 with the old `[0, 60 seconds)` row
 changing to total 15/count 2. API regression tests verify this behavior;
 the commands below are not recorded live-service evidence:
 
 ```sh
-curl -sS -i -X POST http://127.0.0.1:8080/v1/ingest \
+curl -sS -i -X POST http://127.0.0.1:8080/v1/relations/purchases/ingest \
   -H 'content-type: application/json' --data-binary '{
-    "relation_id":"purchases","relation_version":"v1",
-    "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":5,
+    "relation_version":"v1",
+    "stream_id":"purchases-stream","partition_id":0,"start_offset_inclusive":6,
+    "row_format":"operation_envelopes",
     "event_time_watermark":{"event_time_column_id":"event_time","max_observed_event_time_ns":180000000000,"watermark_ns":180000000000},
-    "rows":[{"user_id":"alice","amount":5,"event_time":30000000000,"delta":1}]
+    "rows":[{"operation":"update","before":{"user_id":"alice","amount":1,"event_time":30000000000},"after":{"user_id":"alice","amount":5,"event_time":30000000000}}]
   }'
 ```
 
@@ -768,10 +778,11 @@ an already verified executable to skip the download, or pass an output path as
 the first argument to avoid replacing the archive.
 
 The runner evaluates every admitted sink after initial load, insert, update,
-delete, process restart, and tail replay. Each phase is compared with an
+source removal, process restart, and tail replay. Each phase is compared with an
 independent DuckDB batch recomputation. Because GreptimeDB does not accept SQL
-`UPDATE`, the corpus update is represented as the equivalent primary-key delete
-followed by insert, and the artifact records that input semantic explicitly.
+`UPDATE`, the external comparison corpus models an update as a primary-key delete
+followed by insert; that is benchmark input semantics, not a Velorix public-ingest
+request. The artifact records the comparator's input semantic explicitly.
 Admission errors and observed stale sink rows remain `unsupported` or `failed`;
 the runner does not hide them with source recomputation.
 

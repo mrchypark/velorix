@@ -7,6 +7,14 @@ Kubernetes evidence for the exercised operator paths; object-store authority
 evidence still has to come from Versity Gateway/S3-compatible storage instead of the
 run-local filesystem slices used by some tests.
 
+The checked-in gate is implemented by `scripts/run-vind-k8s-gate.sh` and
+`.github/workflows/k8s-vind.yml`. A successful gate only establishes the
+recorded Kubernetes paths; it does not establish deployed multi-pod ingest,
+external object-store durability, or release readiness. The CI baseline at
+`c6222abd054858109c90a63a061db698fa9fc9e8` is recorded in
+[production-readiness-status.md](../architecture/production-readiness-status.md);
+it does not say that this manual live-cluster gate ran.
+
 Prerequisites:
 
 ```bash
@@ -87,8 +95,8 @@ scripts/run-vind-k8s-gate.sh
 By default, the gate creates a run-owned `velorix-vind-*` vCluster, deletes
 that cluster on exit, and writes
 `target/velorix-k8s/vind-k8s-gate-evidence.json` with the cluster context,
-namespace, applied CRDs, tool versions, and live k8s test set. The artifact is
-writes live Kubernetes evidence for the exercised paths, but it does not by
+namespace, applied CRDs, tool versions, and live k8s test set. The artifact
+records live Kubernetes evidence for the exercised paths, but it does not by
 itself claim multi-pod production ingest-admission readiness or Versity Gateway/S3-backed
 object-store authority. On failure, the gate
 writes `target/velorix-k8s/vind-k8s-gate-diagnostics.txt` before cleaning up
