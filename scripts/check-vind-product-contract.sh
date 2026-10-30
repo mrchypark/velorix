@@ -2,6 +2,54 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
+check_product_docker_contexts() {
+  local root="$1"
+  local dockerfile crate
+  for dockerfile in Dockerfile.api Dockerfile.meta Dockerfile.ingest-writer Dockerfile.all-in-one; do
+    if ! grep -F 'COPY third_party ./third_party' "$root/$dockerfile" >/dev/null; then
+      echo "$dockerfile must copy third_party into the Cargo build context" >&2
+      return 1
+    fi
+  done
+  for crate in arrow-ipc-59.3.0 parquet-59.3.0 foyer-storage-0.22.6; do
+    if [ ! -f "$root/third_party/$crate/Cargo.toml" ] ||
+      ! grep -F "path = \"third_party/$crate\"" "$root/Cargo.toml" >/dev/null; then
+      echo "local Cargo patch source is missing from Docker build context: $crate" >&2
+      return 1
+    fi
+  done
+}
+
+check_product_docker_contexts "$repo_root"
+
+# Replay the reported missing-context failure against a tiny fixture, then
+# verify the corrected COPY contract accepts that same fixture.
+docker_context_fixture="$(mktemp -d)"
+trap 'rm -rf "$docker_context_fixture"' EXIT
+mkdir -p "$docker_context_fixture/third_party"
+for dockerfile in Dockerfile.api Dockerfile.meta Dockerfile.ingest-writer Dockerfile.all-in-one; do
+  printf '%s\n' 'COPY Cargo.toml Cargo.lock ./' 'COPY crates ./crates' >"$docker_context_fixture/$dockerfile"
+done
+cat >"$docker_context_fixture/Cargo.toml" <<'EOF'
+[patch.crates-io]
+arrow-ipc = { path = "third_party/arrow-ipc-59.3.0" }
+parquet = { path = "third_party/parquet-59.3.0" }
+foyer-storage = { path = "third_party/foyer-storage-0.22.6" }
+EOF
+for crate in arrow-ipc-59.3.0 parquet-59.3.0 foyer-storage-0.22.6; do
+  mkdir -p "$docker_context_fixture/third_party/$crate"
+  : >"$docker_context_fixture/third_party/$crate/Cargo.toml"
+done
+if check_product_docker_contexts "$docker_context_fixture" >/dev/null 2>&1; then
+  echo "Docker build context contract failed to catch the missing-third_party regression" >&2
+  exit 1
+fi
+for dockerfile in Dockerfile.api Dockerfile.meta Dockerfile.ingest-writer Dockerfile.all-in-one; do
+  printf '%s\n' 'COPY third_party ./third_party' >>"$docker_context_fixture/$dockerfile"
+done
+check_product_docker_contexts "$docker_context_fixture"
+echo "product Docker context shell contract passed, including missing-third_party failure replay"
+
 sh "${repo_root}/scripts/check-rhiza-go-toolchain-contract.sh"
 script_path="${repo_root}/scripts/run-vind-product.sh"
 bash "${repo_root}/scripts/check-vind-external-meta-contract.sh"
