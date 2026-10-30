@@ -114,6 +114,7 @@ fn check_config_with_vars(vars: &HashMap<String, String>) -> anyhow::Result<Meta
 
 async fn serve() -> anyhow::Result<()> {
     let config = parse_meta_serve_config_from_env()?;
+    let mut shutdown = shutdown_receiver().await;
     #[cfg(feature = "rhiza-backend")]
     let (store, local_rhiza) = match config.rhiza.as_ref() {
         Some(RhizaServeConfig::Explicit(explicit)) if explicit.local => {
@@ -121,7 +122,12 @@ async fn serve() -> anyhow::Result<()> {
             let store: Arc<dyn MetaStore> = Arc::new(RhizaKvMetaStore::new(kv.clone()));
             (store, Some(kv))
         }
-        _ => (meta_store_from_config(&config).await?, None),
+        _ => {
+            let Some(store) = meta_store_from_config(&config, &mut shutdown).await? else {
+                return Ok(());
+            };
+            (store, None)
+        }
     };
     #[cfg(not(feature = "rhiza-backend"))]
     let store = meta_store_from_config(&config).await?;
@@ -134,7 +140,15 @@ async fn serve() -> anyhow::Result<()> {
     // until a quorum-backed operation succeeds, so a learner that has not been
     // promoted yet never answers metadata requests. That readiness distinction
     // is the same one native reports on `/recovery/status`.
-    if let Err(error) = wait_for_meta_store_readiness(&config, &store).await {
+    let Some(readiness) = shutdown_or(
+        shutdown_requested(&mut shutdown),
+        wait_for_meta_store_readiness(&config, &store),
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    if let Err(error) = readiness {
         if !rhiza_operator_managed_learner(&config) {
             return Err(error);
         }
@@ -151,15 +165,19 @@ async fn serve() -> anyhow::Result<()> {
             "operator-managed learner has no quorum yet, so Velorix metadata traffic stays closed while it keeps re-probing: {error}"
         );
         let probe_store = Arc::clone(&store);
-        await_meta_store_quorum(
+        let reached_quorum = await_meta_store_quorum_or_shutdown(
             move || {
                 let store = Arc::clone(&probe_store);
                 async move { store.read_meta_store_capabilities().await.map(|_| ()) }
             },
             QUORUM_REPROBE_INITIAL_DELAY,
             QUORUM_REPROBE_MAX_DELAY,
+            shutdown_requested(&mut shutdown),
         )
         .await?;
+        if !reached_quorum {
+            return Ok(());
+        }
         eprintln!("operator-managed learner now has a quorum, so Velorix metadata traffic opens");
     }
     let service = match config.bearer_token.clone() {
@@ -198,7 +216,7 @@ async fn serve() -> anyhow::Result<()> {
                         .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
                         .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
                 )
-                .serve_with_shutdown(config.bind, shutdown_signal())
+                .serve_with_shutdown(config.bind, shutdown_requested(&mut shutdown))
                 .await?;
         } else {
             Server::builder()
@@ -207,7 +225,7 @@ async fn serve() -> anyhow::Result<()> {
                         .max_decoding_message_size(MAX_META_GRPC_MESSAGE_BYTES)
                         .max_encoding_message_size(MAX_META_GRPC_MESSAGE_BYTES),
                 )
-                .serve_with_shutdown(config.bind, shutdown_signal())
+                .serve_with_shutdown(config.bind, shutdown_requested(&mut shutdown))
                 .await?;
         }
         Ok(())
@@ -238,21 +256,47 @@ async fn serve() -> anyhow::Result<()> {
     server_result
 }
 
-async fn shutdown_signal() {
+async fn shutdown_receiver() -> tokio::sync::watch::Receiver<bool> {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
     #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("install SIGINT handler");
+    tokio::spawn(async move {
+        #[cfg(unix)]
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
             _ = terminate.recv() => {},
+            _ = interrupt.recv() => {},
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        sender.send_replace(true);
+    });
+    receiver
+}
+
+async fn shutdown_requested(receiver: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
         }
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c()
-        .await
-        .expect("install Ctrl-C handler");
+}
+
+async fn shutdown_or<T, W, S>(shutdown: S, work: W) -> Option<T>
+where
+    W: Future<Output = T>,
+    S: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        () = shutdown => None,
+        result = work => Some(result),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1960,6 +2004,31 @@ fn smoke_tls_config(config: &MetaSmokeConfig) -> anyhow::Result<Option<GrpcClien
 /// An opened metadata store plus the concrete handles a backend may need for
 /// its own startup probe. Holding the concrete Rhiza handle keeps `MetaStore`
 /// free of a Rhiza-only readiness method that no other backend could honor.
+#[cfg(feature = "rhiza-backend")]
+async fn meta_store_from_config(
+    config: &MetaServeConfig,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<Arc<dyn MetaStore>>> {
+    match config.backend {
+        MetaBackendKind::Memory => Ok(Some(Arc::new(InMemoryMetaStore::default()))),
+        MetaBackendKind::RhizaKv => {
+            rhiza_meta_store_from_config(
+                config
+                    .rhiza
+                    .as_ref()
+                    .expect("Rhiza config is parsed for the Rhiza backend"),
+                config.readiness_timeout,
+                shutdown,
+            )
+            .await
+        }
+        MetaBackendKind::Oss => Ok(Some(Arc::new(OssMetaStore::new(
+            oss_object_store_from_env()?,
+        )))),
+    }
+}
+
+#[cfg(not(feature = "rhiza-backend"))]
 async fn meta_store_from_config(config: &MetaServeConfig) -> anyhow::Result<Arc<dyn MetaStore>> {
     match config.backend {
         MetaBackendKind::Memory => Ok(Arc::new(InMemoryMetaStore::default())),
@@ -2048,6 +2117,28 @@ where
                 anyhow::bail!("metadata backend quorum probe failed: {error}");
             }
         }
+    }
+}
+
+async fn await_meta_store_quorum_or_shutdown<F, Fut, S>(
+    probe: F,
+    initial_delay: Duration,
+    max_delay: Duration,
+    shutdown: S,
+) -> anyhow::Result<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), MetaStoreError>>,
+    S: Future<Output = ()>,
+{
+    match shutdown_or(
+        shutdown,
+        await_meta_store_quorum(probe, initial_delay, max_delay),
+    )
+    .await
+    {
+        None => Ok(false),
+        Some(result) => result.map(|()| true),
     }
 }
 
@@ -2215,7 +2306,8 @@ fn optional_nonempty_env(name: &str) -> Option<String> {
 async fn rhiza_meta_store_from_config(
     config: &RhizaServeConfig,
     readiness_timeout: Duration,
-) -> anyhow::Result<Arc<dyn MetaStore>> {
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<Option<Arc<dyn MetaStore>>> {
     if let RhizaServeConfig::OperatorManaged {
         recovery_bind,
         learner,
@@ -2236,10 +2328,23 @@ async fn rhiza_meta_store_from_config(
         eprintln!(
             "rhiza operator recovery listener bound at {address}; Velorix gRPC remains on VELORIX_META_BIND"
         );
-        rhiza_local_readiness_gate(
-            *learner,
-            wait_for_rhiza_local_readiness(&store, readiness_timeout).await,
-        )?;
+        let Some(readiness) = shutdown_or(
+            shutdown_requested(shutdown),
+            wait_for_rhiza_local_readiness(&store, readiness_timeout),
+        )
+        .await
+        else {
+            store.close().await.map_err(anyhow::Error::from)?;
+            return Ok(None);
+        };
+        if let Err(error) = rhiza_local_readiness_gate(*learner, readiness) {
+            return match store.close().await {
+                Ok(()) => Err(error),
+                Err(close) => Err(error.context(format!(
+                    "also failed to close Rhiza after readiness failure: {close}"
+                ))),
+            };
+        }
         if *learner {
             // A learner exists only to be promoted into the target generation.
             // The recovery endpoints are already serving, so the Operator can
@@ -2250,11 +2355,11 @@ async fn rhiza_meta_store_from_config(
                 "rhiza is running as an Operator-managed learner; recovery endpoints are serving but Velorix metadata traffic stays closed until this node has quorum"
             );
         }
-        return Ok(Arc::new(store));
+        return Ok(Some(Arc::new(store)));
     }
-    Ok(Arc::new(
+    Ok(Some(Arc::new(
         rhiza_explicit_meta_store_from_config(config).await?,
-    ))
+    )))
 }
 
 /// Serialize one member into the exact `quepaxa.Member` shape native decodes
@@ -3027,6 +3132,89 @@ mod tests {
             attempts.load(Ordering::SeqCst) > 2,
             "the pre-quorum learner must keep re-probing instead of parking: {}",
             attempts.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_wait_returns_on_shutdown_and_preserves_probe_results() {
+        let ready = await_meta_store_quorum_or_shutdown(
+            || async { Ok(()) },
+            Duration::ZERO,
+            Duration::ZERO,
+            std::future::pending(),
+        )
+        .await
+        .expect("successful quorum probe should be preserved");
+        assert!(ready);
+
+        let error = await_meta_store_quorum_or_shutdown(
+            || async { Err(MetaStoreError::Serialization("bad config".into())) },
+            Duration::ZERO,
+            Duration::ZERO,
+            std::future::pending(),
+        )
+        .await
+        .expect_err("nonretryable probe errors should fail startup");
+        assert!(error.to_string().contains("bad config"));
+
+        let (probe_started_tx, probe_started_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut probe_started_tx = Some(probe_started_tx);
+        let pending = tokio::spawn(await_meta_store_quorum_or_shutdown(
+            move || {
+                if let Some(started) = probe_started_tx.take() {
+                    let _ = started.send(());
+                }
+                std::future::pending::<Result<(), MetaStoreError>>()
+            },
+            Duration::ZERO,
+            Duration::from_secs(60),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), probe_started_rx)
+            .await
+            .expect("probe start should not hang")
+            .expect("probe should start before shutdown");
+        shutdown_tx
+            .send(())
+            .expect("quorum wait still owns shutdown receiver");
+        assert!(!tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("shutdown should cancel a pending probe")
+            .expect("quorum wait task should not panic")
+            .expect("shutdown is a clean exit"));
+
+        let simultaneous = await_meta_store_quorum_or_shutdown(
+            || async { Ok(()) },
+            Duration::ZERO,
+            Duration::ZERO,
+            std::future::ready(()),
+        )
+        .await
+        .expect("simultaneous shutdown is a clean exit");
+        assert!(
+            !simultaneous,
+            "shutdown must win when both branches are ready"
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let initial_readiness = tokio::spawn(shutdown_or(
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            std::future::pending::<()>(),
+        ));
+        shutdown_tx
+            .send(())
+            .expect("startup wait owns shutdown receiver");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), initial_readiness)
+                .await
+                .expect("initial readiness cancellation should return")
+                .expect("initial readiness task should not panic")
+                .is_none()
         );
     }
 
