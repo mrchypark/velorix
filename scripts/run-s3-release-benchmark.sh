@@ -11,6 +11,9 @@ versitygw_image='versity/versitygw:v1.8.0@sha256:30292fc2eeacc67a36993b01f7a7a5e
 aws_cli_image='amazon/aws-cli:2.17.36@sha256:b9a5694d2c5fea14c9d5d3c5ba221e8c74914960afce322aad251d83ead6f8b7'
 default_baseline_path="$repo_root/baselines/benchmark/s3/release.json"
 baseline_path=$default_baseline_path
+collect_only=0
+collection_data_valid=0
+checkout_clean_final=0
 run_id="$(date -u +%Y%m%dt%H%M%Sz)-$$"
 resource_label="velorix-s3-release-benchmark-${run_id}"
 resource_prefix="velorix-s3-release-${run_id}"
@@ -47,7 +50,7 @@ finished=0
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/run-s3-release-benchmark.sh [--baseline PATH]
+  scripts/run-s3-release-benchmark.sh [--baseline PATH] [--collect-only]
   scripts/run-s3-release-benchmark.sh --self-test
 
 Run a release-level S3-compatible benchmark against a disposable, pinned local
@@ -58,6 +61,9 @@ Self-tests use jq and the existing Velorix CLI; they do not start Docker.
 The default baseline is historical baselines/benchmark/s3/release.json. A
 calibrated baseline may be selected explicitly; the CLI still compares the
 complete workload sets and applies its existing regression budget.
+
+--collect-only validates and retains a measured result and provenance after
+clean fixture shutdown. It does not run or claim the release comparison.
 EOF
 }
 
@@ -104,6 +110,15 @@ source_checkout_matches_head() {
   current_head=$(git rev-parse HEAD) || return 1
   [ "$current_head" = "$expected_head" ] || return 1
   checkout_is_clean
+}
+
+collection_can_succeed() {
+  [ "$collect_only" -eq 1 ] &&
+    [ "$gate_evaluated" -eq 0 ] &&
+    [ "$collection_data_valid" -eq 1 ] &&
+    [ "$checkout_clean_initial" -eq 1 ] &&
+    [ "$checkout_clean_final" -eq 1 ] &&
+    [ "$cleanup_failed" -eq 0 ]
 }
 
 file_sha256() {
@@ -387,6 +402,49 @@ run_self_tests() {
     cat "$selftest_dir/historical-baseline-mismatch.log" >&2
     die "self-test failed: historical baseline rejection did not identify datafusion_table_scan"
   fi
+  collect_only=1
+  collection_data_valid=1
+  checkout_clean_initial=1
+  checkout_clean_final=1
+  cleanup_failed=0
+  gate_evaluated=0
+  gate_status=collected
+  if ! collection_can_succeed; then
+    die 'self-test failed: complete clean collection was rejected'
+  fi
+  jq -n --arg status "$gate_status" --argjson gate_evaluated "$gate_evaluated" \
+    '{collection_only:true,collection_complete:true,gate_status:$status,
+      gate_evaluated:($gate_evaluated == 1),release_gate_passed:false,
+      calibrated_gate_artifact_created:false}' >"$selftest_dir/collection-report.json"
+  jq -e '.collection_only == true and .collection_complete == true and
+    .gate_status == "collected" and .gate_evaluated == false and
+    .release_gate_passed == false and .calibrated_gate_artifact_created == false' \
+    "$selftest_dir/collection-report.json" >/dev/null ||
+    die 'self-test failed: collection report claimed a gate evaluation or release pass'
+  gate_evaluated=1
+  if collection_can_succeed; then
+    die 'self-test failed: collection marked as gate-evaluated was accepted'
+  fi
+  gate_evaluated=0
+  collection_data_valid=0
+  if collection_can_succeed; then
+    die 'self-test failed: incomplete collection was accepted'
+  fi
+  collection_data_valid=1
+  checkout_clean_initial=0
+  if collection_can_succeed; then
+    die 'self-test failed: dirty initial source checkout was accepted for collection'
+  fi
+  checkout_clean_initial=1
+  checkout_clean_final=0
+  if collection_can_succeed; then
+    die 'self-test failed: source checkout changed during collection'
+  fi
+  checkout_clean_final=1
+  cleanup_failed=1
+  if collection_can_succeed; then
+    die 'self-test failed: collection with fixture cleanup failure was accepted'
+  fi
   printf '%s\n' \
     'S3 release benchmark runner self-tests passed:' \
     '  missing result commit rejected' \
@@ -402,7 +460,9 @@ run_self_tests() {
     '  baseline JSON and companion hashes detect changed inputs' \
     '  baseline companion workload and harness fingerprints checked' \
     '  matching current-workload baseline passed the CLI gate' \
-    '  historical datafusion_table_scan baseline mismatch surfaced by the unmodified CLI gate'
+    '  historical datafusion_table_scan baseline mismatch surfaced by the unmodified CLI gate' \
+    '  complete collection succeeds without gate or release-pass claims' \
+    '  gate-evaluated, incomplete, dirty-source, and cleanup-failed collection rejected'
 }
 
 finish() {
@@ -478,6 +538,23 @@ finish() {
     fi
   fi
 
+  if [ "$collect_only" -eq 1 ]; then
+    if source_checkout_matches_head "$head_commit"; then
+      checkout_clean_final=1
+    else
+      checkout_clean_final=0
+    fi
+    if [ "$exit_code" -eq 0 ] && collection_can_succeed; then
+      gate_status=collected
+      run_phase=collection_complete
+    else
+      gate_status=collection_failed
+      run_phase=collection_failed
+      exit_code=1
+      printf 'collection did not complete with valid evidence, clean source, and fixture cleanup; run report: %s\n' "$run_report_path" >&2
+    fi
+  fi
+
   if [ ! -f "$run_report_path" ]; then
     jq -n \
       --arg run_id "$run_id" \
@@ -490,11 +567,13 @@ finish() {
       --arg baseline_companion_sha256 "$baseline_companion_sha256" \
       --arg phase "$run_phase" \
       --arg gate_status "$gate_status" \
+      --argjson collect_only "$collect_only" \
       --argjson gate_evaluated "$gate_evaluated" \
       --argjson exit_code "$exit_code" \
       '{schema_version:1,run_id:$run_id,commit:$commit,benchmark_result:$result,
         provenance:$provenance,baseline:{path:$baseline,sha256:$baseline_sha256,
           companion_path:$baseline_companion,companion_sha256:(if $baseline_companion_sha256 == "" then null else $baseline_companion_sha256 end)},
+        collection_only:($collect_only == 1),collection_complete:false,
         measurement_complete:false,result_pair_complete:false,result_validated:false,
         gate_status:$gate_status,gate_evaluated:($gate_evaluated == 1),release_gate_passed:false,
         phase:$phase,runner_exit_code:$exit_code,credentials_redacted:true,
@@ -508,8 +587,15 @@ finish() {
       --arg phase "$run_phase" \
       --arg gate_status "$gate_status" \
       --argjson gate_evaluated "$gate_evaluated" \
+      --argjson collect_only "$collect_only" \
+      --argjson collection_complete "$([ "$gate_status" = collected ] && printf true || printf false)" \
+      --argjson checkout_clean_final "$checkout_clean_final" \
       '.cleanup_status = $status | .runner_exit_code = $exit_code | .last_phase = $phase |
        .gate_status = $gate_status | .gate_evaluated = ($gate_evaluated == 1) |
+       .collection_only = ($collect_only == 1) | .collection_complete = $collection_complete |
+       .checkout_clean_after_measurement = (if $collect_only == 1 then ($checkout_clean_final == 1) else null end) |
+       .baseline_comparison_performed = ($gate_evaluated == 1) |
+       .calibrated_gate_artifact_created = ($collect_only == 0 and $gate_status == "pass") |
        .release_gate_passed = ($gate_status == "pass" and ($gate_evaluated == 1))' \
       "$run_report_path" >"$run_report_tmp" &&
       mv "$run_report_tmp" "$run_report_path"
@@ -542,6 +628,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo '--baseline requires a path' >&2; exit 64; }
       baseline_path=$2
       shift 2
+      ;;
+    --collect-only)
+      collect_only=1
+      shift
       ;;
     -h | --help)
       usage
@@ -649,12 +739,14 @@ jq -n \
   --arg benchmark_stderr "${result_path}.bench.stderr.log" \
   --arg runner_log "$runner_log_path" \
   --arg phase "$run_phase" \
+  --argjson collect_only "$collect_only" \
   --argjson checkout_clean "$checkout_clean_initial" \
   '{schema_version:1,run_id:$run_id,commit:$commit,benchmark_result:$result,
     provenance:$provenance,baseline:{path:$baseline,sha256:$baseline_sha256,
       companion_path:$baseline_companion,companion_sha256:(if $baseline_companion_sha256 == "" then null else $baseline_companion_sha256 end)},
-    artifacts:{gate_log:$gate_log,fixture_log:$fixture_log,validation_log:$validation_log,
+    artifacts:{gate_log:(if $collect_only == 1 then null else $gate_log end),fixture_log:$fixture_log,validation_log:$validation_log,
       benchmark_stderr:$benchmark_stderr,runner_log:$runner_log},
+    collection_only:($collect_only == 1),collection_complete:false,
     measurement_complete:false,result_pair_complete:false,result_validated:false,
     docker_network_mode:"dedicated per-run bridge (non-internal); published endpoint loopback-only",
     gate_evaluated:false,gate_status:"not_run",phase:$phase,
@@ -812,6 +904,12 @@ jq '.measurement_complete = true | .result_pair_complete = true | .result_valida
   "$run_report_path" >"$run_report_tmp"
 mv "$run_report_tmp" "$run_report_path"
 run_phase=measurement_validated
+collection_data_valid=1
+
+if [ "$collect_only" -eq 1 ]; then
+  run_phase=collection_pending_cleanup
+  exit 0
+fi
 
 gate_status=not_run
 if ! source_checkout_matches_head "$head_commit"; then

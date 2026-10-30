@@ -224,6 +224,15 @@ The shell launcher builds a source/toolchain-keyed Go process-group helper in
 ignored `target/`; SIGTERM reaches the owned Cargo process group, and the run
 report records incomplete or interrupted phases without marking them passed.
 
+The calibration controller uses `--collect-only` to retain a measured,
+validated result and provenance without invoking the historical baseline
+comparison. A successful collection records `gate_status: "collected"`,
+`gate_evaluated: false`, and `release_gate_passed: false`; it does not create a
+calibrated gate artifact. Collection succeeds only after fixture cleanup and a
+second clean-checkout/HEAD check. The controller then builds and evaluates its
+separate predecessor envelope with the unchanged CLI comparator. Ordinary
+runner invocations retain the default baseline comparison behavior.
+
 Current implementation references: [`local_incremental.rs`](../../crates/velorix-runtime/benches/local_incremental.rs),
 [`materialized_output_workloads.rs`](../../crates/velorix-runtime/benches/materialized_output_workloads.rs),
 and [`benchmark_gate.rs`](../../crates/velorix-runtime/tests/benchmark_gate.rs).
