@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: velorix-meta-local-config
+  labels:
+    app.kubernetes.io/name: velorix-meta
+    app.kubernetes.io/instance: local-rhiza
+data:
+  VELORIX_META_MODE: production
+  VELORIX_META_BACKEND: rhiza-kv
+  VELORIX_META_BIND: 0.0.0.0:9090
+  VELORIX_META_TRANSPORT_SECURITY: native-mtls
+  VELORIX_META_TLS_CERT_FILE: /etc/velorix-meta/tls/tls.crt
+  VELORIX_META_TLS_KEY_FILE: /etc/velorix-meta/tls/tls.key
+  VELORIX_META_TLS_CLIENT_CA_FILE: /etc/velorix-meta/tls/ca.crt
+  VELORIX_RHIZA_MODE: local
+  VELORIX_RHIZA_DATA_DIR: /var/lib/velorix-meta
+  VELORIX_RHIZA_CLUSTER_ID: velorix-meta-local
+  VELORIX_RHIZA_NODE_ID: velorix-meta-local-0
+  VELORIX_RHIZA_OBJECT_STORE_PROVIDER: s3
+  # Replace all three archive placeholders with a fresh greenfield namespace.
+  VELORIX_RHIZA_OBJECT_STORE_ENDPOINT: replace-me.invalid:9000
+  VELORIX_RHIZA_OBJECT_STORE_BUCKET: REPLACE_ME
+  VELORIX_RHIZA_OBJECT_STORE_REGION: us-east-1
+  VELORIX_RHIZA_OBJECT_STORE_PREFIX: REPLACE_WITH_UNIQUE_PREFIX
+  VELORIX_RHIZA_OBJECT_STORE_DURABILITY: before-ack
+  VELORIX_RHIZA_OBJECT_STORE_INSECURE: "0"

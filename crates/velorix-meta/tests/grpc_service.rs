@@ -171,7 +171,7 @@ async fn grpc_rhiza_backend_requires_bearer_and_executes_linearizable_store_path
             .production_multi_writer_safe
     );
     assert!(
-        !capabilities
+        capabilities
             .standing_runtime_fencing
             .multi_writer_fencing_safe
     );
@@ -1133,6 +1133,63 @@ async fn grpc_meta_store_sends_bearer_token_to_authenticated_service() {
 }
 
 #[tokio::test]
+async fn grpc_meta_store_explicit_standing_owner_reacquire_fences_old_token() {
+    let backend = InMemoryMetaStore::default();
+    backend.set_partition_authority_clock_for_test(10).await;
+    let endpoint = spawn_meta_service_for(backend).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let old_endpoint = "https://runtime.example".to_string();
+    let old = match store
+        .acquire_standing_runtime_owner_with_endpoint(
+            owner_request("process-a"),
+            old_endpoint.clone(),
+        )
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+        other => panic!("unexpected initial owner claim: {other:?}"),
+    };
+    let new = match store
+        .reacquire_standing_runtime_owner(velorix_meta::ReacquireStandingRuntimeOwnerRequest {
+            expected_current: old.clone(),
+            owner_id: "process-b".into(),
+            owner_endpoint: old_endpoint,
+            ttl_ms: 30_000,
+        })
+        .await
+        .unwrap()
+    {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim) => claim,
+        other => panic!("unexpected reacquired owner claim: {other:?}"),
+    };
+    assert_eq!(new.owner_epoch, old.owner_epoch + 1);
+    assert_eq!(new.owner_id, "process-b");
+    let old_token = StandingRuntimeOwnerToken {
+        tenant_id: old.tenant_id.clone(),
+        program_id: old.program_id.clone(),
+        view_id: old.view_id.clone(),
+        owner_id: old.owner_id.clone(),
+        owner_epoch: old.owner_epoch,
+    };
+    assert!(store
+        .renew_standing_runtime_owner(old_token.clone(), 30_000)
+        .await
+        .is_err());
+    let stale_publish = store
+        .publish_standing_runtime_checkpoint(
+            velorix_meta::PublishStandingRuntimeCheckpointRequest {
+                expected_previous: None,
+                candidate: checkpoint_pointer(1, "a"),
+                owner: old_token,
+                expected_relation_source_cuts: None,
+            },
+        )
+        .await;
+    assert!(stale_publish.is_err());
+}
+
+#[tokio::test]
 async fn grpc_meta_store_publishes_standing_runtime_checkpoint_pointer() {
     let endpoint = spawn_meta_service().await;
     let store = GrpcMetaStore::connect(endpoint).await.unwrap();
@@ -1810,6 +1867,57 @@ async fn grpc_relation_authority_round_trips_scope_fencing_and_publication() {
     assert!(matches!(
         stale_result,
         Ok(PublishIngestReservationOutcome::InvalidAuthority)
+    ));
+}
+
+#[tokio::test]
+async fn grpc_relation_authority_explicit_reacquire_is_a_separate_fenced_operation() {
+    let backend = InMemoryMetaStore::default();
+    backend.set_partition_authority_clock_for_test(10).await;
+    let endpoint = spawn_meta_service_for(backend).await;
+    let store = GrpcMetaStore::connect(endpoint).await.unwrap();
+    let key = RelationPartitionAuthorityKey {
+        namespace: "tenant-a".into(),
+        relation_id: "orders".into(),
+        stream_id: "orders-stream".into(),
+        partition_id: 0,
+    };
+    let request = |current_token| AcquireRelationPartitionAuthorityRequest {
+        key: key.clone(),
+        owner_id: "writer-a".into(),
+        current_token,
+        ttl_ms: 100,
+    };
+    let old = match store
+        .acquire_relation_partition_authority(request(None))
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected initial acquisition: {other:?}"),
+    };
+    assert!(matches!(
+        store
+            .acquire_relation_partition_authority(request(None))
+            .await
+            .unwrap(),
+        AcquireRelationPartitionAuthorityOutcome::Conflict(_)
+    ));
+    let next = match store
+        .reacquire_relation_partition_authority(request(Some(old.clone())))
+        .await
+        .unwrap()
+    {
+        AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+        other => panic!("unexpected explicit reacquisition: {other:?}"),
+    };
+    assert_eq!(next.owner_epoch, old.owner_epoch + 1);
+    assert!(matches!(
+        store
+            .reacquire_relation_partition_authority(request(Some(old)))
+            .await
+            .unwrap(),
+        AcquireRelationPartitionAuthorityOutcome::Conflict(_)
     ));
 }
 

@@ -79,6 +79,8 @@ enum FaultMode {
     AbsentThenRetry,
     MismatchOnRead,
     ResponseLossTwice,
+    RaceAfterExpiredAuthorityRead,
+    IgnoreExplicitReacquire,
 }
 
 struct FaultMeta {
@@ -212,11 +214,38 @@ impl MetaStore for FaultMeta {
             .await
     }
 
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        if matches!(self.mode, FaultMode::IgnoreExplicitReacquire) {
+            return self
+                .inner
+                .acquire_relation_partition_authority(request)
+                .await;
+        }
+        self.inner
+            .reacquire_relation_partition_authority(request)
+            .await
+    }
+
     async fn read_relation_partition_authority(
         &self,
         key: &RelationPartitionAuthorityKey,
     ) -> Result<Option<RelationPartitionAuthorityToken>, MetaStoreError> {
-        self.inner.read_relation_partition_authority(key).await
+        let observed = self.inner.read_relation_partition_authority(key).await?;
+        if observed.is_none() && matches!(self.mode, FaultMode::RaceAfterExpiredAuthorityRead) {
+            let _ = self
+                .inner
+                .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+                    key: key.clone(),
+                    owner_id: "writer-b".into(),
+                    current_token: None,
+                    ttl_ms: 100,
+                })
+                .await?;
+        }
+        Ok(observed)
     }
 
     async fn reserve_relation_authoritative_ingest_range(
@@ -432,4 +461,103 @@ async fn stale_takeover_clears_old_session() {
         first.publish(0, 10, Bytes::from_static(b"stale")).await,
         Err(RelationIngestPublisherError::NotStarted)
     ));
+}
+
+#[tokio::test]
+async fn explicit_restart_reacquire_advances_epoch_and_fences_old_publisher() {
+    let meta = Arc::new(FaultMeta::new(FaultMode::PassThrough));
+    let old = publisher(Arc::clone(&meta), "writer-a").await;
+    let old_token = old.start().await.unwrap();
+
+    let restarted = publisher(Arc::clone(&meta), "writer-a").await;
+    assert!(matches!(
+        restarted.start().await,
+        Err(RelationIngestPublisherError::AuthorityConflict { .. })
+    ));
+    let new_token = restarted.start_after_restart().await.unwrap();
+    assert_eq!(new_token.owner_epoch, old_token.owner_epoch + 1);
+    assert!(matches!(
+        restarted.start_after_restart().await,
+        Err(RelationIngestPublisherError::RestartReacquireAlreadyAttempted)
+    ));
+
+    assert!(matches!(
+        old.publish(0, 10, Bytes::from_static(b"stale")).await,
+        Err(RelationIngestPublisherError::AuthorityLost { .. })
+    ));
+
+    assert!(matches!(
+        old.renew().await,
+        Err(RelationIngestPublisherError::AuthorityConflict { .. })
+    ));
+    assert!(old.session().token().await.is_none());
+}
+
+#[tokio::test]
+async fn restart_startup_without_existing_token_acquires_initial_authority() {
+    let meta = Arc::new(FaultMeta::new(FaultMode::PassThrough));
+    let publisher = publisher(Arc::clone(&meta), "writer-new").await;
+    let token = publisher.start_after_restart().await.unwrap();
+    assert_eq!(token.owner_id, "writer-new");
+    assert_eq!(token.owner_epoch, 1);
+}
+
+#[tokio::test]
+async fn restart_reacquires_expired_same_owner_through_ordinary_cas_acquire() {
+    let meta = Arc::new(FaultMeta::new(FaultMode::PassThrough));
+    let first = publisher(Arc::clone(&meta), "writer-a").await;
+    let old = first.start().await.unwrap();
+    meta.inner
+        .set_partition_authority_clock_for_test(old.expires_at_unix_ms)
+        .await;
+
+    let restarted = publisher(Arc::clone(&meta), "writer-a").await;
+    let next = restarted.start_after_restart().await.unwrap();
+    assert_eq!(next.owner_epoch, old.owner_epoch + 1);
+}
+
+#[tokio::test]
+async fn expiry_read_race_with_new_active_owner_fails_closed() {
+    let meta = Arc::new(FaultMeta::new(FaultMode::RaceAfterExpiredAuthorityRead));
+    let first = publisher(Arc::clone(&meta), "writer-a").await;
+    let old = first.start().await.unwrap();
+    meta.inner
+        .set_partition_authority_clock_for_test(old.expires_at_unix_ms)
+        .await;
+
+    let restarted = publisher(Arc::clone(&meta), "writer-a").await;
+    assert!(matches!(
+        restarted.start_after_restart().await,
+        Err(RelationIngestPublisherError::AuthorityConflict { current })
+            if current.owner_id == "writer-b"
+    ));
+}
+
+#[tokio::test]
+async fn restart_reacquire_rejects_old_server_renewal_response() {
+    let meta = Arc::new(FaultMeta::new(FaultMode::IgnoreExplicitReacquire));
+    let original = publisher(Arc::clone(&meta), "writer-a").await;
+    let old_token = original.start().await.unwrap();
+
+    let restarted = publisher(Arc::clone(&meta), "writer-a").await;
+    assert!(matches!(
+        restarted.start_after_restart().await,
+        Err(RelationIngestPublisherError::AuthorityLost { .. })
+    ));
+    assert!(restarted.session().token().await.is_none());
+    assert_eq!(
+        meta.inner
+            .read_relation_partition_authority(&RelationPartitionAuthorityKey {
+                namespace: "default".into(),
+                relation_id: "orders".into(),
+                stream_id: "orders-stream".into(),
+                partition_id: 0,
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_epoch,
+        old_token.owner_epoch,
+        "a legacy Renewed response must not be accepted as a new fence"
+    );
 }

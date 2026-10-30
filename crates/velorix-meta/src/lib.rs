@@ -78,6 +78,8 @@ pub const STANDING_RUNTIME_LEASE_AUTHORITY_KIND_PROCESS_LOCAL: &str = "process_l
 pub const STANDING_RUNTIME_LEASE_AUTHORITY_KIND_RAFT_REPLICATED_TIME: &str = "raft_replicated_time";
 pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_UNAVAILABLE: &str = "unavailable";
 pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_PROCESS_CLOCK_TTL: &str = "process_clock_ttl";
+/// Authority expiry uses the root-CAS serialized logical mutation counter.
+pub const ROOT_CAS_AUTHORITY_CLOCK_KIND: &str = "root_cas_logical_clock";
 pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL: &str =
     "operation_driven_logical";
 pub const STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL: &str =
@@ -270,6 +272,17 @@ pub struct StandingRuntimeOwnerToken {
     pub owner_epoch: u64,
 }
 
+/// Explicitly replaces the exact observed standing-runtime owner claim with a
+/// new process identity. The expected claim is compared in full and the new
+/// owner receives the next fencing epoch in the same metadata mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReacquireStandingRuntimeOwnerRequest {
+    pub expected_current: StandingRuntimeOwnerClaim,
+    pub owner_id: String,
+    pub owner_endpoint: String,
+    pub ttl_ms: u64,
+}
+
 /// Identifies the independent authority domain for one input partition.
 ///
 /// This is intentionally not a standing-runtime owner scope: a runtime owner
@@ -310,6 +323,9 @@ pub struct RelationPartitionAuthorityToken {
     pub key: RelationPartitionAuthorityKey,
     pub owner_id: String,
     pub owner_epoch: u64,
+    /// Logical tick deadline. The legacy field name is retained for wire
+    /// compatibility; relation authority TTLs count committed metadata
+    /// mutations, not elapsed wall-clock milliseconds.
     pub expires_at_unix_ms: u64,
 }
 
@@ -396,6 +412,7 @@ pub enum PublishPartitionCheckpointPointerOutcome {
 #[serde(deny_unknown_fields)]
 pub struct PartitionAuthorityCapability {
     pub backend_name: String,
+    pub authority_clock_kind: String,
     pub partition_scoped_authority: bool,
     pub backend_owned_time: bool,
     pub fenced_checkpoint_pointer_publish: bool,
@@ -413,6 +430,7 @@ impl PartitionAuthorityCapability {
     fn unsupported(backend_name: &str) -> Self {
         Self {
             backend_name: backend_name.to_string(),
+            authority_clock_kind: "unavailable".into(),
             partition_scoped_authority: false,
             backend_owned_time: false,
             fenced_checkpoint_pointer_publish: false,
@@ -1173,6 +1191,17 @@ pub trait MetaStore: Send + Sync + 'static {
         ))
     }
 
+    /// Explicit takeover using an exact observed claim. Ordinary acquire and
+    /// renewal never perform this operation implicitly.
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        _request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        Err(MetaStoreError::UnsupportedCapability(
+            "explicit_standing_runtime_owner_reacquisition",
+        ))
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         tenant_id: &str,
@@ -1227,6 +1256,19 @@ pub trait MetaStore: Send + Sync + 'static {
         request.validate()?;
         Err(MetaStoreError::UnsupportedCapability(
             "relation_partition_authority",
+        ))
+    }
+
+    /// Explicitly supersedes the exact observed same-owner relation token.
+    /// This is a restart recovery operation, not renewal: it advances the
+    /// fenced owner epoch and makes the observed token unusable.
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        Err(MetaStoreError::UnsupportedCapability(
+            "relation_partition_authority_reacquisition",
         ))
     }
 
@@ -1522,6 +1564,13 @@ where
         (**self).renew_standing_runtime_owner(owner, ttl_ms).await
     }
 
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        (**self).reacquire_standing_runtime_owner(request).await
+    }
+
     async fn isolated_owner_renewal_store(
         &self,
     ) -> Result<Option<Arc<dyn MetaStore>>, MetaStoreError> {
@@ -1584,6 +1633,15 @@ where
         (**self).acquire_relation_partition_authority(request).await
     }
 
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        (**self)
+            .reacquire_relation_partition_authority(request)
+            .await
+    }
+
     async fn read_relation_partition_authority(
         &self,
         key: &RelationPartitionAuthorityKey,
@@ -1644,6 +1702,7 @@ where
 pub struct InMemoryMetaStore {
     inner: Arc<RwLock<InMemoryMetaState>>,
     evaluation_now_unix_ms: Option<u64>,
+    authority_clock_override: Option<u64>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -1671,6 +1730,12 @@ struct InMemoryMetaState {
     #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     standing_runtime_checkpoints:
         HashMap<(String, String, String), StandingRuntimeCheckpointPointer>,
+    /// Serialized logical tick; name retained for snapshot compatibility.
+    #[serde(
+        default,
+        rename = "partition_authority_logical_tick",
+        alias = "partition_authority_now_unix_ms"
+    )]
     partition_authority_now_unix_ms: u64,
     #[serde(with = "crate::rhiza_snapshot::map_pairs")]
     partition_authorities: HashMap<PartitionAuthorityKey, PartitionAuthorityToken>,
@@ -1768,6 +1833,45 @@ impl InMemoryMetaStore {
         }
     }
 
+    async fn reacquire_owner_claim(
+        &self,
+        request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        request.validate()?;
+        let now = self.evaluation_time_ms()?;
+        let expires_at_unix_ms = now
+            .checked_add(request.ttl_ms)
+            .ok_or(MetaStoreError::TimestampOverflow)?;
+        let expected = request.expected_current;
+        let key = standing_runtime_owner_scope_key(
+            &expected.tenant_id,
+            &expected.program_id,
+            &expected.view_id,
+        );
+        let mut guard = self.inner.write().await;
+        let Some(current) = guard.standing_runtime_owners.get(&key).cloned() else {
+            return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+        };
+        if current != expected {
+            return Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(current));
+        }
+        let owner_epoch = current
+            .owner_epoch
+            .checked_add(1)
+            .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
+        let claim = StandingRuntimeOwnerClaim {
+            tenant_id: current.tenant_id,
+            program_id: current.program_id,
+            view_id: current.view_id,
+            owner_id: request.owner_id,
+            owner_endpoint: Some(request.owner_endpoint),
+            owner_epoch,
+            expires_at_unix_ms,
+        };
+        guard.standing_runtime_owners.insert(key, claim.clone());
+        Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim))
+    }
+
     #[cfg(any(test, feature = "rhiza-backend"))]
     pub(crate) fn from_state_for_evaluation(state: InMemoryMetaState, now_unix_ms: u64) -> Self {
         let mut state = state;
@@ -1775,6 +1879,7 @@ impl InMemoryMetaStore {
         Self {
             inner: Arc::new(RwLock::new(state)),
             evaluation_now_unix_ms: Some(now_unix_ms),
+            authority_clock_override: Some(now_unix_ms),
         }
     }
 
@@ -1786,6 +1891,7 @@ impl InMemoryMetaStore {
         Self {
             inner,
             evaluation_now_unix_ms: Some(now_unix_ms),
+            authority_clock_override: None,
         }
     }
 
@@ -1799,8 +1905,8 @@ impl InMemoryMetaStore {
     }
 
     async fn authority_read_time_ms(&self) -> u64 {
-        match self.evaluation_now_unix_ms {
-            Some(now_unix_ms) => now_unix_ms,
+        match self.authority_clock_override {
+            Some(tick) => tick,
             None => self.inner.read().await.partition_authority_now_unix_ms,
         }
     }
@@ -2784,6 +2890,13 @@ impl MetaStore for InMemoryMetaStore {
             .await
     }
 
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        self.reacquire_owner_claim(request).await
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         tenant_id: &str,
@@ -2995,64 +3108,15 @@ impl MetaStore for InMemoryMetaStore {
         &self,
         request: AcquireRelationPartitionAuthorityRequest,
     ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
-        request.validate()?;
-        let mut guard = self.inner.write().await;
-        let now = guard.partition_authority_now_unix_ms;
-        let expires_at_unix_ms = now
-            .checked_add(request.ttl_ms)
-            .ok_or(MetaStoreError::TimestampOverflow)?;
-        match guard
-            .relation_partition_authorities
-            .get(&request.key)
-            .cloned()
-        {
-            Some(current) if current.expires_at_unix_ms > now => {
-                if current.owner_id == request.owner_id
-                    && request.current_token.as_ref() == Some(&current)
-                {
-                    let renewed = RelationPartitionAuthorityToken {
-                        expires_at_unix_ms,
-                        ..current
-                    };
-                    guard
-                        .relation_partition_authorities
-                        .insert(request.key, renewed.clone());
-                    Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(renewed))
-                } else {
-                    Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(current))
-                }
-            }
-            Some(current) => {
-                let owner_epoch = current
-                    .owner_epoch
-                    .checked_add(1)
-                    .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
-                let token = RelationPartitionAuthorityToken {
-                    key: request.key.clone(),
-                    owner_id: request.owner_id,
-                    owner_epoch,
-                    expires_at_unix_ms,
-                };
-                guard
-                    .relation_partition_authorities
-                    .insert(request.key, token.clone());
-                Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
-            }
-            None => {
-                let token = RelationPartitionAuthorityToken {
-                    key: request.key.clone(),
-                    owner_id: request.owner_id,
-                    owner_epoch: 1,
-                    expires_at_unix_ms,
-                };
-                guard
-                    .relation_partition_authorities
-                    .insert(request.key, token.clone());
-                Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
-            }
-        }
+        acquire_relation_partition_authority_inner(self, request, false).await
     }
 
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        acquire_relation_partition_authority_inner(self, request, true).await
+    }
     async fn read_relation_partition_authority(
         &self,
         key: &RelationPartitionAuthorityKey,
@@ -3342,6 +3406,91 @@ impl MetaStore for InMemoryMetaStore {
     }
 }
 
+async fn acquire_relation_partition_authority_inner(
+    store: &InMemoryMetaStore,
+    request: AcquireRelationPartitionAuthorityRequest,
+    explicit_reacquire: bool,
+) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+    request.validate()?;
+    let mut guard = store.inner.write().await;
+    let now = guard.partition_authority_now_unix_ms;
+    let expires_at_unix_ms = now
+        .checked_add(request.ttl_ms)
+        .ok_or(MetaStoreError::TimestampOverflow)?;
+    match guard
+        .relation_partition_authorities
+        .get(&request.key)
+        .cloned()
+    {
+        Some(current) if current.expires_at_unix_ms > now => {
+            if explicit_reacquire
+                && current.owner_id == request.owner_id
+                && request.current_token.as_ref() == Some(&current)
+            {
+                let owner_epoch = current
+                    .owner_epoch
+                    .checked_add(1)
+                    .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
+                let token = RelationPartitionAuthorityToken {
+                    key: request.key.clone(),
+                    owner_id: request.owner_id,
+                    owner_epoch,
+                    expires_at_unix_ms,
+                };
+                guard
+                    .relation_partition_authorities
+                    .insert(request.key, token.clone());
+                Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
+            } else if !explicit_reacquire
+                && current.owner_id == request.owner_id
+                && request.current_token.as_ref() == Some(&current)
+            {
+                let renewed = RelationPartitionAuthorityToken {
+                    expires_at_unix_ms,
+                    ..current
+                };
+                guard
+                    .relation_partition_authorities
+                    .insert(request.key, renewed.clone());
+                Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(renewed))
+            } else {
+                Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(current))
+            }
+        }
+        Some(current) => {
+            if explicit_reacquire && request.current_token.as_ref() != Some(&current) {
+                return Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(current));
+            }
+            let owner_epoch = current
+                .owner_epoch
+                .checked_add(1)
+                .ok_or(MetaStoreError::AuthorityEpochOverflow)?;
+            let token = RelationPartitionAuthorityToken {
+                key: request.key.clone(),
+                owner_id: request.owner_id,
+                owner_epoch,
+                expires_at_unix_ms,
+            };
+            guard
+                .relation_partition_authorities
+                .insert(request.key, token.clone());
+            Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
+        }
+        None => {
+            let token = RelationPartitionAuthorityToken {
+                key: request.key.clone(),
+                owner_id: request.owner_id,
+                owner_epoch: 1,
+                expires_at_unix_ms,
+            };
+            guard
+                .relation_partition_authorities
+                .insert(request.key, token.clone());
+            Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OssMetaStore {
     relation_catalogs: RelationCatalogRegistry,
@@ -3567,6 +3716,41 @@ impl AcquireStandingRuntimeOwnerRequest {
     fn validate(&self) -> Result<(), MetaStoreError> {
         validate_standing_runtime_scope(&self.tenant_id, &self.program_id, &self.view_id)?;
         require_non_empty("owner_id", &self.owner_id)?;
+        if self.ttl_ms == 0 {
+            return Err(MetaStoreError::InvalidDuration { field: "ttl_ms" });
+        }
+        if self.ttl_ms > MAX_STANDING_RUNTIME_OWNER_TTL_MS {
+            return Err(MetaStoreError::IntegerOutOfRange {
+                field: "ttl_ms",
+                value: self.ttl_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ReacquireStandingRuntimeOwnerRequest {
+    fn validate(&self) -> Result<(), MetaStoreError> {
+        validate_standing_runtime_scope(
+            &self.expected_current.tenant_id,
+            &self.expected_current.program_id,
+            &self.expected_current.view_id,
+        )?;
+        require_non_empty("expected_owner_id", &self.expected_current.owner_id)?;
+        if self.expected_current.owner_epoch == 0 {
+            return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+        }
+        if let Some(endpoint) = self.expected_current.owner_endpoint.as_deref() {
+            validate_owner_endpoint(endpoint)?;
+        }
+        require_non_empty("owner_id", &self.owner_id)?;
+        if self.owner_id == self.expected_current.owner_id {
+            return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+        }
+        validate_owner_endpoint(&self.owner_endpoint)?;
+        if self.expected_current.owner_endpoint.as_deref() != Some(&self.owner_endpoint) {
+            return Err(MetaStoreError::StandingRuntimeOwnerMismatch);
+        }
         if self.ttl_ms == 0 {
             return Err(MetaStoreError::InvalidDuration { field: "ttl_ms" });
         }
@@ -4083,6 +4267,7 @@ struct StandingRuntimeFencingCapabilityInput {
 fn in_memory_partition_authority_capability() -> PartitionAuthorityCapability {
     PartitionAuthorityCapability {
         backend_name: "in-memory".to_string(),
+        authority_clock_kind: "process_local_test_clock".into(),
         partition_scoped_authority: true,
         backend_owned_time: true,
         fenced_checkpoint_pointer_publish: true,
@@ -4467,13 +4652,19 @@ where
         request: Request<proto::AcquireRelationPartitionAuthorityRequest>,
     ) -> Result<Response<proto::AcquireRelationPartitionAuthorityResponse>, Status> {
         self.authorize(&request)?;
-        let request = acquire_relation_partition_authority_request_from_proto(request.into_inner())
-            .map_err(partition_authority_status)?;
-        let outcome = self
-            .store
-            .acquire_relation_partition_authority(request)
-            .await
-            .map_err(partition_authority_status)?;
+        let (request, explicit_reacquire) =
+            acquire_relation_partition_authority_request_from_proto(request.into_inner())
+                .map_err(partition_authority_status)?;
+        let outcome = if explicit_reacquire {
+            self.store
+                .reacquire_relation_partition_authority(request)
+                .await
+        } else {
+            self.store
+                .acquire_relation_partition_authority(request)
+                .await
+        }
+        .map_err(partition_authority_status)?;
         let token = match &outcome {
             AcquireRelationPartitionAuthorityOutcome::Acquired(token)
             | AcquireRelationPartitionAuthorityOutcome::Renewed(token)
@@ -5131,6 +5322,32 @@ where
         }))
     }
 
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        request: Request<proto::ReacquireStandingRuntimeOwnerRequest>,
+    ) -> Result<Response<proto::AcquireStandingRuntimeOwnerResponse>, Status> {
+        self.authorize(&request)?;
+        let request = request.into_inner();
+        let expected_current = request
+            .expected_current
+            .map(standing_runtime_owner_claim_from_proto)
+            .ok_or_else(|| Status::invalid_argument("expected current owner claim is required"))?;
+        let outcome = self
+            .store
+            .reacquire_standing_runtime_owner(ReacquireStandingRuntimeOwnerRequest {
+                expected_current,
+                owner_id: request.owner_id,
+                owner_endpoint: request.owner_endpoint,
+                ttl_ms: request.ttl_ms,
+            })
+            .await
+            .map_err(meta_status)?;
+        Ok(Response::new(proto::AcquireStandingRuntimeOwnerResponse {
+            outcome: acquire_standing_runtime_owner_outcome(&outcome).to_string(),
+            claim: Some(acquire_standing_runtime_owner_claim(outcome)),
+        }))
+    }
+
     async fn renew_standing_runtime_owner(
         &self,
         request: Request<proto::RenewStandingRuntimeOwnerRequest>,
@@ -5566,6 +5783,7 @@ fn partition_authority_capability_to_proto(
 ) -> proto::PartitionAuthorityCapability {
     proto::PartitionAuthorityCapability {
         backend_name: capability.backend_name,
+        authority_clock_kind: capability.authority_clock_kind,
         partition_scoped_authority: capability.partition_scoped_authority,
         backend_owned_time: capability.backend_owned_time,
         fenced_checkpoint_pointer_publish: capability.fenced_checkpoint_pointer_publish,
@@ -5606,6 +5824,7 @@ fn partition_authority_capability_from_proto(
         && capability.durable_across_restart;
     PartitionAuthorityCapability {
         backend_name: capability.backend_name,
+        authority_clock_kind: capability.authority_clock_kind,
         partition_scoped_authority: capability.partition_scoped_authority,
         backend_owned_time: capability.backend_owned_time,
         fenced_checkpoint_pointer_publish: capability.fenced_checkpoint_pointer_publish,
@@ -5720,7 +5939,8 @@ fn relation_partition_authority_token_from_proto(
 
 fn acquire_relation_partition_authority_request_from_proto(
     request: proto::AcquireRelationPartitionAuthorityRequest,
-) -> Result<AcquireRelationPartitionAuthorityRequest, MetaStoreError> {
+) -> Result<(AcquireRelationPartitionAuthorityRequest, bool), MetaStoreError> {
+    let explicit_reacquire = request.explicit_reacquire;
     let key = request
         .key
         .ok_or_else(|| MetaStoreError::Serialization("relation authority key is required".into()))
@@ -5735,7 +5955,7 @@ fn acquire_relation_partition_authority_request_from_proto(
         ttl_ms: request.ttl_ms,
     };
     request.validate()?;
-    Ok(request)
+    Ok((request, explicit_reacquire))
 }
 
 fn relation_authoritative_ingest_publication_to_proto(
@@ -6044,6 +6264,36 @@ fn acquire_standing_runtime_owner_outcome_from_proto(
         )),
         "conflict" => Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(claim)),
         other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+    }
+}
+
+fn reacquire_standing_runtime_owner_outcome_from_proto(
+    response: proto::AcquireStandingRuntimeOwnerResponse,
+    expected_current: &StandingRuntimeOwnerClaim,
+    new_owner_id: &str,
+    owner_endpoint: &str,
+) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+    let outcome =
+        acquire_standing_runtime_owner_outcome_from_proto(response, Some(owner_endpoint))?;
+    match outcome {
+        AcquireStandingRuntimeOwnerOutcome::Acquired(claim)
+            if claim.tenant_id == expected_current.tenant_id
+                && claim.program_id == expected_current.program_id
+                && claim.view_id == expected_current.view_id
+                && claim.owner_id == new_owner_id
+                && claim.owner_endpoint.as_deref() == Some(owner_endpoint)
+                && expected_current.owner_epoch.checked_add(1) == Some(claim.owner_epoch) =>
+        {
+            Ok(AcquireStandingRuntimeOwnerOutcome::Acquired(claim))
+        }
+        AcquireStandingRuntimeOwnerOutcome::Conflict(claim) => {
+            Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(claim))
+        }
+        AcquireStandingRuntimeOwnerOutcome::Acquired(_)
+        | AcquireStandingRuntimeOwnerOutcome::Renewed(_) => Err(MetaStoreError::UnexpectedOutcome(
+            "standing runtime reacquire response did not install the expected next owner epoch"
+                .into(),
+        )),
     }
 }
 
@@ -6496,6 +6746,42 @@ impl MetaStore for GrpcMetaStore {
                         .current_token
                         .map(relation_partition_authority_token_to_proto),
                     ttl_ms: request.ttl_ms,
+                    explicit_reacquire: false,
+                }),
+            )
+            .await
+            .map_err(partition_authority_remote_error)?
+            .into_inner();
+        let token = response
+            .token
+            .ok_or_else(|| {
+                MetaStoreError::UnexpectedOutcome("missing relation authority token".into())
+            })
+            .and_then(relation_partition_authority_token_from_proto)?;
+        match response.outcome.as_str() {
+            "acquired" => Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(token)),
+            "renewed" => Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(token)),
+            "conflict" => Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(token)),
+            other => Err(MetaStoreError::UnexpectedOutcome(other.to_string())),
+        }
+    }
+
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        request.validate()?;
+        let response = self
+            .client()
+            .acquire_relation_partition_authority(
+                self.request(proto::AcquireRelationPartitionAuthorityRequest {
+                    key: Some(relation_partition_authority_key_to_proto(request.key)),
+                    owner_id: request.owner_id,
+                    current_token: request
+                        .current_token
+                        .map(relation_partition_authority_token_to_proto),
+                    ttl_ms: request.ttl_ms,
+                    explicit_reacquire: true,
                 }),
             )
             .await
@@ -7069,6 +7355,37 @@ impl MetaStore for GrpcMetaStore {
             })?
             .into_inner();
         acquire_standing_runtime_owner_outcome_from_proto(response, Some(&expected_owner_endpoint))
+    }
+
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        request.validate()?;
+        let expected_current = request.expected_current.clone();
+        let new_owner_id = request.owner_id.clone();
+        let expected_owner_endpoint = request.owner_endpoint.clone();
+        let response = self
+            .client()
+            .reacquire_standing_runtime_owner(self.request(
+                proto::ReacquireStandingRuntimeOwnerRequest {
+                    expected_current: Some(standing_runtime_owner_claim_to_proto(
+                        request.expected_current,
+                    )),
+                    owner_id: request.owner_id,
+                    owner_endpoint: request.owner_endpoint,
+                    ttl_ms: request.ttl_ms,
+                },
+            ))
+            .await
+            .map_err(|error| MetaStoreError::Remote(error.to_string()))?
+            .into_inner();
+        reacquire_standing_runtime_owner_outcome_from_proto(
+            response,
+            &expected_current,
+            &new_owner_id,
+            &expected_owner_endpoint,
+        )
     }
 
     async fn renew_standing_runtime_owner(
@@ -7957,6 +8274,38 @@ mod standing_runtime_owner_endpoint_tests {
             result,
             Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(claim))
                 if claim.owner_endpoint.as_deref() == Some("http://other-owner.example:8080")
+        ));
+    }
+
+    #[test]
+    fn grpc_reacquire_rejects_legacy_renewed_response_and_wrong_epoch() {
+        let expected = StandingRuntimeOwnerClaim {
+            tenant_id: "tenant".into(),
+            program_id: "program".into(),
+            view_id: "view".into(),
+            owner_id: "old-owner".into(),
+            owner_endpoint: Some("http://owner.example:8080".into()),
+            owner_epoch: 4,
+            expires_at_unix_ms: 99,
+        };
+        let renewed = reacquire_standing_runtime_owner_outcome_from_proto(
+            owner_response("renewed", "http://owner.example:8080"),
+            &expected,
+            "new-owner",
+            "http://owner.example:8080",
+        );
+        assert!(matches!(renewed, Err(MetaStoreError::UnexpectedOutcome(_))));
+
+        let wrong_epoch = reacquire_standing_runtime_owner_outcome_from_proto(
+            owner_response("acquired", "http://owner.example:8080"),
+            &expected,
+            "owner",
+            "http://owner.example:8080",
+        );
+        assert!(matches!(
+            wrong_epoch,
+            Err(MetaStoreError::UnexpectedOutcome(message))
+                if message.contains("next owner epoch")
         ));
     }
 

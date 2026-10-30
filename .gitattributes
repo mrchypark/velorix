@@ -1,0 +1,2 @@
+# Preserve the published help snapshot verbatim; vendor integrity is checked in CI.
+third_party/parquet-59.3.0/src/bin/parquet-fromcsv-help.txt -whitespace

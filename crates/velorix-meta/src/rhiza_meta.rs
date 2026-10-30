@@ -15,7 +15,7 @@ use crate::rhiza_kv::{RhizaKvError, RhizaKvStore};
 use crate::rhiza_kv_snapshot::{CompareExchange, RhizaKvSnapshot, RootToken, SnapshotError};
 use crate::rhiza_snapshot;
 use crate::{
-    unix_time_ms, AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
+    AcquirePartitionAuthorityOutcome, AcquirePartitionAuthorityRequest,
     AcquireRelationPartitionAuthorityOutcome, AcquireRelationPartitionAuthorityRequest,
     AcquireStandingRuntimeOwnerOutcome, AcquireStandingRuntimeOwnerRequest,
     AuthoritativeIngestPublication, BeginViewBootstrapOutcome, BeginViewBootstrapRequest,
@@ -28,13 +28,13 @@ use crate::{
     PublishIngestReservationOutcome, PublishIngestReservationRequest,
     PublishPartitionCheckpointPointerOutcome, PublishPartitionCheckpointPointerRequest,
     PublishRelationIngestReservationRequest, PublishStandingRuntimeCheckpointOutcome,
-    PublishStandingRuntimeCheckpointRequest, RelationAuthoritativeIngestPublication,
-    RelationIngestCapability, RelationIngestSourceCutV1, RelationIngestSourceIdentityCutV1,
-    RelationPartitionAuthorityKey, RelationPartitionAuthorityToken,
-    ReserveAuthoritativeIngestRangeRequest, ReserveIngestRangeOutcome,
-    ReserveRelationAuthoritativeIngestRangeRequest, StandingRuntimeCheckpointPointer,
-    StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken, StoreRelationCatalogOutcome,
-    VelorixRelationCatalogV1, ViewBootstrapControlV1,
+    PublishStandingRuntimeCheckpointRequest, ReacquireStandingRuntimeOwnerRequest,
+    RelationAuthoritativeIngestPublication, RelationIngestCapability, RelationIngestSourceCutV1,
+    RelationIngestSourceIdentityCutV1, RelationPartitionAuthorityKey,
+    RelationPartitionAuthorityToken, ReserveAuthoritativeIngestRangeRequest,
+    ReserveIngestRangeOutcome, ReserveRelationAuthoritativeIngestRangeRequest,
+    StandingRuntimeCheckpointPointer, StandingRuntimeOwnerClaim, StandingRuntimeOwnerToken,
+    StoreRelationCatalogOutcome, VelorixRelationCatalogV1, ViewBootstrapControlV1,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 8;
@@ -44,7 +44,7 @@ type CachedRootState = (RootToken, Arc<RwLock<crate::InMemoryMetaState>>);
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// A metadata store using only Rhiza 0.19.0's linearizable KV operations.
+/// A metadata store using only Rhiza's linearizable KV operations.
 #[derive(Clone)]
 pub struct RhizaKvMetaStore {
     snapshot: RhizaKvSnapshot,
@@ -166,16 +166,14 @@ impl RhizaKvMetaStore {
         let loaded = self.load_state().await;
         let cache_hit = loaded.as_ref().is_ok_and(|loaded| loaded.cache_hit);
         let result = match loaded {
-            Ok(loaded) => match unix_time_ms() {
-                Ok(now) => {
-                    evaluate(InMemoryMetaStore::from_shared_state_for_evaluation(
-                        loaded.state,
-                        now,
-                    ))
-                    .await
-                }
-                Err(error) => Err(error),
-            },
+            Ok(loaded) => {
+                let logical_tick = loaded.state.read().await.partition_authority_now_unix_ms;
+                evaluate(InMemoryMetaStore::from_shared_state_for_evaluation(
+                    loaded.state,
+                    logical_tick,
+                ))
+                .await
+            }
             Err(error) => Err(error),
         };
         report_diag(operation, cache_hit, started);
@@ -207,17 +205,18 @@ impl RhizaKvMetaStore {
                 }
             };
             cache_hit = Some(loaded.cache_hit);
-            let now = match unix_time_ms() {
-                Ok(now) => now,
-                Err(error) => {
-                    result = Err(error);
+            // Mutations always own a deep candidate copy. A failed root CAS
+            // must leave any same-root read evaluation pinned to its old state.
+            let mut candidate = loaded.state.read().await.clone();
+            let logical_tick = match candidate.partition_authority_now_unix_ms.checked_add(1) {
+                Some(tick) => tick,
+                None => {
+                    result = Err(MetaStoreError::TimestampOverflow);
                     break;
                 }
             };
-            // Mutations always own a deep candidate copy. A failed root CAS
-            // must leave any same-root read evaluation pinned to its old state.
-            let candidate = loaded.state.read().await.clone();
-            let evaluator = InMemoryMetaStore::from_state_for_evaluation(candidate, now);
+            candidate.partition_authority_now_unix_ms = logical_tick;
+            let evaluator = InMemoryMetaStore::from_state_for_evaluation(candidate, logical_tick);
             let outcome = match evaluate(evaluator.clone()).await {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -270,23 +269,22 @@ impl RhizaKvMetaStore {
         standing.backend_name = "rhiza-kv".into();
         standing.durable_monotonic_owner_epoch = true;
         standing.authoritative_backend_time = false;
-        standing.backend_time_source_kind =
-            crate::STANDING_RUNTIME_BACKEND_TIME_SOURCE_PROCESS_CLOCK.into();
-        standing.backend_time_blocked_reason =
-            "proposer_wall_clock_has_no_bounded_skew_guarantee".into();
-        standing.lease_authority_kind = "rhiza_quepaxa_root_cas".into();
+        standing.backend_time_source_kind = crate::ROOT_CAS_AUTHORITY_CLOCK_KIND.into();
+        standing.backend_time_blocked_reason = "logical_ticks_do_not_measure_elapsed_time".into();
+        standing.lease_authority_kind = crate::ROOT_CAS_AUTHORITY_CLOCK_KIND.into();
         standing.lease_expiry_semantics =
-            crate::STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_PROCESS_CLOCK_TTL.into();
+            crate::STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL.into();
         standing.bounded_wall_clock_failover = false;
         standing.failover_time_bound_ms = 0;
-        standing.multi_writer_fencing_safe = false;
+        standing.multi_writer_fencing_safe = true;
         standing.production_bounded_failover_safe = false;
         standing.production_multi_writer_safe = false;
 
         capabilities.partition_authority = PartitionAuthorityCapability {
             backend_name: "rhiza-kv".into(),
+            authority_clock_kind: crate::ROOT_CAS_AUTHORITY_CLOCK_KIND.into(),
             partition_scoped_authority: true,
-            backend_owned_time: false,
+            backend_owned_time: true,
             fenced_checkpoint_pointer_publish: true,
             durable_across_restart: true,
             production_safe: false,
@@ -700,6 +698,17 @@ impl MetaStore for RhizaKvMetaStore {
         .await
     }
 
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        self.mutate("reacquire_standing_runtime_owner", move |store| {
+            let request = request.clone();
+            async move { store.reacquire_standing_runtime_owner(request).await }
+        })
+        .await
+    }
+
     async fn read_standing_runtime_owner(
         &self,
         tenant_id: &str,
@@ -793,6 +802,17 @@ impl MetaStore for RhizaKvMetaStore {
         self.mutate("acquire_relation_partition_authority", move |store| {
             let request = request.clone();
             async move { store.acquire_relation_partition_authority(request).await }
+        })
+        .await
+    }
+
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        self.mutate("reacquire_relation_partition_authority", move |store| {
+            let request = request.clone();
+            async move { store.reacquire_relation_partition_authority(request).await }
         })
         .await
     }
@@ -1010,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_read_clock_override_does_not_change_standalone_authority_clock() {
+    async fn shared_read_evaluation_uses_persisted_partition_logical_clock() {
         let memory = InMemoryMetaStore::default();
         memory.set_partition_authority_clock_for_test(100).await;
         let key = crate::PartitionAuthorityKey {
@@ -1038,7 +1058,7 @@ mod tests {
             .read_partition_authority(&key)
             .await
             .unwrap()
-            .is_none());
+            .is_some());
         assert!(memory
             .read_partition_authority(&key)
             .await
@@ -1248,6 +1268,142 @@ mod tests {
         assert_eq!(
             store.read_relation_catalog("orders", "v2").await.unwrap(),
             catalog("v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_authority_logical_tick_is_cas_serialized_and_restart_stable() {
+        async fn logical_clock(store: &RhizaKvMetaStore) -> u64 {
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .state
+                .read()
+                .await
+                .partition_authority_now_unix_ms
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let config = || {
+            rhizadb::Config::new(directory.path())
+                .node_id("logical-clock")
+                .local()
+        };
+        let store = RhizaKvMetaStore::open_config(config()).await.unwrap();
+        let key = RelationPartitionAuthorityKey {
+            namespace: "default".into(),
+            relation_id: "orders".into(),
+            stream_id: "orders-stream".into(),
+            partition_id: 0,
+        };
+        let initial_clock = logical_clock(&store).await;
+        let request = |current_token| AcquireRelationPartitionAuthorityRequest {
+            key: key.clone(),
+            owner_id: "writer-a".into(),
+            current_token,
+            ttl_ms: 100,
+        };
+        let first = match store
+            .acquire_relation_partition_authority(request(None))
+            .await
+            .unwrap()
+        {
+            AcquireRelationPartitionAuthorityOutcome::Acquired(token) => token,
+            other => panic!("unexpected initial acquire: {other:?}"),
+        };
+        assert_eq!(logical_clock(&store).await, initial_clock + 1);
+
+        let competing = store
+            .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
+                key: key.clone(),
+                owner_id: "writer-b".into(),
+                current_token: None,
+                ttl_ms: 100,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            competing,
+            AcquireRelationPartitionAuthorityOutcome::Conflict(_)
+        ));
+
+        let before_cas_retry = logical_clock(&store).await;
+        store.force_conflict_once();
+        let renewed = store
+            .acquire_relation_partition_authority(request(Some(first.clone())))
+            .await
+            .unwrap();
+        assert!(matches!(
+            renewed,
+            AcquireRelationPartitionAuthorityOutcome::Renewed(_)
+        ));
+        assert_eq!(
+            logical_clock(&store).await,
+            before_cas_retry + 1,
+            "the failed CAS candidate must not consume a logical tick"
+        );
+
+        let observed = store
+            .read_relation_partition_authority(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let (left, right) = tokio::join!(
+            store.reacquire_relation_partition_authority(request(Some(observed.clone()))),
+            store.reacquire_relation_partition_authority(request(Some(observed.clone()))),
+        );
+        let outcomes = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    AcquireRelationPartitionAuthorityOutcome::Acquired(_)
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    AcquireRelationPartitionAuthorityOutcome::Conflict(_)
+                ))
+                .count(),
+            1
+        );
+        let current = store
+            .read_relation_partition_authority(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.owner_epoch, 2);
+        let persisted_tick = logical_clock(&store).await;
+        drop(store);
+
+        let reopened = RhizaKvMetaStore::open_config(config()).await.unwrap();
+        assert_eq!(logical_clock(&reopened).await, persisted_tick);
+        assert_eq!(
+            reopened
+                .read_relation_partition_authority(&key)
+                .await
+                .unwrap(),
+            Some(current)
+        );
+        assert_eq!(
+            logical_clock(&reopened).await,
+            persisted_tick,
+            "reads do not advance logical time"
+        );
+        assert_eq!(
+            reopened
+                .read_meta_store_capabilities()
+                .await
+                .unwrap()
+                .partition_authority
+                .authority_clock_kind,
+            crate::ROOT_CAS_AUTHORITY_CLOCK_KIND,
         );
     }
 }

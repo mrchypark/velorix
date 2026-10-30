@@ -1,22 +1,122 @@
 # Meta Service
 
 The metadata service owns hot control-plane metadata. Object storage owns large
-artifacts, checkpoint payloads, and the durable recovery archive. Foyer remains a
+artifacts and checkpoint payloads; Rhiza Local's own archive is a distinct
+durability path with its own bucket/prefix configuration. API/worker checkpoint
+objects do not configure or qualify the Rhiza archive. Foyer remains a
 non-authoritative local cache only.
 
-The product path is the embedded Rhiza KV backend, implemented against the
-`rhizadb = { version = "=0.19.0", optional = true }` API pinned by
-`crates/velorix-meta`. It is not production
-multi-writer safe and does not provide bounded wall-clock failover: the backend
-reports `authoritative_backend_time=false`,
-`backend_time_source_kind=process_clock`,
-`lease_authority_kind=rhiza_quepaxa_root_cas`,
-`lease_expiry_semantics=process_clock_ttl`, `bounded_wall_clock_failover=false`,
-`multi_writer_fencing_safe=false`, and `production_multi_writer_safe=false`.
-Those values are the current product truth and must not be relabeled to clear a
-release gate. What exists today is a no-PVC manual generation replacement shown
-by the official operator's `RhizaRecovery`; automatic operator fencing is not
-part of that evidence.
+The product path is the embedded Rhiza KV backend, pinned locally to
+`rhizadb = "=0.21.2"` with Cargo.lock checksum
+`c913bfcb9a6c6c6b5340a92c320d08c4941ae07d985e6174de7d59ad12f03db0`.
+The current release is Rhiza v0.21.2, whose exact official source is
+[`8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd`](https://github.com/mrchypark/rhiza/commit/8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd).
+The downloaded crate SHA matches the lockfile checksum. The package's
+`.cargo_vcs_info.json` is absent, an optional provenance gap. Velorix verifies
+the crate version, release checksum, and relevant source; this missing file is
+not a runtime artifact requirement. The packaged `local.go` used for the
+maintenance fix matches the exact tag source (SHA-256 prefix `dfcf564`). Native
+Mac ARM64 and Linux AMD64 sidecars match the release, and the Docker Go 1.27.3
+tarball pin is available and verified. The v0.21.2 Meta Rhiza-feature suite
+passed 196 tests, with 4 fixture-only tests ignored. The standalone native Local
+recovery probe and split-process service recovery also passed against a pinned
+local VersityGW fixture. These are local fixture results, not live-cloud or
+Kubernetes qualification. The workspace pre-push checks passed: formatting,
+clippy with `-D warnings`, runtime library (86 tests), and
+`materialized_view_runtime` (263 tests). Evidence is recorded under
+`target/rhiza-0.21.2-integration-evidence/`,
+`target/rhiza-recovery-evidence/20261029T111251Z-89574/`, and
+`target/rhiza-service-recovery-evidence/20261029t111346z-89570/`.
+The v0.21.0 release changes the archive format shared
+by filesystem, S3, GCS, and Azure storage. This is a greenfield format: startup
+must reject unsupported older database/archive formats without modifying
+them. Do not upgrade existing user data in place; use a new local data
+directory and a new archive prefix for verification. Historical crate
+checksums remain recorded alongside the current v0.21.2 pin in
+`dependency-governance.json`.
+
+Rhiza v0.21.2 reconciles an errored Local maintenance release only after
+bounded, stable remote readback proves the exact expected free control at a
+changed object version. Work errors, cancellation, unreadable or uncertain
+state, and unresolved held controls remain fail-closed. This is not a manual
+unlock or orphaned-token clearing API. It makes no archive format, identity,
+receipt, or public API change; the release upload timeout is unchanged. The
+exact-source [CI](https://github.com/mrchypark/rhiza/actions/runs/40840202108),
+[Performance](https://github.com/mrchypark/rhiza/actions/runs/40840202329),
+[Native archives](https://github.com/mrchypark/rhiza/actions/runs/40841322381),
+[Release sync](https://github.com/mrchypark/rhiza/actions/runs/40840963425),
+and [Operator image](https://github.com/mrchypark/rhiza/actions/runs/40841322597)
+runs were verified successful at that commit. CI includes pinned emulator SDK
+contracts and explicit skips; these runs do not establish independent
+live-cloud qualification. The local Cargo pin and required native artifact
+download/pins are verified at v0.21.2. External exclusion of
+overlapping writers remains required.
+
+The v0.20 logical-fencing evidence below is historical. For v0.21.0, the
+Velorix Meta feature suite passed 190 tests with 3 ignored, and the fresh-data
+single-node archive drill passed 1 test in 2.13 seconds. A split-process
+recovery run passed against S3 via the pinned local VersityGW fixture on macOS
+ARM64; its recorded results are summarized below. Filesystem, GCS, Azure,
+native archive image variants, and older-format rejection/non-modification
+remain unverified. S3 evidence does not pass those cases. Formatting, workspace
+clippy, Meta/Control feature clippy with `-D warnings`, runtime tests (86 unit
+and 263 integration), and API tests (458 passed, 1 ignored) passed. Both live
+harnesses exited 0. No Rhiza defect was reproduced.
+
+The application-owned `init-local` deployment contract follows the official
+Rhiza v0.21.1 [Local init-container recovery guide](https://raw.githubusercontent.com/mrchypark/rhiza/v0.21.1/docs/local-init-container-recovery.md),
+introduced at upstream commit
+[`66e2416b52e3d64aa86134b7b0c8b70c5ace88be`](https://github.com/mrchypark/rhiza/commit/66e2416b52e3d64aa86134b7b0c8b70c5ace88be).
+`init-local` opens Rhiza with the same S3 configuration, identity, and mounted
+`DataDir` used by `serve`, waits for native recovery/reconciliation, then
+explicitly closes the database and surfaces close errors. It may perform
+Rhiza's native archive operations; it must not start application SQL or other
+listeners. Its successful close is required before the init container
+acknowledges completion. `serve` must then use the same configuration and
+`DataDir`, drains work, and explicitly closes Rhiza on shutdown, also
+surfacing close errors. This does not imply a Rhiza-provided CLI or image, and
+does not relabel the historical v0.21.0 tests above as v0.21.2 results. Init
+sequencing alone does not exclude a second external writer;
+single-writer exclusion remains an operational requirement. The all-in-one
+image's entrypoint accepts `meta init-local` and forwards
+those arguments to `velorix-meta`; run the image again with `meta serve` and the
+same volume and environment. `velorix-all` is the image name, not a native CLI.
+Its `all` mode already opens Rhiza as
+part of service startup and does not need a separate init container. This
+manifest explicitly selects Local mode and does not opt legacy clustered
+deployments into it. The checked-in
+Kubernetes contract is static and offline; no Kubernetes deployment or
+container image qualification has been performed. Local mode remains
+single-writer and does not establish HA or production failover safety. The
+v0.21.2 maintenance release-acknowledgement fix addresses the previously
+recorded S3 release-control issue. External quiescence and exclusion of
+overlapping writers remain required for maintenance and any second writer.
+
+The previously observed Rhiza 0.20 capability reports
+`authoritative_backend_time=false`,
+`backend_time_source_kind=root_cas_logical_clock`,
+`lease_authority_kind=root_cas_logical_clock`, and
+`lease_expiry_semantics=operation_driven_logical`. Its logical owner-lease
+capability reports `multi_writer_fencing_safe=true`, while
+`bounded_wall_clock_failover=false`,
+`production_bounded_failover_safe=false`, and
+`production_multi_writer_safe=false`. The logical fencing capability describes
+root-CAS owner and epoch checks; it is not a production safety claim and does
+not establish bounded failover.
+
+## Logical fencing and version cutover
+
+Under Rhiza's root-CAS clock, the `VELORIX_STANDING_RUNTIME_OWNER_TTL_MS`
+parameter is a logical-tick budget, not elapsed milliseconds. The functional
+recovery run used `30000`; that value does not imply a 30-second expiry or a
+wall-clock recovery bound. A restarted process uses the explicit
+`ReacquireStandingRuntimeOwner` operation to acquire the next owner epoch; the
+old epoch remains fenced. The new RPC is not implemented by older Meta servers,
+which return `UNIMPLEMENTED`; API callers fail closed.
+
+Cutover requires quiescing metadata writers and moving Meta, API, and worker
+processes to compatible versions together. Do not run old and new metadata
+writers concurrently or use a mixed-version rollout for this protocol change.
 
 The operator-managed runtime opens `RhizaKvMetaStore` from the native
 `RHIZA_*` environment and starts the operator recovery listener on the same
@@ -58,7 +158,7 @@ The metadata binary also supports the embedded Rhiza KV backend behind the
 `VELORIX_RHIZA_MEMBERS_JSON` or a secret-mounted
 `VELORIX_RHIZA_MEMBERS_FILE` (never both). The value is a JSON array whose
 members carry exactly `node_id`, `url`, `peer_url` (`quic://...`), and
-`public_key` fields. Under the Rhiza 0.19.0 contract `public_key` is required
+`public_key` fields. Under the Rhiza 0.20.0 contract `public_key` is required
 public material: standard padded base64 of the 32 raw Ed25519 public key
 bytes, never the URL-safe alphabet. Any other field, including the legacy
 per-member `token`, is a hard unknown-field error rather than an ignored key.
@@ -80,14 +180,35 @@ This contract is greenfield. A run starts from a fresh empty
 migration path from a pre-0.19.0 membership document; such a document is not a
 valid input.
 
-Development Rhiza mode is explicitly single-node and defaults to asynchronous
-object-store durability. Production mode requires exactly three voters,
-explicit S3/GCS/Azure object storage, and
+Development Rhiza cluster mode is explicitly single-node and defaults to
+asynchronous object-store durability. Production cluster mode requires exactly
+three voters, explicit S3/GCS/Azure object storage, and
 `VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack`; no local filesystem object
 store is accepted as production durability. The service performs a
 linearizable metadata read before opening its gRPC listener, so an unavailable
 Rhiza quorum fails startup. Rhiza's production fencing capability remains
 fail-closed until the separately recorded three-node recovery evidence exists.
+
+`VELORIX_RHIZA_MODE=local` explicitly selects Rhiza 0.21's native
+`Config::local()` mode. It is a single-writer local database, not a one-voter
+consensus cluster. It requires `VELORIX_RHIZA_DATA_DIR`,
+`VELORIX_RHIZA_NODE_ID`, and a stable `VELORIX_RHIZA_CLUSTER_ID`. When an
+object store is configured, Rhiza stores Local archives at
+`path.Join(ObjStorePrefix, ClusterID, "local/v1")`; keep the cluster ID and
+prefix stable across restarts. Production Local mode
+requires explicit S3/GCS/Azure object storage and
+`VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack`. It rejects peer listeners,
+membership, peer identity secrets, admin credentials, and runtime `RHIZA_*`
+configuration variables that could shadow the explicit settings. Build-time
+`RHIZA_NATIVE_LIB_DIR` remains allowed. Local mode is not a multi-writer
+fencing claim.
+
+`velorix-meta check-config` applies the same production environment admission
+as `serve` without opening Rhiza, accessing the archive, or binding a listener.
+It validates settings as supplied; it does not parse TLS PEM files or contact
+the object store. The serving process opens `Config::local()` and Rhiza performs
+its native Local archive recovery when the data directory is empty. The
+official test-helper staging path is not used as a production archive handoff.
 
 Production transport may use native mutual TLS with
 `VELORIX_META_TRANSPORT_SECURITY=native-mtls` and the server files
@@ -198,3 +319,42 @@ Append admission order is:
 If a range reservation succeeds but the payload append fails, an identical retry
 is admitted as a duplicate metadata reservation and can complete the missing
 object-store payload write.
+
+## v0.21.0 local S3 logical-fencing recovery evidence
+
+The recorded run at
+`target/rhiza-service-recovery-evidence/20261027t111801z-12147/result.json`
+used one Rhiza 0.21.0 Meta process and separate API and worker processes. It
+started with fresh metadata directories and a new archive prefix. Initial
+sum/count outputs were `2.5/1` and remained so after the first empty-directory
+restore. A new input produced `4/2`; the duplicate retry kept `4/2` and the
+descriptor unchanged. A second empty-directory restore also returned `4/2`.
+Both restored views read checkpoint bodies from S3. The incremental query read
+the new source batch once and the old batch zero times; checkpoint bodies used
+`velorix-arrow-ipc-zstd3-v1`.
+
+The run verified logical fencing with a `30000` logical-tick owner-lease
+parameter. It reported `production_bounded_failover_safe=false` and
+`production_multi_writer_safe=false`. This is local S3 evidence, not production
+safety or multi-provider archive compatibility evidence.
+
+## Historical 0.20 local logical-fencing recovery evidence
+
+The 2026-10-27 historical split-process functional run used one Rhiza 0.20 Meta process,
+separate API and worker processes, fresh metadata state and read caches after
+each restart, and manually pinned VersityGW source commit
+`fd04bc1df2656298577b82667a4195c77f8c7563`. Initial sum/count results were
+`2.5/1`; they remained `2.5/1` after the first empty-directory Meta restore.
+After one post-restore input, results were `4/2`; a duplicate retry preserved
+the `1..2` ingest offsets, and a second empty-directory restore retained `4/2`.
+Both restored views returned checkpoint-body S3 GETs. The first-restore
+startup/query audit recorded zero GETs for the original source batch; the
+incremental query recorded one GET for the new batch and zero for the original
+batch. The query `logical_epoch` stayed equal across both recorded restart
+pairs. The run used a 30000 logical-tick owner TTL parameter.
+
+This is historical local logical-fencing functional evidence only. It does not
+establish v0.21.0 archive compatibility, provider coverage, production bounded
+failover, production multi-writer safety, or a production deployment. Existing
+older data is not migrated by v0.21.0 and must remain unchanged when rejected;
+that rejection behavior remains unverified.

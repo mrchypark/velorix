@@ -1,5 +1,190 @@
 # Rhiza KV Kubernetes validation
 
+## Standalone Local deployment with S3 backup
+
+`deploy/rhiza-k8s/local` is a separate, single-writer production template for
+Rhiza Local mode. It runs one `velorix-meta` Deployment replica with
+`strategy: Recreate`, uses the same Velorix image for both init and main
+containers, enables native mTLS and bearer authentication, and configures S3
+backup with `before-ack` durability. It does not install or use the Rhiza
+operator.
+
+The initContainer runs the application-owned `velorix-meta init-local`
+command, with the same immutable Velorix image, ConfigMap, Secrets, TLS files,
+object-store settings, and mounted `VELORIX_RHIZA_DATA_DIR` as the main
+container. It opens Rhiza, waits for recovery and reconciliation to finish,
+then closes the database before exiting. The `serve` process subsequently opens
+Rhiza with the same configuration and same `DataDir`. Rhiza has no dedicated
+init CLI or image; both commands belong to the Velorix application. The
+initContainer does not start the Meta service or report its readiness.
+Its CPU, memory, and ephemeral-storage requests and limits are set comparable
+to the main process because opening Rhiza and reconciling an archive is native
+database work, not a lightweight configuration parse. These are initial
+resource settings, not a measured budget: no image build or Kubernetes run was
+performed, so peak init resource use is unqualified. `check-config` remains a
+separate, non-opening preflight command and is not used for recovery.
+
+For the standalone binary, the command sequence is `velorix-meta init-local`
+followed by `velorix-meta serve` in the main container, with identical Rhiza
+configuration and the same mounted data directory. The all-in-one image
+uses the `meta` argument to dispatch to `velorix-meta`; `velorix-all` is the
+image name, not a native executable. For example, invoke the image with
+`meta init-local`, then run it again with `meta serve`, keeping the same
+environment and volume options on both invocations:
+
+```sh
+docker run --rm --env-file ./meta.env -v velorix-meta-data:/var/lib/velorix-meta \
+  ghcr.io/mrchypark/velorix-all@sha256:REPLACE_WITH_DIGEST meta init-local
+docker run --rm --env-file ./meta.env -v velorix-meta-data:/var/lib/velorix-meta \
+  ghcr.io/mrchypark/velorix-all@sha256:REPLACE_WITH_DIGEST meta serve
+```
+
+All-in-one `all` mode already starts Meta and opens Rhiza as part of the
+combined service; it does not need a separate init container. Local mode is
+explicitly selected and this deployment does not change existing
+operator-managed cluster users to Local mode.
+
+This contract follows the official [Rhiza v0.21.1 Local init-container
+recovery guide](https://raw.githubusercontent.com/mrchypark/rhiza/v0.21.1/docs/local-init-container-recovery.md),
+introduced by upstream commit
+[`66e2416b52e3d64aa86134b7b0c8b70c5ace88be`](https://github.com/mrchypark/rhiza/commit/66e2416b52e3d64aa86134b7b0c8b70c5ace88be).
+The active local Cargo pin is v0.21.2. Its published crate hash, relevant
+packaged source, Mac ARM64 and Linux AMD64 native sidecars, and Docker Go
+1.27.3 tarball pin are verified. The crate omits optional
+`.cargo_vcs_info.json`, which is a provenance gap but not a Velorix runtime
+artifact requirement. The
+v0.21.2 Local maintenance fix accepts a release only after
+bounded stable readback sees the exact expected free control at a changed
+object version; uncertain work, errors, cancellation, and held controls remain
+fail-closed. It does not add archive/API changes or a manual unlock for an
+orphaned held token. External exclusion of concurrent writers remains
+required.
+
+For each init-local/serve lifecycle, use the same Rhiza configuration and the
+same mounted `DataDir`; init-local must complete native open/recovery and
+reconciliation and successfully close before acknowledging completion. The
+main process then opens the same directory and configuration. This sequence
+does not provide a lock against another external writer: deployment operations
+must still enforce single-writer exclusion. The historical runtime evidence
+below remains attributed to v0.21.1. Separate v0.21.2 evidence is recorded in
+the current architecture assessment; it does not qualify a Kubernetes
+deployment or live-cloud behavior.
+
+The main container deliberately uses `emptyDir` for its working directory, so
+Pod replacement depends on Rhiza's S3 recovery path. The manifest configures
+`before-ack`. A successful Kubernetes render or `check-config` result alone
+does not prove that data was restored. The native Local recovery test has now
+passed against Rhiza 0.21.0; its evidence and limits are recorded below. That
+test did not run this Kubernetes manifest.
+
+### Native Local S3 recovery evidence
+
+The local service recovery run used Rhiza 0.21.0 in Local mode, Velorix Meta
+production admission with native mTLS, and a pinned local Versity Gateway. It
+restored twice from a fresh local data directory: first the existing output remained
+sum/count `2.5/1`; after a new input it became `4/2`, and the same-offset
+duplicate retry left it unchanged. The second empty-directory restore retained
+`4/2`. The run also recorded eight checkpoint bodies with the Arrow IPC ZSTD
+codec, zero old-source batch GETs during first-restore boot, and one GET for the
+new source batch. See the [run result](../../target/rhiza-service-recovery-evidence/20261028t132247z-28327/result.json),
+[cleanup record](../../target/rhiza-service-recovery-evidence/20261028t132247z-28327/cleanup.txt),
+and [first-restore query audit](../../target/rhiza-service-recovery-evidence/20261028t132247z-28327/s3-first-restore-boot-query-audit.log).
+
+This proves the tested local service path only. The API and worker in that run
+used local-development mode and logical fencing; the evidence explicitly says
+production bounded failover and production multi-writer safety are false. It
+was not a Kubernetes deployment test and does not validate a built or pinned
+container image, Kubernetes Secret wiring, cluster scheduling, or production
+cloud S3 behavior.
+The API/worker checkpoint objects in S3 are separate from Rhiza's own Local
+archive; configuring one does not configure or qualify the other.
+
+This template is greenfield. Before first use, replace the placeholder image
+with an immutable image digest built from the current Velorix source; both
+containers must use the same digest. `imagePullPolicy: IfNotPresent` allows the
+cluster to pull that digest when it is absent locally. Replace the S3 endpoint,
+bucket, and prefix placeholders. Use a new dedicated bucket or prefix for this
+Local store; do not point it at an existing Rhiza cluster archive. Preserve the
+same `VELORIX_RHIZA_CLUSTER_ID`, node ID, S3 bucket, and prefix for the life of
+this store. Do not reuse that archive namespace for a replacement store.
+
+Provision these Secrets in the target namespace before applying the Kustomize
+directory:
+
+- `velorix-meta-local-auth`, with key `token` for the Velorix gRPC bearer
+  credential.
+- `velorix-meta-local-s3`, with keys `access_key` and `secret_key`; add
+  `session_token` when using temporary S3 credentials. A workload identity
+  configuration may replace static credentials if its SDK credential chain is
+  verified for the target environment.
+- `velorix-meta-local-tls`, with `tls.crt`, `tls.key`, and `ca.crt`. The
+  certificate must cover the Service DNS name `velorix-meta-local` and the
+  namespace-qualified Service name used by clients.
+
+Set the image to a digest in `deploy/rhiza-k8s/local/deployment.yaml` and fill
+the endpoint, bucket, and unique prefix in `configmap.yaml`. Then render and
+inspect the result with `kustomize build deploy/rhiza-k8s/local`. Apply only
+with an explicit target context, for example
+`kubectl --context "<isolated-context>" --namespace "<dedicated-namespace>" apply -k deploy/rhiza-k8s/local`.
+Never apply this template using an implicit context.
+
+The checked-in image value `velorix-meta:PIN_REQUIRED` is deliberately a
+placeholder. No Velorix image was built or digest-pinned for this template.
+After building and publishing an image from the current source, replace both
+container references with its resolved immutable digest. From the repository
+root, the command has this form:
+
+```sh
+cd deploy/rhiza-k8s/local
+kustomize edit set image velorix-meta=registry.example.com/velorix/velorix-meta@sha256:REPLACE_WITH_RESOLVED_DIGEST
+cd ../../..
+```
+
+Create the namespace and Secrets with an explicit isolated context. The
+`--from-file` inputs must be outside the repository and contain only their
+corresponding token, credential, or certificate material:
+
+```sh
+kubectl --context "<isolated-context>" create namespace "<dedicated-namespace>"
+kubectl --context "<isolated-context>" --namespace "<dedicated-namespace>" create secret generic velorix-meta-local-auth --from-file=token=/secure/path/meta-bearer-token
+kubectl --context "<isolated-context>" --namespace "<dedicated-namespace>" create secret generic velorix-meta-local-s3 --from-file=access_key=/secure/path/s3-access-key --from-file=secret_key=/secure/path/s3-secret-key
+kubectl --context "<isolated-context>" --namespace "<dedicated-namespace>" create secret generic velorix-meta-local-tls --from-file=tls.crt=/secure/path/server.crt --from-file=tls.key=/secure/path/server.key --from-file=ca.crt=/secure/path/client-ca.crt
+sh scripts/check-rhiza-local-k8s-contract.sh
+kustomize build deploy/rhiza-k8s/local
+kubectl --context "<isolated-context>" --namespace "<dedicated-namespace>" apply -k deploy/rhiza-k8s/local
+```
+
+The apply command is an example only; this task did not build an image or apply
+the template to Kubernetes. Init resource sizing has not been measured against
+a built image or a live cluster.
+
+`Recreate` and `replicas: 1` serialize rollouts managed by this Deployment;
+they do not fence another workload or an operator that uses the same S3
+namespace. Enforce external single-writer quiescence for maintenance, restore,
+or any second process that could open this archive. The Local archive identity
+is independent of the old three-voter operator deployment below; do not reuse
+its manifests, cluster membership, or S3 prefix.
+
+Never use `kubectl delete --force --grace-period=0` as a recovery or fencing
+step. Removing a Pod object or setting a StatefulSet partition does not prove
+the process stopped on an unreachable node. Before any restore or second writer
+starts, confirm the old process/container has terminated and externally fence
+the node if its state is uncertain. Do not run two Velorix processes against
+the same Local archive.
+
+Run `sh scripts/check-rhiza-local-k8s-contract.sh` for an offline Kustomize
+render and local YAML structural check. It uses Kustomize, Mike Farah `yq`,
+and `jq`; it does not call `kubectl` or contact a Kubernetes API server.
+This contract proves the manifest shape only, not Rhiza recovery or production
+cloud behavior. As of this change, CI runs the existing operator-manifest
+contract and Rhiza backend/recovery jobs, but does not invoke this new Local
+manifest contract script. The successful local run is therefore not a CI gate.
+
+## Historical three-voter Operator validation (Rhiza 0.19.0)
+
+The following section documents the separate three-voter operator recovery
+path. It does not configure or validate the standalone Local deployment above.
+
 `scripts/run-rhiza-kv-k8s-gate.sh` is an explicit, isolated validation harness
 for the embedded Rhiza KV metadata service. It is preflight-only by default.
 It does not select a cluster, create a namespace, or change Kubernetes state
@@ -14,7 +199,7 @@ migration path from an earlier membership shape and none is described here: a
 pre-0.19.0 membership document is not a valid input to this harness and is
 rejected during preflight.
 
-## Membership document: public material only
+### Membership document: public material only
 
 The membership document is supplied through `VELORIX_RHIZA_MEMBERS_JSON` and
 must be a three-element array whose node IDs are exactly `velorix-meta-0`,
@@ -63,7 +248,7 @@ fallback, and must never be set. The harness supplies it as
 peer-key derivation is checked against, and the gate asserts the published
 `RHIZA_CLUSTER_ID` against it after the operator rotates the generation.
 
-## Operator-managed mode
+### Operator-managed mode
 
 `VELORIX_RHIZA_OPERATOR_MANAGED=1` is the only Velorix-owned variable that takes
 part in this deployment, and it is an opt-in rather than configuration. It
@@ -90,7 +275,7 @@ padded base64 of the trailing 32 bytes. Each intermediate result is length- and
 alphabet-checked, so an OpenSSL build that cannot produce the accepted encoding
 is rejected rather than allowed to publish a key no node would accept.
 
-## Peer tokens: private, per node, never in the membership document
+### Peer tokens: private, per node, never in the membership document
 
 Private peer tokens are supplied separately through `VELORIX_RHIZA_PEER_TOKENS`,
 a JSON object keyed by node ID, for example
@@ -123,7 +308,7 @@ point at that Secret, and it must additionally blank any inherited scalar
 `RHIZA_PEER_TOKEN`, because a scalar token alongside the map fails the next
 process start.
 
-## Fail-closed preflight
+### Fail-closed preflight
 
 Preflight runs before any cluster mutation and refuses to proceed on any of the
 following, with a message naming the offending input:
@@ -140,7 +325,7 @@ following, with a message naming the offending input:
 - a Secret or fixed resource name already present in the isolated namespace
 - any object-store, TLS, image, or namespace-isolation violation described below
 
-## Executed workload
+### Executed workload
 
 Native mTLS is mandatory for the executed workload. Set
 `VELORIX_RHIZA_SERVER_TLS_SECRET` and `VELORIX_RHIZA_CLIENT_TLS_SECRET` to
@@ -211,7 +396,7 @@ The image workflow builds `Dockerfile.meta` with the `rhiza-backend` feature;
 its pinned Go 1.27.0 toolchain is used only in the builder stage for Rhiza's
 native FFI.
 
-## Operator image pin
+### Operator image pin
 
 The official operator image defaults to the published Rhiza 0.19.0 manifest
 digest. `VELORIX_RHIZA_OPERATOR_IMAGE` may only be set to that exact reference;
@@ -239,7 +424,7 @@ Without provenance the override is refused. Evidence reports
 run is never presented as the published release image, and the production pin is
 never weakened to make one run possible.
 
-## Test-only Versity Gateway fixture
+### Test-only Versity Gateway fixture
 
 If no approved external S3 service is available, the explicitly opt-in
 `scripts/run-rhiza-kv-k8s-fixture.sh` wrapper provisions a fresh, test-only
@@ -270,7 +455,7 @@ inspection and can delete only its own created namespace with
 `VELORIX_RHIZA_FIXTURE_CLEANUP=1`. Its evidence is explicitly marked
 fixture-only and cannot establish provider-loss or production durability behavior.
 
-## Local recovery regression and proof boundaries
+### Local recovery regression and proof boundaries
 
 `sh scripts/check-rhiza-recovery.sh` builds official Versity Gateway v1.8.0
 (`fd04bc1df2656298577b82667a4195c77f8c7563`) into a run-local binary directory,
@@ -304,10 +489,55 @@ pins and GC locks lack that second HEAD check. Concurrent DELETE and unexpected
 metadata-error handling remain unverified limits. The drill's competing CAS
 assertion concerns Rhiza's replicated metadata, not general S3 atomicity.
 
-The former MinIO-backed local drill passed on 2026-09-05, including an independent rerun in 18.53
-seconds. GitHub Actions runs this ignored integration test explicitly and
-retains its logs and JSON evidence. The JSON summarizes passing assertions;
-the test and logs are the underlying evidence.
+The former MinIO-backed local drill passed on 2026-09-05, including an
+independent rerun in 18.53 seconds. GitHub Actions runs this ignored integration
+test explicitly and retains its logs and JSON evidence. The JSON summarizes
+passing assertions; the test and logs are the underlying evidence.
+
+### Rhiza 0.21.1 Local service evidence (2026-10-29)
+
+The native `Config::local` S3 recovery probe and the split-process Local service
+harness passed against `rhizadb` 0.21.1 and the source-pinned VersityGW fixture.
+The service run exercised `init-local` before all three meta starts, a real
+missing-bucket SDK open failure with no listener, HTTP materialized-view
+recovery across two empty-directory restores, duplicate ingest handling, and
+SIGTERM close of all three meta processes with exit status 0 and the database
+close diagnostic. The full Local service result is
+[target/rhiza-service-recovery-evidence/20261028t151124z-45170/result.json](../../target/rhiza-service-recovery-evidence/20261028t151124z-45170/result.json);
+the standalone native probe result is
+[target/rhiza-recovery-evidence/20261028T145528Z-24843/rhiza-recovery.json](../../target/rhiza-recovery-evidence/20261028T145528Z-24843/rhiza-recovery.json).
+The `velorix-meta` Rhiza-feature suite completed with 196 passed, 0 failed, and
+4 ignored in
+[`target/rhiza-0.21.1-contract-evidence/meta-feature-tests-rerun1.log`](../../target/rhiza-0.21.1-contract-evidence/meta-feature-tests-rerun1.log)
+(exit status 0).
+
+The service harness had four earlier failed attempts, all classified as
+harness/build issues rather than Rhiza failures: `20261028t145657z-24836` used
+the API generation number to select the meta log/status and signalled a shell
+wrapper PID; `20261028t150445z-39501` let foreground `exec` replace the harness
+after the expected missing-bucket failure; `20261028t150609z-40857` used a meta
+binary built before the source’s graceful-shutdown change; and
+`20261028t150902z-42902` checked final-generation shutdown evidence before
+performing that shutdown. Their logs, statuses, timestamps, and binary hashes
+remain under `target/rhiza-service-recovery-evidence/`; none is counted as a
+recovery result. The final run above passed and its fixture processes and data
+were removed after evidence capture.
+
+### Rhiza 0.21.2 Local recovery evidence (2026-10-29)
+
+The standalone `Config::local` recovery probe passed with Rhiza 0.21.2 against
+the pinned local VersityGW fixture. The split-process service run also passed
+with separate API, worker, and Meta processes: `init-local` ran before each
+Meta start, a missing-bucket open failed closed, SIGTERM closed each Meta
+process cleanly, and two empty-directory restores retained the materialized
+sum/count before a new input advanced them from `(2.5, 1)` to `(4, 2)`. A
+same-offset retry was reported as a duplicate with an unchanged descriptor.
+Evidence is in
+[`target/rhiza-recovery-evidence/20261029T111251Z-89574/rhiza-recovery.json`](../../target/rhiza-recovery-evidence/20261029T111251Z-89574/rhiza-recovery.json)
+and
+[`target/rhiza-service-recovery-evidence/20261029t111346z-89570/result.json`](../../target/rhiza-service-recovery-evidence/20261029t111346z-89570/result.json).
+This is native local-fixture evidence; no Kubernetes deployment or live-cloud
+qualification was performed.
 
 This is a graceful cold-restart test, not a SIGKILL or power-loss test. The gateway
 remains available throughout the retained-WAL restart. Neither this drill nor
@@ -326,7 +556,7 @@ in `crates/velorix-meta/tests/rhiza_recovery.rs`, and
 carry the same `public_key` and per-node `PeerToken` treatment as this harness.
 They are outside this harness's contract and are not covered by it.
 
-## Isolated kind evidence, 0.19.0 operator path
+### Isolated kind evidence, 0.19.0 operator path
 
 The 0.19.0 harness passed end to end again on 2026-10-08, on the current
 branch source, against an explicitly selected disposable kind context, on a
@@ -380,7 +610,7 @@ whose only writer is the operator, so the fence attestation is harness ownership
 rather than an attested external production fence, and the evidence records
 `production_fence_attested: false` and `trusted_for_production: false`.
 
-## Superseded Kubernetes evidence
+### Superseded Kubernetes evidence
 
 The isolated fixture passed against an explicitly selected target context on
 2026-09-05 using runtime source `c4d957b` and GHCR Meta image

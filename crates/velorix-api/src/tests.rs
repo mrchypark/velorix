@@ -98,6 +98,297 @@ fn unsafe_dev_multi_api_mode_is_explicit_and_keeps_other_modes_guarded() {
     .is_err());
 }
 
+fn root_cas_logical_fencing_capability() -> StandingRuntimeFencingCapability {
+    StandingRuntimeFencingCapability {
+        capability_schema_version: STANDING_RUNTIME_FENCING_CAPABILITY_SCHEMA_VERSION,
+        backend_name: "rhiza-kv".into(),
+        owner_scope_kind: STANDING_RUNTIME_OWNER_SCOPE_KIND_TENANT_PROGRAM_VIEW.into(),
+        linearizable_owner_lease: true,
+        durable_monotonic_owner_epoch: true,
+        authoritative_backend_time: false,
+        owner_validated_checkpoint_publish: true,
+        publish_checks_owner_and_latest_atomically: true,
+        publish_rejects_expired_owner: true,
+        latest_read_linearizable: true,
+        publish_rejects_scope_mismatch: true,
+        max_owner_ttl_ms: 1_000,
+        control_plane_auth_enforced: true,
+        production_multi_writer_safe: false,
+        backend_time_source_kind: ROOT_CAS_AUTHORITY_CLOCK_KIND.into(),
+        backend_time_blocked_reason: "logical_ticks_do_not_measure_elapsed_time".into(),
+        lease_authority_kind: ROOT_CAS_AUTHORITY_CLOCK_KIND.into(),
+        lease_expiry_semantics: STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_OPERATION_DRIVEN_LOGICAL
+            .into(),
+        bounded_wall_clock_failover: false,
+        failover_time_bound_ms: 0,
+        multi_writer_fencing_safe: true,
+        production_bounded_failover_safe: false,
+    }
+}
+
+#[test]
+fn root_cas_logical_clock_is_admitted_only_with_operation_driven_expiry() {
+    let capability = root_cas_logical_fencing_capability();
+    assert!(owner_routing::supports_cold_standing_owner_reacquire(
+        &capability
+    ));
+    assert!(validate_standing_runtime_fencing_for_mode(
+        &capability,
+        StandingRuntimeFencingMode::LogicalFencing
+    )
+    .is_ok());
+
+    let mut unknown_authority = capability.clone();
+    unknown_authority.lease_authority_kind = "unknown_authority".into();
+    assert!(!owner_routing::supports_cold_standing_owner_reacquire(
+        &unknown_authority
+    ));
+    assert!(validate_standing_runtime_fencing_for_mode(
+        &unknown_authority,
+        StandingRuntimeFencingMode::LogicalFencing
+    )
+    .is_err());
+
+    let mut wrong_expiry = capability;
+    wrong_expiry.lease_expiry_semantics =
+        STANDING_RUNTIME_LEASE_EXPIRY_SEMANTICS_BACKEND_WALL_CLOCK_TTL.into();
+    assert!(!owner_routing::supports_cold_standing_owner_reacquire(
+        &wrong_expiry
+    ));
+    assert!(validate_standing_runtime_fencing_for_mode(
+        &wrong_expiry,
+        StandingRuntimeFencingMode::LogicalFencing
+    )
+    .is_err());
+}
+
+#[test]
+fn root_cas_logical_clock_does_not_satisfy_production_fencing() {
+    let capability = root_cas_logical_fencing_capability();
+    let error = validate_standing_runtime_fencing_for_mode(
+        &capability,
+        StandingRuntimeFencingMode::Required,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("authoritative_backend_time"));
+    assert!(error
+        .to_string()
+        .contains("backend_wall_clock_ttl_lease_expiry"));
+}
+
+#[tokio::test]
+async fn process_that_previously_owned_scope_cannot_reacquire_after_restart_takeover() {
+    let meta = Arc::new(InMemoryMetaStore::default());
+    let checkpoint = test_runtime_checkpoint(Vec::new());
+    let identity = &checkpoint.identity;
+    let view_id = &identity.view_ids[0];
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let old_process = test_api_state_with_store(store.clone(), "old-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    let new_process = test_api_state_with_store(store, "new-process", false)
+        .await
+        .with_meta_store(meta.clone());
+
+    old_process
+        .acquire_standing_runtime_owner(identity, view_id)
+        .await
+        .unwrap()
+        .expect("old process should acquire initial owner token");
+    let old_claim = meta
+        .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .unwrap()
+        .expect("acquired owner token should have a persisted claim");
+    let expected_next_epoch = old_claim.owner_epoch + 1;
+    let reacquired = meta
+        .reacquire_standing_runtime_owner(ReacquireStandingRuntimeOwnerRequest {
+            expected_current: meta
+                .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            owner_id: new_process.owner_id.clone(),
+            owner_endpoint: new_process.owner_endpoint.clone(),
+            ttl_ms: new_process.standing_runtime_owner_ttl_ms,
+        })
+        .await
+        .unwrap();
+    let AcquireStandingRuntimeOwnerOutcome::Acquired(new_claim) = reacquired else {
+        panic!("new process should acquire a higher owner epoch");
+    };
+    assert_eq!(new_claim.owner_epoch, expected_next_epoch);
+    new_process
+        .set_standing_runtime_owner(identity, view_id, new_claim.clone())
+        .unwrap();
+
+    assert!(!old_process
+        .mark_standing_runtime_reacquire_attempted(identity, view_id, &old_claim)
+        .unwrap());
+    let current = meta
+        .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, new_claim);
+    assert_eq!(current.owner_epoch, expected_next_epoch);
+}
+
+#[tokio::test]
+async fn cold_owner_reacquire_retries_after_known_precommit_failure() {
+    let meta = Arc::new(
+        DurableCapabilityMetaStore::new(InMemoryMetaStore::default()).with_reacquire_fault(1),
+    );
+    let checkpoint = test_runtime_checkpoint(Vec::new());
+    let identity = &checkpoint.identity;
+    let view_id = &identity.view_ids[0];
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let old_process = test_api_state_with_store(store.clone(), "old-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    let new_process = test_api_state_with_store(store, "new-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    old_process
+        .acquire_standing_runtime_owner(identity, view_id)
+        .await
+        .unwrap()
+        .expect("old process should acquire initial owner token");
+    let old_claim = meta
+        .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .unwrap()
+        .expect("acquired owner token should have a persisted claim");
+
+    let first = owner_routing::cold_reacquire_standing_owner(
+        &new_process,
+        meta.as_ref(),
+        identity,
+        view_id,
+        &old_claim,
+    )
+    .await;
+    assert!(first.is_err(), "the injected failure occurs before commit");
+    assert_eq!(
+        new_process
+            .pending_standing_runtime_reacquire(identity, view_id)
+            .unwrap(),
+        Some(old_claim.clone()),
+        "the exact predecessor remains pending for safe retry"
+    );
+
+    let retried = owner_routing::cold_reacquire_standing_owner(
+        &new_process,
+        meta.as_ref(),
+        identity,
+        view_id,
+        &old_claim,
+    )
+    .await
+    .unwrap()
+    .expect("retry should acquire while the exact predecessor remains current");
+    assert_eq!(retried.owner_id, new_process.owner_id);
+    assert_eq!(retried.owner_epoch, old_claim.owner_epoch + 1);
+}
+
+#[tokio::test]
+async fn cold_owner_reacquire_resolves_lost_response_after_readback_error() {
+    let meta = Arc::new(
+        DurableCapabilityMetaStore::new(InMemoryMetaStore::default()).with_reacquire_fault(3),
+    );
+    let checkpoint = test_runtime_checkpoint(Vec::new());
+    let identity = &checkpoint.identity;
+    let view_id = &identity.view_ids[0];
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let old_process = test_api_state_with_store(store.clone(), "old-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    let new_process = test_api_state_with_store(store, "new-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    old_process
+        .acquire_standing_runtime_owner(identity, view_id)
+        .await
+        .unwrap()
+        .expect("old process should acquire initial owner token");
+    let old_claim = meta
+        .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .unwrap()
+        .expect("acquired owner token should have a persisted claim");
+
+    let first = owner_routing::cold_reacquire_standing_owner(
+        &new_process,
+        meta.as_ref(),
+        identity,
+        view_id,
+        &old_claim,
+    )
+    .await;
+    assert!(first.is_err(), "the injected readback failure is surfaced");
+    assert_eq!(
+        new_process
+            .pending_standing_runtime_reacquire(identity, view_id)
+            .unwrap(),
+        Some(old_claim.clone()),
+        "ambiguous commit keeps the predecessor claim for reconciliation"
+    );
+
+    let reconciled = owner_routing::cold_reacquire_standing_owner(
+        &new_process,
+        meta.as_ref(),
+        identity,
+        view_id,
+        &old_claim,
+    )
+    .await
+    .unwrap()
+    .expect("later read should accept our already-committed next epoch");
+    assert_eq!(reconciled.owner_id, new_process.owner_id);
+    assert_eq!(reconciled.owner_epoch, old_claim.owner_epoch + 1);
+}
+
+#[tokio::test]
+async fn cold_owner_reacquire_rejects_wrong_scope_conflict_response() {
+    let meta = Arc::new(
+        DurableCapabilityMetaStore::new(InMemoryMetaStore::default()).with_reacquire_fault(4),
+    );
+    let checkpoint = test_runtime_checkpoint(Vec::new());
+    let identity = &checkpoint.identity;
+    let view_id = &identity.view_ids[0];
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let old_process = test_api_state_with_store(store.clone(), "old-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    let new_process = test_api_state_with_store(store, "new-process", false)
+        .await
+        .with_meta_store(meta.clone());
+    old_process
+        .acquire_standing_runtime_owner(identity, view_id)
+        .await
+        .unwrap()
+        .expect("old process should acquire initial owner token");
+    let old_claim = meta
+        .read_standing_runtime_owner(&identity.tenant_id, &identity.program_id, view_id)
+        .await
+        .unwrap()
+        .expect("acquired owner token should have a persisted claim");
+
+    let result = owner_routing::cold_reacquire_standing_owner(
+        &new_process,
+        meta.as_ref(),
+        identity,
+        view_id,
+        &old_claim,
+    )
+    .await;
+    assert!(result.is_err(), "wrong-scope conflict must fail closed");
+    assert!(new_process
+        .pending_standing_runtime_reacquire(identity, view_id)
+        .unwrap()
+        .is_some());
+}
+
 #[test]
 fn unsafe_dev_multi_api_requires_loopback_api_and_meta_endpoints() {
     let mode = StandingRuntimeFencingMode::UnsafeDevMultiApi;
@@ -13322,6 +13613,8 @@ pub(super) struct DurableCapabilityMetaStore {
     active_view_snapshot_reads: Arc<AtomicUsize>,
     guard_race: Option<Arc<GuardRaceHook>>,
     renewal_delay: Option<Arc<RenewalDelayHook>>,
+    reacquire_fault: Arc<AtomicUsize>,
+    owner_read_fault: Arc<AtomicUsize>,
 }
 
 struct RenewalDelayHook {
@@ -13345,11 +13638,18 @@ impl DurableCapabilityMetaStore {
             active_view_snapshot_reads: Arc::new(AtomicUsize::new(0)),
             guard_race: None,
             renewal_delay: None,
+            reacquire_fault: Arc::new(AtomicUsize::new(0)),
+            owner_read_fault: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn with_guard_race(mut self, guard_race: Arc<GuardRaceHook>) -> Self {
         self.guard_race = Some(guard_race);
+        self
+    }
+
+    fn with_reacquire_fault(self, mode: usize) -> Self {
+        self.reacquire_fault.store(mode, Ordering::SeqCst);
         self
     }
 
@@ -13475,6 +13775,34 @@ impl MetaStore for DurableCapabilityMetaStore {
             .await
     }
 
+    async fn reacquire_standing_runtime_owner(
+        &self,
+        request: ReacquireStandingRuntimeOwnerRequest,
+    ) -> Result<AcquireStandingRuntimeOwnerOutcome, MetaStoreError> {
+        let fault = self.reacquire_fault.swap(0, Ordering::SeqCst);
+        match fault {
+            1 => Err(MetaStoreError::UnexpectedOutcome(
+                "injected pre-commit reacquire failure".into(),
+            )),
+            2 | 3 => {
+                let lose_readback = fault == 3;
+                let _ = self.inner.reacquire_standing_runtime_owner(request).await?;
+                if lose_readback {
+                    self.owner_read_fault.store(1, Ordering::SeqCst);
+                }
+                Err(MetaStoreError::UnexpectedOutcome(
+                    "injected lost reacquire response".into(),
+                ))
+            }
+            4 => {
+                let mut wrong_scope = request.expected_current;
+                wrong_scope.tenant_id.push_str("-unexpected");
+                Ok(AcquireStandingRuntimeOwnerOutcome::Conflict(wrong_scope))
+            }
+            _ => self.inner.reacquire_standing_runtime_owner(request).await,
+        }
+    }
+
     async fn renew_standing_runtime_owner(
         &self,
         owner: StandingRuntimeOwnerToken,
@@ -13505,6 +13833,11 @@ impl MetaStore for DurableCapabilityMetaStore {
         program_id: &str,
         view_id: &str,
     ) -> Result<Option<StandingRuntimeOwnerClaim>, MetaStoreError> {
+        if self.owner_read_fault.swap(0, Ordering::SeqCst) != 0 {
+            return Err(MetaStoreError::UnexpectedOutcome(
+                "injected owner readback failure".into(),
+            ));
+        }
         self.inner
             .read_standing_runtime_owner(tenant_id, program_id, view_id)
             .await
@@ -13558,6 +13891,15 @@ impl MetaStore for DurableCapabilityMetaStore {
     ) -> Result<meta::AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
         self.inner
             .acquire_relation_partition_authority(request)
+            .await
+    }
+
+    async fn reacquire_relation_partition_authority(
+        &self,
+        request: meta::AcquireRelationPartitionAuthorityRequest,
+    ) -> Result<meta::AcquireRelationPartitionAuthorityOutcome, MetaStoreError> {
+        self.inner
+            .reacquire_relation_partition_authority(request)
             .await
     }
 
@@ -13695,6 +14037,87 @@ async fn test_authoritative_api_state_with_store(
             30_000,
         )
         .unwrap()
+}
+
+#[tokio::test]
+async fn authoritative_publisher_reacquires_same_owner_token_on_new_api_startup() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta = Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
+    let catalog = test_scores_catalog();
+    let request = IngestRowsRequest {
+        relation_id: "scores".into(),
+        relation_version: "2026-05-24.v1".into(),
+        stream_id: "restart-reacquire-stream".into(),
+        partition_id: 0,
+        start_offset_inclusive: 1,
+        event_time_watermark: None,
+        rows: vec![json!({"user_id":"oak","score":7,"delta":1})],
+    };
+
+    let first_state = test_authoritative_api_state_with_store(
+        Arc::clone(&store),
+        "restart-reacquire-owner",
+        meta.clone(),
+    )
+    .await;
+    let first_publisher = first_state
+        .relation_ingest_publisher(&catalog, &request)
+        .await
+        .unwrap();
+    let first_token = first_publisher
+        .session()
+        .token()
+        .await
+        .expect("first API startup should acquire its relation token");
+
+    let restarted_state =
+        test_authoritative_api_state_with_store(store, "restart-reacquire-owner", meta).await;
+    let restarted_publisher = restarted_state
+        .relation_ingest_publisher(&catalog, &request)
+        .await
+        .unwrap();
+    let restarted_token = restarted_publisher
+        .session()
+        .token()
+        .await
+        .expect("restarted API startup should reacquire its relation token");
+
+    assert_eq!(restarted_token.owner_id, first_token.owner_id);
+    assert!(restarted_token.owner_epoch > first_token.owner_epoch);
+}
+
+#[tokio::test]
+async fn concurrent_first_authoritative_publisher_requests_share_one_startup() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let meta = Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
+    let state =
+        test_authoritative_api_state_with_store(store, "concurrent-startup-owner", meta).await;
+    let catalog = test_scores_catalog();
+    let request = IngestRowsRequest {
+        relation_id: "scores".into(),
+        relation_version: "2026-05-24.v1".into(),
+        stream_id: "concurrent-startup-stream".into(),
+        partition_id: 0,
+        start_offset_inclusive: 1,
+        event_time_watermark: None,
+        rows: vec![json!({"user_id":"oak","score":7,"delta":1})],
+    };
+
+    let (first, second) = tokio::join!(
+        state.relation_ingest_publisher(&catalog, &request),
+        state.relation_ingest_publisher(&catalog, &request),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    first.start().await.unwrap();
+    second
+        .publish(
+            1,
+            2,
+            bytes::Bytes::from_static(b"future-ingest-after-concurrent-startup"),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

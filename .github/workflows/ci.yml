@@ -45,6 +45,16 @@ jobs:
           bash -n scripts/check-no-external-runtime-artifacts.sh
           sh -n scripts/check-rust-toolchain-contract.sh
           sh -n scripts/check-rhiza-operator-manifests-contract.sh
+          sh -n scripts/check-rhiza-go-toolchain-contract.sh
+          sh -n scripts/check-rhiza-local-k8s-contract.sh
+          sh -n scripts/check-rhiza-local-recovery.sh
+          sh -n scripts/check-rhiza-service-recovery.sh
+          sh -n scripts/check-rhiza-single-node-recovery.sh
+          sh -n scripts/check-rhiza-local-chaos.sh
+          sh -n scripts/check-rhiza-dory-chaos-http.sh
+          sh -n scripts/check-rhiza-chaos-contract.sh
+          sh -n scripts/check-vendor-integrity.sh
+          sh -n scripts/rhiza-service-recovery-payloads.sh
           sh -n scripts/velorix-all-in-one-entrypoint.sh
           sh -n scripts/check-all-image-entrypoint-contract.sh
           python3 -m py_compile scripts/copy-readiness-sibling-evidence.py
@@ -59,7 +69,10 @@ jobs:
           scripts/check-no-external-runtime-artifacts.sh
           sh scripts/check-rust-toolchain-contract.sh
           scripts/check-rhiza-operator-manifests-contract.sh
+          sh scripts/check-rhiza-go-toolchain-contract.sh
           sh scripts/check-all-image-entrypoint-contract.sh
+          sh scripts/check-rhiza-chaos-contract.sh
+          sh scripts/check-vendor-integrity.sh
 
   msrv:
     name: MSRV check
@@ -125,13 +138,27 @@ jobs:
         with:
           components: clippy
 
-      - name: Install Go 1.27.0
+      - name: Install Go 1.27.3
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.0'
+          go-version: '1.27.3'
           # The published SDK's Go module is bundled inside Cargo's registry;
           # this repository has no Go module/sum path for setup-go to cache.
           cache: false
+
+      - name: Install pinned offline manifest validators
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64 \
+            -o "$RUNNER_TEMP/bin/yq"
+          echo '75d893a0d5940d1019cb7cdc60001d9e876623852c31cfc6267047bc31149fa9  '"$RUNNER_TEMP/bin/yq" \
+            | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/bin/yq"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Check offline local Rhiza Kubernetes manifest contract
+        run: sh scripts/check-rhiza-local-k8s-contract.sh
 
       - name: Cache cargo build artifacts
         uses: Swatinem/rust-cache@v2
@@ -179,7 +206,13 @@ jobs:
         run: |
           mkdir -p target/dependency-governance
           cargo metadata --format-version 1 --locked --all-features > target/dependency-governance/cargo-metadata.json
-          cargo deny --color never --locked --metadata-path target/dependency-governance/cargo-metadata.json -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl
+          if cargo deny --color never --locked --metadata-path target/dependency-governance/cargo-metadata.json -f json check -W unmaintained 2> target/dependency-governance/cargo-deny.jsonl; then
+            :
+          else
+            status=$?
+            jq -r 'select(.type == "diagnostic" and .fields.severity == "error") | .fields as $f | [$f.code, ($f.notes[]? | select(startswith("ID: "))), $f.message] | @tsv' target/dependency-governance/cargo-deny.jsonl >&2
+            exit "$status"
+          fi
 
       - name: Validate dependency governance manifest
         run: |
@@ -189,6 +222,7 @@ jobs:
             --json > target/dependency-governance/dependency-governance-evidence.json
 
       - name: Upload dependency governance evidence
+        if: always()
         uses: actions/upload-artifact@v6
         with:
           name: dependency-governance-evidence

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: velorix-meta-local
+  labels:
+    app.kubernetes.io/name: velorix-meta
+    app.kubernetes.io/instance: local-rhiza
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: velorix-meta
+    app.kubernetes.io/instance: local-rhiza
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc
+      protocol: TCP

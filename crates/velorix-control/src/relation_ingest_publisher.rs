@@ -95,6 +95,7 @@ pub struct RelationIngestPublisherSession {
     owner_id: String,
     authority_ttl_ms: u64,
     token: Arc<Mutex<Option<RelationPartitionAuthorityToken>>>,
+    restart_reacquire_attempted: Arc<AtomicBool>,
 }
 
 impl RelationIngestPublisherSession {
@@ -104,6 +105,7 @@ impl RelationIngestPublisherSession {
             owner_id: config.owner_id.clone(),
             authority_ttl_ms: config.authority_ttl_ms,
             token: Arc::new(Mutex::new(None)),
+            restart_reacquire_attempted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -125,21 +127,74 @@ impl RelationIngestPublisherSession {
         &self,
         meta: &dyn MetaStore,
     ) -> Result<RelationPartitionAuthorityToken, RelationIngestPublisherError> {
+        self.acquire_with(meta, false).await
+    }
+
+    /// Explicitly supersedes the exact persisted same-owner token after a
+    /// process restart. This advances the fence epoch; it is not renewal.
+    pub async fn reacquire_after_restart(
+        &self,
+        meta: &dyn MetaStore,
+    ) -> Result<RelationPartitionAuthorityToken, RelationIngestPublisherError> {
+        self.acquire_with(meta, true).await
+    }
+
+    async fn acquire_with(
+        &self,
+        meta: &dyn MetaStore,
+        reacquire: bool,
+    ) -> Result<RelationPartitionAuthorityToken, RelationIngestPublisherError> {
+        if reacquire
+            && self
+                .restart_reacquire_attempted
+                .swap(true, Ordering::AcqRel)
+        {
+            return Err(RelationIngestPublisherError::RestartReacquireAlreadyAttempted);
+        }
         let mut token = self.token.lock().await;
-        let current_token = token.clone();
-        let result = meta
-            .acquire_relation_partition_authority(AcquireRelationPartitionAuthorityRequest {
-                key: self.scope.authority_key(),
-                owner_id: self.owner_id.clone(),
-                current_token,
-                ttl_ms: self.authority_ttl_ms,
-            })
-            .await;
+        let current_token = if reacquire {
+            meta.read_relation_partition_authority(&self.scope.authority_key())
+                .await?
+        } else {
+            token.clone()
+        };
+        let explicit_reacquire = reacquire && current_token.is_some();
+        let observed_token = current_token.clone();
+        let request = AcquireRelationPartitionAuthorityRequest {
+            key: self.scope.authority_key(),
+            owner_id: self.owner_id.clone(),
+            current_token,
+            ttl_ms: self.authority_ttl_ms,
+        };
+        let result = if explicit_reacquire {
+            meta.reacquire_relation_partition_authority(request).await
+        } else {
+            meta.acquire_relation_partition_authority(request).await
+        };
         match result {
-            Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(next))
-            | Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(next)) => {
+            Ok(AcquireRelationPartitionAuthorityOutcome::Acquired(next)) => {
+                if reacquire
+                    && observed_token.as_ref().is_some_and(|observed| {
+                        observed.owner_epoch.checked_add(1) != Some(next.owner_epoch)
+                            || observed.key != next.key
+                            || next.key != self.scope.authority_key()
+                            || observed.owner_id != next.owner_id
+                            || next.owner_id != self.owner_id
+                    })
+                {
+                    *token = None;
+                    return Err(reacquire_not_fenced());
+                }
                 *token = Some(next.clone());
                 Ok(next)
+            }
+            Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(next)) if !reacquire => {
+                *token = Some(next.clone());
+                Ok(next)
+            }
+            Ok(AcquireRelationPartitionAuthorityOutcome::Renewed(_)) => {
+                *token = None;
+                Err(reacquire_not_fenced())
             }
             Ok(AcquireRelationPartitionAuthorityOutcome::Conflict(current)) => {
                 *token = None;
@@ -158,6 +213,14 @@ impl RelationIngestPublisherSession {
 
     fn clear(&self, token: &mut Option<RelationPartitionAuthorityToken>) {
         *token = None;
+    }
+}
+
+fn reacquire_not_fenced() -> RelationIngestPublisherError {
+    RelationIngestPublisherError::AuthorityLost {
+        source: Box::new(MetaStoreError::UnsupportedCapability(
+            "relation_authority_reacquire_not_fenced",
+        )),
     }
 }
 
@@ -259,6 +322,21 @@ impl RelationIngestPublisher {
             self.capability_validated.store(true, Ordering::Release);
         }
         self.session.acquire_or_renew(self.meta.as_ref()).await
+    }
+
+    /// Starts a restarted publisher by explicitly superseding the exact
+    /// persisted token for its stable owner identity.
+    pub async fn start_after_restart(
+        &self,
+    ) -> Result<RelationPartitionAuthorityToken, RelationIngestPublisherError> {
+        if !self.capability_validated.load(Ordering::Acquire) {
+            let capabilities = self.meta.read_meta_store_capabilities().await?;
+            validate_relation_ingest_capability(&capabilities.relation_ingest)?;
+            self.capability_validated.store(true, Ordering::Release);
+        }
+        self.session
+            .reacquire_after_restart(self.meta.as_ref())
+            .await
     }
 
     pub async fn renew(
@@ -531,6 +609,10 @@ pub enum RelationIngestPublisherError {
     CapabilityNotValidated,
     #[error("relation ingest publisher has not acquired relation authority")]
     NotStarted,
+    #[error(
+        "relation ingest restart reacquisition was already attempted for this publisher session"
+    )]
+    RestartReacquireAlreadyAttempted,
     #[error("relation ingest authority is held by `{}` at epoch {}", current.owner_id, current.owner_epoch)]
     AuthorityConflict {
         current: Box<RelationPartitionAuthorityToken>,
