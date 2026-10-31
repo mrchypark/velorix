@@ -1,0 +1,107 @@
+name: S3 Release Calibration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/s3-release-calibration.yml
+      - Cargo.toml
+      - Cargo.lock
+      - baselines/benchmark/s3/**
+      - crates/velorix-cli/src/main.rs
+      - crates/velorix-runtime/benches/**
+      - crates/velorix-runtime/src/**
+      - crates/velorix-runtime/tests/benchmark_gate.rs
+      - crates/velorix-storage/src/**
+      - docs/architecture/benchmark-gate-v1.md
+      - scripts/check-s3-release-*
+      - scripts/run-s3-release-benchmark.sh
+      - scripts/run-s3-release-calibration.sh
+      - scripts/run-process-group.sh
+      - scripts/run-process-group-src/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/s3-release-calibration.yml
+      - Cargo.toml
+      - Cargo.lock
+      - baselines/benchmark/s3/**
+      - crates/velorix-cli/src/main.rs
+      - crates/velorix-runtime/benches/**
+      - crates/velorix-runtime/src/**
+      - crates/velorix-runtime/tests/benchmark_gate.rs
+      - crates/velorix-storage/src/**
+      - docs/architecture/benchmark-gate-v1.md
+      - scripts/check-s3-release-*
+      - scripts/run-s3-release-benchmark.sh
+      - scripts/run-s3-release-calibration.sh
+      - scripts/run-process-group.sh
+      - scripts/run-process-group-src/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  calibration:
+    name: Controlled S3 release calibration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      # Separate the engine and gateway after diagnostics showed CPU contention.
+      VELORIX_S3_BENCHMARK_ENGINE_CPUSET: '0,1'
+      VELORIX_S3_BENCHMARK_GATEWAY_CPUSET: '2,3'
+      VELORIX_S3_CALIBRATION_BASELINE_COMMIT: d143c6301552b69444b5843fce13c67a48f101ff
+      VELORIX_S3_CALIBRATION_CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      VELORIX_S3_CALIBRATION_EVIDENCE_DIR: ${{ github.workspace }}/target/s3-release-calibration-evidence
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify checkout and calibration source commits
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$VELORIX_S3_CALIBRATION_CANDIDATE_COMMIT"
+          git cat-file -e "$VELORIX_S3_CALIBRATION_BASELINE_COMMIT^{commit}"
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Install Go 1.27.3
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.27.3
+          check-latest: false
+          cache: false
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: s3-release-calibration-v1
+          cache-workspace-crates: true
+          cache-on-failure: true
+
+      - name: Run paired S3 calibration
+        shell: bash
+        run: |
+          sh scripts/run-s3-release-calibration.sh \
+            --candidate-commit "$VELORIX_S3_CALIBRATION_CANDIDATE_COMMIT" \
+            --baseline-parent "$VELORIX_S3_CALIBRATION_BASELINE_COMMIT" \
+            --historical-baseline "$GITHUB_WORKSPACE/baselines/benchmark/s3/release.json" \
+            --output-dir "$VELORIX_S3_CALIBRATION_EVIDENCE_DIR" \
+            --cargo-target-dir "$GITHUB_WORKSPACE/target"
+
+      - name: Upload calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: s3-release-calibration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/s3-release-calibration-evidence/
+          if-no-files-found: warn
+          retention-days: 30

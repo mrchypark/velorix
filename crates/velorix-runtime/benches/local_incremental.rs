@@ -20,12 +20,14 @@ use arrow::{
 };
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use object_store::{
-    local::LocalFileSystem, path::Path, CopyOptions, GetOptions, GetRange, GetResult, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult,
+    aws::AmazonS3Builder, local::LocalFileSystem, path::Path, prefix::PrefixStore, CopyOptions,
+    GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use velorix_core::{
     delta::{DeltaBatch, DeltaKey, DeltaRecord, DeltaValue},
@@ -75,8 +77,45 @@ const GC_EXECUTION_RUN_ID: &str = "local-incremental-gc-execution";
 const MATERIALIZED_VIEW_SQL: &str =
     "select account_id, sum(amount) as sum, count(*) as count from orders group by account_id";
 const MATERIALIZED_VIEW_ID: &str = "orders_by_account";
+const HARNESS_SOURCE_FILES: &[(&str, &[u8])] = &[
+    (
+        "benches/local_incremental.rs",
+        include_bytes!("local_incremental.rs"),
+    ),
+    (
+        "benches/materialized_output_workloads.rs",
+        include_bytes!("materialized_output_workloads.rs"),
+    ),
+    (
+        "benches/phase8_family_workloads.rs",
+        include_bytes!("phase8_family_workloads.rs"),
+    ),
+    (
+        "benches/scale_group_key_workloads.rs",
+        include_bytes!("scale_group_key_workloads.rs"),
+    ),
+    (
+        "benches/scale_join_key_workloads.rs",
+        include_bytes!("scale_join_key_workloads.rs"),
+    ),
+    (
+        "benches/fixtures/incremental_sql_corpus_v1.json",
+        include_bytes!("fixtures/incremental_sql_corpus_v1.json"),
+    ),
+];
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+fn harness_source_sha256() -> String {
+    let mut hasher = Sha256::new();
+    for (path, contents) in HARNESS_SOURCE_FILES {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update((contents.len() as u64).to_be_bytes());
+        hasher.update(contents);
+    }
+    hex::encode(hasher.finalize())
+}
 
 struct MeasuredWorkload {
     samples: Vec<Duration>,
@@ -99,7 +138,11 @@ fn main() -> BenchResult<()> {
 }
 
 async fn run() -> BenchResult<()> {
-    let (_temp_dir, metered_store, store) = temp_store()?;
+    let config = BackendConfig::from_env()?;
+    let host_before = matches!(config, BackendConfig::S3 { .. }).then(host_diagnostics);
+    let store_handle = config.create_store("main")?;
+    let metered_store = Arc::clone(&store_handle.metered_store);
+    let store = Arc::clone(&store_handle.store);
     let capability_probe_requests_before = metered_store.snapshot();
     let capability_probe_started = Instant::now();
     let capabilities = probe_authoritative_object_store_capabilities(
@@ -215,8 +258,11 @@ async fn run() -> BenchResult<()> {
     let mut checkpoint_samples = vec![checkpoint_elapsed];
     let mut checkpoint_requests =
         request_delta(&metered_store.snapshot(), &checkpoint_requests_before);
+    let mut sample_store_totals = empty_object_requests();
     for sample_index in 1..CHECKPOINT_SAMPLE_COUNT {
-        let (_sample_temp_dir, sample_metered_store, sample_store) = temp_store()?;
+        let sample_handle = config.create_store(&format!("checkpoint-sample-{sample_index}"))?;
+        let sample_metered_store = Arc::clone(&sample_handle.metered_store);
+        let sample_store = Arc::clone(&sample_handle.store);
         let sample_capabilities = probe_authoritative_object_store_capabilities(
             sample_store.as_ref(),
             "local-benchmark",
@@ -258,11 +304,9 @@ async fn run() -> BenchResult<()> {
             })
             .await?;
         checkpoint_samples.push(started.elapsed());
-        add_request_delta(
-            &mut checkpoint_requests,
-            &sample_metered_store.snapshot(),
-            &requests_before,
-        );
+        let sample_delta = request_delta(&sample_metered_store.snapshot(), &requests_before);
+        add_request_totals(&mut checkpoint_requests, &sample_delta);
+        add_request_totals(&mut sample_store_totals, &sample_metered_store.snapshot());
     }
 
     let tail_input = workload_batch(BATCH_COUNT, RECORDS_PER_BATCH);
@@ -332,25 +376,74 @@ async fn run() -> BenchResult<()> {
     let phase8_family_workloads = phase8_family_workloads::run()?;
 
     let records_per_second = total_records as f64 / materialized_view_apply_elapsed.as_secs_f64();
-    let object_requests = metered_store.snapshot();
+    let release_s3 = matches!(config, BackendConfig::S3 { .. });
+    let timing_diagnostics = release_s3.then(|| {
+        let mut samples = serde_json::Map::new();
+        samples.insert("checkpoint_publish".into(), duration_samples(&checkpoint_samples));
+        samples.insert("checkpoint_recovery".into(), duration_samples(&recovery_samples));
+        for measurement in &scale_group_key_workloads {
+            samples.insert(measurement.name.clone(), duration_samples(&measurement.samples));
+        }
+        for measurement in &scale_join_key_workloads {
+            samples.insert(measurement.name.clone(), duration_samples(&measurement.samples));
+        }
+        for measurement in &phase8_family_workloads {
+            samples.insert(measurement.name.clone(), duration_samples(&measurement.samples));
+        }
+        json!({"samples_ms":samples,"host_before":host_before,"host_after":host_diagnostics(),
+            "scope":"diagnostic only; snapshots bracket the whole workload, not individual samples; no sample is excluded or adjusted"})
+    });
+    let byte_ratio_row_count = if release_s3 {
+        total_records + RECORDS_PER_BATCH
+    } else {
+        total_records
+    };
+    let mut object_requests = metered_store.snapshot();
+    if release_s3 {
+        add_request_totals(&mut object_requests, &sample_store_totals);
+    }
     let result = BenchmarkGateResultV1 {
         schema_version: 1,
         commit: git_commit(),
-        gate_level: BenchmarkGateLevel::PrSmoke,
-        backend: BenchmarkBackend::Local,
+        gate_level: if release_s3 {
+            BenchmarkGateLevel::Release
+        } else {
+            BenchmarkGateLevel::PrSmoke
+        },
+        backend: if release_s3 {
+            BenchmarkBackend::S3Compatible
+        } else {
+            BenchmarkBackend::Local
+        },
         backend_evidence_scope: BenchmarkEvidenceScope::LiveOrNative,
-        workload: "local_incremental".to_string(),
+        workload: if release_s3 {
+            "s3_incremental"
+        } else {
+            "local_incremental"
+        }
+        .to_string(),
         metrics: BenchmarkMetricsV1 {
             rows_per_second: records_per_second,
-            bytes_per_row: bytes_per_row(object_requests.bytes_written, total_records),
+            bytes_per_row: bytes_per_row(object_requests.bytes_written, byte_ratio_row_count),
             put_per_gib: put_per_gib(object_requests.put_count, object_requests.bytes_written),
             object_requests,
             checkpoint_p50_ms: percentile_ms(&checkpoint_samples, 0.50),
             checkpoint_p95_ms: percentile_ms(&checkpoint_samples, 0.95),
             recovery_p95_ms: percentile_ms(&recovery_samples, 0.95),
-            peak_rss_bytes: current_rss_bytes().unwrap_or(0),
+            peak_rss_bytes: if release_s3 {
+                peak_rss_bytes()?
+            } else {
+                current_rss_bytes().unwrap_or(0)
+            },
             spill_bytes: 0,
-            scan_bytes: 0,
+            scan_bytes: if release_s3 {
+                materialized_output_workloads
+                    .iter()
+                    .map(|metric| metric.scan_bytes)
+                    .sum()
+            } else {
+                0
+            },
         },
         workload_metrics: {
             let mut workload_metrics = vec![
@@ -425,7 +518,21 @@ async fn run() -> BenchResult<()> {
             workload_metrics
         },
     };
+    if release_s3 {
+        assert_total_requests_cover_workloads(&result)?;
+    }
     result.validate()?;
+
+    if release_s3 {
+        write_s3_provenance(
+            &config,
+            &result,
+            total_records + RECORDS_PER_BATCH,
+            timing_diagnostics
+                .as_ref()
+                .expect("S3 diagnostics recorded"),
+        )?;
+    }
 
     println!("{}", serde_json::to_string(&result)?);
 
@@ -557,13 +664,218 @@ async fn gc_execution_denied(
     })
 }
 
-fn temp_store() -> BenchResult<(TempDir, Arc<MeteredObjectStore>, Arc<dyn ObjectStore>)> {
-    let temp_dir = tempfile::tempdir()?;
-    let inner = Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path())?);
-    let metered_store = Arc::new(MeteredObjectStore::new(inner));
-    let store: Arc<dyn ObjectStore> = metered_store.clone();
+enum BackendConfig {
+    Local,
+    S3 {
+        endpoint: String,
+        bucket: String,
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+        prefix: String,
+    },
+}
 
-    Ok((temp_dir, metered_store, store))
+struct CreatedStore {
+    _temp_dir: Option<TempDir>,
+    metered_store: Arc<MeteredObjectStore>,
+    store: Arc<dyn ObjectStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeteringMode {
+    Local,
+    S3,
+}
+
+impl BackendConfig {
+    fn from_env() -> BenchResult<Self> {
+        match std::env::var("VELORIX_BENCHMARK_BACKEND")
+            .as_deref()
+            .unwrap_or("local")
+        {
+            "local" => Ok(Self::Local),
+            "s3-compatible" => {
+                if required_env("VELORIX_BENCHMARK_GATE_LEVEL")? != "release" {
+                    return Err(
+                        "S3-compatible benchmark runs require VELORIX_BENCHMARK_GATE_LEVEL=release"
+                            .into(),
+                    );
+                }
+                required_env("VELORIX_BENCHMARK_RESULT_PATH")?;
+                Ok(Self::S3 {
+                    endpoint: required_env("AWS_ENDPOINT_URL")?,
+                    bucket: required_env("VELORIX_S3_BUCKET")?,
+                    access_key_id: required_env("AWS_ACCESS_KEY_ID")?,
+                    secret_access_key: required_env("AWS_SECRET_ACCESS_KEY")?,
+                    region: required_env("AWS_REGION")?,
+                    prefix: isolated_prefix(&required_env("VELORIX_S3_PREFIX")?)?,
+                })
+            }
+            other => Err(format!(
+                "unsupported VELORIX_BENCHMARK_BACKEND {other:?}; expected local or s3-compatible"
+            )
+            .into()),
+        }
+    }
+
+    fn create_store(&self, suffix: &str) -> BenchResult<CreatedStore> {
+        let (temp_dir, inner): (Option<TempDir>, Arc<dyn ObjectStore>) = match self {
+            Self::Local => {
+                let temp_dir = tempfile::tempdir()?;
+                let local = Arc::new(LocalFileSystem::new_with_prefix(temp_dir.path())?);
+                (Some(temp_dir), local)
+            }
+            Self::S3 {
+                endpoint,
+                bucket,
+                access_key_id,
+                secret_access_key,
+                region,
+                prefix,
+            } => {
+                let s3 = AmazonS3Builder::new()
+                    .with_endpoint(endpoint)
+                    .with_bucket_name(bucket)
+                    .with_region(region)
+                    .with_access_key_id(access_key_id)
+                    .with_secret_access_key(secret_access_key)
+                    .with_allow_http(true)
+                    .build()?;
+                (
+                    None,
+                    Arc::new(PrefixStore::new(s3, format!("{prefix}/{suffix}"))),
+                )
+            }
+        };
+        let mode = match self {
+            Self::Local => MeteringMode::Local,
+            Self::S3 { .. } => MeteringMode::S3,
+        };
+        let metered = Arc::new(MeteredObjectStore::new(inner, mode));
+        let store: Arc<dyn ObjectStore> = metered.clone();
+        Ok(CreatedStore {
+            _temp_dir: temp_dir,
+            metered_store: metered,
+            store,
+        })
+    }
+}
+
+fn required_env(name: &str) -> BenchResult<String> {
+    let value =
+        std::env::var(name).map_err(|_| format!("{name} is required for the S3 backend"))?;
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty").into());
+    }
+    Ok(value)
+}
+
+fn isolated_prefix(prefix: &str) -> BenchResult<String> {
+    let normalized = prefix.trim_matches('/');
+    if normalized.split('/').count() < 2
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("VELORIX_S3_PREFIX must be an isolated, non-root prefix with at least two path components".into());
+    }
+    Ok(normalized.to_string())
+}
+
+fn duration_samples(samples: &[Duration]) -> serde_json::Value {
+    json!(samples
+        .iter()
+        .map(|sample| millis(*sample))
+        .collect::<Vec<_>>())
+}
+
+fn host_diagnostics() -> serde_json::Value {
+    let mut sources = serde_json::Map::new();
+    for path in [
+        "/proc/stat",
+        "/proc/self/status",
+        "/proc/loadavg",
+        "/proc/pressure/cpu",
+        "/proc/pressure/io",
+        "/proc/pressure/memory",
+        "/sys/fs/cgroup/cpu.stat",
+        "/sys/fs/cgroup/cpu.max",
+    ] {
+        let value = match std::fs::read_to_string(path) {
+            Ok(contents) => json!({"status":"available","contents":contents}),
+            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+        };
+        sources.insert(path.into(), value);
+    }
+    json!({"platform":std::env::consts::OS,"sources":sources})
+}
+
+fn write_s3_provenance(
+    config: &BackendConfig,
+    result: &BenchmarkGateResultV1,
+    appended_input_rows: u64,
+    timing_diagnostics: &serde_json::Value,
+) -> BenchResult<()> {
+    let BackendConfig::S3 {
+        endpoint,
+        bucket,
+        prefix,
+        ..
+    } = config
+    else {
+        unreachable!()
+    };
+    let path = format!(
+        "{}.provenance.json",
+        required_env("VELORIX_BENCHMARK_RESULT_PATH")?
+    );
+    let workload_profile = json!({
+        "name": "local_incremental",
+        "profile_version": 1,
+        "batch_count": BATCH_COUNT,
+        "records_per_batch": RECORDS_PER_BATCH,
+        "checkpoint_samples": CHECKPOINT_SAMPLE_COUNT,
+        "recovery_samples": RECOVERY_SAMPLE_COUNT,
+        "includes_legacy_datafusion_source_scan": false,
+        "engine_cpuset": std::env::var("VELORIX_S3_BENCHMARK_ENGINE_CPUSET").ok(),
+        "gateway_cpuset": std::env::var("VELORIX_S3_BENCHMARK_GATEWAY_CPUSET").ok(),
+        "harness_source_files": HARNESS_SOURCE_FILES.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+        "harness_source_sha256": harness_source_sha256(),
+        "workload_metrics": result.workload_metrics.iter().map(|metric| &metric.name).collect::<Vec<_>>()
+    });
+    let workload_profile_fingerprint =
+        hex::encode(Sha256::digest(serde_json::to_vec(&workload_profile)?));
+    let provenance = json!({
+        "schema_version": 1,
+        "candidate_git_head": result.commit,
+        "backend": "s3_compatible",
+        "gate_level": "release",
+        "workload": "s3_incremental",
+        "workload_profile": workload_profile,
+        "workload_profile_sha256": workload_profile_fingerprint,
+        "harness_source_sha256": harness_source_sha256(),
+        "adapter": "object_store::aws::AmazonS3Builder wrapped by PrefixStore and MeteredObjectStore",
+        "endpoint": endpoint,
+        "bucket": bucket,
+        "prefix": prefix,
+        "object_request_metric_scope": "logical object_store trait method calls observed by MeteredObjectStore; excludes HEAD, delete, and copy; does not count retries, list pagination subrequests, multipart subrequests, or wire-level HTTP operations",
+        "get_count_definition": "attempted non-range get_opts method invocations, excluding HEAD; bytes_read accumulates only successful body chunks delivered to the caller for S3 get_opts and fully returned get_ranges payload bytes",
+        "range_read_count_definition": "requested range specs: one for get_opts with a range, and one per entry passed to get_ranges",
+        "list_count_definition": "logical ObjectStore list/list_with_offset/list_with_delimiter invocations; not service pagination pages",
+        "put_count_definition": "attempted put_opts invocations; S3 multipart calls fail closed because this harness does not use multipart and does not instrument multipart part bytes",
+        "bytes_written_definition": "PutPayload content lengths submitted to put_opts before awaiting completion, summed across the full measured benchmark workload; includes attempted conditional writes and does not claim persisted bytes",
+        "bytes_per_row_definition": format!("total measured benchmark PutPayload bytes divided by {appended_input_rows} appended relation input rows (main batches plus the tail batch); amortized benchmark storage bytes per input row, not ingest-envelope-only bytes"),
+        "put_per_gib_definition": "total measured benchmark put_opts invocations per GiB of PutPayload bytes; amortized benchmark cost ratio, not ingest-only",
+        "scan_bytes_definition": "sum of selected materialized-output page/vector bytes reported by the existing output workloads; incremental source batches are supplied in memory, with no source-relation scan",
+        "spill_bytes_definition": "zero for this workload because no spill-capable operator or spill path is invoked; this is workload scope, not an uninstrumented system-wide spill counter",
+        "peak_rss_definition": "OS process high-water resident set size from getrusage(RUSAGE_SELF); platform units normalized to bytes",
+        "checkpoint_samples": CHECKPOINT_SAMPLE_COUNT,
+        "recovery_samples": RECOVERY_SAMPLE_COUNT,
+        "timing_diagnostics": timing_diagnostics
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&provenance)?)?;
+    Ok(())
 }
 
 fn workload_batch(batch_index: u64, records: u64) -> DeltaBatch {
@@ -826,12 +1138,38 @@ fn add_request_delta(
     before: &ObjectRequestMetricsV1,
 ) {
     let delta = request_delta(after, before);
+    add_request_totals(target, &delta);
+}
+
+fn add_request_totals(target: &mut ObjectRequestMetricsV1, delta: &ObjectRequestMetricsV1) {
     target.put_count += delta.put_count;
     target.get_count += delta.get_count;
     target.list_count += delta.list_count;
     target.range_read_count += delta.range_read_count;
     target.bytes_written += delta.bytes_written;
     target.bytes_read += delta.bytes_read;
+}
+
+fn assert_total_requests_cover_workloads(result: &BenchmarkGateResultV1) -> BenchResult<()> {
+    let mut reported = empty_object_requests();
+    for workload in &result.workload_metrics {
+        if let Some(requests) = &workload.object_requests {
+            add_request_totals(&mut reported, requests);
+        }
+    }
+    let total = &result.metrics.object_requests;
+    if reported.put_count > total.put_count
+        || reported.get_count > total.get_count
+        || reported.list_count > total.list_count
+        || reported.range_read_count > total.range_read_count
+        || reported.bytes_written > total.bytes_written
+        || reported.bytes_read > total.bytes_read
+    {
+        return Err(format!(
+            "S3 top-level logical adapter counters do not cover workload counters: total={total:?}, workload_sum={reported:?}"
+        ).into());
+    }
+    Ok(())
 }
 
 fn request_delta(
@@ -853,24 +1191,26 @@ fn request_delta(
 #[derive(Debug)]
 struct MeteredObjectStore {
     inner: Arc<dyn ObjectStore>,
+    mode: MeteringMode,
     put_count: AtomicU64,
     get_count: AtomicU64,
     list_count: AtomicU64,
     range_read_count: AtomicU64,
     bytes_written: AtomicU64,
-    bytes_read: AtomicU64,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl MeteredObjectStore {
-    fn new(inner: Arc<dyn ObjectStore>) -> Self {
+    fn new(inner: Arc<dyn ObjectStore>, mode: MeteringMode) -> Self {
         Self {
             inner,
+            mode,
             put_count: AtomicU64::new(0),
             get_count: AtomicU64::new(0),
             list_count: AtomicU64::new(0),
             range_read_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
+            bytes_read: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -906,6 +1246,17 @@ impl MeteredObjectStore {
                 .fetch_add(result.meta.size, Ordering::SeqCst);
         }
     }
+
+    fn record_s3_get_call(&self, options: &GetOptions) {
+        if options.head {
+            return;
+        }
+        if options.range.is_some() {
+            self.range_read_count.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.get_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 impl fmt::Display for MeteredObjectStore {
@@ -931,6 +1282,13 @@ impl ObjectStore for MeteredObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        if self.mode == MeteringMode::S3 {
+            return Err(object_store::Error::NotSupported {
+                source: Box::new(std::io::Error::other(
+                    "S3 benchmark metering fails closed for multipart uploads; this workload does not account multipart part bytes",
+                )),
+            });
+        }
         self.put_count.fetch_add(1, Ordering::SeqCst);
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -940,9 +1298,51 @@ impl ObjectStore for MeteredObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if self.mode == MeteringMode::S3 {
+            self.record_s3_get_call(&options);
+        }
         let result = self.inner.get_opts(location, options.clone()).await?;
-        self.record_get(&options, &result);
-        Ok(result)
+        if self.mode == MeteringMode::Local {
+            self.record_get(&options, &result);
+            return Ok(result);
+        }
+
+        let GetResult {
+            payload,
+            meta,
+            range,
+            attributes,
+            extensions,
+        } = result;
+        let payload = match payload {
+            GetResultPayload::Stream(stream) => {
+                let bytes_read = Arc::clone(&self.bytes_read);
+                GetResultPayload::Stream(
+                    stream
+                        .map(move |item| {
+                            if let Ok(bytes) = &item {
+                                bytes_read.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+                            }
+                            item
+                        })
+                        .boxed(),
+                )
+            }
+            GetResultPayload::File(_, _) => {
+                return Err(object_store::Error::NotSupported {
+                    source: Box::new(std::io::Error::other(
+                        "S3 benchmark adapter returned a local file payload; refusing unmeasured read bytes",
+                    )),
+                });
+            }
+        };
+        Ok(GetResult {
+            payload,
+            meta,
+            range,
+            attributes,
+            extensions,
+        })
     }
 
     async fn get_ranges(
@@ -950,9 +1350,15 @@ impl ObjectStore for MeteredObjectStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
+        if self.mode == MeteringMode::S3 {
+            self.range_read_count
+                .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        }
         let bytes = self.inner.get_ranges(location, ranges).await?;
-        self.range_read_count
-            .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        if self.mode == MeteringMode::Local {
+            self.range_read_count
+                .fetch_add(ranges.len() as u64, Ordering::SeqCst);
+        }
         self.bytes_read.fetch_add(
             bytes.iter().map(|chunk| chunk.len() as u64).sum(),
             Ordering::SeqCst,
@@ -1045,4 +1451,23 @@ fn current_rss_bytes() -> Option<u64> {
         .parse::<u64>()
         .ok()?;
     Some(rss_kib * 1024)
+}
+
+fn peak_rss_bytes() -> BenchResult<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage writes a complete rusage value when it returns zero.
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: successful getrusage initialized the structure above.
+    let usage = unsafe { usage.assume_init() };
+    let value = u64::try_from(usage.ru_maxrss)?;
+    #[cfg(target_os = "macos")]
+    let bytes = value;
+    #[cfg(not(target_os = "macos"))]
+    let bytes = value
+        .checked_mul(1024)
+        .ok_or("peak RSS byte conversion overflow")?;
+    Ok(bytes)
 }

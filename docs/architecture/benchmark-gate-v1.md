@@ -181,6 +181,73 @@ support.
   result. The removed source-scan benchmark is not accepted as standing-runtime
   performance evidence.
 
+## Local S3 release producer
+
+`scripts/run-s3-release-benchmark.sh` is the local producer for the release
+S3-compatible workload. It runs `cargo bench -p velorix-runtime --bench
+local_incremental` against a per-run bucket and prefix on a dedicated,
+run-specific Docker bridge network (non-internal) with the digest-pinned
+Versity Gateway fixture and one-shot AWS CLI helpers. The ephemeral published
+port binds only to `127.0.0.1`; readiness checks require both an S3 response
+inside the run network and an HTTP response through the host mapping. The
+benchmark SDK uses the explicit loopback endpoint and generated test
+credentials.
+The AWS CLI helper image is pinned to its multiarch manifest-index digest;
+Docker selects the host-native architecture without forcing emulation.
+The runner rejects dirty tracked checkouts, derives the candidate commit from
+Git `HEAD`, requires fresh non-existing result and evidence paths, and retains
+the measured JSON, producer provenance sidecar, fixture log, and complete
+gate output. `--self-test` exercises validation without contacting Docker.
+Cleanliness rejects tracked changes and nonignored untracked files while
+allowing ignored build/evidence files. The runner rechecks both `HEAD` and
+checkout cleanliness after measurement and immediately before gate comparison;
+if either changed, it retains the result and fails closed without comparison.
+
+The default comparison remains `baselines/benchmark/s3/release.json` and
+therefore exposes its historical `datafusion_table_scan` workload mismatch
+against the current S3 producer's required workload set. The runner supports
+`--baseline PATH` for an independently measured and reviewed calibrated
+predecessor baseline; this only selects the input file and does not filter
+workloads or change the CLI comparator or regression budgets. Until such a
+baseline exists and passes the unchanged gate, the producer is not release
+evidence that clears the gate.
+Custom calibrated baselines require a companion file named
+`<baseline-path>.provenance.json`; the runner requires exact matches for the
+workload profile and benchmark harness SHA-256 fingerprints before invoking
+the gate. It records hashes of both baseline inputs and rechecks them after
+measurement. A mismatch is retained in the full gate log and fails closed.
+The historical baseline has no companion and receives no implicit fingerprint
+claim; its incompatible workload set is still rejected by the unchanged CLI
+gate. The run report is initialized before fixture startup and marks measured
+evidence complete only after the result and provenance pair both validate.
+The shell launcher builds a source/toolchain-keyed Go process-group helper in
+ignored `target/`; SIGTERM reaches the owned Cargo process group, and the run
+report records incomplete or interrupted phases without marking them passed.
+
+The calibration controller uses `--collect-only` to retain a measured,
+validated result and provenance without invoking the historical baseline
+comparison. A successful collection records `gate_status: "collected"`,
+`gate_evaluated: false`, and `release_gate_passed: false`; it does not create a
+calibrated gate artifact. Collection succeeds only after fixture cleanup and a
+second clean-checkout/HEAD check. The controller then builds and evaluates its
+separate predecessor envelope with the unchanged CLI comparator. Ordinary
+runner invocations retain the default baseline comparison behavior.
+
+Controlled calibration assigns engine processes to CPUs `0,1` and the disposable
+gateway to CPUs `2,3`. Both predecessor and candidate use that same topology.
+Unavailable affinities fail the run; there is no fallback to shared CPUs. This
+isolates engine/gateway scheduling contention without changing workloads,
+sample counts, percentile definitions, or the 10% regression budget. The standalone
+runner retains its existing behavior unless both CPU-set environment variables
+are supplied; sets must be valid and disjoint.
+
+S3 provenance retains raw timing samples and whole-workload host snapshots
+(CPU counters, pressure, load, cgroup counters, and process affinity). The
+controller checks that raw samples reproduce the reported percentiles. Missing
+host diagnostic files are recorded as unavailable. These snapshots can establish
+contention during the run, but cannot attribute an individual slow sample to
+external VM noise. Failed samples remain part of the gate and retained evidence.
+
 Current implementation references: [`local_incremental.rs`](../../crates/velorix-runtime/benches/local_incremental.rs),
 [`materialized_output_workloads.rs`](../../crates/velorix-runtime/benches/materialized_output_workloads.rs),
 and [`benchmark_gate.rs`](../../crates/velorix-runtime/tests/benchmark_gate.rs).
