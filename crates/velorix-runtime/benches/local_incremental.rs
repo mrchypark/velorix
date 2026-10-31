@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     ops::Range,
@@ -72,6 +73,7 @@ const RECORDS_PER_BATCH: u64 = 16;
 const CHECKPOINT_VERSION: u64 = 0;
 const CHECKPOINT_SAMPLE_COUNT: usize = 9;
 const RECOVERY_SAMPLE_COUNT: usize = 9;
+const S3_MINIMUM_TIMING_SAMPLES: usize = 101;
 const STATE_OWNER: &str = "orders_sum_count";
 const GC_EXECUTION_RUN_ID: &str = "local-incremental-gc-execution";
 const MATERIALIZED_VIEW_SQL: &str =
@@ -105,6 +107,14 @@ const HARNESS_SOURCE_FILES: &[(&str, &[u8])] = &[
 ];
 
 type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+fn timing_sample_count(local_count: usize) -> usize {
+    if std::env::var("VELORIX_BENCHMARK_BACKEND").as_deref() == Ok("s3-compatible") {
+        local_count.max(S3_MINIMUM_TIMING_SAMPLES)
+    } else {
+        local_count
+    }
+}
 
 fn harness_source_sha256() -> String {
     let mut hasher = Sha256::new();
@@ -151,7 +161,18 @@ async fn run() -> BenchResult<()> {
         "local-incremental-startup-capability-probes",
     )
     .await?;
-    let capability_probe_elapsed = capability_probe_started.elapsed();
+    let mut capability_probe_samples = vec![capability_probe_started.elapsed()];
+    for index in 1..timing_sample_count(1) {
+        let started = Instant::now();
+        let repeated_capabilities = probe_authoritative_object_store_capabilities(
+            store.as_ref(),
+            "local-benchmark",
+            &format!("local-incremental-startup-capability-probes-{index}"),
+        )
+        .await?;
+        capability_probe_samples.push(started.elapsed());
+        assert_eq!(repeated_capabilities, capabilities);
+    }
     let capability_probe_requests =
         request_delta(&metered_store.snapshot(), &capability_probe_requests_before);
     let ingest_coordinator =
@@ -259,7 +280,7 @@ async fn run() -> BenchResult<()> {
     let mut checkpoint_requests =
         request_delta(&metered_store.snapshot(), &checkpoint_requests_before);
     let mut sample_store_totals = empty_object_requests();
-    for sample_index in 1..CHECKPOINT_SAMPLE_COUNT {
+    for sample_index in 1..timing_sample_count(CHECKPOINT_SAMPLE_COUNT) {
         let sample_handle = config.create_store(&format!("checkpoint-sample-{sample_index}"))?;
         let sample_metered_store = Arc::clone(&sample_handle.metered_store);
         let sample_store = Arc::clone(&sample_handle.store);
@@ -326,9 +347,9 @@ async fn run() -> BenchResult<()> {
         &requests_before,
     );
 
-    let mut recovery_samples = Vec::with_capacity(RECOVERY_SAMPLE_COUNT);
+    let mut recovery_samples = Vec::with_capacity(timing_sample_count(RECOVERY_SAMPLE_COUNT));
     let mut recovery_requests = empty_object_requests();
-    for _ in 0..RECOVERY_SAMPLE_COUNT {
+    for _ in 0..timing_sample_count(RECOVERY_SAMPLE_COUNT) {
         let requests_before = metered_store.snapshot();
         let recovery_started = Instant::now();
         let checkpoint_bytes = publisher.read_state_object(&checkpoint_state_ref).await?;
@@ -364,13 +385,8 @@ async fn run() -> BenchResult<()> {
     .await?;
     let gc_execution_denied =
         gc_execution_denied(&publisher, &metered_store, &gc_dry_run_planning).await?;
-    let materialized_output_workloads =
-        materialized_output_workloads::run_materialized_output_workloads(
-            Arc::clone(&store),
-            || metered_store.snapshot(),
-            CHECKPOINT_VERSION,
-        )
-        .await?;
+    let (materialized_output_workloads, output_samples) =
+        repeated_output_workloads(Arc::clone(&store), &metered_store).await?;
     let scale_group_key_workloads = scale_group_key_workloads::run()?;
     let scale_join_key_workloads = scale_join_key_workloads::run()?;
     let phase8_family_workloads = phase8_family_workloads::run()?;
@@ -378,7 +394,12 @@ async fn run() -> BenchResult<()> {
     let records_per_second = total_records as f64 / materialized_view_apply_elapsed.as_secs_f64();
     let release_s3 = matches!(config, BackendConfig::S3 { .. });
     let timing_diagnostics = release_s3.then(|| {
-        let mut samples = serde_json::Map::new();
+        let mut samples = output_samples;
+        samples.insert("object_store_capability_probe".into(), duration_samples(&capability_probe_samples));
+        samples.insert("ingest_envelope_validation".into(), duration_samples(&ingest_samples));
+        samples.insert("native_sql_materialized_view_apply".into(), duration_samples(&materialized_view_apply_samples));
+        samples.insert("gc_dry_run_planning".into(), duration_samples(&gc_dry_run_planning.measurement.samples));
+        samples.insert("gc_execution_denied".into(), duration_samples(&gc_execution_denied.samples));
         samples.insert("checkpoint_publish".into(), duration_samples(&checkpoint_samples));
         samples.insert("checkpoint_recovery".into(), duration_samples(&recovery_samples));
         for measurement in &scale_group_key_workloads {
@@ -449,7 +470,7 @@ async fn run() -> BenchResult<()> {
             let mut workload_metrics = vec![
                 workload_metric(
                     "object_store_capability_probe",
-                    &[capability_probe_elapsed],
+                    &capability_probe_samples,
                     capability_probe_requests,
                     0,
                 ),
@@ -539,6 +560,66 @@ async fn run() -> BenchResult<()> {
     Ok(())
 }
 
+async fn repeated_output_workloads(
+    store: Arc<dyn ObjectStore>,
+    metered_store: &MeteredObjectStore,
+) -> BenchResult<(
+    Vec<BenchmarkWorkloadMetricsV1>,
+    serde_json::Map<String, serde_json::Value>,
+)> {
+    if timing_sample_count(1) == 1 {
+        return Ok((
+            materialized_output_workloads::run_materialized_output_workloads(
+                store,
+                || metered_store.snapshot(),
+                CHECKPOINT_VERSION,
+            )
+            .await?,
+            serde_json::Map::new(),
+        ));
+    }
+    let mut observations = BTreeMap::<String, (Vec<Duration>, ObjectRequestMetricsV1, u64)>::new();
+    for repetition in 0..timing_sample_count(1) {
+        let isolated: Arc<dyn ObjectStore> = Arc::new(PrefixStore::new(
+            Arc::clone(&store),
+            Path::from(format!("timing-repeat/{repetition}")),
+        ));
+        for metric in materialized_output_workloads::run_materialized_output_workloads(
+            isolated,
+            || metered_store.snapshot(),
+            CHECKPOINT_VERSION,
+        )
+        .await?
+        {
+            assert_eq!(
+                metric.p50_ms, metric.p95_ms,
+                "output workload must report one raw observation"
+            );
+            let entry = observations
+                .entry(metric.name)
+                .or_insert_with(|| (Vec::new(), empty_object_requests(), 0));
+            entry
+                .0
+                .push(Duration::from_secs_f64(metric.p50_ms / 1000.0));
+            add_request_totals(
+                &mut entry.1,
+                &metric
+                    .object_requests
+                    .expect("output workload request counts"),
+            );
+            entry.2 += metric.scan_bytes;
+        }
+    }
+    let mut metrics = Vec::new();
+    let mut samples = serde_json::Map::new();
+    for (name, (observations, requests, scan_bytes)) in observations {
+        assert_eq!(observations.len(), timing_sample_count(1));
+        samples.insert(name.clone(), duration_samples(&observations));
+        metrics.push(workload_metric(&name, &observations, requests, scan_bytes));
+    }
+    Ok((metrics, samples))
+}
+
 async fn gc_dry_run_planning(
     publisher: &CheckpointPublisher,
     metered_store: &MeteredObjectStore,
@@ -608,7 +689,13 @@ async fn gc_dry_run_planning(
     let requests_before = metered_store.snapshot();
     let started = Instant::now();
     let plan = publisher.plan_garbage_collection(policy).await?;
-    let elapsed = started.elapsed();
+    let mut samples = vec![started.elapsed()];
+    for _ in 1..timing_sample_count(1) {
+        let started = Instant::now();
+        let repeated_plan = publisher.plan_garbage_collection(policy).await?;
+        samples.push(started.elapsed());
+        assert_eq!(repeated_plan, plan);
+    }
 
     assert_eq!(
         plan.retained_manifest_versions,
@@ -626,7 +713,7 @@ async fn gc_dry_run_planning(
 
     Ok(GcDryRunPlanningWorkload {
         measurement: MeasuredWorkload {
-            samples: vec![elapsed],
+            samples,
             object_requests: request_delta(&metered_store.snapshot(), &requests_before),
             scan_bytes: 0,
         },
@@ -641,24 +728,27 @@ async fn gc_execution_denied(
     planning: &GcDryRunPlanningWorkload,
 ) -> BenchResult<MeasuredWorkload> {
     let requests_before = metered_store.snapshot();
-    let started = Instant::now();
-    let error = publisher
-        .execute_garbage_collection_plan_with_evidence(
-            GC_EXECUTION_RUN_ID,
-            planning.policy,
-            &planning.plan,
-        )
-        .await
-        .expect_err("uncoordinated GC must fail closed");
-    let elapsed = started.elapsed();
+    let mut samples = Vec::new();
+    for _ in 0..timing_sample_count(1) {
+        let started = Instant::now();
+        let error = publisher
+            .execute_garbage_collection_plan_with_evidence(
+                GC_EXECUTION_RUN_ID,
+                planning.policy,
+                &planning.plan,
+            )
+            .await
+            .expect_err("uncoordinated GC must fail closed");
+        samples.push(started.elapsed());
 
-    assert!(matches!(
-        error,
-        velorix_storage::state::CheckpointPublishError::GarbageCollectionCoordinationRequired
-    ));
+        assert!(matches!(
+            error,
+            velorix_storage::state::CheckpointPublishError::GarbageCollectionCoordinationRequired
+        ));
+    }
 
     Ok(MeasuredWorkload {
-        samples: vec![elapsed],
+        samples,
         object_requests: request_delta(&metered_store.snapshot(), &requests_before),
         scan_bytes: 0,
     })
@@ -832,11 +922,13 @@ fn write_s3_provenance(
     );
     let workload_profile = json!({
         "name": "local_incremental",
-        "profile_version": 1,
+        "profile_version": 2,
+        "minimum_timing_samples": S3_MINIMUM_TIMING_SAMPLES,
+        "repetition_policy": "retain every observation; repeat complete stateful epoch sequences and isolate mutating fixtures; no warmup or outlier exclusion",
         "batch_count": BATCH_COUNT,
         "records_per_batch": RECORDS_PER_BATCH,
-        "checkpoint_samples": CHECKPOINT_SAMPLE_COUNT,
-        "recovery_samples": RECOVERY_SAMPLE_COUNT,
+        "checkpoint_samples": timing_sample_count(CHECKPOINT_SAMPLE_COUNT),
+        "recovery_samples": timing_sample_count(RECOVERY_SAMPLE_COUNT),
         "includes_legacy_datafusion_source_scan": false,
         "engine_cpuset": std::env::var("VELORIX_S3_BENCHMARK_ENGINE_CPUSET").ok(),
         "gateway_cpuset": std::env::var("VELORIX_S3_BENCHMARK_GATEWAY_CPUSET").ok(),
@@ -870,8 +962,8 @@ fn write_s3_provenance(
         "scan_bytes_definition": "sum of selected materialized-output page/vector bytes reported by the existing output workloads; incremental source batches are supplied in memory, with no source-relation scan",
         "spill_bytes_definition": "zero for this workload because no spill-capable operator or spill path is invoked; this is workload scope, not an uninstrumented system-wide spill counter",
         "peak_rss_definition": "OS process high-water resident set size from getrusage(RUSAGE_SELF); platform units normalized to bytes",
-        "checkpoint_samples": CHECKPOINT_SAMPLE_COUNT,
-        "recovery_samples": RECOVERY_SAMPLE_COUNT,
+        "checkpoint_samples": timing_sample_count(CHECKPOINT_SAMPLE_COUNT),
+        "recovery_samples": timing_sample_count(RECOVERY_SAMPLE_COUNT),
         "timing_diagnostics": timing_diagnostics
     });
     std::fs::write(path, serde_json::to_vec_pretty(&provenance)?)?;

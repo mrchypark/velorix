@@ -248,6 +248,17 @@ host diagnostic files are recorded as unavailable. These snapshots can establish
 contention during the run, but cannot attribute an individual slow sample to
 external VM noise. Failed samples remain part of the gate and retained evidence.
 
+The S3 timing profile v2 requires at least 101 observations per named workload.
+Independent operations repeat against fresh fixtures where they mutate state;
+stateful workloads repeat complete original epoch sequences, rather than extending
+one sequence to a larger state. Setup boundaries and percentile formulas stay the
+same. Every observation, including the first and all slow observations, is retained.
+Logical storage counters include all repetitions, so v1 cost totals are not directly
+comparable. Local PR smoke keeps its original profile. Before release comparison,
+all ordered pairs within each version must also pass the unchanged 10% comparator;
+an unstable identical-source control blocks qualification rather than relaxing the
+budget or inflating the predecessor baseline.
+
 Current implementation references: [`local_incremental.rs`](../../crates/velorix-runtime/benches/local_incremental.rs),
 [`materialized_output_workloads.rs`](../../crates/velorix-runtime/benches/materialized_output_workloads.rs),
 and [`benchmark_gate.rs`](../../crates/velorix-runtime/tests/benchmark_gate.rs).

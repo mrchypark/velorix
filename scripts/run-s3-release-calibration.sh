@@ -129,7 +129,8 @@ write_summary() {
         runner_arch:$runner_arch,github_run_id:$github_run_id,github_run_attempt:$github_run_attempt,
         rustc_identity:$rustc_identity,uname:$runner_uname,cpu_count:$cpu_count},
       fixture_identity:($fixture_identity | fromjson?),target_disk_free_kib:$target_disk_free_kib,
-      measurements_validated:$measurement_count,candidate_gates_evaluated:$candidate_gate_count,
+      measurements_validated:$measurement_count,candidate_gates_evaluated:($gate_results | length),
+      candidate_gates_passed:$candidate_gate_count,
       candidate_gate_results:$gate_results,cleanup_status:$cleanup_status}' \
     >"$output_dir/calibration-summary.json.tmp"
   mv "$output_dir/calibration-summary.json.tmp" "$output_dir/calibration-summary.json"
@@ -408,9 +409,12 @@ timing_diagnostics_valid() {
   jq -e --slurpfile result "$1" '
     def percentile($fraction): sort | .[(((length - 1) * $fraction) | ceil)];
     .timing_diagnostics.samples_ms as $samples |
+    .workload_profile.profile_version == 2 and
     ($samples | type == "object" and length > 0) and
-    ($samples.checkpoint_publish | length == 9) and
-    ($samples.checkpoint_recovery | length == 9) and
+    ($samples.checkpoint_publish | length == 101) and
+    ($samples.checkpoint_recovery | length == 101) and
+    all($result[0].workload_metrics[]; .name as $name |
+      ($samples[$name] | type == "array" and length >= 101)) and
     all($samples | to_entries[];
       .key as $name | .value as $values |
       ([$result[0].workload_metrics[] | select(.name == $name)] | .[0]) as $metric |
@@ -575,6 +579,39 @@ record_raw_result_hashes() {
   done
 }
 
+run_sampling_controls() {
+  sampling_controls_pass=true
+  sampling_results='[]'
+  for control_kind in baseline candidate; do
+    for control_base in 01 02 03; do
+      for control_probe in 01 02 03; do
+        [ "$control_base" = "$control_probe" ] && continue
+        control_label="aa-$control_kind-$control_base-to-$control_probe"
+        control_base_path="$output_dir/$control_kind-$control_base.json"
+        control_probe_path="$output_dir/$control_kind-$control_probe.json"
+        [ "$(jq -r '.commit' "$control_base_path")" = "$(jq -r '.commit' "$control_probe_path")" ] ||
+          die 'identical-source control contains different source commits'
+        if run_logged "$control_label" "$repo_root" cargo run --quiet -p velorix-cli -- \
+          benchmark-gate --gate-level release --backend s3-compatible \
+          --baseline "$control_base_path" --result "$control_probe_path" \
+          --max-regression-fraction "$regression_budget" --json; then
+          control_status=pass
+        else
+          control_status=fail
+          sampling_controls_pass=false
+        fi
+        sampling_results=$(jq -cn --argjson existing "$sampling_results" \
+          --arg pair "$control_label" --arg status "$control_status" \
+          '$existing + [{pair:$pair,status:$status}]')
+      done
+    done
+  done
+  jq -n --argjson passed "$sampling_controls_pass" --argjson results "$sampling_results" \
+    '{schema_version:1,method:"all ordered within-source pairs; unchanged 10% comparator",
+      passed:$passed,results:$results}' >"$output_dir/sampling-controls.json"
+  [ "$sampling_controls_pass" = true ]
+}
+
 self_test() {
   require_command jq
   require_command mktemp
@@ -618,16 +655,21 @@ self_test() {
     (.calibration.predecessor_samples | length) == 3
   ' "$output_dir/predecessor-envelope.json.provenance.json" >/dev/null ||
     die 'self-test failed: predecessor envelope provenance'
-  jq -n '{workload_metrics:[{name:"checkpoint_publish",p50_ms:5,p95_ms:9},
-    {name:"checkpoint_recovery",p50_ms:5,p95_ms:9}]}' >"$selftest_dir/timing-result.json"
-  jq -n '{timing_diagnostics:{samples_ms:{checkpoint_publish:[range(1;10)],
-    checkpoint_recovery:[range(1;10)]}}}' >"$selftest_dir/timing-provenance.json"
+  jq -n '{workload_metrics:[{name:"checkpoint_publish",p50_ms:51,p95_ms:96},
+    {name:"checkpoint_recovery",p50_ms:51,p95_ms:96}]}' >"$selftest_dir/timing-result.json"
+  jq -n '{workload_profile:{profile_version:2},timing_diagnostics:{samples_ms:{checkpoint_publish:[range(1;102)],
+    checkpoint_recovery:[range(1;102)]}}}' >"$selftest_dir/timing-provenance.json"
   timing_diagnostics_valid "$selftest_dir/timing-result.json" "$selftest_dir/timing-provenance.json" ||
     die 'self-test failed: matching raw timing samples rejected'
-  jq '.timing_diagnostics.samples_ms.checkpoint_publish[8]=10' \
+  jq '.timing_diagnostics.samples_ms.checkpoint_publish[50]=200' \
     "$selftest_dir/timing-provenance.json" >"$selftest_dir/invalid-timing.json"
   if timing_diagnostics_valid "$selftest_dir/timing-result.json" "$selftest_dir/invalid-timing.json"; then
     die 'self-test failed: mismatched raw timing samples accepted'
+  fi
+  jq '.timing_diagnostics.samples_ms.checkpoint_publish |= .[0:100]' \
+    "$selftest_dir/timing-provenance.json" >"$selftest_dir/short-timing.json"
+  if timing_diagnostics_valid "$selftest_dir/timing-result.json" "$selftest_dir/short-timing.json"; then
+    die 'self-test failed: insufficient timing samples accepted'
   fi
   jq -n '{commit:"candidate",measurement_complete:true,result_pair_complete:true,
     result_validated:true,gate_evaluated:false,gate_status:"collected",
@@ -658,6 +700,20 @@ self_test() {
   compute_release_passed true 6 3 cleaned
   [ "$release_passed" = true ] && calibration_exit_code ||
     die 'self-test failed: three passing gates and clean complete evidence did not yield success'
+  for control_kind in baseline candidate; do
+    for control_index in 01 02 03; do
+      printf '%s\n' '{"commit":"identical-source"}' >"$output_dir/$control_kind-$control_index.json"
+    done
+  done
+  run_logged() { [ "$mock_control_failure" = false ] || [ "$1" != aa-candidate-01-to-02 ]; }
+  mock_control_failure=false
+  run_sampling_controls || die 'self-test failed: stable identical-source controls rejected'
+  jq -e '.passed and (.results|length)==12' "$output_dir/sampling-controls.json" >/dev/null ||
+    die 'self-test failed: identical-source controls incomplete'
+  mock_control_failure=true
+  if run_sampling_controls; then die 'self-test failed: unstable identical-source control accepted'; fi
+  jq -e '(.passed|not) and ([.results[]|select(.status=="fail")]|length)==1' \
+    "$output_dir/sampling-controls.json" >/dev/null || die 'self-test failed: failed control not retained'
   printf '%s\n' 'offline calibration self-test passed: conservative envelope and fail-closed collection/gates'
 }
 
@@ -804,6 +860,10 @@ for pair in 01 02 03; do
     --arg status "$gate_status" --arg log "$gate_log_file" \
     '$existing + [{sample:$sample,status:$status,log:$log}]')
 done
+
+if ! run_sampling_controls; then
+  all_candidate_gates_pass=false
+fi
 
 if ! checkout_is_clean; then
   all_candidate_gates_pass=false
