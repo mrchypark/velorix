@@ -404,6 +404,24 @@ write_envelope_provenance() {
     "$output_dir/baseline-01.json.provenance.json" >"$output_dir/predecessor-envelope.json.provenance.json"
 }
 
+timing_diagnostics_valid() {
+  jq -e --slurpfile result "$1" '
+    def percentile($fraction): sort | .[(((length - 1) * $fraction) | ceil)];
+    .timing_diagnostics.samples_ms as $samples |
+    ($samples | type == "object" and length > 0) and
+    ($samples.checkpoint_publish | length == 9) and
+    ($samples.checkpoint_recovery | length == 9) and
+    all($samples | to_entries[];
+      .key as $name | .value as $values |
+      ([$result[0].workload_metrics[] | select(.name == $name)] | .[0]) as $metric |
+      ($values | type == "array" and length > 0) and
+      all($values[]; type == "number" and . >= 0) and
+      $metric != null and
+      ((($values | percentile(0.50)) - $metric.p50_ms) | fabs) < 0.000000001 and
+      ((($values | percentile(0.95)) - $metric.p95_ms) | fabs) < 0.000000001)
+  ' "$2" >/dev/null
+}
+
 validate_collected_measurement() {
   label=$1
   expected_commit=$2
@@ -426,6 +444,8 @@ validate_collected_measurement() {
     (.harness_source_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
     (.workload_profile_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
   ' "$provenance" >/dev/null || die "$label provenance lacks the expected source or fixture identity"
+  timing_diagnostics_valid "$result" "$provenance" ||
+    die "$label raw timing samples do not reproduce the reported percentiles"
   measurement_count=$((measurement_count + 1))
 }
 
@@ -598,6 +618,17 @@ self_test() {
     (.calibration.predecessor_samples | length) == 3
   ' "$output_dir/predecessor-envelope.json.provenance.json" >/dev/null ||
     die 'self-test failed: predecessor envelope provenance'
+  jq -n '{workload_metrics:[{name:"checkpoint_publish",p50_ms:5,p95_ms:9},
+    {name:"checkpoint_recovery",p50_ms:5,p95_ms:9}]}' >"$selftest_dir/timing-result.json"
+  jq -n '{timing_diagnostics:{samples_ms:{checkpoint_publish:[range(1;10)],
+    checkpoint_recovery:[range(1;10)]}}}' >"$selftest_dir/timing-provenance.json"
+  timing_diagnostics_valid "$selftest_dir/timing-result.json" "$selftest_dir/timing-provenance.json" ||
+    die 'self-test failed: matching raw timing samples rejected'
+  jq '.timing_diagnostics.samples_ms.checkpoint_publish[8]=10' \
+    "$selftest_dir/timing-provenance.json" >"$selftest_dir/invalid-timing.json"
+  if timing_diagnostics_valid "$selftest_dir/timing-result.json" "$selftest_dir/invalid-timing.json"; then
+    die 'self-test failed: mismatched raw timing samples accepted'
+  fi
   jq -n '{commit:"candidate",measurement_complete:true,result_pair_complete:true,
     result_validated:true,gate_evaluated:false,gate_status:"collected",
     cleanup_status:"cleaned",release_gate_passed:false,runner_exit_code:0,

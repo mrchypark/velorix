@@ -139,6 +139,7 @@ fn main() -> BenchResult<()> {
 
 async fn run() -> BenchResult<()> {
     let config = BackendConfig::from_env()?;
+    let host_before = matches!(config, BackendConfig::S3 { .. }).then(host_diagnostics);
     let store_handle = config.create_store("main")?;
     let metered_store = Arc::clone(&store_handle.metered_store);
     let store = Arc::clone(&store_handle.store);
@@ -376,6 +377,22 @@ async fn run() -> BenchResult<()> {
 
     let records_per_second = total_records as f64 / materialized_view_apply_elapsed.as_secs_f64();
     let release_s3 = matches!(config, BackendConfig::S3 { .. });
+    let timing_diagnostics = release_s3.then(|| {
+        let mut samples = serde_json::Map::new();
+        samples.insert("checkpoint_publish".into(), duration_samples(&checkpoint_samples));
+        samples.insert("checkpoint_recovery".into(), duration_samples(&recovery_samples));
+        for measurement in &scale_group_key_workloads {
+            samples.insert(measurement.name.clone(), duration_samples(&measurement.samples));
+        }
+        for measurement in &scale_join_key_workloads {
+            samples.insert(measurement.name.clone(), duration_samples(&measurement.samples));
+        }
+        for measurement in &phase8_family_workloads {
+            samples.insert(measurement.name.clone(), duration_samples(&measurement.samples));
+        }
+        json!({"samples_ms":samples,"host_before":host_before,"host_after":host_diagnostics(),
+            "scope":"diagnostic only; snapshots bracket the whole workload, not individual samples; no sample is excluded or adjusted"})
+    });
     let byte_ratio_row_count = if release_s3 {
         total_records + RECORDS_PER_BATCH
     } else {
@@ -507,7 +524,14 @@ async fn run() -> BenchResult<()> {
     result.validate()?;
 
     if release_s3 {
-        write_s3_provenance(&config, &result, total_records + RECORDS_PER_BATCH)?;
+        write_s3_provenance(
+            &config,
+            &result,
+            total_records + RECORDS_PER_BATCH,
+            timing_diagnostics
+                .as_ref()
+                .expect("S3 diagnostics recorded"),
+        )?;
     }
 
     println!("{}", serde_json::to_string(&result)?);
@@ -759,10 +783,38 @@ fn isolated_prefix(prefix: &str) -> BenchResult<String> {
     Ok(normalized.to_string())
 }
 
+fn duration_samples(samples: &[Duration]) -> serde_json::Value {
+    json!(samples
+        .iter()
+        .map(|sample| millis(*sample))
+        .collect::<Vec<_>>())
+}
+
+fn host_diagnostics() -> serde_json::Value {
+    let mut sources = serde_json::Map::new();
+    for path in [
+        "/proc/stat",
+        "/proc/loadavg",
+        "/proc/pressure/cpu",
+        "/proc/pressure/io",
+        "/proc/pressure/memory",
+        "/sys/fs/cgroup/cpu.stat",
+        "/sys/fs/cgroup/cpu.max",
+    ] {
+        let value = match std::fs::read_to_string(path) {
+            Ok(contents) => json!({"status":"available","contents":contents}),
+            Err(error) => json!({"status":"unavailable","error":error.to_string()}),
+        };
+        sources.insert(path.into(), value);
+    }
+    json!({"platform":std::env::consts::OS,"sources":sources})
+}
+
 fn write_s3_provenance(
     config: &BackendConfig,
     result: &BenchmarkGateResultV1,
     appended_input_rows: u64,
+    timing_diagnostics: &serde_json::Value,
 ) -> BenchResult<()> {
     let BackendConfig::S3 {
         endpoint,
@@ -816,7 +868,8 @@ fn write_s3_provenance(
         "spill_bytes_definition": "zero for this workload because no spill-capable operator or spill path is invoked; this is workload scope, not an uninstrumented system-wide spill counter",
         "peak_rss_definition": "OS process high-water resident set size from getrusage(RUSAGE_SELF); platform units normalized to bytes",
         "checkpoint_samples": CHECKPOINT_SAMPLE_COUNT,
-        "recovery_samples": RECOVERY_SAMPLE_COUNT
+        "recovery_samples": RECOVERY_SAMPLE_COUNT,
+        "timing_diagnostics": timing_diagnostics
     });
     std::fs::write(path, serde_json::to_vec_pretty(&provenance)?)?;
     Ok(())
