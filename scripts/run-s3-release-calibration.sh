@@ -390,6 +390,20 @@ commit_baseline_instrumentation() {
     >"$output_dir/baseline-provenance.json"
 }
 
+write_envelope_provenance() {
+  jq --arg baseline_parent "$baseline_parent" \
+    --arg instrumentation_commit "$instrumentation_commit" \
+    --argjson fixture_identity "$fixture_identity" \
+    --argjson result_hashes "$(jq -R -s 'split("\n")|map(select(length>0))' "$output_dir/predecessor-result-sha256.txt")" \
+    '.candidate_git_head=$instrumentation_commit |
+     .fixture_identity=$fixture_identity |
+     .calibration={method:"componentwise conservative envelope of exactly three predecessor raw samples",
+       predecessor_production_parent:$baseline_parent,
+       predecessor_instrumentation_commit:$instrumentation_commit,
+       predecessor_samples:$result_hashes}' \
+    "$output_dir/baseline-01.json.provenance.json" >"$output_dir/predecessor-envelope.json.provenance.json"
+}
+
 validate_collected_measurement() {
   label=$1
   expected_commit=$2
@@ -568,6 +582,22 @@ self_test() {
     .metrics.object_requests.put_count == 3 and
     .workload_metrics[0].p95_ms == 3 and .workload_metrics[0].scan_bytes == 30
   ' "$selftest_dir/envelope.json" >/dev/null || die 'self-test failed: predecessor componentwise envelope'
+  output_dir=$selftest_dir
+  baseline_parent=predecessor-production
+  instrumentation_commit=baseline-instrumentation
+  fixture_identity='{"mode":"docker","image_platform":"linux/amd64"}'
+  printf '%s\n' '{"harness_source_sha256":"retained-harness"}' >"$output_dir/baseline-01.json.provenance.json"
+  printf '%s\n' 'hash1  baseline-01.json' 'hash2  baseline-02.json' 'hash3  baseline-03.json' >"$output_dir/predecessor-result-sha256.txt"
+  write_envelope_provenance
+  jq -e '
+    .candidate_git_head == "baseline-instrumentation" and
+    .harness_source_sha256 == "retained-harness" and
+    .fixture_identity.image_platform == "linux/amd64" and
+    .calibration.predecessor_production_parent == "predecessor-production" and
+    .calibration.predecessor_instrumentation_commit == "baseline-instrumentation" and
+    (.calibration.predecessor_samples | length) == 3
+  ' "$output_dir/predecessor-envelope.json.provenance.json" >/dev/null ||
+    die 'self-test failed: predecessor envelope provenance'
   jq -n '{commit:"candidate",measurement_complete:true,result_pair_complete:true,
     result_validated:true,gate_evaluated:false,gate_status:"collected",
     cleanup_status:"cleaned",release_gate_passed:false,runner_exit_code:0,
@@ -717,16 +747,7 @@ mv "$output_dir/baseline-provenance.json.tmp" "$output_dir/baseline-provenance.j
 status=baseline_envelope
 build_envelope "$output_dir/predecessor-envelope.json" "$instrumentation_commit" \
   "$output_dir/baseline-01.json" "$output_dir/baseline-02.json" "$output_dir/baseline-03.json"
-jq --arg instrumentation_commit "$instrumentation_commit" \
-  --argjson fixture_identity "$fixture_identity" \
-  --argjson result_hashes "$(jq -R -s 'split("\n")|map(select(length>0))' "$output_dir/predecessor-result-sha256.txt")" \
-  '.candidate_git_head=$instrumentation_commit |
-   .fixture_identity=$fixture_identity |
-   .calibration={method:"componentwise conservative envelope of exactly three predecessor raw samples",
-     predecessor_production_parent:$baseline_parent,
-     predecessor_instrumentation_commit:$instrumentation_commit,
-     predecessor_samples:$result_hashes}' \
-  "$output_dir/baseline-01.json.provenance.json" >"$output_dir/predecessor-envelope.json.provenance.json"
+write_envelope_provenance
 
 status=candidate_gates
 all_candidate_gates_pass=true
