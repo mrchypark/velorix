@@ -794,6 +794,7 @@ fn host_diagnostics() -> serde_json::Value {
     let mut sources = serde_json::Map::new();
     for path in [
         "/proc/stat",
+        "/proc/self/status",
         "/proc/loadavg",
         "/proc/pressure/cpu",
         "/proc/pressure/io",
@@ -837,6 +838,8 @@ fn write_s3_provenance(
         "checkpoint_samples": CHECKPOINT_SAMPLE_COUNT,
         "recovery_samples": RECOVERY_SAMPLE_COUNT,
         "includes_legacy_datafusion_source_scan": false,
+        "engine_cpuset": std::env::var("VELORIX_S3_BENCHMARK_ENGINE_CPUSET").ok(),
+        "gateway_cpuset": std::env::var("VELORIX_S3_BENCHMARK_GATEWAY_CPUSET").ok(),
         "harness_source_files": HARNESS_SOURCE_FILES.iter().map(|(name, _)| name).collect::<Vec<_>>(),
         "harness_source_sha256": harness_source_sha256(),
         "workload_metrics": result.workload_metrics.iter().map(|metric| &metric.name).collect::<Vec<_>>()

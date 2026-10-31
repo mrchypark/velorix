@@ -233,6 +233,21 @@ second clean-checkout/HEAD check. The controller then builds and evaluates its
 separate predecessor envelope with the unchanged CLI comparator. Ordinary
 runner invocations retain the default baseline comparison behavior.
 
+Controlled calibration assigns engine processes to CPUs `0,1` and the disposable
+gateway to CPUs `2,3`. Both predecessor and candidate use that same topology.
+Unavailable affinities fail the run; there is no fallback to shared CPUs. This
+isolates engine/gateway scheduling contention without changing workloads,
+sample counts, percentile definitions, or the 10% regression budget. The standalone
+runner retains its existing behavior unless both CPU-set environment variables
+are supplied; sets must be valid and disjoint.
+
+S3 provenance retains raw timing samples and whole-workload host snapshots
+(CPU counters, pressure, load, cgroup counters, and process affinity). The
+controller checks that raw samples reproduce the reported percentiles. Missing
+host diagnostic files are recorded as unavailable. These snapshots can establish
+contention during the run, but cannot attribute an individual slow sample to
+external VM noise. Failed samples remain part of the gate and retained evidence.
+
 Current implementation references: [`local_incremental.rs`](../../crates/velorix-runtime/benches/local_incremental.rs),
 [`materialized_output_workloads.rs`](../../crates/velorix-runtime/benches/materialized_output_workloads.rs),
 and [`benchmark_gate.rs`](../../crates/velorix-runtime/tests/benchmark_gate.rs).

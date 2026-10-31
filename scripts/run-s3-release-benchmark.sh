@@ -12,6 +12,8 @@ aws_cli_image='amazon/aws-cli:2.17.36@sha256:b9a5694d2c5fea14c9d5d3c5ba221e8c749
 default_baseline_path="$repo_root/baselines/benchmark/s3/release.json"
 baseline_path=$default_baseline_path
 collect_only=0
+engine_cpuset=${VELORIX_S3_BENCHMARK_ENGINE_CPUSET:-}
+gateway_cpuset=${VELORIX_S3_BENCHMARK_GATEWAY_CPUSET:-}
 collection_data_valid=0
 checkout_clean_final=0
 run_id="$(date -u +%Y%m%dt%H%M%Sz)-$$"
@@ -233,12 +235,28 @@ require_result_shape() {
   run_owned_command cargo run --quiet -p velorix-cli -- benchmark-validate --result "$candidate_file"
 }
 
+cpu_sets_valid() {
+  [ -n "$1$2" ] || return 0
+  printf '%s\n' "$1" | grep -Eq '^[0-9]+(,[0-9]+)*$' || return 1
+  printf '%s\n' "$2" | grep -Eq '^[0-9]+(,[0-9]+)*$' || return 1
+  for cpu in $(printf '%s' "$1" | tr ',' ' '); do
+    case ",$2," in *",$cpu,"*) return 1 ;; esac
+  done
+}
+
 run_self_tests() {
   require_command jq
   require_command cargo
   require_command go
   require_command grep
   require_command sed
+  cpu_sets_valid '' '' && cpu_sets_valid '0,1' '2,3' ||
+    die 'self-test failed: valid CPU isolation rejected'
+  for invalid_sets in '0,1:1,2' '0,1:' 'x:2,3' '0,,1:2,3'; do
+    if cpu_sets_valid "${invalid_sets%:*}" "${invalid_sets#*:}"; then
+      die 'self-test failed: invalid CPU isolation accepted'
+    fi
+  done
   (cd "$script_dir/run-process-group-src" && go test ./...)
   selftest_dir=$(mktemp -d "${TMPDIR:-/tmp}/velorix-s3-release-benchmark.XXXXXX")
   trap 'rm -rf "$selftest_dir"' EXIT HUP INT TERM
@@ -651,6 +669,13 @@ case "$head_commit" in
 esac
 
 require_command docker
+cpu_sets_valid "$engine_cpuset" "$gateway_cpuset" || die 'CPU isolation requires disjoint comma-separated engine and gateway CPU lists'
+if [ -n "$engine_cpuset" ]; then
+  require_command taskset
+  for cpu in $(printf '%s,%s' "$engine_cpuset" "$gateway_cpuset" | tr ',' ' '); do
+    taskset -c "$cpu" true || die "requested CPU $cpu is unavailable"
+  done
+fi
 require_command cargo
 require_command go
 require_command jq
@@ -793,7 +818,9 @@ docker volume create \
   --label "velorix.s3-release-benchmark.run=$resource_label" \
   "$volume_name" >/dev/null
 created_volume=1
-docker run -d \
+set --
+if [ -n "$gateway_cpuset" ]; then set -- --cpuset-cpus "$gateway_cpuset"; fi
+docker run -d "$@" \
   --name "$container_name" \
   --label "velorix.s3-release-benchmark.run=$resource_label" \
   --network "$network_name" \
@@ -803,6 +830,10 @@ docker run -d \
   -v "$volume_name:/data" \
   "$versitygw_image" --port :9000 posix /data >/dev/null
 created_container=1
+if [ -n "$gateway_cpuset" ]; then
+  actual_gateway_cpuset=$(docker container inspect --format '{{.HostConfig.CpusetCpus}}' "$container_name")
+  [ "$actual_gateway_cpuset" = "$gateway_cpuset" ] || die 'gateway CPU affinity differs from requested isolation'
+fi
 run_phase=fixture_started
 
 actual_image_digest=$(docker container inspect --format '{{.Image}}' "$container_name" |
@@ -877,7 +908,9 @@ export VELORIX_S3_PREFIX="$prefix"
 export CARGO_TARGET_DIR="${VELORIX_S3_BENCHMARK_CARGO_TARGET_DIR:-$repo_root/target}"
 
 run_phase=measurement
-if ! run_owned_command cargo bench -p velorix-runtime --bench local_incremental >"$bench_stage_path" 2>"${result_path}.bench.stderr.log"; then
+set -- cargo bench -p velorix-runtime --bench local_incremental
+if [ -n "$engine_cpuset" ]; then set -- taskset -c "$engine_cpuset" "$@"; fi
+if ! run_owned_command "$@" >"$bench_stage_path" 2>"${result_path}.bench.stderr.log"; then
   printf 'benchmark producer failed; stderr retained at %s\n' "${result_path}.bench.stderr.log" >&2
   exit 1
 fi

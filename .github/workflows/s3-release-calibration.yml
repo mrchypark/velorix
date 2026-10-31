@@ -50,6 +50,9 @@ jobs:
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
+      # Separate the engine and gateway after diagnostics showed CPU contention.
+      VELORIX_S3_BENCHMARK_ENGINE_CPUSET: '0,1'
+      VELORIX_S3_BENCHMARK_GATEWAY_CPUSET: '2,3'
       VELORIX_S3_CALIBRATION_BASELINE_COMMIT: d143c6301552b69444b5843fce13c67a48f101ff
       VELORIX_S3_CALIBRATION_CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
       VELORIX_S3_CALIBRATION_EVIDENCE_DIR: ${{ github.workspace }}/target/s3-release-calibration-evidence
