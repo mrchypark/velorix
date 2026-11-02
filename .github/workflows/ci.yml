@@ -49,6 +49,7 @@ jobs:
           sh -n scripts/check-rhiza-local-k8s-contract.sh
           sh -n scripts/check-rhiza-local-recovery.sh
           sh -n scripts/check-rhiza-service-recovery.sh
+          sh scripts/check-rhiza-service-recovery.sh --self-test
           sh -n scripts/check-rhiza-single-node-recovery.sh
           sh -n scripts/check-rhiza-local-chaos.sh
           sh -n scripts/check-rhiza-dory-chaos-http.sh

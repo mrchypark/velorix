@@ -6,6 +6,42 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
+default_binary_dir() { printf '%s\n' "$repo_root/target/debug"; }
+binary_dir=${RHIZA_SERVICE_BINARY_DIR:-$(default_binary_dir)}
+validate_binary_dir() {
+    case "$1" in
+        /*) ;;
+        *) echo "RHIZA_SERVICE_BINARY_DIR must be an absolute path: $1" >&2; return 2 ;;
+    esac
+    [ -d "$1" ] || { echo "RHIZA_SERVICE_BINARY_DIR is not an existing directory: $1" >&2; return 2; }
+    for binary_name in velorix-api velorix-meta; do
+        [ -x "$1/$binary_name" ] || { echo "required built binary is missing or not executable: $1/$binary_name" >&2; return 1; }
+    done
+}
+if [ "${1:-}" = --self-test ]; then
+    [ "$(default_binary_dir)" = "$repo_root/target/debug" ] || {
+        echo 'default binary directory contract failed' >&2
+        exit 1
+    }
+    test_dir=$(mktemp -d "${TMPDIR:-/tmp}/velorix-rhiza-self-test.XXXXXX")
+    trap 'rm -r "$test_dir"' EXIT
+    trap 'exit 130' HUP INT TERM
+    if validate_binary_dir "$test_dir/missing" >/dev/null 2>&1; then exit 1; else [ "$?" -eq 2 ] || exit 1; fi
+    if validate_binary_dir relative/path >/dev/null 2>&1; then
+        echo 'relative binary directory unexpectedly passed validation' >&2
+        exit 1
+    else
+        [ "$?" -eq 2 ] || exit 1
+    fi
+    if validate_binary_dir "$test_dir" >/dev/null 2>&1; then exit 1; else [ "$?" -eq 1 ] || exit 1; fi
+    : >"$test_dir/velorix-api"
+    : >"$test_dir/velorix-meta"
+    chmod +x "$test_dir/velorix-api" "$test_dir/velorix-meta"
+    validate_binary_dir "$test_dir"
+    echo 'binary directory preflight self-test passed'
+    exit 0
+fi
+validate_binary_dir "$binary_dir"
 service_mode=${RHIZA_SERVICE_MODE:-cluster}
 case "$service_mode" in
     cluster|local) ;;
@@ -155,10 +191,10 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for binary in "$repo_root/target/debug/velorix-api" "$repo_root/target/debug/velorix-meta"; do
-    [ -x "$binary" ] || { echo "required built binary is missing: $binary" >&2; exit 1; }
-done
-shasum -a 256 "$repo_root/target/debug/velorix-api" "$repo_root/target/debug/velorix-meta" >"$evidence_dir/binary-sha256.txt"
+{
+    printf 'binary_dir=%s\n' "$binary_dir"
+    shasum -a 256 "$binary_dir/velorix-api" "$binary_dir/velorix-meta"
+} >"$evidence_dir/binary-sha256.txt"
 cargo tree -p velorix-meta --features rhiza-backend -e features -i rhizadb >"$evidence_dir/rhizadb-feature-provenance.txt" 2>&1
 rg -q 'velorix-meta feature "rhiza-backend"' "$evidence_dir/rhizadb-feature-provenance.txt" || {
     echo 'meta build feature provenance is missing rhiza-backend' >&2
@@ -248,7 +284,7 @@ check_local_meta_config() {
         VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY="$secret_key" \
         VELORIX_RHIZA_OBJECT_STORE_INSECURE=1 \
         VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack \
-        "$repo_root/target/debug/velorix-meta" check-config >"$evidence_dir/meta-config-check.log" 2>&1
+        "$binary_dir/velorix-meta" check-config >"$evidence_dir/meta-config-check.log" 2>&1
     [ ! -e "$evidence_dir/rhiza" ] || {
         echo 'meta check-config unexpectedly created the Local Rhiza data directory' >&2
         return 1
@@ -290,7 +326,7 @@ run_local_meta() {
         VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY="$secret_key" \
         VELORIX_RHIZA_OBJECT_STORE_INSECURE=1 \
         VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack \
-        "$repo_root/target/debug/velorix-meta" "$run_local_command" "$@"
+        "$binary_dir/velorix-meta" "$run_local_command" "$@"
     if [ "$run_local_command" = serve ]; then
         exec "$@"
     fi
@@ -381,7 +417,7 @@ start_meta() {
         VELORIX_RHIZA_OBJECT_STORE_SECRET_KEY="$secret_key" \
         VELORIX_RHIZA_OBJECT_STORE_INSECURE=1 \
         VELORIX_RHIZA_OBJECT_STORE_DURABILITY=before-ack \
-        "$repo_root/target/debug/velorix-meta" serve >"$evidence_dir/meta-$generation.log" 2>&1 &
+        "$binary_dir/velorix-meta" serve >"$evidence_dir/meta-$generation.log" 2>&1 &
     fi
     meta_pid=$!
     if [ "$service_mode" = local ]; then
@@ -391,14 +427,14 @@ start_meta() {
         while [ "$process_check" -lt 10 ]; do
             meta_command=$(ps -p "$meta_pid" -o command= 2>/dev/null || true)
             case "$meta_command" in
-                *"$repo_root/target/debug/velorix-meta"*) break ;;
+                *"$binary_dir/velorix-meta"*) break ;;
             esac
             pid_running "$meta_pid" || break
             sleep 1
             process_check=$((process_check + 1))
         done
         case "$meta_command" in
-            *"$repo_root/target/debug/velorix-meta"*)
+            *"$binary_dir/velorix-meta"*)
                 printf '%s\n' "$meta_command" >"$evidence_dir/meta-$meta_generation.process.txt"
                 ;;
             *)
@@ -419,7 +455,7 @@ start_meta() {
            VELORIX_META_TLS_CLIENT_KEY_FILE="$private_dir/client.key" \
            VELORIX_META_TLS_DOMAIN_NAME=localhost \
            VELORIX_META_BEARER_TOKEN="$meta_token" \
-           "$repo_root/target/debug/velorix-meta" smoke --expect-backend rhiza-kv --expect-auth-enforced true --expect-production-multi-writer-safe false --capabilities-only --connect-retry-timeout-seconds 2 \
+           "$binary_dir/velorix-meta" smoke --expect-backend rhiza-kv --expect-auth-enforced true --expect-production-multi-writer-safe false --capabilities-only --connect-retry-timeout-seconds 2 \
            >"$evidence_dir/meta-smoke-$generation.log" 2>&1; then return 0; fi
         sleep 1
         i=$((i + 1))
@@ -451,7 +487,7 @@ start_worker_api() {
         VELORIX_MATERIALIZED_READ_CACHE_DIR="$cache/worker" VELORIX_SERVICE_ROLE=worker \
         VELORIX_API_BIND="127.0.0.1:$worker_port" VELORIX_API_OWNER_ENDPOINT="http://127.0.0.1:$worker_port" \
         VELORIX_OPERATOR_ID="$worker_operator" VELORIX_API_REPLICA_COUNT=1 \
-        "$repo_root/target/debug/velorix-api" >"$evidence_dir/worker-$generation.log" 2>&1 &
+        "$binary_dir/velorix-api" >"$evidence_dir/worker-$generation.log" 2>&1 &
     worker_pid=$!
     i=0
     while [ "$i" -lt 90 ]; do
@@ -477,7 +513,7 @@ start_worker_api() {
         VELORIX_WORKER_ENDPOINTS="http://127.0.0.1:$worker_port" \
         VELORIX_API_BIND="127.0.0.1:$api_port" VELORIX_API_OWNER_ENDPOINT="http://127.0.0.1:$api_port" \
         VELORIX_OPERATOR_ID="$api_operator" VELORIX_API_REPLICA_COUNT=1 \
-        "$repo_root/target/debug/velorix-api" >"$evidence_dir/api-$generation.log" 2>&1 &
+        "$binary_dir/velorix-api" >"$evidence_dir/api-$generation.log" 2>&1 &
     api_pid=$!
     i=0
     while [ "$i" -lt 90 ]; do
