@@ -280,6 +280,22 @@ async fn timed_out_precommit_source_load_finishes_once_and_later_query_uses_chec
     let meta = Arc::new(DurableCapabilityMetaStore::new(InMemoryMetaStore::default()));
     let state = test_authoritative_api_state_with_store(store, "precommit-owner", meta).await;
     let router = app(state.clone());
+    let mut schema = test_scores_catalog().relation_schema;
+    schema.primary_key_column_ids.clear();
+    schema.columns[0].semantic_role = RelationSemanticRoleV1::Value;
+    schema.allowed_operations = vec![RelationOperationV1::Insert];
+    let catalog = VelorixRelationCatalogV1::from_relation_schema(
+        schema,
+        CATALOG_GENERIC_INCREMENTAL_ADAPTER_ID.into(),
+    )
+    .unwrap();
+    let registered = post(
+        &router,
+        "/v1/relations",
+        public_relation_registration(&catalog),
+    )
+    .await;
+    assert_eq!(registered.0, StatusCode::CREATED, "{registered:?}");
     ingest(&router, 0, json!([{"user_id":"a","score":7}])).await;
     declare(
         &router,
