@@ -336,8 +336,9 @@ async fn timed_out_precommit_source_load_finishes_once_and_later_query_uses_chec
         operation.clone().try_lock_owned().is_err(),
         "timed-out job released its view lock"
     );
-    assert!(
-        state.try_compute_slot().is_err(),
+    assert_eq!(
+        state.compute_slots.available_permits(),
+        state.max_compute_jobs - 1,
         "timed-out job released its compute slot"
     );
 
@@ -346,6 +347,13 @@ async fn timed_out_precommit_source_load_finishes_once_and_later_query_uses_chec
         .await
         .expect("detached materialization did not release its view lock");
     drop(completed_job);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.compute_slots.available_permits() != state.max_compute_jobs {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finished materialization did not release its compute slot");
     assert_eq!(
         demand(&router, "precommit_timeout_output", None, 64).await,
         vec![json!({"user_id":"a","total":7})]
