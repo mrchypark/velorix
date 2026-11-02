@@ -5,6 +5,14 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Image platform
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+        default: linux/amd64
 
 env:
   VELORIX_SOURCE_REF: ${{ github.sha }}
@@ -16,7 +24,7 @@ permissions:
 jobs:
   build-push:
     name: Build and push ${{ matrix.name }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: true
       matrix:
@@ -37,6 +45,12 @@ jobs:
             dockerfile: Dockerfile.all-in-one
             target: runtime
     steps:
+      - name: Validate requested platform
+        env:
+          BUILD_PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+        run: |
+          case "$BUILD_PLATFORM" in linux/amd64|linux/arm64) ;; *) echo "unsupported platform: $BUILD_PLATFORM" >&2; exit 1 ;; esac
+
       - name: Checkout Velorix source
         uses: actions/checkout@v5
         with:
@@ -62,24 +76,25 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
-          platforms: linux/amd64
+          platforms: ${{ inputs.platform || 'linux/amd64' }}
           push: true
           provenance: false
-          tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}
+          tags: ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}${{ inputs.platform == 'linux/arm64' && '-arm64' || '' }}
 
       - name: Record immutable image digest
         run: |
-          image="ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}@${{ steps.build.outputs.digest }}"
-          printf 'source_ref=%s\nimage=%s\n' "${{ env.VELORIX_SOURCE_REF }}" "$image" > image-digest-${{ matrix.name }}.txt
+          image="ghcr.io/mrchypark/velorix-${{ matrix.name }}:${{ env.VELORIX_SOURCE_REF }}${{ inputs.platform == 'linux/arm64' && '-arm64' || '' }}@${{ steps.build.outputs.digest }}"
+          printf 'source_ref=%s\nimage=%s\nplatform=%s\n' "${{ env.VELORIX_SOURCE_REF }}" "$image" "${{ inputs.platform || 'linux/amd64' }}" > image-digest-${{ matrix.name }}.txt
           {
             echo "### ${{ matrix.name }} image"
             echo "- source ref: \`${{ env.VELORIX_SOURCE_REF }}\`"
             echo "- immutable image: \`$image\`"
+            echo "- platform: \`${{ inputs.platform || 'linux/amd64' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload immutable image digest
         uses: actions/upload-artifact@v6
         with:
-          name: velorix-${{ matrix.name }}-image-digest
+          name: velorix-${{ matrix.name }}-image-digest${{ inputs.platform == 'linux/arm64' && '-arm64' || '' }}
           path: image-digest-${{ matrix.name }}.txt
           if-no-files-found: error

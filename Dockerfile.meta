@@ -12,14 +12,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GO_VERSION=1.27.3
-ARG GO_TARBALL_SHA256=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
-RUN curl --fail --silent --show-error --location \
-      "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+ARG TARGETARCH
+RUN case "$TARGETARCH" in amd64) goarch=amd64; gosha=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40 ;; arm64) goarch=arm64; gosha=a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49 ;; *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; esac \
+    && curl --fail --silent --show-error --location \
+      "https://go.dev/dl/go${GO_VERSION}.linux-${goarch}.tar.gz" \
       --output /tmp/go.tar.gz \
-    && echo "${GO_TARBALL_SHA256}  /tmp/go.tar.gz" | sha256sum --check --strict \
+    && echo "${gosha}  /tmp/go.tar.gz" | sha256sum --check --strict \
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && rm -f /tmp/go.tar.gz \
-    && /usr/local/go/bin/go version | grep -Eq '^go version go1\.27\.3 linux/amd64$'
+    && /usr/local/go/bin/go version | grep -Eq "^go version go1\\.27\\.3 linux/${goarch}$"
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 WORKDIR /workspace

@@ -4,28 +4,42 @@ set -eu
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 rhiza_manifest="$repo_root/crates/velorix-meta/Cargo.toml"
 expected_version=1.27.3
-expected_sha=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+amd64_sha=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+arm64_sha=a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49
 
-# rhizadb 0.21.2's published native/go.mod requires Go 1.27.3. The checksum
-# is the official go.dev/dl/?mode=json linux-amd64 archive entry for that release.
+# rhizadb 0.21.2 requires Go 1.27.3. Checksums are official go.dev archive entries.
 grep -Fq 'rhizadb = { version = "=0.21.2"' "$rhiza_manifest" || {
   echo "rhizadb pin changed; re-audit its native Go minimum before updating this contract" >&2
   exit 1
 }
 
-for dockerfile in Dockerfile.meta Dockerfile.all-in-one; do
-  path="$repo_root/$dockerfile"
-  for required in \
-    "ARG GO_VERSION=$expected_version" \
-    "ARG GO_TARBALL_SHA256=$expected_sha" \
-    "^go version go1\\.27\\.3 linux/amd64$" \
-    'GOTOOLCHAIN=local' \
-    '--features "rhiza-backend"'; do
+check_dockerfile() {
+  path=$1
+  label=$2
+  for required in "ARG GO_VERSION=$expected_version" 'ARG TARGETARCH' 'GOTOOLCHAIN=local' '--features "rhiza-backend"' "$amd64_sha" "$arm64_sha" 'sha256sum --check --strict' 'go version go1\\.27\\.3 linux/${goarch}'; do
     grep -Fq -- "$required" "$path" || {
-      echo "$dockerfile is missing Go/Rhiza toolchain contract: $required" >&2
+      echo "$label is missing Go/Rhiza toolchain contract: $required" >&2
       exit 1
     }
   done
-done
+}
+
+if [ "${1-}" = --self-test ]; then
+  tmp=${TMPDIR:-/tmp}/rhiza-go-contract.$$
+  trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+  mkdir -p "$tmp"
+  for dockerfile in Dockerfile.meta Dockerfile.all-in-one; do
+    cp "$repo_root/$dockerfile" "$tmp/$dockerfile"
+    check_dockerfile "$tmp/$dockerfile" "$dockerfile fixture"
+    sed "s/$arm64_sha/0000000000000000000000000000000000000000000000000000000000000000/" "$tmp/$dockerfile" > "$tmp/bad-sha"
+    if (check_dockerfile "$tmp/bad-sha" 'wrong ARM checksum fixture') 2>/dev/null; then exit 1; fi
+    sed '/go version go1/d' "$tmp/$dockerfile" > "$tmp/no-version"
+    if (check_dockerfile "$tmp/no-version" 'missing Go assertion fixture') 2>/dev/null; then exit 1; fi
+  done
+  echo 'Go toolchain contract self-test passed'
+  exit 0
+fi
+
+for dockerfile in Dockerfile.meta Dockerfile.all-in-one; do check_dockerfile "$repo_root/$dockerfile" "$dockerfile"; done
 
 echo "Dockerfiles match rhizadb 0.21.2 Go 1.27.3 minimum and official Go archive checksum"
