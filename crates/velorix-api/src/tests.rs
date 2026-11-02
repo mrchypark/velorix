@@ -44,6 +44,128 @@ use velorix_core::{
 };
 
 #[test]
+fn api_object_store_provider_defaults_to_s3_and_accepts_native_gcs() {
+    assert_eq!(
+        parse_object_store_provider(None).unwrap(),
+        ApiObjectStoreProviderKind::S3
+    );
+    assert_eq!(
+        parse_object_store_provider(Some("s3")).unwrap(),
+        ApiObjectStoreProviderKind::S3
+    );
+    assert_eq!(
+        parse_object_store_provider(Some("gcs")).unwrap(),
+        ApiObjectStoreProviderKind::Gcs
+    );
+}
+
+#[test]
+fn api_object_store_provider_rejects_unsupported_provider() {
+    let error = parse_object_store_provider(Some("azure")).unwrap_err();
+    assert!(error.to_string().contains("VELORIX_OBJECT_STORE_PROVIDER"));
+    assert!(error.to_string().contains("s3` or `gcs"));
+}
+
+#[test]
+fn api_gcs_requires_generic_bucket_and_does_not_need_aws_settings() {
+    let error = api_object_store_config(ApiObjectStoreProviderKind::Gcs, |_| None).unwrap_err();
+    assert!(error.to_string().contains("VELORIX_OBJECT_STORE_BUCKET"));
+    let values = std::collections::HashMap::from([
+        ("VELORIX_OBJECT_STORE_BUCKET", "product-bucket"),
+        ("VELORIX_OBJECT_STORE_PREFIX", "quickstart"),
+    ]);
+    let config = api_object_store_config(ApiObjectStoreProviderKind::Gcs, |name| {
+        values.get(name).map(|value| (*value).to_string())
+    })
+    .unwrap();
+    assert_eq!(config.bucket, "product-bucket");
+    assert_eq!(config.prefix, "quickstart");
+    assert!(matches!(
+        config.provider,
+        ApiObjectStoreProvider::Gcs { .. }
+    ));
+}
+
+#[test]
+fn api_gcs_accepts_adc_path_and_rejects_two_explicit_credential_sources() {
+    let values = std::collections::HashMap::from([
+        ("VELORIX_OBJECT_STORE_BUCKET", "product-bucket"),
+        ("GOOGLE_APPLICATION_CREDENTIALS", "/credentials/adc.json"),
+    ]);
+    let config = api_object_store_config(ApiObjectStoreProviderKind::Gcs, |name| {
+        values.get(name).map(|value| (*value).to_string())
+    })
+    .unwrap();
+    assert!(matches!(
+        config.provider,
+        ApiObjectStoreProvider::Gcs {
+            application_credentials_path: Some(ref path),
+            service_account_path: None
+        } if path == "/credentials/adc.json"
+    ));
+
+    let values = std::collections::HashMap::from([
+        ("VELORIX_OBJECT_STORE_BUCKET", "product-bucket"),
+        ("GOOGLE_APPLICATION_CREDENTIALS", "/credentials/adc.json"),
+        (
+            "VELORIX_GCS_SERVICE_ACCOUNT_PATH",
+            "/credentials/service-account.json",
+        ),
+    ]);
+    let error = api_object_store_config(ApiObjectStoreProviderKind::Gcs, |name| {
+        values.get(name).map(|value| (*value).to_string())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("set only one of"));
+}
+
+#[test]
+fn api_default_authority_store_id_distinguishes_s3_and_gcs() {
+    assert_eq!(
+        default_authority_store_id(ApiObjectStoreProviderKind::S3, "bucket", "prefix"),
+        "s3://s3-compatible/bucket/prefix"
+    );
+    assert_eq!(
+        default_authority_store_id(ApiObjectStoreProviderKind::Gcs, "bucket", "prefix"),
+        "gcs://google-cloud-storage/bucket/prefix"
+    );
+}
+
+#[test]
+fn object_store_cache_identity_separates_provider_and_endpoint_without_credentials() {
+    let gcs = ApiObjectStoreProvider::Gcs {
+        service_account_path: Some("path-one".into()),
+        application_credentials_path: None,
+    };
+    let gcs_other_credentials = ApiObjectStoreProvider::Gcs {
+        service_account_path: None,
+        application_credentials_path: Some("path-two".into()),
+    };
+    let s3 = ApiObjectStoreProvider::S3 {
+        endpoint: "https://s3.example.test".into(),
+        access_key_id: String::new(),
+        secret_access_key: String::new(),
+        session_token: None,
+        region: String::new(),
+        force_path_style: true,
+    };
+    let s3_other_endpoint = ApiObjectStoreProvider::S3 {
+        endpoint: "https://other-s3.example.test".into(),
+        access_key_id: String::new(),
+        secret_access_key: String::new(),
+        session_token: None,
+        region: String::new(),
+        force_path_style: true,
+    };
+    let identity = |provider: &ApiObjectStoreProvider| {
+        object_store_cache_identity(provider, "bucket", "prefix", "authority").unwrap()
+    };
+    assert_eq!(identity(&gcs), identity(&gcs_other_credentials));
+    assert_ne!(identity(&gcs), identity(&s3));
+    assert_ne!(identity(&s3), identity(&s3_other_endpoint));
+}
+
+#[test]
 fn unsafe_dev_multi_api_mode_is_explicit_and_keeps_other_modes_guarded() {
     let mode = StandingRuntimeFencingMode::from_env(Some("unsafe-dev-multi-api"), 3).unwrap();
     assert_eq!(mode, StandingRuntimeFencingMode::UnsafeDevMultiApi);

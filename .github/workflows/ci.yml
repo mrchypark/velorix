@@ -71,6 +71,7 @@ jobs:
           sh scripts/check-rust-toolchain-contract.sh
           scripts/check-rhiza-operator-manifests-contract.sh
           sh scripts/check-rhiza-go-toolchain-contract.sh
+          sh scripts/check-rhiza-go-toolchain-contract.sh --self-test
           sh scripts/check-all-image-entrypoint-contract.sh
           sh scripts/check-rhiza-chaos-contract.sh
           sh scripts/check-vendor-integrity.sh

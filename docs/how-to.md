@@ -127,6 +127,23 @@ export VELORIX_MATERIALIZED_READ_CACHE_DIR="${TMPDIR:-/tmp}/velorix-materialized
 cargo run -p velorix-api
 ```
 
+To use native Google Cloud Storage for the API's object data, select the GCS SDK
+instead of the S3-compatible settings above:
+
+```bash
+export VELORIX_OBJECT_STORE_PROVIDER=gcs
+export VELORIX_OBJECT_STORE_BUCKET=your-bucket
+export VELORIX_OBJECT_STORE_PREFIX=quickstart
+# Optional: use Application Default Credentials from a credentials file.
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/application-credentials.json
+# Alternatively, set VELORIX_GCS_SERVICE_ACCOUNT_PATH to a service-account JSON
+# file. With neither path set, the SDK uses its default credentials chain.
+```
+
+GCS does not require `VELORIX_S3_COMPAT` or AWS endpoint, region, or credential
+variables. The API uses `object_store`'s native GCS client; it does not route GCS
+through an S3 compatibility endpoint.
+
 The first build can take several minutes. Keep this process running.
 
 In terminal 3, check the service and run all remaining request commands:
