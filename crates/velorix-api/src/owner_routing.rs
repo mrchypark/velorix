@@ -587,17 +587,34 @@ pub(super) async fn materialize_demand_step(
                 }
                 let mut bounded = request.clone();
                 bounded.budget.max_duration_ms = bounded.budget.max_duration_ms.min(remaining_ms);
+                let slot = match state.try_compute_slot() {
+                    Ok(slot) => slot,
+                    Err(error) if error.status == StatusCode::ACCEPTED => {
+                        log_owner_pending("worker_slots_full", local_epoch);
+                        return Ok(pending_outcome());
+                    }
+                    Err(error) => return Err(error),
+                };
+                let job_state = state.clone();
+                let job_active = active.clone();
+                let job_slot = slot.clone();
+                let foreground = query_priority.then(|| state.demand_scheduler.foreground_guard());
                 let result = materialize_with_deadline(
                     std::time::Duration::from_millis(remaining_ms),
-                    demand_materialization::materialize_demand_step(
-                        state,
-                        active,
-                        &bounded,
-                        order,
-                        query_priority,
-                        claim,
-                        None,
-                    ),
+                    async move {
+                        let _foreground = foreground;
+                        demand_materialization::materialize_demand_step(
+                            &job_state,
+                            &job_active,
+                            &bounded,
+                            order,
+                            query_priority,
+                            claim,
+                            Some(slot),
+                        )
+                        .await
+                    },
+                    job_slot,
                 )
                 .await;
                 match result {
@@ -946,28 +963,34 @@ async fn demand_step_rpc_inner(
     };
     let result = match request.operation {
         DemandStepRpcOperation::Materialize => {
-            // This is only a priority signal for the received local step.
-            // Never take the global query turn here: a caller may already
-            // hold its own turn while waiting on this RPC.
-            let _foreground = request
-                .query_priority
-                .then(|| state.demand_scheduler.foreground_guard());
             let mut demand = demand_materialization::DemandRequest {
                 scope: request.scope,
                 budget: request.budget,
             };
             demand.budget.max_duration_ms = demand.budget.max_duration_ms.min(remaining_ms);
+            let job_state = state.clone();
+            let job_active = active.clone();
+            let job_slot = slot.clone();
+            let foreground = request
+                .query_priority
+                .then(|| state.demand_scheduler.foreground_guard());
             let outcome = materialize_with_deadline(
                 std::time::Duration::from_millis(remaining_ms),
-                demand_materialization::materialize_demand_step(
-                    &state,
-                    &active,
-                    &demand,
-                    request.order,
-                    request.query_priority,
-                    claim,
-                    Some(slot.clone()),
-                ),
+                async move {
+                    // Keep this priority marker alive with the worker-owned step.
+                    let _foreground = foreground;
+                    demand_materialization::materialize_demand_step(
+                        &job_state,
+                        &job_active,
+                        &demand,
+                        request.order,
+                        request.query_priority,
+                        claim,
+                        Some(slot),
+                    )
+                    .await
+                },
+                job_slot,
             )
             .await?;
             DemandStepRpcResult::Materialization(outcome.into())
@@ -1354,14 +1377,50 @@ fn pending_outcome() -> demand_materialization::DemandOutcome {
 async fn materialize_with_deadline<F>(
     timeout: std::time::Duration,
     future: F,
+    slot: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<demand_materialization::DemandOutcome, ApiError>
 where
-    F: std::future::Future<Output = Result<demand_materialization::DemandOutcome, ApiError>>,
+    F: std::future::Future<Output = Result<demand_materialization::DemandOutcome, ApiError>>
+        + Send
+        + 'static,
 {
-    match tokio::time::timeout(timeout, future).await {
-        Ok(result) => result,
-        Err(_) => Ok(pending_outcome()),
+    let job_slot = slot.clone();
+    let mut job = tokio::spawn(async move {
+        let _slot = job_slot;
+        let result = future.await;
+        if result.is_err() {
+            log_materialization_job_failure("materialization_error");
+        }
+        result
+    });
+    match tokio::time::timeout(timeout, &mut job).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            log_materialization_job_failure(if error.is_panic() {
+                "task_panicked"
+            } else {
+                "task_cancelled"
+            });
+            Err(ApiError::internal("materialization task failed"))
+        }
+        Err(_) => {
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Err(error) = job.await {
+                    log_materialization_job_failure(if error.is_panic() {
+                        "task_panicked"
+                    } else {
+                        "task_cancelled"
+                    });
+                }
+            });
+            Ok(pending_outcome())
+        }
     }
+}
+
+fn log_materialization_job_failure(class: &str) {
+    eprintln!("demand_materialization_job_failure class={class}");
 }
 
 pub(super) fn unix_now_ms() -> u64 {
@@ -1526,11 +1585,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elapsed_materialization_deadline_returns_incomplete_accepted_outcome() {
-        let outcome = materialize_with_deadline(std::time::Duration::from_millis(1), async {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            Ok(pending_outcome())
-        })
+    async fn elapsed_deadline_detaches_bounded_job_and_retains_its_compute_slot() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let monitor_slot = slot.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let job_entered = entered.clone();
+        let job_release = release.clone();
+        let job_completed = completed.clone();
+        let outcome = materialize_with_deadline(
+            std::time::Duration::from_millis(1),
+            async move {
+                let _slot = slot;
+                job_entered.notify_one();
+                job_release.notified().await;
+                job_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(demand_materialization::DemandOutcome {
+                    checkpoint_epoch: Some(1),
+                    work_units: 1,
+                    status: "complete".into(),
+                    complete: true,
+                    processed_rows: 1,
+                    read_bytes: 1,
+                    remaining_rows: 0,
+                    dependency_mode: "full_closure".into(),
+                })
+            },
+            monitor_slot,
+        )
         .await
         .unwrap();
 
@@ -1540,13 +1624,86 @@ mod tests {
             rpc_result_response(DemandStepRpcResult::Materialization(outcome.into())).status(),
             StatusCode::ACCEPTED
         );
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("bounded job did not start");
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "timed-out caller released the slot"
+        );
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded job did not finish after the request deadline");
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished job leaked its slot");
+    }
+
+    #[tokio::test]
+    async fn aborted_waiter_does_not_release_helper_owned_job_slot() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let job_entered = entered.clone();
+        let job_release = release.clone();
+        let job_completed = completed.clone();
+        let waiter = tokio::spawn(materialize_with_deadline(
+            std::time::Duration::from_secs(30),
+            async move {
+                job_entered.notify_one();
+                job_release.notified().await;
+                job_completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(pending_outcome())
+            },
+            slot,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("job did not start before waiter cancellation");
+
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "aborted waiter released job slot"
+        );
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.load(std::sync::atomic::Ordering::SeqCst) == 0
+                || slots.available_permits() == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("helper-owned job did not finish after waiter cancellation");
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[tokio::test]
     async fn materialization_deadline_wrapper_preserves_inner_errors() {
-        let error = materialize_with_deadline(std::time::Duration::from_secs(1), async {
-            Err(ApiError::bad_request("invalid demand"))
-        })
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let error = materialize_with_deadline(
+            std::time::Duration::from_secs(1),
+            async { Err(ApiError::bad_request("invalid demand")) },
+            slot,
+        )
         .await
         .unwrap_err();
 

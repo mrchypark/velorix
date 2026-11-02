@@ -34,6 +34,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures::{StreamExt, TryStreamExt};
 use object_store::{
     aws::{AmazonS3Builder, S3ConditionalPut},
+    gcp::GoogleCloudStorageBuilder,
     path::Path as ObjectPath,
     prefix::PrefixStore,
     ObjectStore, ObjectStoreExt, PutMode,
@@ -2360,12 +2361,12 @@ pub async fn run_from_env() -> anyhow::Result<()> {
             config.standing_runtime_owner_ttl_ms,
         )?;
     }
-    state.materialized_read_cache_store_id = stable_bytes_hash(&serde_json::to_vec(&(
-        &config.endpoint,
+    state.materialized_read_cache_store_id = object_store_cache_identity(
+        &config.object_store_provider,
         &config.bucket,
         &config.prefix,
         &config.authority_store_id,
-    ))?);
+    )?;
     if let Some(cache_config) = config.materialized_read_cache {
         match materialized_read_cache::MaterializedReadCache::open(cache_config).await {
             Ok(cache) => state = state.with_materialized_read_cache(Arc::new(cache)),
@@ -2375,6 +2376,8 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         }
     }
     let materialized_read_cache = state.materialized_read_cache.clone();
+    let compute_slots = Arc::clone(&state.compute_slots);
+    let max_compute_jobs = state.max_compute_jobs;
     let serve_result = async {
         state
             .restore_standing_program_runtimes_from_active_views_with_legacy_rebuild(true)
@@ -2431,12 +2434,48 @@ pub async fn run_from_env() -> anyhow::Result<()> {
         result
     }
     .await;
-    if let Some(cache) = materialized_read_cache {
+    let drain_result = drain_compute_slots(compute_slots, max_compute_jobs).await;
+    if let Err(error) = &drain_result {
+        eprintln!("compute job drain failed; leaving materialized read cache open: {error}");
+    } else if let Some(cache) = materialized_read_cache {
         if let Err(error) = cache.close().await {
             eprintln!("materialized read cache close failed: {error}");
         }
     }
-    serve_result
+    serve_result.and(drain_result)
+}
+
+async fn drain_compute_slots(
+    slots: Arc<tokio::sync::Semaphore>,
+    max_compute_jobs: usize,
+) -> anyhow::Result<()> {
+    if max_compute_jobs > tokio::sync::Semaphore::MAX_PERMITS {
+        anyhow::bail!("compute job capacity exceeds semaphore limit");
+    }
+    let mut remaining = max_compute_jobs;
+    let mut drained: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    while remaining > 0 {
+        let (count, acquired) = compute_slot_drain_chunk(remaining)?;
+        let permit = slots
+            .clone()
+            .acquire_many_owned(count)
+            .await
+            .context("compute job semaphore closed during shutdown")?;
+        if let Some(drained) = &mut drained {
+            drained.merge(permit);
+        } else {
+            drained = Some(permit);
+        }
+        remaining -= acquired;
+    }
+    drop(drained);
+    Ok(())
+}
+
+fn compute_slot_drain_chunk(remaining: usize) -> anyhow::Result<(u32, usize)> {
+    let count = u32::try_from(remaining).unwrap_or(u32::MAX);
+    let acquired = usize::try_from(count).context("compute drain chunk does not fit usize")?;
+    Ok((count, acquired))
 }
 
 async fn api_shutdown_signal() -> anyhow::Result<()> {
@@ -2497,9 +2536,11 @@ where
 
 #[cfg(test)]
 mod api_shutdown_tests {
-    use super::drain_api_listeners;
+    use super::{compute_slot_drain_chunk, drain_api_listeners, drain_compute_slots};
     use anyhow::anyhow;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn signal_drains_both_listeners() {
@@ -2549,6 +2590,54 @@ mod api_shutdown_tests {
         .unwrap_err();
         assert_eq!(drained.load(Ordering::SeqCst), 1);
         assert_eq!(error.to_string(), "original HTTP error");
+    }
+
+    #[tokio::test]
+    async fn compute_slot_drain_waits_for_admitted_job() {
+        let slots = Arc::new(Semaphore::new(1));
+        let job_slot = slots.clone().try_acquire_owned().unwrap();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let job = tokio::spawn(async move {
+            let _slot = job_slot;
+            finish_rx.await.unwrap();
+        });
+
+        let drain = drain_compute_slots(slots.clone(), 1);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(drain.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("shutdown did not drain the admitted compute job")
+            .unwrap();
+        job.await.unwrap();
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn compute_slot_drain_rejects_unrepresentable_capacity() {
+        assert!(drain_compute_slots(Arc::new(Semaphore::new(1)), usize::MAX)
+            .await
+            .is_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn compute_slot_drain_chunks_capacity_above_u32_max() {
+        let maximum = usize::try_from(u32::MAX).unwrap();
+        let remaining = maximum + 1;
+        let (first_count, first_acquired) = compute_slot_drain_chunk(remaining).unwrap();
+        assert_eq!(first_count, u32::MAX);
+        assert_eq!(first_acquired, maximum);
+        assert_eq!(
+            compute_slot_drain_chunk(remaining - first_acquired).unwrap(),
+            (1, 1)
+        );
     }
 }
 
@@ -9133,14 +9222,9 @@ struct ApiConfig {
     max_compute_jobs: usize,
     materialized_read_cache: Option<materialized_read_cache::MaterializedReadCacheConfig>,
     tls: Option<ApiTlsConfig>,
-    endpoint: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
-    region: String,
+    object_store_provider: ApiObjectStoreProvider,
     bucket: String,
     prefix: String,
-    force_path_style: bool,
     authority_store_id: String,
     authority_namespace: String,
     operator_id: String,
@@ -9164,17 +9248,120 @@ struct ApiConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ApiObjectStoreProvider {
+    S3 {
+        endpoint: String,
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+        region: String,
+        force_path_style: bool,
+    },
+    Gcs {
+        service_account_path: Option<String>,
+        application_credentials_path: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiObjectStoreProviderKind {
+    S3,
+    Gcs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ApiTlsConfig {
     bind: SocketAddr,
     cert_path: String,
     key_path: String,
 }
 
+fn parse_object_store_provider(value: Option<&str>) -> anyhow::Result<ApiObjectStoreProviderKind> {
+    match value.unwrap_or("s3") {
+        "s3" => Ok(ApiObjectStoreProviderKind::S3),
+        "gcs" => Ok(ApiObjectStoreProviderKind::Gcs),
+        other => Err(anyhow!(
+            "unsupported VELORIX_OBJECT_STORE_PROVIDER `{other}`; expected `s3` or `gcs`"
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct ApiObjectStoreConfig {
+    provider: ApiObjectStoreProvider,
+    bucket: String,
+    prefix: String,
+}
+
+fn api_object_store_config(
+    provider: ApiObjectStoreProviderKind,
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> anyhow::Result<ApiObjectStoreConfig> {
+    let (config, bucket, prefix) = match provider {
+        ApiObjectStoreProviderKind::S3 => {
+            if get("VELORIX_S3_COMPAT").as_deref() != Some("1") {
+                return Err(anyhow!("velorix-api requires VELORIX_S3_COMPAT=1 for S3"));
+            }
+            let bucket =
+                get("VELORIX_S3_BUCKET").ok_or_else(|| anyhow!("VELORIX_S3_BUCKET is required"))?;
+            let prefix = get("VELORIX_S3_PREFIX").unwrap_or_else(|| "product".to_string());
+            let config = ApiObjectStoreProvider::S3 {
+                endpoint: get("AWS_ENDPOINT_URL")
+                    .ok_or_else(|| anyhow!("AWS_ENDPOINT_URL is required"))?,
+                access_key_id: get("AWS_ACCESS_KEY_ID")
+                    .ok_or_else(|| anyhow!("AWS_ACCESS_KEY_ID is required"))?,
+                secret_access_key: get("AWS_SECRET_ACCESS_KEY")
+                    .ok_or_else(|| anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
+                session_token: get("AWS_SESSION_TOKEN").filter(|value| !value.trim().is_empty()),
+                region: get("AWS_REGION").ok_or_else(|| anyhow!("AWS_REGION is required"))?,
+                force_path_style: get("VELORIX_S3_FORCE_PATH_STYLE")
+                    .map(|value| match value.trim() {
+                        "1" | "true" => Ok(true),
+                        "0" | "false" => Ok(false),
+                        other => Err(anyhow!(
+                            "VELORIX_S3_FORCE_PATH_STYLE must be 0, 1, true, or false; got `{other}`"
+                        )),
+                    })
+                    .transpose()?
+                    .unwrap_or(true),
+            };
+            (config, bucket, prefix)
+        }
+        ApiObjectStoreProviderKind::Gcs => {
+            let bucket = get("VELORIX_OBJECT_STORE_BUCKET")
+                .ok_or_else(|| anyhow!("VELORIX_OBJECT_STORE_BUCKET is required for GCS"))?;
+            let prefix =
+                get("VELORIX_OBJECT_STORE_PREFIX").unwrap_or_else(|| "product".to_string());
+            let service_account_path = get("VELORIX_GCS_SERVICE_ACCOUNT_PATH");
+            let application_credentials_path = get("GOOGLE_APPLICATION_CREDENTIALS");
+            if service_account_path.is_some() && application_credentials_path.is_some() {
+                return Err(anyhow!(
+                    "set only one of VELORIX_GCS_SERVICE_ACCOUNT_PATH and GOOGLE_APPLICATION_CREDENTIALS"
+                ));
+            }
+            let config = ApiObjectStoreProvider::Gcs {
+                service_account_path,
+                application_credentials_path,
+            };
+            (config, bucket, prefix)
+        }
+    };
+    Ok(ApiObjectStoreConfig {
+        provider: config,
+        bucket,
+        prefix,
+    })
+}
+
 impl ApiConfig {
     fn from_env() -> anyhow::Result<Self> {
-        if std::env::var("VELORIX_S3_COMPAT").ok().as_deref() != Some("1") {
-            return Err(anyhow!("velorix-api requires VELORIX_S3_COMPAT=1"));
-        }
+        let provider_kind = parse_object_store_provider(
+            optional_nonempty_env("VELORIX_OBJECT_STORE_PROVIDER").as_deref(),
+        )?;
+        let object_store = api_object_store_config(provider_kind, |name| match provider_kind {
+            ApiObjectStoreProviderKind::S3 => env::var(name).ok(),
+            ApiObjectStoreProviderKind::Gcs => optional_nonempty_env(name),
+        })?;
         let bind = std::env::var("VELORIX_API_BIND")
             .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
             .parse()
@@ -9184,16 +9371,11 @@ impl ApiConfig {
             std::env::var("VELORIX_API_TLS_KEY_PATH").ok(),
             std::env::var("VELORIX_API_TLS_BIND").ok(),
         )?;
-        let endpoint = required_env("AWS_ENDPOINT_URL")?;
-        let access_key_id = required_env("AWS_ACCESS_KEY_ID")?;
-        let secret_access_key = required_env("AWS_SECRET_ACCESS_KEY")?;
-        let session_token = optional_nonempty_env("AWS_SESSION_TOKEN");
-        let region = required_env("AWS_REGION")?;
-        let bucket = required_env("VELORIX_S3_BUCKET")?;
-        let prefix = std::env::var("VELORIX_S3_PREFIX").unwrap_or_else(|_| "product".to_string());
-        let force_path_style = parse_bool_env("VELORIX_S3_FORCE_PATH_STYLE", true)?;
+        let bucket = object_store.bucket;
+        let prefix = object_store.prefix;
+        let object_store_provider = object_store.provider;
         let authority_store_id = std::env::var("VELORIX_AUTHORITY_STORE_ID")
-            .unwrap_or_else(|_| default_authority_store_id(&bucket, &prefix));
+            .unwrap_or_else(|_| default_authority_store_id(provider_kind, &bucket, &prefix));
         let authority_namespace =
             std::env::var("VELORIX_AUTHORITY_NAMESPACE").unwrap_or_else(|_| "velorix".to_string());
         let operator_id =
@@ -9223,8 +9405,13 @@ impl ApiConfig {
             cache.validate()?;
             Some(cache)
         };
-        let backend_name = std::env::var("VELORIX_OBJECT_STORE_BACKEND")
-            .unwrap_or_else(|_| "s3-compatible".into());
+        let backend_name = std::env::var("VELORIX_OBJECT_STORE_BACKEND").unwrap_or_else(|_| {
+            match provider_kind {
+                ApiObjectStoreProviderKind::S3 => "s3-compatible",
+                ApiObjectStoreProviderKind::Gcs => "gcs-native",
+            }
+            .into()
+        });
         let meta_grpc_endpoint = std::env::var("VELORIX_META_GRPC_ENDPOINT")
             .ok()
             .filter(|value| !value.trim().is_empty());
@@ -9337,14 +9524,9 @@ impl ApiConfig {
             max_compute_jobs,
             materialized_read_cache,
             tls,
-            endpoint,
-            access_key_id,
-            secret_access_key,
-            session_token,
-            region,
+            object_store_provider,
             bucket,
             prefix,
-            force_path_style,
             authority_store_id,
             authority_namespace,
             operator_id,
@@ -9369,23 +9551,47 @@ impl ApiConfig {
     }
 
     fn object_store(&self) -> anyhow::Result<Arc<dyn ObjectStore>> {
-        let mut builder = AmazonS3Builder::new()
-            .with_endpoint(&self.endpoint)
-            .with_region(&self.region)
-            .with_bucket_name(&self.bucket)
-            .with_access_key_id(&self.access_key_id)
-            .with_secret_access_key(&self.secret_access_key)
-            .with_virtual_hosted_style_request(!self.force_path_style)
-            .with_conditional_put(S3ConditionalPut::ETagMatch);
-        if let Some(session_token) = &self.session_token {
-            builder = builder.with_token(session_token);
-        }
-        if self.endpoint.starts_with("http://") {
-            builder = builder.with_allow_http(true);
-        }
-        let store = builder.build()?;
+        let store: Arc<dyn ObjectStore> = match &self.object_store_provider {
+            ApiObjectStoreProvider::S3 {
+                endpoint,
+                access_key_id,
+                secret_access_key,
+                session_token,
+                region,
+                force_path_style,
+            } => {
+                let mut builder = AmazonS3Builder::new()
+                    .with_endpoint(endpoint)
+                    .with_region(region)
+                    .with_bucket_name(&self.bucket)
+                    .with_access_key_id(access_key_id)
+                    .with_secret_access_key(secret_access_key)
+                    .with_virtual_hosted_style_request(!force_path_style)
+                    .with_conditional_put(S3ConditionalPut::ETagMatch);
+                if let Some(session_token) = session_token {
+                    builder = builder.with_token(session_token);
+                }
+                if endpoint.starts_with("http://") {
+                    builder = builder.with_allow_http(true);
+                }
+                Arc::new(builder.build()?)
+            }
+            ApiObjectStoreProvider::Gcs {
+                service_account_path,
+                application_credentials_path,
+            } => {
+                let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(&self.bucket);
+                if let Some(path) = service_account_path {
+                    builder = builder.with_service_account_path(path);
+                }
+                if let Some(path) = application_credentials_path {
+                    builder = builder.with_application_credentials(path);
+                }
+                Arc::new(builder.build()?)
+            }
+        };
         if self.prefix.trim().is_empty() {
-            Ok(Arc::new(store))
+            Ok(store)
         } else {
             Ok(Arc::new(PrefixStore::new(
                 store,
@@ -9395,12 +9601,34 @@ impl ApiConfig {
     }
 }
 
-fn default_authority_store_id(bucket: &str, prefix: &str) -> String {
-    format!("s3://s3-compatible/{bucket}/{prefix}")
+fn default_authority_store_id(
+    provider: ApiObjectStoreProviderKind,
+    bucket: &str,
+    prefix: &str,
+) -> String {
+    match provider {
+        ApiObjectStoreProviderKind::S3 => format!("s3://s3-compatible/{bucket}/{prefix}"),
+        ApiObjectStoreProviderKind::Gcs => format!("gcs://google-cloud-storage/{bucket}/{prefix}"),
+    }
 }
 
-fn required_env(name: &str) -> anyhow::Result<String> {
-    std::env::var(name).with_context(|| format!("{name} is required"))
+fn object_store_cache_identity(
+    provider: &ApiObjectStoreProvider,
+    bucket: &str,
+    prefix: &str,
+    authority_store_id: &str,
+) -> anyhow::Result<String> {
+    let (provider, endpoint) = match provider {
+        ApiObjectStoreProvider::S3 { endpoint, .. } => ("s3", endpoint.as_str()),
+        ApiObjectStoreProvider::Gcs { .. } => ("gcs", "https://storage.googleapis.com"),
+    };
+    Ok(stable_bytes_hash(&serde_json::to_vec(&(
+        provider,
+        endpoint,
+        bucket,
+        prefix,
+        authority_store_id,
+    ))?))
 }
 
 fn optional_nonempty_env(name: &str) -> Option<String> {
