@@ -45,6 +45,10 @@ jobs:
       - name: Run workspace compatibility check
         shell: bash
         run: |
+          # Blaze registers io_uring buffers before loading the workspace.
+          ulimit -l | tee target/blaze-linux-validation/memlock-before.txt
+          sudo prlimit --pid "$$" --memlock=unlimited
+          ulimit -l | tee target/blaze-linux-validation/memlock-after.txt
           set +e
           start=$(date +%s)
           "$BLAZE_BIN" check --workspace --all-targets 2>&1 | tee target/blaze-linux-validation/blaze-check.log
