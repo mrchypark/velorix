@@ -18,13 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust 1.98.1 and Go 1.27.3
+      - name: Install Rust 1.98.1
         uses: dtolnay/rust-toolchain@1.98.1
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.27.3'
-          cache: false
 
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libxml2-dev libzstd-dev clang
@@ -76,6 +71,28 @@ jobs:
           status=${PIPESTATUS[0]}
           printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/test-result.txt
           exit "$status"
+
+      - name: Install Go for optional Rhiza backend validation
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+
+      - name: Check optional Rhiza backend
+        shell: bash
+        run: |
+          set +e
+          "$BLAZE_BIN" check -p velorix-meta --all-targets --features rhiza-backend 2>&1 | tee target/blaze-linux-validation/blaze-rhiza-check.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Preserve Blaze daemon diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p target/blaze-linux-validation
+          if [ -f "$HOME/.cache/blaze/v2/serve.log" ]; then
+            cp "$HOME/.cache/blaze/v2/serve.log" target/blaze-linux-validation/serve.log
+          fi
 
       - name: Upload Linux validation logs
         if: always()
