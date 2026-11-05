@@ -1,0 +1,86 @@
+name: Blaze advisory
+
+on:
+  push:
+    branches:
+      - feature/blaze-prerelease-evaluation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  blaze-check:
+    # Experimental only: this diagnostic branch verifies Blaze on Linux before adoption.
+    name: Experimental Blaze probe (not a default check)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.98.1 and Go 1.27.3
+        uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libxml2-dev libzstd-dev clang
+
+      - name: Prepare validation log
+        run: mkdir -p target/blaze-linux-validation
+
+      - name: Download pinned Blaze release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=v0.20261105.1
+          archive="blaze-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          url="https://github.com/indexable-inc/blaze/releases/download/${version}/${archive}"
+          curl --fail --location --retry 3 "$url" -o "$RUNNER_TEMP/$archive"
+          echo 'aaf09e38f7cd9e873c84d4fa6afe8c26f713cb558e2e9dfc1a599af31b15ad8b  '"$RUNNER_TEMP/$archive" | sha256sum --check
+          mkdir "$RUNNER_TEMP/blaze"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/blaze"
+          binary="$(find "$RUNNER_TEMP/blaze" -type f -name blaze -perm -u+x -print -quit)"
+          test -n "$binary"
+          echo "BLAZE_BIN=$binary" >> "$GITHUB_ENV"
+
+      - name: Run workspace compatibility check
+        shell: bash
+        run: |
+          set +e
+          start=$(date +%s)
+          "$BLAZE_BIN" check --workspace --all-targets 2>&1 | tee target/blaze-linux-validation/blaze-check.log
+          status=${PIPESTATUS[0]}
+          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/result.txt
+          exit "$status"
+
+      - name: Build workspace with captured result
+        shell: bash
+        run: |
+          set +e
+          start=$(date +%s)
+          "$BLAZE_BIN" build --workspace --all-targets 2>&1 | tee target/blaze-linux-validation/blaze-build.log
+          status=${PIPESTATUS[0]}
+          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/build-result.txt
+          exit "$status"
+
+      - name: Test workspace with captured result
+        shell: bash
+        run: |
+          set +e
+          start=$(date +%s)
+          "$BLAZE_BIN" test --workspace 2>&1 | tee target/blaze-linux-validation/blaze-test.log
+          status=${PIPESTATUS[0]}
+          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/test-result.txt
+          exit "$status"
+
+      - name: Upload Linux validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blaze-linux-validation
+          path: target/blaze-linux-validation/
+          if-no-files-found: warn

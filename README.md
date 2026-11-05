@@ -71,6 +71,19 @@ cargo check -p velorix-storage --lib
 cargo check --workspace --all-targets
 ```
 
+Blaze is not a recommended default check. On 2026-11-05, pinned stable `v0.20261027.0`
+failed on Darwin ARM64 after 40 seconds (`blaze check --workspace --all-targets`, exit 101)
+while loading the workspace: Blaze could not compile the `lz4-sys v1.11.1` build script
+because `cc::parallel::job_token::inherited_jobserver::HelperThread::new` reaches an
+unsupported writable static, `__RUST_STD_INTERNAL_VAL`. The full check did not complete.
+Blaze used its own `blaze-2026-10-27` Rust toolchain; Cargo remains the required source of
+truth. The latest tested prerelease, `v0.20261105.1`, progressed further on Darwin ARM64
+but did not complete the workspace check within a 20-minute diagnostic limit; this is
+neither a compatibility pass nor a compiler failure. No build-speed comparison is established.
+The [Blaze advisory workflow](.github/workflows/blaze-advisory.yml) tests that pinned
+prerelease on Linux on the diagnostic branch or by manual dispatch. It is experimental
+and does not replace the required Cargo CI.
+
 Repository-wide operational and smoke tools live under `scripts/`. Product
 scenarios should exercise the REST API directly: create relation, ingest rows,
 create view, query the view, restart, and query again.
