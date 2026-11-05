@@ -27,6 +27,37 @@ jobs:
       - name: Prepare validation log
         run: mkdir -p target/blaze-linux-validation
 
+      - name: Prepare isolated Btrfs reflink workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/target/blaze-linux-validation/reflink-setup.log") 2>&1
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends btrfs-progs rsync
+          root="$RUNNER_TEMP/blaze-reflink"
+          mkdir -p "$root/mnt"
+          available_bytes=$(df --output=avail -B1 "$RUNNER_TEMP" | tail -n 1 | tr -d ' ')
+          printf 'runner_temp_available_bytes=%s\n' "$available_bytes" | tee target/blaze-linux-validation/reflink-filesystem.txt
+          test "$available_bytes" -gt 8589934592
+          truncate -s 32G "$root/fs.img"
+          mkfs.btrfs -f "$root/fs.img"
+          sudo mount -o loop "$root/fs.img" "$root/mnt"
+          sudo chown "$USER":"$(id -gn)" "$root/mnt"
+          printf 'probe\n' > "$root/mnt/probe"
+          test "$(stat -f -c %T "$root/mnt")" = btrfs
+          findmnt -no FSTYPE "$root/mnt" | tee -a target/blaze-linux-validation/reflink-filesystem.txt
+          mkdir -p "$root/mnt/workspace" "$root/mnt/home" "$root/mnt/cache"
+          mkdir -p "$root/mnt/xdg-cache"
+          rsync -a --exclude=target/ "$GITHUB_WORKSPACE/" "$root/mnt/workspace/"
+          cp --reflink=always "$root/mnt/workspace/Cargo.toml" "$root/mnt/cache/reflink-probe"
+          rm "$root/mnt/cache/reflink-probe"
+          printf 'source_to_cache_reflink_probe=passed\n' | tee -a target/blaze-linux-validation/reflink-filesystem.txt
+          {
+            echo "BLAZE_CI_WORKSPACE=$root/mnt/workspace"
+            echo "BLAZE_HOME=$root/mnt/home"
+            echo "BLAZE_CACHE=$root/mnt/cache"
+            echo "XDG_CACHE_HOME=$root/mnt/xdg-cache"
+          } >> "$GITHUB_ENV"
+
       - name: Download pinned Blaze release
         shell: bash
         run: |
@@ -51,9 +82,10 @@ jobs:
           ulimit -l | tee target/blaze-linux-validation/memlock-after.txt
           set +e
           start=$(date +%s)
-          "$BLAZE_BIN" check --workspace --all-targets 2>&1 | tee target/blaze-linux-validation/blaze-check.log
+          cd "$BLAZE_CI_WORKSPACE"
+          "$BLAZE_BIN" check --workspace --all-targets 2>&1 | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/blaze-check.log"
           status=${PIPESTATUS[0]}
-          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/result.txt
+          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/result.txt"
           exit "$status"
 
       - name: Build workspace with captured result
@@ -61,9 +93,10 @@ jobs:
         run: |
           set +e
           start=$(date +%s)
-          "$BLAZE_BIN" build --workspace --all-targets 2>&1 | tee target/blaze-linux-validation/blaze-build.log
+          cd "$BLAZE_CI_WORKSPACE"
+          "$BLAZE_BIN" build --workspace --all-targets 2>&1 | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/blaze-build.log"
           status=${PIPESTATUS[0]}
-          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/build-result.txt
+          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/build-result.txt"
           exit "$status"
 
       - name: Test workspace with captured result
@@ -71,9 +104,10 @@ jobs:
         run: |
           set +e
           start=$(date +%s)
-          "$BLAZE_BIN" test --workspace 2>&1 | tee target/blaze-linux-validation/blaze-test.log
+          cd "$BLAZE_CI_WORKSPACE"
+          "$BLAZE_BIN" test --workspace 2>&1 | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/blaze-test.log"
           status=${PIPESTATUS[0]}
-          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee target/blaze-linux-validation/test-result.txt
+          printf 'elapsed_seconds=%s\nexit_code=%s\n' "$(( $(date +%s) - start ))" "$status" | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/test-result.txt"
           exit "$status"
 
       - name: Install Go for optional Rhiza backend validation
@@ -86,16 +120,34 @@ jobs:
         shell: bash
         run: |
           set +e
-          "$BLAZE_BIN" check -p velorix-meta --all-targets --features rhiza-backend 2>&1 | tee target/blaze-linux-validation/blaze-rhiza-check.log
+          cd "$BLAZE_CI_WORKSPACE"
+          "$BLAZE_BIN" check -p velorix-meta --all-targets --features rhiza-backend 2>&1 | tee "$GITHUB_WORKSPACE/target/blaze-linux-validation/blaze-rhiza-check.log"
           exit "${PIPESTATUS[0]}"
 
-      - name: Preserve Blaze daemon diagnostics
+      - name: Stop Blaze and unmount reflink filesystem
         if: always()
         shell: bash
         run: |
-          mkdir -p target/blaze-linux-validation
-          if [ -f "$HOME/.cache/blaze/v2/serve.log" ]; then
-            cp "$HOME/.cache/blaze/v2/serve.log" target/blaze-linux-validation/serve.log
+          root="$RUNNER_TEMP/blaze-reflink"
+          blaze_state_home="$root/mnt/home"
+          if [ -d "$root/mnt" ] && mountpoint -q "$root/mnt"; then
+            if [ -n "${BLAZE_BIN:-}" ] && [ -d "$blaze_state_home" ]; then
+              if ! BLAZE_HOME="$blaze_state_home" "$BLAZE_BIN" stop; then
+                printf 'daemon_stop=failed\n' >> target/blaze-linux-validation/cleanup.txt
+              fi
+              if [ -f "$blaze_state_home/v2/serve.log" ]; then
+                cp "$blaze_state_home/v2/serve.log" target/blaze-linux-validation/serve.log
+              fi
+            fi
+            sudo umount "$root/mnt"
+            if mountpoint -q "$root/mnt"; then
+              echo 'loop_mount_detach=failed' >> target/blaze-linux-validation/cleanup.txt
+              exit 1
+            fi
+            echo 'loop_mount_detach=passed' >> target/blaze-linux-validation/cleanup.txt
+            rm "$root/fs.img"
+          elif [ -f "$root/fs.img" ]; then
+            rm "$root/fs.img"
           fi
 
       - name: Upload Linux validation logs
