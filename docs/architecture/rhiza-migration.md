@@ -9,7 +9,60 @@ Historical release and test records below remain historical and are not
 re-verified by this source reconciliation. Run-local `target/` evidence is not
 a public repository artifact or provider/deployment qualification.
 
-## Current upstream maintenance-release assessment: v0.21.2
+## Current upstream release assessment: v0.23.0
+
+Velorix pins optional `rhizadb` v0.23.0 in `crates/velorix-meta/Cargo.toml`;
+Cargo.lock records checksum
+`4a0ca9564448b32bd974509d919b6ac92ddd0913bda8a6804474d8106703ab52`. The
+annotated `v0.23.0` tag object is
+`6f774d90ee535a6f47ac5c0cfe5086aa5467fb69`, peeled to
+`f050d6e30f57718736c8c4fdb5edef777183bc05`. Native
+release archive SHA-256 values are macOS arm64
+`26b8890ef659351440f948cc7902e2f451076d898be9e778071bf54901863546`, Linux
+arm64 GNU `d6665fcf44dcf5c3183c7d3db7018a6d70aff7eb14248782b21c7f9648b3e8f6`,
+and Linux x86_64 GNU
+`b4c226fea57fbd6da3a75fe3003ad92faeb3717b1469d6e845a6da11691d7bef`.
+Upstream publishes these beside the [v0.23.0 release](https://github.com/mrchypark/rhiza/releases/tag/v0.23.0).
+Artifact provenance does not establish runtime or deployment qualification.
+
+The existing Rust `Config`, local mode, KV/SQL facade, and C FFI API call sites
+compiled and passed Velorix's Rhiza-feature tests on macOS arm64. The crate
+build requires Go 1.27.3+ and a C toolchain unless a checksum-verified,
+exact-target archive is provided with `RHIZA_NATIVE_LIB_DIR`. The SDK build
+script does not check the archive release identity itself. Do not assume that the crate bump repairs
+Local GCS maintenance or missing-`DataDir` behavior. Preserve the supplier
+contract and unresolved task state; Local object-store recovery and managed HA
+are separate evidence scopes. No automatic legacy migration, JSON fallback,
+local state deletion, archive deletion, or destructive rebootstrap is allowed.
+
+On the exact `47ee843860500e8b3c20c153e3ee5f0816d935b6` main base, on macOS
+arm64, these checks passed: `cargo fmt --check`, workspace clippy
+with `--all-targets --locked -- -D warnings`, Rhiza-feature Meta clippy,
+`cargo test -p velorix-meta --features rhiza-backend --tests --locked` (197
+passed, 5 fixture tests ignored in that command: four recovery tests and the
+separate cross-version fixture), runtime library tests (86),
+and materialized-view runtime tests (263). All four recovery tests passed
+through `scripts/check-rhiza-recovery.sh`; the Go toolchain contract passed.
+The recovery tests used a fresh isolated VersityGW S3-compatible fixture. The
+split-process service recovery was not rerun on this exact base and is not
+counted as a passing rebased check.
+
+The Linux arm64/amd64 Velorix builds, Local GCS, v0.21.2-to-v0.23.0 SQL/archive
+compatibility, and production cloud/deployment qualification remain
+unverified. The opt-in `scripts/check-rhiza-local-cross-version.sh` built a
+separate 0.21.2 writer and passed the 0.23.0 KV read/CAS/append/restart test
+(one test, 3.20 seconds). Both versions used the same node identity and
+checksum-verified matching native archives. The harness subsequently exited
+75 because its final disk-space guard detected less than 5 GiB free; this
+resource stop is separate from the passing test result. Temporary state was
+removed. Formatting, workspace/feature clippy and runtime tests passed again
+after the final CAS assertion. This does not qualify SQL or archive compatibility.
+Do not make a broader old-state deployment claim. The Local
+tests do not resolve the GCS maintenance/DataDir-loss blocker or prove failure
+preservation for that GCS interleaving. Existing S3 release benchmark
+requirements remain in force; this dependency update does not waive them.
+
+## Historical upstream maintenance-release assessment: v0.21.2
 
 The official v0.21.2 tag resolves to the exact source commit
 [`8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd`](https://github.com/mrchypark/rhiza/commit/8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd).
@@ -30,7 +83,7 @@ These workflow results do not establish independent live-cloud qualification.
 The upstream operator image is not a Velorix dependency: Velorix embeds the Go
 SDK and owns its application image and init-local command.
 
-The local project pins `rhizadb` v0.21.2 in Cargo.toml/Cargo.lock with SHA-256
+At that historical assessment, the local project pinned `rhizadb` v0.21.2 in Cargo.toml/Cargo.lock with SHA-256
 `c913bfcb9a6c6c6b5340a92c320d08c4941ae07d985e6174de7d59ad12f03db0`. Artifact
 readiness is recorded below. The crate omits optional `.cargo_vcs_info.json`;
 this provenance gap does not block Velorix runtime verification, which checks
