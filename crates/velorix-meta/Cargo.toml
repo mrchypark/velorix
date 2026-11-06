@@ -12,7 +12,7 @@ rhiza-backend = ["dep:rhizadb", "dep:uuid"]
 anyhow = { workspace = true }
 base64 = { workspace = true }
 async-trait = { workspace = true }
-rhizadb = { version = "=0.21.2", optional = true }
+rhizadb = { version = "=0.23.0", optional = true }
 uuid = { workspace = true, optional = true }
 object_store = { workspace = true, features = ["aws"] }
 rustls = { workspace = true }
