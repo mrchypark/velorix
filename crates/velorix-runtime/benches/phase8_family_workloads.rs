@@ -37,11 +37,28 @@ pub(super) struct Phase8WorkloadMeasurement {
 }
 
 pub(super) fn run() -> BenchResult<Vec<Phase8WorkloadMeasurement>> {
-    Ok(vec![
+    let mut measurements = vec![
         interval_join_workload()?,
         recursive_fixpoint_workload()?,
         cross_join_workload()?,
-    ])
+    ];
+    let observed = measurements
+        .iter()
+        .map(|measurement| measurement.samples.len())
+        .min()
+        .expect("phase workloads provide observations");
+    let repetitions = super::timing_sample_count(observed).div_ceil(observed);
+    for _ in 1..repetitions {
+        for (measurement, repeated) in measurements.iter_mut().zip([
+            interval_join_workload()?,
+            recursive_fixpoint_workload()?,
+            cross_join_workload()?,
+        ]) {
+            assert_eq!(measurement.name, repeated.name);
+            measurement.samples.extend(repeated.samples);
+        }
+    }
+    Ok(measurements)
 }
 
 const INTERVAL_JOIN_SQL: &str =

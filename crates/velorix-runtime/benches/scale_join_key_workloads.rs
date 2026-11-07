@@ -154,7 +154,7 @@ fn run_outer_samples(
     let identity = outer_identity(name);
     let mut samples = Vec::with_capacity(OUTER_SAMPLES as usize);
 
-    for sample in 0..OUTER_SAMPLES {
+    for sample in 0..super::timing_sample_count(OUTER_SAMPLES as usize) {
         let mut runtime = create_standing_runtime_with_sql_and_catalogs(
             &identity,
             &catalogs,
@@ -219,7 +219,7 @@ fn run_workload(workload: &JoinScaleWorkload) -> BenchResult<JoinScaleWorkloadMe
     let identity = identity(workload);
     let mut samples = Vec::with_capacity(workload.samples as usize);
 
-    for sample in 0..workload.samples {
+    for sample in 0..super::timing_sample_count(workload.samples as usize) {
         let mut runtime = create_standing_runtime_with_sql_and_catalogs(
             &identity,
             &catalogs,

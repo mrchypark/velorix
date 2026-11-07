@@ -32,7 +32,8 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
-object_store = { workspace = true }
+libc = "0.2"
+object_store = { workspace = true, features = ["aws"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
