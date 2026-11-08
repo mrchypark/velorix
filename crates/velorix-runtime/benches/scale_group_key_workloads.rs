@@ -61,7 +61,19 @@ enum Distribution {
 
 pub(super) fn run() -> BenchResult<Vec<ScaleWorkloadMeasurement>> {
     let corpus: Corpus = serde_json::from_str(CORPUS)?;
-    corpus.scale_workloads.iter().map(run_workload).collect()
+    corpus
+        .scale_workloads
+        .iter()
+        .map(|workload| {
+            let mut measurement = run_workload(workload)?;
+            let repetitions = super::timing_sample_count(measurement.samples.len())
+                .div_ceil(measurement.samples.len());
+            for _ in 1..repetitions {
+                measurement.samples.extend(run_workload(workload)?.samples);
+            }
+            Ok(measurement)
+        })
+        .collect()
 }
 
 /// Separate native-runtime evidence: never mixed into the unchanged cost-gate corpus.
