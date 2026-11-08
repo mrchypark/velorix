@@ -10,12 +10,12 @@ free_space_limit_kib=$((5 * 1024 * 1024))
 legacy_archive_sha=19a256b8098f144afc0f5fc007d90a5b8550086140264025abf2ecb1ac5bc75e
 legacy_sidecar_sha=a95fb666bded00c963a536877ab67da237c736afd94a9ccb91dadf57bd0bc86f
 legacy_crate_sha=c913bfcb9a6c6c6b5340a92c320d08c4941ae07d985e6174de7d59ad12f03db0
-current_archive_sha=26b8890ef659351440f948cc7902e2f451076d898be9e778071bf54901863546
-current_crate_sha=4a0ca9564448b32bd974509d919b6ac92ddd0913bda8a6804474d8106703ab52
+current_archive_sha=bb5d698149a9b7e94d8db74dfee45db2ecc5420b4e5c327bcc8b36f5ac3696bb
+current_crate_sha=7478cd8fd7e10dd35ffd8d457a2fac8dca9cfa45d0a97027663dc4c3de85bb8c
 legacy_archive_name=librhiza_ffi-0.21.2-aarch64-apple-darwin.a
 legacy_sidecar_name=$legacy_archive_name.sha256
-current_archive_name=librhiza_ffi-0.23.0-aarch64-apple-darwin.a
-artifact_dir=${RHIZA_0230_ARTIFACT_DIR:-"$repo_root/target/rhiza-0230-assessment/artifacts"}
+current_archive_name=librhiza_ffi-0.23.3-aarch64-apple-darwin.a
+artifact_dir=${RHIZA_0233_ARTIFACT_DIR:-"$repo_root/target/rhiza-0233-integration/native"}
 current_archive=$artifact_dir/$current_archive_name
 cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
 
@@ -52,7 +52,7 @@ if [ "${1-}" = --self-test ]; then
     echo "disk guard accepted an unavailable space requirement" >&2
     exit 1
   fi
-  echo "self-test passed: checksum and disk guards accept/reject through production functions"
+  echo "self-test passed: archive checksum and disk guards accept/reject through production functions"
   exit 0
 fi
 
@@ -61,8 +61,8 @@ if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
   echo "this verified artifact pair is macOS ARM64 only; current host is $(uname -s)/$(uname -m)" >&2
   exit 1
 fi
-grep -Fq 'rhizadb = { version = "=0.23.0"' "$repo_root/crates/velorix-meta/Cargo.toml" || {
-  echo "workspace rhizadb dependency is not pinned to 0.23.0" >&2
+grep -Fq 'rhizadb = { version = "=0.23.3"' "$repo_root/crates/velorix-meta/Cargo.toml" || {
+  echo "workspace rhizadb dependency is not pinned to 0.23.3" >&2
   exit 1
 }
 locked_version=$(awk '
@@ -70,8 +70,8 @@ locked_version=$(awk '
   /^name = "rhizadb"$/ { in_package = 1 }
   in_package && /^version = / { gsub(/"/, "", $3); print $3; exit }
 ' "$repo_root/Cargo.lock")
-if [ "$locked_version" != 0.23.0 ]; then
-  echo "Cargo.lock rhizadb version is $locked_version, expected 0.23.0" >&2
+if [ "$locked_version" != 0.23.3 ]; then
+  echo "Cargo.lock rhizadb version is $locked_version, expected 0.23.3" >&2
   exit 1
 fi
 set -- "$cargo_home"/registry/cache/*/rhizadb-0.21.2.crate
@@ -80,23 +80,23 @@ if [ ! -f "$1" ]; then
   exit 1
 fi
 check_sha "$legacy_crate_sha" "$1"
-set -- "$cargo_home"/registry/cache/*/rhizadb-0.23.0.crate
+set -- "$cargo_home"/registry/cache/*/rhizadb-0.23.3.crate
 if [ ! -f "$1" ]; then
-  echo "rhizadb 0.23.0 crate is not cached; refusing to download a crate" >&2
+  echo "rhizadb 0.23.3 crate is not cached; refusing to download a crate" >&2
   exit 1
 fi
 check_sha "$current_crate_sha" "$1"
+echo "verified rhizadb crates: 0.21.2 ($legacy_crate_sha), 0.23.3 ($current_crate_sha)"
 check_sha "$current_archive_sha" "$current_archive"
-echo "verified rhizadb crates: 0.21.2 ($legacy_crate_sha), 0.23.0 ($current_crate_sha)"
-echo "verified current native archive: 0.23.0 macOS ARM64 ($current_archive_sha)"
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-local-cross-version.XXXXXX")
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 legacy_native_dir=$tmp_dir/native-0.21.2
-current_native_dir=$tmp_dir/native-0.23.0
+current_native_dir=$tmp_dir/native-0.23.3
 mkdir -p "$legacy_native_dir" "$current_native_dir" "$tmp_dir/legacy/src"
 legacy_archive=$legacy_native_dir/librhiza_ffi.a
 cp "$current_archive" "$current_native_dir/librhiza_ffi.a"
+echo "verified current native archive: 0.23.3 macOS ARM64 ($current_archive_sha)"
 
 echo "Downloading published 0.21.2 macOS ARM64 native archive"
 curl --fail --location --retry 2 --connect-timeout 15 --max-time 300 \
@@ -146,13 +146,13 @@ RHIZA_NATIVE_LIB_DIR=$legacy_native_dir \
     --target-dir "$target_dir"
 check_space
 
-echo "Running the 0.23.0 reader/append/restart test with one Cargo job"
+echo "Running the 0.23.3 reader/append/restart test with one Cargo job"
 RHIZA_NATIVE_LIB_DIR=$current_native_dir \
 RHIZA_0212_FIXTURE_BIN=$target_dir/debug/rhiza-0212-local-writer \
   cargo test --offline --locked --jobs 1 -p velorix-meta \
     --features rhiza-backend --test rhiza_local_cross_version \
-    rhiza_0212_local_kv_opens_appends_and_restarts_on_0230 -- --ignored --exact
+    rhiza_0212_local_kv_opens_appends_and_restarts_on_0233 -- --ignored --exact
 check_space
-echo "PASS: isolated Local DataDir 0.21.2 to 0.23.0 KV restart compatibility"
-echo "Artifact scope: published macOS ARM64 SDK archives with verified SHA-256; current SDK pin checked from Cargo.toml/Cargo.lock."
+echo "PASS: isolated Local DataDir 0.21.2 to 0.23.3 KV restart compatibility"
+echo "Artifact scope: published macOS ARM64 SDK archives verified by SHA-256; current archive SHA-256 $current_archive_sha; Cargo.toml/Cargo.lock pin checked."
 echo "Scope: KV and DataDir only; SQL, object-store archives, and provider behavior were not tested."
