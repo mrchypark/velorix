@@ -9,10 +9,22 @@ Historical release and test records below remain historical and are not
 re-verified by this source reconciliation. Run-local `target/` evidence is not
 a public repository artifact or provider/deployment qualification.
 
-## Current upstream release assessment: v0.23.0
+## Current upstream release assessment: v0.23.3
 
-Velorix pins optional `rhizadb` v0.23.0 in `crates/velorix-meta/Cargo.toml`;
-Cargo.lock records checksum
+Velorix pins `rhizadb` v0.23.3. The crate matches its registry checksum
+`7478cd8fd7e10dd35ffd8d457a2fac8dca9cfa45d0a97027663dc4c3de85bb8c`; the
+published macOS ARM64, Linux ARM64, and Linux AMD64 archives match their
+release digests and checksum sidecars. The native Go requirement remains
+1.27.3. On macOS ARM64, 54 Rhiza-enabled Meta library tests passed, including
+CAS and Local restart. The opt-in fixture also passed KV read, CAS, append,
+and restart from a disposable v0.21.2 Local DataDir. This does not qualify SQL
+or object-store archive recovery. The existing Local GCS maintenance-token
+recovery limitation remains unchanged.
+
+## Historical upstream release assessment: v0.23.0
+
+At that assessment, Velorix pinned optional `rhizadb` v0.23.0 in `crates/velorix-meta/Cargo.toml`;
+Cargo.lock recorded checksum
 `4a0ca9564448b32bd974509d919b6ac92ddd0913bda8a6804474d8106703ab52`. The
 annotated `v0.23.0` tag object is
 `6f774d90ee535a6f47ac5c0cfe5086aa5467fb69`, peeled to

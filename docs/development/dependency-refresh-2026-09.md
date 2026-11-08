@@ -2,7 +2,8 @@
 
 > Historical refresh record; versions and migration assessment below are a
 > September snapshot, not current dependency state. The current workspace pins
-> Rhiza 0.21.2 and no longer includes Hiqlite; inspect
+> Rhiza 0.23.3 and no longer includes Hiqlite; see the
+> [current Rhiza assessment](../architecture/rhiza-migration.md) and inspect
 > [Cargo.toml](../../Cargo.toml), [Cargo.lock](../../Cargo.lock), and
 > [dependency-governance.json](../../dependency-governance.json) for current
 > facts. The 2026-10-30 CI run is recorded in
