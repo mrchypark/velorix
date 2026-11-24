@@ -48,9 +48,9 @@
     {
       "subject": "rhizadb",
       "owner": "metadata",
-      "reviewed_on": "2026-10-28",
-      "audit_status": "v0212_pin_core_source_and_native_build_artifacts_verified_runtime_tests_and_mandatory_pipeline_pending_optional_vcs_metadata_absent",
-      "feature_policy": "Active Cargo.toml/Cargo.lock pin: rhizadb 0.21.2, official tag source 8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd, crate SHA-256 c913bfcb9a6c6c6b5340a92c320d08c4941ae07d985e6174de7d59ad12f03db0. Packaged local.go for the maintenance fix matches the exact tag source (SHA-256 prefix dfcf564). Mac ARM64 and Linux AMD64 native sidecars match the release; Docker Go 1.27.3 tarball pin is available and verified. Core source/artifact provenance is verified. Optional .cargo_vcs_info.json is absent; record this provenance gap, but it is not required for Velorix runtime verification because version, release hash and relevant code are checked. v0.21.2 runtime tests have started and remain pending; do not add test outcomes until verified. The v0.21.2 Local maintenance fix reconciles release errors only after bounded stable remote readback proves the exact expected free control at a changed object version. Errors, cancellation, uncertainty, unreadable state and held controls remain fail-closed. It is not a manual unlock or orphan-held-token recovery API. No archive format, identity, receipt, public API or upload-timeout change. Exact-source official workflows CI 40840202108, Performance 40840202329, Native archives 40841322381, Release sync 40840963425 and Operator image 40841322597 were independently verified successful at the tag SHA. These workflow results do not constitute independent live-cloud qualification. The upstream release CI's pinned emulator adapter contracts include explicit skips; do not generalize this to all-cloud compatibility. The upstream operator image is not a Velorix dependency because Velorix embeds the SDK. Velorix build artifacts are the published crate, Mac ARM64 and Linux AMD64 native sidecars, and the Docker Go 1.27.3 toolchain pin; no upstream operator image is required. Historical v0.21.1 verification remains scoped: 196 Meta feature tests passed, 4 ignored; native Local S3 recovery and service lifecycle recovery passed; Kubernetes execution, filesystem/GCS/Azure recovery, independent live-cloud qualification, older-format refusal, and production multi-writer/failover safety were not established. The earlier v0.21.1 S3 maintenance-control CI issue is historical and addressed by the targeted v0.21.2 fix; do not claim automatic recovery of an already-held orphan control. Same-config init-local and serve use the same DataDir; init-local must finish recovery/reconciliation and successfully close before acknowledgement. External exclusion of concurrent writers remains required.",
+      "reviewed_on": "2026-11-24",
+      "audit_status": "v0275_source_and_required_artifacts_verified",
+      "feature_policy": "Embedded Rhiza KV uses rhizadb 0.27.5 at tag source 97bd7314ed8aa22581d848d46ae96a5f12743575 and crate SHA-256 7e159c47055a5633b82a3072f421f3ad21fcd63b7381b4e25e06de67e426ee16. The required macOS ARM64, Linux AMD64, and Linux ARM64 native artifacts were verified. CI builds bundled native sources with Go 1.27.4; images link the verified native archive. Local recovery requires external exclusion of the previous writer. Managed HA changes do not qualify Local GCS recovery or resolve a held or uncertain remote maintenance token. See docs/architecture/rhiza-migration.md.",
       "replacement_plan": "For future upgrades, verify the exact official tag commit, published crate SHA, relevant packaged source, and required native Go/C artifact downloads and pins for Mac ARM64 and Docker Linux AMD64. Treat .cargo_vcs_info.json absence as an optional provenance gap when version, release hash and relevant source are verified. Validate Local recovery with fresh data. Record provider-specific CI separately from live-cloud qualification, and explicitly report skips, unrun providers, performance scope, older-format behavior and production fencing gaps."
     },
     {
@@ -187,6 +187,33 @@
       "expires_on": "2027-01-08",
       "reason": "sqlparser_derive 0.5.0 supports DataFusion's sqlparser 0.62.0 line, while 0.6.0 supports the visitor feature of velorix-core's sqlparser 0.63.0. These build-time macros follow the two parser versions; admission ASTs stay inside velorix-core and DataFusion receives SQL text.",
       "replacement_plan": "Converge with the parser versions when DataFusion adopts sqlparser 0.63 or later. Re-check version-qualified sqlparser_derive dependency paths after parser upgrades and remove this exception when only one derive version remains.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "chrono",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "RUSTSEC-2026-0543 reports all chrono versions unmaintained. The locked chrono 0.4.45 is used by Arrow 59.3.0, DataFusion 55.1.0, and both object_store versions; no safe upgrade is available according to the advisory.",
+      "replacement_plan": "Track Arrow, DataFusion, and object_store migration to maintained date-time dependencies; re-check the inverse dependency tree after upgrades and remove this record when cargo-deny no longer reports the warning.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "chrono-tz",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "RUSTSEC-2026-0555 reports all chrono-tz versions unmaintained. The locked chrono-tz 0.10.4 is used by arrow-array 59.3.0 and datafusion-functions 55.1.0; no safe upgrade is available according to the advisory.",
+      "replacement_plan": "Track Arrow and DataFusion migration to maintained timezone dependencies; re-check the inverse dependency tree after upgrades and remove this record when cargo-deny no longer reports the warning.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "humantime",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "RUSTSEC-2026-0542 reports all humantime versions unmaintained. The locked humantime 2.4.0 is used by object_store 0.13.2 and 0.14.2; no safe upgrade is available according to the advisory.",
+      "replacement_plan": "Track object_store migration to a maintained alternative; re-check both inverse dependency paths after upgrades and remove this record when cargo-deny no longer reports the warning.",
       "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
     },
     {

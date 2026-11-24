@@ -9,13 +9,36 @@ Historical release and test records below remain historical and are not
 re-verified by this source reconciliation. Run-local `target/` evidence is not
 a public repository artifact or provider/deployment qualification.
 
-## Current upstream release assessment: v0.23.3
+## Current upstream release assessment: v0.27.5
 
-Velorix pins `rhizadb` v0.23.3. The crate matches its registry checksum
+Velorix pins `rhizadb` v0.27.5. The crate matches its registry checksum
+`7e159c47055a5633b82a3072f421f3ad21fcd63b7381b4e25e06de67e426ee16`; the
+`v0.27.5` tag points to commit `97bd7314ed8aa22581d848d46ae96a5f12743575`.
+Published macOS ARM64, Linux ARM64, and Linux AMD64 archives match their
+release digests and checksum sidecars. The published crate bundles the native
+Go source and vendored dependencies; CI builds it with Go 1.27.4. Linux AMD64
+images fetch a version- and checksum-pinned archive using
+`scripts/fetch-rhiza-native.sh`. Artifact verification is not runtime or
+provider qualification. The opt-in 0.21.2 Local
+KV compatibility harness remains in place and must be run separately. Upstream
+managed Graph and HA learner/voter changes do not exercise Velorix Local GCS
+recovery and do not qualify Local GCS. The existing Local GCS
+maintenance-token recovery limitation remains unchanged.
+
+The optional HTTP service client in Rhiza 0.27.5 is not adopted: Velorix
+continues to call the embedded Rust SDK. Read failover advertised for that
+client therefore does not apply to Velorix. Indeterminate mutations retain
+the existing original-request status lookup; no automatic write resubmission
+is added.
+
+## Historical upstream release assessment: v0.23.3
+
+At that assessment, Velorix pinned `rhizadb` v0.23.3. The crate matched its
+registry checksum
 `7478cd8fd7e10dd35ffd8d457a2fac8dca9cfa45d0a97027663dc4c3de85bb8c`; the
-published macOS ARM64, Linux ARM64, and Linux AMD64 archives match their
-release digests and checksum sidecars. The native Go requirement remains
-1.27.3. On macOS ARM64, 54 Rhiza-enabled Meta library tests passed, including
+published macOS ARM64, Linux ARM64, and Linux AMD64 archives matched their
+release digests and checksum sidecars. The native Go requirement was 1.27.3. On
+macOS ARM64, 54 Rhiza-enabled Meta library tests passed, including
 CAS and Local restart. The opt-in fixture also passed KV read, CAS, append,
 and restart from a disposable v0.21.2 Local DataDir. This does not qualify SQL
 or object-store archive recovery. The existing Local GCS maintenance-token
