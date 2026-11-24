@@ -191,6 +191,33 @@
     },
     {
       "kind": "unmaintained",
+      "crate": "chrono",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "RUSTSEC-2026-0543 reports all chrono versions unmaintained. The locked chrono 0.4.45 is used by Arrow 59.3.0, DataFusion 55.1.0, and both object_store versions; no safe upgrade is available according to the advisory.",
+      "replacement_plan": "Track Arrow, DataFusion, and object_store migration to maintained date-time dependencies; re-check the inverse dependency tree after upgrades and remove this record when cargo-deny no longer reports the warning.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "chrono-tz",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "RUSTSEC-2026-0555 reports all chrono-tz versions unmaintained. The locked chrono-tz 0.10.4 is used by arrow-array 59.3.0 and datafusion-functions 55.1.0; no safe upgrade is available according to the advisory.",
+      "replacement_plan": "Track Arrow and DataFusion migration to maintained timezone dependencies; re-check the inverse dependency tree after upgrades and remove this record when cargo-deny no longer reports the warning.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
+      "crate": "humantime",
+      "owner": "runtime",
+      "expires_on": "2027-01-08",
+      "reason": "RUSTSEC-2026-0542 reports all humantime versions unmaintained. The locked humantime 2.4.0 is used by object_store 0.13.2 and 0.14.2; no safe upgrade is available according to the advisory.",
+      "replacement_plan": "Track object_store migration to a maintained alternative; re-check both inverse dependency paths after upgrades and remove this record when cargo-deny no longer reports the warning.",
+      "promotion_rule": "deny_after_expiry_or_renew_with_owner_and_updated_plan"
+    },
+    {
+      "kind": "unmaintained",
       "crate": "bincode",
       "owner": "runtime",
       "expires_on": "2027-01-08",
