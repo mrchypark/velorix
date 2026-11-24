@@ -48,12 +48,12 @@ This contract follows the official [Rhiza v0.21.1 Local init-container
 recovery guide](https://raw.githubusercontent.com/mrchypark/rhiza/v0.21.1/docs/local-init-container-recovery.md),
 introduced by upstream commit
 [`66e2416b52e3d64aa86134b7b0c8b70c5ace88be`](https://github.com/mrchypark/rhiza/commit/66e2416b52e3d64aa86134b7b0c8b70c5ace88be).
-The active local Cargo pin is v0.21.2. Its published crate hash, relevant
-packaged source, Mac ARM64 and Linux AMD64 native sidecars, and Docker Go
-1.27.3 tarball pin are verified. The crate omits optional
-`.cargo_vcs_info.json`, which is a provenance gap but not a Velorix runtime
-artifact requirement. The
-v0.21.2 Local maintenance fix accepts a release only after
+The active local Cargo pin is v0.27.4. Its published crate hash, Mac ARM64 and
+Linux AMD64 native sidecars are verified. Images link the pinned archive;
+CI uses Go 1.27.4 for recovery fixtures. The v0.21.2
+Local maintenance behavior described below remains a historical assessment;
+the 0.27.4 artifact check does not qualify Local GCS recovery. That fix accepts
+a release only after
 bounded stable readback sees the exact expected free control at a changed
 object version; uncertain work, errors, cancellation, and held controls remain
 fail-closed. It does not add archive/API changes or a manual unlock for an
@@ -177,9 +177,7 @@ Run `sh scripts/check-rhiza-local-k8s-contract.sh` for an offline Kustomize
 render and local YAML structural check. It uses Kustomize, Mike Farah `yq`,
 and `jq`; it does not call `kubectl` or contact a Kubernetes API server.
 This contract proves the manifest shape only, not Rhiza recovery or production
-cloud behavior. As of this change, CI runs the existing operator-manifest
-contract and Rhiza backend/recovery jobs, but does not invoke this new Local
-manifest contract script. The successful local run is therefore not a CI gate.
+cloud behavior. CI invokes this script in the Rhiza backend integration job.
 
 ## Historical three-voter Operator validation (Rhiza 0.19.0)
 

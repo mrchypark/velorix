@@ -139,13 +139,17 @@ jobs:
         with:
           components: clippy
 
-      - name: Install Go 1.27.3
+      - name: Install Go 1.27.4
         uses: actions/setup-go@v6
         with:
-          go-version: '1.27.3'
-          # The published SDK's Go module is bundled inside Cargo's registry;
-          # this repository has no Go module/sum path for setup-go to cache.
+          go-version: '1.27.4'
+          # Go builds the isolated VersityGW fixture and offline validators.
           cache: false
+
+      - name: Fetch exact Rhiza native archive
+        run: |
+          sh scripts/fetch-rhiza-native.sh "$RUNNER_TEMP/rhiza-native"
+          echo "RHIZA_NATIVE_LIB_DIR=$RUNNER_TEMP/rhiza-native" >> "$GITHUB_ENV"
 
       - name: Install pinned offline manifest validators
         run: |

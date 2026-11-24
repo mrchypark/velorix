@@ -38,32 +38,21 @@ objects do not configure or qualify the Rhiza archive. Foyer remains a
 non-authoritative local cache only.
 
 The product path is the embedded Rhiza KV backend, pinned locally to
-`rhizadb = "=0.21.2"` with Cargo.lock checksum
-`c913bfcb9a6c6c6b5340a92c320d08c4941ae07d985e6174de7d59ad12f03db0`.
-The current release is Rhiza v0.21.2, whose exact official source is
-[`8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd`](https://github.com/mrchypark/rhiza/commit/8acb6da35a4c6fc83fa14ecec2fe2b64370fa4bd).
-The downloaded crate SHA matches the lockfile checksum. The package's
-`.cargo_vcs_info.json` is absent, an optional provenance gap. Velorix verifies
-the crate version, release checksum, and relevant source; this missing file is
-not a runtime artifact requirement. The packaged `local.go` used for the
-maintenance fix matches the exact tag source (SHA-256 prefix `dfcf564`). Native
-Mac ARM64 and Linux AMD64 sidecars match the release, and the Docker Go 1.27.3
-tarball pin is available and verified. The v0.21.2 Meta Rhiza-feature suite
-passed 196 tests, with 4 fixture-only tests ignored. The standalone native Local
-recovery probe and split-process service recovery also passed against a pinned
-local VersityGW fixture. These are local fixture results, not live-cloud or
-Kubernetes qualification. The workspace pre-push checks passed: formatting,
-clippy with `-D warnings`, runtime library (86 tests), and
-`materialized_view_runtime` (263 tests). Evidence is recorded under
-`target/rhiza-0.21.2-integration-evidence/`,
-`target/rhiza-recovery-evidence/20261029T111251Z-89574/`, and
-`target/rhiza-service-recovery-evidence/20261029t111346z-89570/`.
+`rhizadb = "=0.27.4"` with Cargo.lock checksum
+`d9b897c4f55b16b23dd83201e60af94d11cc662a76151c7ab6d1759efdbace02`.
+The published crate and native archives are checksum-verified in the run-local
+assessment. CI and images link the verified native archive; Go 1.27.4 is used
+by CI's recovery fixture. The 0.21.2 Local KV
+compatibility harness remains opt-in. Upstream managed Graph and HA changes do
+not qualify Velorix Local GCS, whose existing maintenance-token recovery
+limitation remains unchanged. Artifact assessment is not runtime, live-cloud,
+or Kubernetes qualification.
 The v0.21.0 release changes the archive format shared
 by filesystem, S3, GCS, and Azure storage. This is a greenfield format: startup
 must reject unsupported older database/archive formats without modifying
 them. Do not upgrade existing user data in place; use a new local data
 directory and a new archive prefix for verification. Historical crate
-checksums remain recorded alongside the current v0.21.2 pin in
+checksums remain recorded alongside the current pin in
 `dependency-governance.json`.
 
 Rhiza v0.21.2 reconciles an errored Local maintenance release only after

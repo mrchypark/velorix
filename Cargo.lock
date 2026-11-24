@@ -4101,9 +4101,9 @@ dependencies = [
 
 [[package]]
 name = "rhizadb"
-version = "0.23.3"
+version = "0.27.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7478cd8fd7e10dd35ffd8d457a2fac8dca9cfa45d0a97027663dc4c3de85bb8c"
+checksum = "d9b897c4f55b16b23dd83201e60af94d11cc662a76151c7ab6d1759efdbace02"
 dependencies = [
  "base64 0.22.1",
  "serde",
