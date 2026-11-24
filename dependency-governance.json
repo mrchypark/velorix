@@ -49,8 +49,8 @@
       "subject": "rhizadb",
       "owner": "metadata",
       "reviewed_on": "2026-11-24",
-      "audit_status": "v0274_source_and_required_artifacts_verified",
-      "feature_policy": "Embedded Rhiza KV uses rhizadb 0.27.4 at tag source 94e9ef3f29ddf52b3d543133bae3e3d8ba57558c and crate SHA-256 d9b897c4f55b16b23dd83201e60af94d11cc662a76151c7ab6d1759efdbace02. The tagged SDK and required macOS ARM64, Linux AMD64, and Linux ARM64 native artifacts were verified. CI and images link the verified native archive; CI recovery fixtures use Go 1.27.4. Local recovery requires external exclusion of the previous writer. Managed HA changes do not qualify Local GCS recovery or resolve a held or uncertain remote maintenance token. See docs/architecture/rhiza-migration.md.",
+      "audit_status": "v0275_source_and_required_artifacts_verified",
+      "feature_policy": "Embedded Rhiza KV uses rhizadb 0.27.5 at tag source 97bd7314ed8aa22581d848d46ae96a5f12743575 and crate SHA-256 7e159c47055a5633b82a3072f421f3ad21fcd63b7381b4e25e06de67e426ee16. The required macOS ARM64, Linux AMD64, and Linux ARM64 native artifacts were verified. CI builds bundled native sources with Go 1.27.4; images link the verified native archive. Local recovery requires external exclusion of the previous writer. Managed HA changes do not qualify Local GCS recovery or resolve a held or uncertain remote maintenance token. See docs/architecture/rhiza-migration.md.",
       "replacement_plan": "For future upgrades, verify the exact official tag commit, published crate SHA, relevant packaged source, and required native Go/C artifact downloads and pins for Mac ARM64 and Docker Linux AMD64. Treat .cargo_vcs_info.json absence as an optional provenance gap when version, release hash and relevant source are verified. Validate Local recovery with fresh data. Record provider-specific CI separately from live-cloud qualification, and explicitly report skips, unrun providers, performance scope, older-format behavior and production fencing gaps."
     },
     {

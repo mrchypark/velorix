@@ -48,11 +48,11 @@ This contract follows the official [Rhiza v0.21.1 Local init-container
 recovery guide](https://raw.githubusercontent.com/mrchypark/rhiza/v0.21.1/docs/local-init-container-recovery.md),
 introduced by upstream commit
 [`66e2416b52e3d64aa86134b7b0c8b70c5ace88be`](https://github.com/mrchypark/rhiza/commit/66e2416b52e3d64aa86134b7b0c8b70c5ace88be).
-The active local Cargo pin is v0.27.4. Its published crate hash, Mac ARM64 and
-Linux AMD64 native sidecars are verified. Images link the pinned archive;
-CI uses Go 1.27.4 for recovery fixtures. The v0.21.2
+The active local Cargo pin is v0.27.5. Its published crate hash, Mac ARM64 and
+Linux AMD64 and ARM64 native sidecars are verified. Images link the pinned archive;
+CI uses Go 1.27.4 to build the bundled sources and recovery fixtures. The v0.21.2
 Local maintenance behavior described below remains a historical assessment;
-the 0.27.4 artifact check does not qualify Local GCS recovery. That fix accepts
+the 0.27.5 artifact check does not qualify Local GCS recovery. That fix accepts
 a release only after
 bounded stable readback sees the exact expected free control at a changed
 object version; uncertain work, errors, cancellation, and held controls remain

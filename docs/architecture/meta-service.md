@@ -38,11 +38,11 @@ objects do not configure or qualify the Rhiza archive. Foyer remains a
 non-authoritative local cache only.
 
 The product path is the embedded Rhiza KV backend, pinned locally to
-`rhizadb = "=0.27.4"` with Cargo.lock checksum
-`d9b897c4f55b16b23dd83201e60af94d11cc662a76151c7ab6d1759efdbace02`.
-The published crate and native archives are checksum-verified in the run-local
-assessment. CI and images link the verified native archive; Go 1.27.4 is used
-by CI's recovery fixture. The 0.21.2 Local KV
+`rhizadb = "=0.27.5"` with Cargo.lock checksum
+`7e159c47055a5633b82a3072f421f3ad21fcd63b7381b4e25e06de67e426ee16`.
+The published crate and native archives have been checksum-verified.
+CI builds the bundled native sources with Go 1.27.4; images link
+the verified native archive. The 0.21.2 Local KV
 compatibility harness remains opt-in. Upstream managed Graph and HA changes do
 not qualify Velorix Local GCS, whose existing maintenance-token recovery
 limitation remains unchanged. Artifact assessment is not runtime, live-cloud,
